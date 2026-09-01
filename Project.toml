@@ -1,0 +1,19 @@
+name = "PETScDiffEq"
+uuid = "0a65194f-a16f-47d0-900e-080c22068669"
+authors = ["Harsh Singh"]
+version = "0.1.0"
+
+[deps]
+PETSc = "ace2c81b-2b5f-4b1e-a30d-d662738edfe0"
+SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
+
+[compat]
+PETSc = "0.4.10"
+SciMLBase = "3.1"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
