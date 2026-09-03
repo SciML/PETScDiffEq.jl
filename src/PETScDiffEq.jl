@@ -5,6 +5,7 @@ using MPI: MPI
 using PETSc: PETSc
 using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
+using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, sparse
 
 export TSRK, TSRosW, TSImplicit, TSARKIMEX, TSGeneric
 
@@ -67,7 +68,7 @@ _uses_ifunction(::TSImplicit) = true
 _uses_ifunction(::TSARKIMEX) = true
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
-mutable struct TSContext{F, F2, JAC, P, T}
+mutable struct TSContext{F, F2, JAC, JBUF, P, T}
     petsclib::T
     f!::F
     f2!::F2
@@ -75,7 +76,7 @@ mutable struct TSContext{F, F2, JAC, P, T}
     p::P
     du::Vector{Float64}
     u::Vector{Float64}
-    J::Matrix{Float64}
+    J::JBUF
     ts::Vector{Float64}
     us::Vector{Vector{Float64}}
     err::Union{Nothing, Any}
@@ -199,6 +200,56 @@ end
 
 const IJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
+function _sparse_ijacobian!(
+        ::LibPETSc.CTS,
+        t::LibPETSc.PetscReal,
+        x_ptr::LibPETSc.CVec,
+        ::LibPETSc.CVec,
+        shift::LibPETSc.PetscReal,
+        A_ptr::LibPETSc.CMat,
+        B_ptr::LibPETSc.CMat,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
+    A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
+    B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
+    try
+        PETSc.withlocalarray!(x; read = true, write = false) do xa
+            copyto!(ctx.u, xa)
+        end
+        ctx.jac!(ctx.J, ctx.u, ctx.p, t)
+        n = length(ctx.u)
+        # The diagonal always gets a `shift*I` contribution, whether or not
+        # the ODE Jacobian has a stored entry there, so it is set first and
+        # then overwritten below wherever the ODE Jacobian also contributes.
+        for i in 1:n
+            A[i, i] = shift
+        end
+        for j in 1:n, k in ctx.J.colptr[j]:(ctx.J.colptr[j + 1] - 1)
+            i = ctx.J.rowval[k]
+            A[i, j] = (i == j ? shift : 0.0) - ctx.J.nzval[k]
+        end
+        PETSc.assemble!(A)
+        if B.ptr != A.ptr
+            for i in 1:n
+                B[i, i] = shift
+            end
+            for j in 1:n, k in ctx.J.colptr[j]:(ctx.J.colptr[j + 1] - 1)
+                i = ctx.J.rowval[k]
+                B[i, j] = (i == j ? shift : 0.0) - ctx.J.nzval[k]
+            end
+            PETSc.assemble!(B)
+        end
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(1)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+const SPARSE_IJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
 function _monitor!(
         ::LibPETSc.CTS,
         ::LibPETSc.PetscInt,
@@ -255,7 +306,22 @@ function __init__()
             LibPETSc.PetscReal, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid},
         )
     )
+    SPARSE_IJACOBIAN_PTR[] = @cfunction(
+        _sparse_ijacobian!,
+        LibPETSc.PetscErrorCode,
+        (
+            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
+            LibPETSc.PetscReal, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid},
+        )
+    )
     return nothing
+end
+
+function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer)
+    rows, cols, _ = findnz(jac_prototype)
+    all_rows = vcat(rows, 1:n)
+    all_cols = vcat(cols, 1:n)
+    return sparse(all_rows, all_cols, ones(length(all_rows)), n, n)
 end
 
 function _cstr(f::F, s::AbstractString) where {F}
@@ -314,9 +380,12 @@ function SciMLBase.__solve(
     f2 = is_split ? prob.f.f2.f : nothing
     has_jac = _uses_ifunction(alg) && !is_split && prob.f.jac !== nothing
     jac_fn = has_jac ? prob.f.jac : nothing
+    jac_prototype = has_jac ? prob.f.jac_prototype : nothing
+    uses_sparse_jac = jac_prototype isa SparseMatrixCSC
+    J0 = uses_sparse_jac ? SparseMatrixCSC{Float64, Int}(jac_prototype) : zeros(n, n)
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
-        similar(u0), similar(u0), zeros(n, n),
+        similar(u0), similar(u0), J0,
         Float64[], Vector{Float64}[], nothing,
     )
 
@@ -350,7 +419,13 @@ function SciMLBase.__solve(
             if is_split
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, SPLIT_RHS_PTR[], ctxptr)
             end
-            if has_jac
+            if has_jac && uses_sparse_jac
+                pattern = _jacobian_pattern(J0, n)
+                jac_mat = PETSc.MatSeqAIJWithArrays(petsclib, MPI.COMM_SELF, pattern)
+                LibPETSc.TSSetIJacobian(
+                    petsclib, ts, jac_mat, jac_mat, SPARSE_IJACOBIAN_PTR[], ctxptr,
+                )
+            elseif has_jac
                 jac_mat = PETSc.MatSeqAIJ(petsclib, n, n, n)
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, jac_mat, jac_mat, IJACOBIAN_PTR[], ctxptr,
@@ -392,7 +467,7 @@ function SciMLBase.__solve(
     finally
         pushed && pop!(opts)
         opts.ptr == C_NULL || PETSc.destroy(opts)
-        jac_mat.ptr == C_NULL || LibPETSc.MatDestroy(petsclib, jac_mat)
+        jac_mat.ptr == C_NULL || PETSc.destroy(jac_mat)
         u.ptr == C_NULL || PETSc.destroy(u)
         ts.ptr == C_NULL || LibPETSc.TSDestroy(petsclib, ts)
     end

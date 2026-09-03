@@ -1,5 +1,6 @@
 using PETScDiffEq
 using SciMLBase
+using SparseArrays
 using Test
 
 decay!(du, u, p, t) = (du[1] = -u[1]; nothing)
@@ -21,6 +22,37 @@ function lotka_volterra_jac!(J, u, p, t)
     J[2, 1] = d * u[2]
     return J[2, 2] = -c + d * u[1]
 end
+
+function chain!(du, u, p, t)
+    du[1] = -u[1] + u[2]
+    du[2] = u[1] - 2u[2] + u[3]
+    return du[3] = u[2] - u[3]
+end
+function chain_jac!(J, u, p, t)
+    J[1, 1] = -1.0
+    J[2, 1] = 1.0
+    J[1, 2] = 1.0
+    J[2, 2] = -2.0
+    J[3, 2] = 1.0
+    J[2, 3] = 1.0
+    return J[3, 3] = -1.0
+end
+const CHAIN_PROTOTYPE = sparse(
+    [1, 2, 1, 2, 3, 2, 3], [1, 1, 2, 2, 2, 3, 3], ones(7), 3, 3,
+)
+
+function damped_oscillator!(du, u, p, t)
+    du[1] = u[2]
+    return du[2] = -u[1] - 0.5 * u[2]
+end
+function damped_oscillator_jac!(J, u, p, t)
+    J[1, 2] = 1.0
+    J[2, 1] = -1.0
+    return J[2, 2] = -0.5
+end
+# Deliberately omits the structural zero at (1,1): u1' = u2 does not depend
+# on u1 at all, so a correct sparsity pattern must not reserve that entry.
+const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
 @testset "PETScDiffEq.jl" begin
     @testset "TSRK convergence order" begin
@@ -209,6 +241,84 @@ end
             )
             @test sol_jac.retcode == SciMLBase.ReturnCode.Success
             @test maximum(abs.(sol_jac.u[end] .- sol_fd.u[end])) < 1.0e-6
+        end
+
+        @testset "sparse jac_prototype matches the dense path" begin
+            sparse_prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    chain!; jac = chain_jac!, jac_prototype = CHAIN_PROTOTYPE,
+                ),
+                [1.0, 0.0, 0.0], (0.0, 2.0),
+            )
+            dense_prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(chain!; jac = chain_jac!),
+                [1.0, 0.0, 0.0], (0.0, 2.0),
+            )
+            alg = PETScDiffEq.TSImplicit("bdf")
+            sol_sparse = SciMLBase.solve(
+                sparse_prob, alg; dt = 0.01, reltol = 1.0e-9, abstol = 1.0e-11,
+            )
+            sol_dense = SciMLBase.solve(
+                dense_prob, alg; dt = 0.01, reltol = 1.0e-9, abstol = 1.0e-11,
+            )
+            @test sol_sparse.retcode == SciMLBase.ReturnCode.Success
+            @test maximum(abs.(sol_sparse.u[end] .- sol_dense.u[end])) < 1.0e-10
+        end
+
+        @testset "sparse jac_prototype convergence order" begin
+            exact = exp(-1.0)
+            proto = sparse([1], [1], [1.0], 1, 1)
+            prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(decay!; jac = decay_jac!, jac_prototype = proto),
+                [1.0], (0.0, 1.0),
+            )
+            errs = Float64[]
+            for dt in (0.1, 0.05, 0.025, 0.0125)
+                sol = SciMLBase.solve(
+                    prob, PETScDiffEq.TSImplicit("cn", ["-ts_adapt_type", "none"]);
+                    dt = dt,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                push!(errs, abs(sol.u[end][1] - exact))
+            end
+            orders = [log2(errs[i] / errs[i + 1]) for i in 1:(length(errs) - 1)]
+            @test all(o -> isapprox(o, 2; atol = 0.15), orders)
+        end
+
+        @testset "sparse prototype handles a structural zero on the diagonal" begin
+            proto_prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    damped_oscillator!; jac = damped_oscillator_jac!,
+                    jac_prototype = OSCILLATOR_PROTOTYPE,
+                ),
+                [1.0, 0.0], (0.0, 3.0),
+            )
+            fd_prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(damped_oscillator!; jac = damped_oscillator_jac!),
+                [1.0, 0.0], (0.0, 3.0),
+            )
+            alg = PETScDiffEq.TSImplicit("bdf")
+            sol_sparse = SciMLBase.solve(
+                proto_prob, alg; dt = 0.01, reltol = 1.0e-9, abstol = 1.0e-11,
+            )
+            sol_fd = SciMLBase.solve(
+                fd_prob, alg; dt = 0.01, reltol = 1.0e-9, abstol = 1.0e-11,
+            )
+            @test sol_sparse.retcode == SciMLBase.ReturnCode.Success
+            @test maximum(abs.(sol_sparse.u[end] .- sol_fd.u[end])) < 1.0e-10
+        end
+
+        @testset "a wrong sparse Jacobian breaks Newton convergence" begin
+            proto = sparse([1], [1], [1.0], 1, 1)
+            wrong_prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    decay!; jac = decay_wrong_jac!, jac_prototype = proto,
+                ),
+                [1.0], (0.0, 1.0),
+            )
+            @test_throws Exception SciMLBase.solve(
+                wrong_prob, PETScDiffEq.TSImplicit("cn"); dt = 0.05,
+            )
         end
     end
 

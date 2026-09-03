@@ -40,14 +40,27 @@ sol = SciMLBase.solve(prob, TSGeneric("alpha"); dt = 0.05)
 jac!(J, u, p, t) = (J[1, 1] = -1.0; nothing)
 jac_prob = SciMLBase.ODEProblem(SciMLBase.ODEFunction(f!; jac = jac!), [1.0], (0.0, 1.0))
 sol = SciMLBase.solve(jac_prob, TSImplicit("bdf"); dt = 0.05)
+
+using SparseArrays
+sparse_jac!(J, u, p, t) = (J[1, 1] = -1.0; nothing)
+proto = sparse([1], [1], [1.0], 1, 1)
+sparse_jac_prob = SciMLBase.ODEProblem(
+    SciMLBase.ODEFunction(f!; jac = sparse_jac!, jac_prototype = proto), [1.0], (0.0, 1.0),
+)
+sol = SciMLBase.solve(sparse_jac_prob, TSImplicit("bdf"); dt = 0.05)
 ```
 
 An `ODEFunction`'s `jac` is used automatically by every implicit algorithm
 (`TSRosW`, `TSImplicit`, `TSARKIMEX`'s implicit part, and a non-explicit
-`TSGeneric`) when the problem is not split; it is stored as a dense matrix,
-so this is a win on small and medium systems and does not yet help the
-sparse case `jac_prototype` is for. `TSRK` and an explicit `TSGeneric`
-ignore `jac`, since they never form one.
+`TSGeneric`) when the problem is not split. `TSRK` and an explicit
+`TSGeneric` ignore `jac`, since they never form one.
+
+A `SparseMatrixCSC` `jac_prototype` is used as the PETSc matrix's sparsity
+pattern, so `jac!` only has to fill the pattern's own nonzero entries; the
+`shift*I` term always touches the diagonal, so this package extends the
+declared pattern with the full diagonal itself before handing it to PETSc.
+Any other `jac_prototype` (including none) falls back to a dense matrix,
+which is a real win on small and medium systems but is `O(n^2)` to fill.
 
 A plain `ODEProblem` passed to `TSARKIMEX` is treated as fully implicit, with
 the explicit part left at zero, matching PETSc's own default. `dt` is
@@ -67,12 +80,13 @@ third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: the `init`/`step!`/`solve!` integrator interface;
-a sparse `jac_prototype` (the analytic Jacobian above is always dense);
-an analytic Jacobian for `SplitODEProblem`; and MPI — every solve currently
-runs on `MPI.COMM_SELF`. The next target is the sparse case, which is what
-TSIRK and TSGeneric("radau5") need to become available through this
-interface at all.
+Not yet implemented: the `init`/`step!`/`solve!` integrator interface,
+an analytic Jacobian for `SplitODEProblem`, and MPI — every solve currently
+runs on `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
+supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`
+(Kronecker AIJ) matrix, not the plain AIJ this package builds, so it needs
+its own dedicated setup. `TSGeneric("radau5")` fails for a different,
+unexamined reason.
 
 ## License
 
