@@ -14,10 +14,12 @@ verified against their documented order:
 - `PETSc.TSARKIMEX`, additive Runge-Kutta IMEX (`"3"` order 3), for a
   `SplitODEProblem` `u' = f1(u,p,t) + f2(u,p,t)` with `f1` stiff/implicit and
   `f2` non-stiff/explicit
-- `PETSc.TSGeneric`, a pass-through to any other PETSc TS type by name
-  (`"euler"` order 1, `"alpha"` order 2 tested), for types without a
-  dedicated wrapper such as `"glle"` and `"glee"`. Pass `explicit = true` for
-  a type that registers an RHS function rather than an IFunction.
+- `PETSc.TSGeneric`, a pass-through to any other PETSc TS type by name.
+  Only `"euler"` (order 1) and `"alpha"` (order 2) are tested here. Pass
+  `explicit = true` for a type that registers an RHS function rather than an
+  IFunction. A TS type that needs its own subtype call, `"glee"` and `"glle"`
+  among them, will not work through this pass-through: PETSc integrates
+  nothing and the solve returns the initial condition.
 
 ```julia
 using PETSc, PETScDiffEq, SciMLBase
@@ -64,12 +66,33 @@ which is a real win on small and medium systems but is `O(n^2)` to fill.
 
 A plain `ODEProblem` passed to `TSARKIMEX` is treated as fully implicit, with
 the explicit part left at zero, matching PETSc's own default. `dt` is
-required. `reltol`/`abstol` enable PETSc's adaptive step controller; without
-them the step size is fixed. Only in-place, real-valued, forward-time
+required and sets the first step. Stepping is adaptive by default under
+PETSc's own controller, so `dt` is not held fixed; pass `adaptive = false`
+for fixed steps, and `reltol`/`abstol` to set the controller's tolerances.
+Only in-place, real-valued, forward-time
 `ODEProblem`s are accepted, and `SplitODEProblem` is accepted only by
 `TSARKIMEX`. Without an `ODEFunction` `jac` (see above), every implicit
 solve relies on PETSc's own fallback, so pass `["-snes_fd"]` in
 `petsc_options` on problems where that fallback is not enough.
+
+## Mass matrices
+
+An `ODEFunction` `mass_matrix` is honoured by the implicit algorithms: the
+residual becomes `M*u' - f` and the Jacobian `shift*M - J`, which is PETSc's
+own `IFunction`/`IJacobian` form. A singular `M` therefore gives an index-1
+DAE rather than an ODE.
+
+```julia
+M = [2.0 0.0; 0.0 1.0]
+prob = SciMLBase.ODEProblem(
+    SciMLBase.ODEFunction(f!; mass_matrix = M), [1.0, 1.0], (0.0, 1.0),
+)
+sol = SciMLBase.solve(prob, TSImplicit("bdf"); dt = 0.005)
+```
+
+An explicit algorithm cannot apply `M` without inverting it, so `TSRK` and an
+explicit `TSGeneric` reject a non-identity mass matrix rather than silently
+integrating `u' = f`. A mass matrix on a `SplitODEProblem` is also rejected.
 
 ## Saving
 

@@ -1,5 +1,6 @@
 using PETScDiffEq
 using SciMLBase
+using LinearAlgebra
 using Logging
 using SparseArrays
 using Test
@@ -426,6 +427,104 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         run() = SciMLBase.solve(prob, alg; dt = 0.1, save_everystep = false)
         run()
         @test (@allocated run()) < 800 * 1024
+    end
+
+    @testset "Mass matrices" begin
+        scaled!(du, u, p, t) = (du[1] = -u[1]; du[2] = -u[2]; nothing)
+        function scaled_jac!(J, u, p, t)
+            J .= 0.0
+            J[1, 1] = -1.0
+            return J[2, 2] = -1.0
+        end
+        M = [2.0 0.0; 0.0 1.0]
+        prob = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(scaled!; mass_matrix = M), [1.0, 1.0], (0.0, 1.0),
+        )
+
+        @testset "M u' = f is solved, not u' = f" begin
+            for alg in (
+                    PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW("ra34pw2"),
+                )
+                sol = SciMLBase.solve(
+                    prob, alg; dt = 0.005, reltol = 1.0e-11, abstol = 1.0e-13,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test isapprox(sol.u[end][1], exp(-0.5); atol = 1.0e-6)
+                @test isapprox(sol.u[end][2], exp(-1.0); atol = 1.0e-6)
+            end
+        end
+
+        @testset "with an analytic Jacobian" begin
+            jac_prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(scaled!; mass_matrix = M, jac = scaled_jac!),
+                [1.0, 1.0], (0.0, 1.0),
+            )
+            sol = SciMLBase.solve(
+                jac_prob, PETScDiffEq.TSImplicit("bdf");
+                dt = 0.005, reltol = 1.0e-11, abstol = 1.0e-13,
+            )
+            @test isapprox(sol.u[end][1], exp(-0.5); atol = 1.0e-6)
+        end
+
+        @testset "a singular M gives the index-1 DAE, not an ODE" begin
+            # u1' = -u1 with the algebraic constraint 0 = u2 - u1, so both
+            # components follow exp(-t). Integrating the second row as an ODE
+            # instead would give cosh(1).
+            dae!(du, u, p, t) = (du[1] = -u[1]; du[2] = u[2] - u[1]; nothing)
+            dae_prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(dae!; mass_matrix = [1.0 0.0; 0.0 0.0]),
+                [1.0, 1.0], (0.0, 1.0),
+            )
+            sol = SciMLBase.solve(
+                dae_prob, PETScDiffEq.TSImplicit("bdf");
+                dt = 0.005, reltol = 1.0e-10, abstol = 1.0e-12,
+            )
+            @test isapprox(sol.u[end][1], exp(-1.0); atol = 1.0e-6)
+            @test isapprox(sol.u[end][2], exp(-1.0); atol = 1.0e-6)
+        end
+
+        @testset "rejected where it cannot be applied" begin
+            @test_throws ArgumentError SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.01,
+            )
+            @test_throws ArgumentError SciMLBase.solve(
+                prob, PETScDiffEq.TSGeneric("euler"; explicit = true); dt = 0.01,
+            )
+        end
+    end
+
+    @testset "adaptive = false gives fixed steps" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp")
+        fixed = SciMLBase.solve(prob, alg; dt = 0.05, adaptive = false)
+        @test fixed.stats.naccept == 20
+        @test abs(fixed.u[end][1] - exp(-1.0)) < 1.0e-8
+        # the default controller is PETSc's own, so dt is only the first step
+        @test SciMLBase.solve(prob, alg; dt = 0.05).stats.naccept < 20
+    end
+
+    @testset "Failure is reported as failure" begin
+        blowup!(du, u, p, t) = (du[1] = u[1]^2; nothing)
+        sol = SciMLBase.solve(
+            SciMLBase.ODEProblem(blowup!, [1.0], (0.0, 5.0)),
+            PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"]); dt = 0.1,
+        )
+        @test !SciMLBase.successful_retcode(sol)
+        @test sol.retcode == SciMLBase.ReturnCode.Unstable
+    end
+
+    @testset "A user exception reaches the caller" begin
+        boom!(du, u, p, t) = (t > 0.25 && error("user rhs failed"); du[1] = -u[1]; nothing)
+        prob = SciMLBase.ODEProblem(boom!, [1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
+        err = try
+            SciMLBase.solve(prob, alg; dt = 0.1)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("user rhs failed", err.msg)
     end
 
     @testset "Input validation" begin

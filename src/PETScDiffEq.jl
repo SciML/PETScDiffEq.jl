@@ -1,6 +1,7 @@
 module PETScDiffEq
 
 using DiffEqBase: DiffEqBase
+using LinearAlgebra: LinearAlgebra, mul!
 using MPI: MPI
 using PETSc: PETSc
 using PETSc.LibPETSc: LibPETSc
@@ -76,6 +77,8 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     p::P
     du::Vector{Float64}
     u::Vector{Float64}
+    mudot::Vector{Float64}
+    M::Union{Nothing, Matrix{Float64}}
     J::JBUF
     ts::Vector{Float64}
     us::Vector{Vector{Float64}}
@@ -158,7 +161,12 @@ function _ifunction!(
         ) do xa, xda, fa
             copyto!(ctx.u, xa)
             ctx.f!(ctx.du, ctx.u, ctx.p, t)
-            @. fa = xda - ctx.du
+            if ctx.M === nothing
+                @. fa = xda - ctx.du
+            else
+                mul!(ctx.mudot, ctx.M, xda)
+                @. fa = ctx.mudot - ctx.du
+            end
         end
     catch e
         ctx.err = e
@@ -190,12 +198,14 @@ function _ijacobian!(
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
         n = length(ctx.u)
         for j in 1:n, i in 1:n
-            A[i, j] = (i == j ? shift : 0.0) - ctx.J[i, j]
+            m = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
+            A[i, j] = shift * m - ctx.J[i, j]
         end
         PETSc.assemble!(A)
         if B.ptr != A.ptr
             for j in 1:n, i in 1:n
-                B[i, j] = (i == j ? shift : 0.0) - ctx.J[i, j]
+                m = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
+                B[i, j] = shift * m - ctx.J[i, j]
             end
             PETSc.assemble!(B)
         end
@@ -387,6 +397,7 @@ function SciMLBase.__solve(
         reltol = nothing,
         abstol = nothing,
         maxiters = 1000000,
+        adaptive = true,
         saveat = Float64[],
         save_everystep = true,
         save_start = true,
@@ -406,6 +417,19 @@ function SciMLBase.__solve(
     is_split = prob.f isa SciMLBase.SplitFunction
     is_split && !(alg isa TSARKIMEX) &&
         throw(ArgumentError("PETScDiffEq only supports SplitODEProblem with TSARKIMEX"))
+    mass_matrix = prob.f.mass_matrix
+    has_mass = !(mass_matrix === nothing || mass_matrix == LinearAlgebra.I)
+    if has_mass && !_uses_ifunction(alg)
+        throw(
+            ArgumentError(
+                "PETScDiffEq cannot apply a mass matrix with an explicit algorithm; " *
+                    "use an implicit one such as TSImplicit or TSRosW",
+            ),
+        )
+    end
+    if has_mass && is_split
+        throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
+    end
 
     t0, tf = Float64(prob.tspan[1]), Float64(prob.tspan[2])
     t0 < tf || throw(ArgumentError("PETScDiffEq requires tspan[1] < tspan[2]"))
@@ -436,9 +460,10 @@ function SciMLBase.__solve(
             saveat_times[1] > t0 + 100 * eps(max(one(Float64), abs(tf)))
         pushfirst!(saveat_times, t0)
     end
+    M = has_mass ? Matrix{Float64}(mass_matrix) : nothing
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
-        similar(u0), similar(u0), J0,
+        similar(u0), similar(u0), similar(u0), M, J0,
         Float64[], Vector{Float64}[],
         saveat_times, 1, save_everystep,
         PETSc.VecSeq(petsclib, n), 0, nothing,
@@ -506,8 +531,11 @@ function SciMLBase.__solve(
                     reltol === nothing ? 1.0e-3 : Float64(reltol), novec,
                 )
             end
-            if !isempty(alg.petsc_options)
-                parsed = PETSc.parse_options(alg.petsc_options)
+            # A user's own -ts_adapt_type wins: their options are parsed last.
+            effective_options = adaptive ? alg.petsc_options :
+                vcat(["-ts_adapt_type", "none"], alg.petsc_options)
+            if !isempty(effective_options)
+                parsed = PETSc.parse_options(effective_options)
                 opts = PETSc.Options(petsclib; parsed...)
                 push!(opts)
                 pushed = true
@@ -517,7 +545,13 @@ function SciMLBase.__solve(
                 pop!(opts)
                 pushed = false
             end
-            LibPETSc.TSSolve(petsclib, ts, u)
+            try
+                LibPETSc.TSSolve(petsclib, ts, u)
+            catch
+                # A callback that threw reports failure to PETSc, which raises a
+                # PetscError here. The user's own exception is the useful one.
+                ctx.err === nothing && rethrow()
+            end
         end
 
         ctx.err === nothing || throw(ctx.err)
@@ -548,7 +582,10 @@ function SciMLBase.__solve(
         popfirst!(ctx.us)
     end
 
-    retcode = if tend >= tf - tol
+    finite = isempty(ctx.us) || all(isfinite, ctx.us[end])
+    retcode = if !finite
+        SciMLBase.ReturnCode.Unstable
+    elseif tend >= tf - tol
         SciMLBase.ReturnCode.Success
     elseif nsteps >= maxiters
         SciMLBase.ReturnCode.MaxIters
