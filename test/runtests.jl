@@ -565,6 +565,58 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test occursin("user rhs failed", err.msg)
     end
 
+    @testset "The trajectory is well formed under awkward PETSc options" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        @testset "exact_final_time interpolate does not overshoot tspan" begin
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp", ["-ts_exact_final_time", "interpolate"]);
+                dt = 0.3,
+            )
+            @test issorted(sol.t)
+            @test maximum(sol.t) <= 1.0 + 1.0e-10
+            @test sol.t[end] ≈ 1.0
+        end
+        @testset "a cancelled monitor still yields the final state" begin
+            sol = SciMLBase.solve(
+                prob,
+                PETScDiffEq.TSRK(
+                    "5dp", ["-ts_monitor_cancel", "-ts_adapt_type", "none"],
+                ); dt = 0.1,
+            )
+            @test sol.t[end] ≈ 1.0
+            @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-7
+        end
+    end
+
+    @testset "Requested subtypes actually take effect" begin
+        # Each of these differs in order from its family's PETSc default, so a
+        # dropped subtype call shows up as the wrong convergence order.
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        exact = exp(-1.0)
+        function measured_order(alg)
+            errs = Float64[]
+            for dt in (0.1, 0.05, 0.025)
+                sol = SciMLBase.solve(prob, alg; dt = dt)
+                push!(errs, abs(sol.u[end][1] - exact))
+            end
+            return log2(errs[end - 1] / errs[end])
+        end
+        # rk defaults to 3bs (order 3); asking for 5dp must give order 5
+        @test measured_order(
+            PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"]),
+        ) > 4.5
+        @test measured_order(
+            PETScDiffEq.TSRK("3bs", ["-ts_adapt_type", "none"]),
+        ) < 3.5
+        # theta defaults to 0.5 (order 2); theta = 1 is backward Euler, order 1
+        @test measured_order(
+            PETScDiffEq.TSImplicit("theta", 1.0, ["-ts_adapt_type", "none"]),
+        ) < 1.5
+        @test measured_order(
+            PETScDiffEq.TSImplicit("theta", 0.5, ["-ts_adapt_type", "none"]),
+        ) > 1.8
+    end
+
     @testset "Input validation" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"))

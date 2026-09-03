@@ -597,6 +597,13 @@ function SciMLBase.__solve(
     end
 
     tol = 100 * eps(max(one(Float64), abs(tf)))
+    # `-ts_exact_final_time interpolate` steps past tf and then interpolates
+    # back, so the monitor reports an overshoot point mid-sequence, not last.
+    keep = findall(t -> t <= tf + tol, ctx.ts)
+    if length(keep) != length(ctx.ts)
+        ctx.ts = ctx.ts[keep]
+        ctx.us = ctx.us[keep]
+    end
     if save_end && (isempty(ctx.ts) || ctx.ts[end] < tend - tol)
         push!(ctx.ts, tend)
         push!(ctx.us, uend)
