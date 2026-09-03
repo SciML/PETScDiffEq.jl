@@ -61,8 +61,20 @@ A `SparseMatrixCSC` `jac_prototype` is used as the PETSc matrix's sparsity
 pattern, so `jac!` only has to fill the pattern's own nonzero entries; the
 `shift*I` term always touches the diagonal, so this package extends the
 declared pattern with the full diagonal itself before handing it to PETSc.
-Any other `jac_prototype` (including none) falls back to a dense matrix,
-which is a real win on small and medium systems but is `O(n^2)` to fill.
+Any other `jac_prototype` (including none) falls back to a dense matrix.
+
+**Supply a `jac_prototype` for anything sparse.** A dense matrix forces a dense
+factorization, so on a tridiagonal problem the dense path loses to no Jacobian
+at all above roughly `n = 40`, while the sparse path keeps winning and pulls
+further ahead with size. Measured on a 1-D heat equation, `TSImplicit("bdf")`,
+fixed `dt`, against the same solve with no `jac`:
+
+| n | no `jac` | dense `jac` | sparse `jac` |
+|---|---|---|---|
+| 100 | 8.0 ms | 22.3 ms | **3.0 ms** |
+| 400 | 62.5 ms | 381.4 ms | **11.4 ms** |
+
+The dense path is for small or genuinely dense systems.
 
 A plain `ODEProblem` passed to `TSARKIMEX` is treated as fully implicit, with
 the explicit part left at zero, matching PETSc's own default. `dt` is

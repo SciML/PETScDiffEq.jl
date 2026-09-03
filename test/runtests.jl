@@ -232,6 +232,28 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test abs(sol.u[end][1] - exact) < 1.0e-5
         end
 
+        @testset "an asymmetric Jacobian is not transposed" begin
+            # The dense block is handed to PETSc row-major, so a transposition
+            # would survive any symmetric test. du1 = -u1 + 3u2, du2 = -2u2.
+            asym!(du, u, p, t) = (du[1] = -u[1] + 3.0 * u[2]; du[2] = -2.0 * u[2]; nothing)
+            function asym_jac!(J, u, p, t)
+                J[1, 1] = -1.0
+                J[1, 2] = 3.0
+                J[2, 1] = 0.0
+                return J[2, 2] = -2.0
+            end
+            prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(asym!; jac = asym_jac!), [1.0, 1.0], (0.0, 1.0),
+            )
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSImplicit("bdf");
+                dt = 0.002, reltol = 1.0e-11, abstol = 1.0e-13,
+            )
+            exact1 = 3 * (exp(-1) - exp(-2)) + exp(-1)
+            @test isapprox(sol.u[end][1], exact1; atol = 1.0e-6)
+            @test isapprox(sol.u[end][2], exp(-2); atol = 1.0e-6)
+        end
+
         @testset "system Jacobian" begin
             p = (1.5, 1.0, 3.0, 1.0)
             jac_prob = SciMLBase.ODEProblem(

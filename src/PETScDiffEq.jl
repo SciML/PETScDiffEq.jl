@@ -80,6 +80,8 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     mudot::Vector{Float64}
     M::Union{Nothing, Matrix{Float64}}
     missing_diag::Vector{Int}
+    W::Matrix{Float64}
+    idx0::Vector{LibPETSc.PetscInt}
     J::JBUF
     ts::Vector{Float64}
     us::Vector{Vector{Float64}}
@@ -94,6 +96,13 @@ end
 _record!(ctx, t, ua) = (push!(ctx.ts, Float64(t)); push!(ctx.us, Vector{Float64}(ua)))
 
 _mass(ctx, i, j) = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
+
+function _setblock!(ctx, A, n)
+    return LibPETSc.MatSetValues(
+        ctx.petsclib, A, LibPETSc.PetscInt(n), ctx.idx0,
+        LibPETSc.PetscInt(n), ctx.idx0, vec(ctx.W), LibPETSc.INSERT_VALUES,
+    )
+end
 
 _stored(A::SparseMatrixCSC, i, j) = any(==(i), @view A.rowval[A.colptr[j]:(A.colptr[j + 1] - 1)])
 
@@ -202,14 +211,16 @@ function _ijacobian!(
         end
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
         n = length(ctx.u)
-        for j in 1:n, i in 1:n
-            A[i, j] = shift * _mass(ctx, i, j) - ctx.J[i, j]
+        # One batched MatSetValues beats n^2 single-entry ccalls by orders of
+        # magnitude. PETSc reads the block row-major, so entry (i,j) is stored
+        # at W[j,i] and `vec` then yields the order PETSc wants.
+        @inbounds for j in 1:n, i in 1:n
+            ctx.W[j, i] = shift * _mass(ctx, i, j) - ctx.J[i, j]
         end
+        _setblock!(ctx, A, n)
         PETSc.assemble!(A)
         if B.ptr != A.ptr
-            for j in 1:n, i in 1:n
-                B[i, j] = shift * _mass(ctx, i, j) - ctx.J[i, j]
-            end
+            _setblock!(ctx, B, n)
             PETSc.assemble!(B)
         end
     catch e
@@ -491,9 +502,12 @@ function SciMLBase.__solve(
     end
     missing_diag = uses_sparse_jac ?
         [i for i in 1:n if !_stored(J0, i, i)] : Int[]
+    W0 = has_jac && !uses_sparse_jac ? zeros(n, n) : zeros(0, 0)
+    idx0 = has_jac && !uses_sparse_jac ?
+        LibPETSc.PetscInt[i - 1 for i in 1:n] : LibPETSc.PetscInt[]
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
-        similar(u0), similar(u0), similar(u0), M, missing_diag, J0,
+        similar(u0), similar(u0), similar(u0), M, missing_diag, W0, idx0, J0,
         Float64[], Vector{Float64}[],
         saveat_times, 1, save_everystep,
         PETSc.VecSeq(petsclib, n), 0, nothing,
