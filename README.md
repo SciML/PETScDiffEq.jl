@@ -130,6 +130,33 @@ cannot honour, `tstops`, `save_idxs`, `callback`, `dense` and
 `isoutofdomain` among them, emit a warning rather than being silently
 dropped.
 
+## Performance
+
+Measured on a 1-D heat equation discretised to `n = 200`, `reltol = 1e-10`, with the
+same sparse analytic Jacobian given to both sides:
+
+| tspan | PETSc `TSRosW` | OrdinaryDiffEq `Rodas5P` |
+|---|---|---|
+| 0.1 | 0.39 ms | 0.20 ms |
+| 10 | 8.6 ms | 0.50 ms |
+| 100 | 82 ms | 1.6 ms |
+
+PETSc costs roughly 100 microseconds per step here against a few microseconds for
+OrdinaryDiffEq, and because that cost is per step rather than per solve it does not
+amortise: the gap widens as the integration lengthens. Most of it is not the
+right-hand-side callback, which is about 2 microseconds, nor the choice of `KSPType`
+or `PCType`, which barely moves it.
+
+This is PETSc used well outside the regime it is built for. PETSc TS exists for
+large distributed problems, and this package is serial only, so the comparison above
+is not evidence about PETSc's integrators. Use OrdinaryDiffEq.jl for serial problems
+of this size. What this package is for is reaching PETSc's time steppers from the
+SciML interface, and comparing schemes that have no Julia implementation.
+
+Within the package, supply an analytic Jacobian and a `jac_prototype`: on the problem
+above that is 11.7x faster per step than letting PETSc form the Jacobian by finite
+differences (92 microseconds against 1067).
+
 ## Scope
 
 PETSc's linear (KSP) and nonlinear (SNES) solvers are already reachable from
