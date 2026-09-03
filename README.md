@@ -36,15 +36,26 @@ sol = SciMLBase.solve(split_prob, TSARKIMEX("3"); dt = 0.01)
 
 sol = SciMLBase.solve(prob, TSGeneric("euler"; explicit = true); dt = 0.05)
 sol = SciMLBase.solve(prob, TSGeneric("alpha"); dt = 0.05)
+
+jac!(J, u, p, t) = (J[1, 1] = -1.0; nothing)
+jac_prob = SciMLBase.ODEProblem(SciMLBase.ODEFunction(f!; jac = jac!), [1.0], (0.0, 1.0))
+sol = SciMLBase.solve(jac_prob, TSImplicit("bdf"); dt = 0.05)
 ```
+
+An `ODEFunction`'s `jac` is used automatically by every implicit algorithm
+(`TSRosW`, `TSImplicit`, `TSARKIMEX`'s implicit part, and a non-explicit
+`TSGeneric`) when the problem is not split; it is stored as a dense matrix,
+so this is a win on small and medium systems and does not yet help the
+sparse case `jac_prototype` is for. `TSRK` and an explicit `TSGeneric`
+ignore `jac`, since they never form one.
 
 A plain `ODEProblem` passed to `TSARKIMEX` is treated as fully implicit, with
 the explicit part left at zero, matching PETSc's own default. `dt` is
 required. `reltol`/`abstol` enable PETSc's adaptive step controller; without
 them the step size is fixed. Only in-place, real-valued, forward-time
 `ODEProblem`s are accepted, and `SplitODEProblem` is accepted only by
-`TSARKIMEX`. No algorithm has an analytic Jacobian yet (see below); every
-implicit solve relies on PETSc's own fallback, so pass `["-snes_fd"]` in
+`TSARKIMEX`. Without an `ODEFunction` `jac` (see above), every implicit
+solve relies on PETSc's own fallback, so pass `["-snes_fd"]` in
 `petsc_options` on problems where that fallback is not enough.
 
 ## Scope
@@ -56,11 +67,12 @@ third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: the `init`/`step!`/`solve!` integrator interface,
-analytic Jacobians, and MPI — every solve currently runs on
-`MPI.COMM_SELF`. The next target is analytic Jacobians, which is what
-work-precision benchmarking against OrdinaryDiffEq.jl on stiff problems
-requires.
+Not yet implemented: the `init`/`step!`/`solve!` integrator interface;
+a sparse `jac_prototype` (the analytic Jacobian above is always dense);
+an analytic Jacobian for `SplitODEProblem`; and MPI — every solve currently
+runs on `MPI.COMM_SELF`. The next target is the sparse case, which is what
+TSIRK and TSGeneric("radau5") need to become available through this
+interface at all.
 
 ## License
 

@@ -67,13 +67,15 @@ _uses_ifunction(::TSImplicit) = true
 _uses_ifunction(::TSARKIMEX) = true
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
-mutable struct TSContext{F, F2, P, T}
+mutable struct TSContext{F, F2, JAC, P, T}
     petsclib::T
     f!::F
     f2!::F2
+    jac!::JAC
     p::P
     du::Vector{Float64}
     u::Vector{Float64}
+    J::Matrix{Float64}
     ts::Vector{Float64}
     us::Vector{Vector{Float64}}
     err::Union{Nothing, Any}
@@ -158,6 +160,45 @@ end
 
 const IFUNCTION_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
+function _ijacobian!(
+        ::LibPETSc.CTS,
+        t::LibPETSc.PetscReal,
+        x_ptr::LibPETSc.CVec,
+        ::LibPETSc.CVec,
+        shift::LibPETSc.PetscReal,
+        A_ptr::LibPETSc.CMat,
+        B_ptr::LibPETSc.CMat,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
+    A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
+    B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
+    try
+        PETSc.withlocalarray!(x; read = true, write = false) do xa
+            copyto!(ctx.u, xa)
+        end
+        ctx.jac!(ctx.J, ctx.u, ctx.p, t)
+        n = length(ctx.u)
+        for j in 1:n, i in 1:n
+            A[i, j] = (i == j ? shift : 0.0) - ctx.J[i, j]
+        end
+        PETSc.assemble!(A)
+        if B.ptr != A.ptr
+            for j in 1:n, i in 1:n
+                B[i, j] = (i == j ? shift : 0.0) - ctx.J[i, j]
+            end
+            PETSc.assemble!(B)
+        end
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(1)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+const IJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
 function _monitor!(
         ::LibPETSc.CTS,
         ::LibPETSc.PetscInt,
@@ -204,6 +245,14 @@ function __init__()
         (
             LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
             LibPETSc.CVec, Ptr{Cvoid},
+        )
+    )
+    IJACOBIAN_PTR[] = @cfunction(
+        _ijacobian!,
+        LibPETSc.PetscErrorCode,
+        (
+            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
+            LibPETSc.PetscReal, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid},
         )
     )
     return nothing
@@ -263,14 +312,17 @@ function SciMLBase.__solve(
 
     f1 = is_split ? prob.f.f1.f : prob.f.f
     f2 = is_split ? prob.f.f2.f : nothing
+    has_jac = _uses_ifunction(alg) && !is_split && prob.f.jac !== nothing
+    jac_fn = has_jac ? prob.f.jac : nothing
     ctx = TSContext(
-        petsclib, f1, f2, prob.p,
-        similar(u0), similar(u0),
+        petsclib, f1, f2, jac_fn, prob.p,
+        similar(u0), similar(u0), zeros(n, n),
         Float64[], Vector{Float64}[], nothing,
     )
 
     ts = LibPETSc.TS(petsclib)
     u = LibPETSc.PetscVec(petsclib)
+    jac_mat = LibPETSc.PetscMat(petsclib)
     opts = PETSc.Options(petsclib)
     pushed = false
     nsteps = 0
@@ -297,6 +349,12 @@ function SciMLBase.__solve(
             end
             if is_split
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, SPLIT_RHS_PTR[], ctxptr)
+            end
+            if has_jac
+                jac_mat = PETSc.MatSeqAIJ(petsclib, n, n, n)
+                LibPETSc.TSSetIJacobian(
+                    petsclib, ts, jac_mat, jac_mat, IJACOBIAN_PTR[], ctxptr,
+                )
             end
             LibPETSc.TSMonitorSet(petsclib, ts, MONITOR_PTR[], ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
@@ -334,6 +392,7 @@ function SciMLBase.__solve(
     finally
         pushed && pop!(opts)
         opts.ptr == C_NULL || PETSc.destroy(opts)
+        jac_mat.ptr == C_NULL || LibPETSc.MatDestroy(petsclib, jac_mat)
         u.ptr == C_NULL || PETSc.destroy(u)
         ts.ptr == C_NULL || LibPETSc.TSDestroy(petsclib, ts)
     end

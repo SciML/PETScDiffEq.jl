@@ -11,6 +11,17 @@ function lotka_volterra!(du, u, p, t)
     return du[2] = -c * u[2] + d * u[1] * u[2]
 end
 
+decay_jac!(J, u, p, t) = (J[1, 1] = -1.0; nothing)
+decay_wrong_jac!(J, u, p, t) = (J[1, 1] = 100.0; nothing)
+
+function lotka_volterra_jac!(J, u, p, t)
+    a, b, c, d = p
+    J[1, 1] = a - b * u[2]
+    J[1, 2] = -b * u[1]
+    J[2, 1] = d * u[2]
+    return J[2, 2] = -c + d * u[1]
+end
+
 @testset "PETScDiffEq.jl" begin
     @testset "TSRK convergence order" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
@@ -130,6 +141,75 @@ end
         end
         @test PETScDiffEq.TSGeneric("alpha").explicit == false
         @test PETScDiffEq.TSGeneric("euler"; explicit = true).explicit == true
+    end
+
+    @testset "Analytic Jacobian" begin
+        exact = exp(-1.0)
+        prob = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),
+        )
+        wrong_prob = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; jac = decay_wrong_jac!), [1.0], (0.0, 1.0),
+        )
+
+        @testset "matches the FD fallback" begin
+            no_jac_prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+            for alg in (
+                    PETScDiffEq.TSImplicit("cn"), PETScDiffEq.TSImplicit("bdf"),
+                    PETScDiffEq.TSRosW("ra34pw2"),
+                )
+                sol_jac = SciMLBase.solve(prob, alg; dt = 0.05)
+                sol_fd = SciMLBase.solve(no_jac_prob, alg; dt = 0.05)
+                @test sol_jac.retcode == SciMLBase.ReturnCode.Success
+                @test isapprox(sol_jac.u[end][1], sol_fd.u[end][1]; atol = 1.0e-8)
+            end
+        end
+
+        @testset "convergence order is preserved" begin
+            for (alg, expected_order) in (
+                    (PETScDiffEq.TSImplicit("cn", ["-ts_adapt_type", "none"]), 2),
+                    (PETScDiffEq.TSRosW("ra34pw2", ["-ts_adapt_type", "none"]), 3),
+                )
+                errs = Float64[]
+                for dt in (0.1, 0.05, 0.025, 0.0125)
+                    sol = SciMLBase.solve(prob, alg; dt = dt)
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    push!(errs, abs(sol.u[end][1] - exact))
+                end
+                orders = [log2(errs[i] / errs[i + 1]) for i in 1:(length(errs) - 1)]
+                @test all(o -> isapprox(o, expected_order; atol = 0.15), orders)
+            end
+        end
+
+        @testset "a wrong Jacobian breaks Newton convergence" begin
+            @test_throws Exception SciMLBase.solve(
+                wrong_prob, PETScDiffEq.TSImplicit("cn"); dt = 0.05,
+            )
+        end
+
+        @testset "ignored by algorithms that don't use IFunction" begin
+            sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.05)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test abs(sol.u[end][1] - exact) < 1.0e-5
+        end
+
+        @testset "system Jacobian" begin
+            p = (1.5, 1.0, 3.0, 1.0)
+            jac_prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(lotka_volterra!; jac = lotka_volterra_jac!),
+                [1.0, 1.0], (0.0, 5.0), p,
+            )
+            no_jac_prob = SciMLBase.ODEProblem(lotka_volterra!, [1.0, 1.0], (0.0, 5.0), p)
+            alg = PETScDiffEq.TSImplicit("bdf")
+            sol_jac = SciMLBase.solve(
+                jac_prob, alg; dt = 0.01, reltol = 1.0e-8, abstol = 1.0e-10,
+            )
+            sol_fd = SciMLBase.solve(
+                no_jac_prob, alg; dt = 0.01, reltol = 1.0e-8, abstol = 1.0e-10,
+            )
+            @test sol_jac.retcode == SciMLBase.ReturnCode.Success
+            @test maximum(abs.(sol_jac.u[end] .- sol_fd.u[end])) < 1.0e-6
+        end
     end
 
     @testset "Adaptive stepping" begin
