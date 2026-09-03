@@ -541,6 +541,16 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test SciMLBase.solve(prob, alg; dt = 0.05).stats.naccept < 20
     end
 
+    @testset "dtmin and dtmax reach the controller" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp")
+        free = SciMLBase.solve(prob, alg; dt = 0.05)
+        capped = SciMLBase.solve(prob, alg; dt = 0.05, dtmax = 0.1)
+        @test maximum(diff(free.t)) > 0.1
+        @test maximum(diff(capped.t)) <= 0.1 + 1.0e-10
+        @test capped.stats.naccept > free.stats.naccept
+    end
+
     @testset "Failure is reported as failure" begin
         blowup!(du, u, p, t) = (du[1] = u[1]^2; nothing)
         sol = SciMLBase.solve(

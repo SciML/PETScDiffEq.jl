@@ -106,11 +106,12 @@ sol = SciMLBase.solve(prob, TSRK("5dp"); dt = 0.1, saveat = [0.3, 0.7])
 sol.t    # [0.0, 0.3, 0.7, 1.0]
 ```
 
-`sol.stats` reports `nf`, `naccept`, `nreject`, `nnonliniter` and
-`nnonlinconvfail`; the remaining `DEStats` fields stay at the `-1` "unknown"
-sentinel. Keywords this package cannot honour (`tstops`, `save_idxs`,
-`d_discontinuities`, `callback`, `dense`) emit a warning rather than being
-silently dropped.
+`dtmin` and `dtmax` bound the controller's step size. `sol.stats` reports
+`nf`, `naccept`, `nreject`, `nnonliniter` and `nnonlinconvfail`; the remaining
+`DEStats` fields stay at the `-1` "unknown" sentinel. Keywords this package
+cannot honour, `tstops`, `save_idxs`, `callback`, `dense` and
+`isoutofdomain` among them, emit a warning rather than being silently
+dropped.
 
 ## Scope
 

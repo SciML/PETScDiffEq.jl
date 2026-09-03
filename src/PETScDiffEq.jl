@@ -391,7 +391,11 @@ _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
     _cstr(p -> LibPETSc.TSARKIMEXSetType(petsclib, ts, p), alg.subtype)
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
-const UNSUPPORTED_KWARGS = (:tstops, :save_idxs, :d_discontinuities, :callback, :dense)
+const UNSUPPORTED_KWARGS = (
+    :tstops, :save_idxs, :d_discontinuities, :callback, :dense, :isoutofdomain,
+    :unstable_check, :internalnorm, :calck, :force_dtmin, :alias_u0, :sensealg,
+    :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
+)
 
 function SciMLBase.__solve(
         prob::SciMLBase.AbstractODEProblem,
@@ -401,6 +405,8 @@ function SciMLBase.__solve(
         abstol = nothing,
         maxiters = 1000000,
         adaptive = true,
+        dtmin = nothing,
+        dtmax = nothing,
         saveat = Float64[],
         save_everystep = true,
         save_start = true,
@@ -555,9 +561,14 @@ function SciMLBase.__solve(
                     reltol === nothing ? 1.0e-3 : Float64(reltol), novec,
                 )
             end
-            # A user's own -ts_adapt_type wins: their options are parsed last.
-            effective_options = adaptive ? alg.petsc_options :
-                vcat(["-ts_adapt_type", "none"], alg.petsc_options)
+            # A user's own PETSc options are parsed last, so they win.
+            effective_options = String[]
+            adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
+            dtmin === nothing ||
+                append!(effective_options, ["-ts_adapt_dt_min", string(Float64(dtmin))])
+            dtmax === nothing ||
+                append!(effective_options, ["-ts_adapt_dt_max", string(Float64(dtmax))])
+            append!(effective_options, alg.petsc_options)
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
                 opts = PETSc.Options(petsclib; parsed...)
