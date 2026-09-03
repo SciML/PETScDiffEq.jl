@@ -573,6 +573,34 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test capped.stats.naccept > free.stats.naccept
     end
 
+    @testset "Only methods with an error estimate adapt" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        steps(alg, rt) = SciMLBase.solve(
+            prob, alg; dt = 1.0e-3, reltol = rt, abstol = rt * 1.0e-2,
+        ).stats.naccept
+
+        @testset "these respond to tolerance" begin
+            for alg in (
+                    PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
+                    PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSARKIMEX("3"),
+                )
+                @test steps(alg, 1.0e-8) > steps(alg, 1.0e-3)
+            end
+        end
+
+        @testset "these do not, and say so" begin
+            for sub in ("beuler", "cn", "theta")
+                alg = PETScDiffEq.TSImplicit(sub)
+                @test_logs (:warn,) match_mode = :any SciMLBase.solve(
+                    prob, alg; dt = 1.0e-3, reltol = 1.0e-8, abstol = 1.0e-10,
+                )
+                # fixed dt over a unit span, whatever the tolerance
+                @test steps(alg, 1.0e-3) == 1000
+                @test steps(alg, 1.0e-10) == 1000
+            end
+        end
+    end
+
     @testset "Failure is reported as failure" begin
         blowup!(du, u, p, t) = (du[1] = u[1]^2; nothing)
         sol = SciMLBase.solve(

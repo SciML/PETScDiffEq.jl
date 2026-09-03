@@ -78,9 +78,14 @@ The dense path is for small or genuinely dense systems.
 
 A plain `ODEProblem` passed to `TSARKIMEX` is treated as fully implicit, with
 the explicit part left at zero, matching PETSc's own default. `dt` is
-required and sets the first step. Stepping is adaptive by default under
-PETSc's own controller, so `dt` is not held fixed; pass `adaptive = false`
-for fixed steps, and `reltol`/`abstol` to set the controller's tolerances.
+required and sets the first step. Pass `adaptive = false` for fixed steps,
+and `reltol`/`abstol` to set the controller's tolerances.
+
+Only `TSRK`, `TSRosW`, `TSARKIMEX` and `TSImplicit("bdf")` carry an embedded
+error estimate, so only those adapt. `"beuler"`, `"cn"`, `"theta"` and
+PETSc types such as `"alpha"` and `"euler"` have none: they step at the `dt`
+you give and ignore `reltol`/`abstol` entirely. Passing tolerances to one of
+those emits a warning rather than quietly doing nothing.
 Only in-place, real-valued, forward-time
 `ODEProblem`s are accepted, and `SplitODEProblem` is accepted only by
 `TSARKIMEX`. Without an `ODEFunction` `jac` (see above), every implicit

@@ -69,6 +69,15 @@ _uses_ifunction(::TSImplicit) = true
 _uses_ifunction(::TSARKIMEX) = true
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
+# Only these PETSc TS families carry an embedded error estimate. The rest step
+# at the requested dt and ignore any tolerance. `nothing` means "not known",
+# which is the honest answer for an arbitrary TSGeneric type.
+_adapts(::TSRK) = true
+_adapts(::TSRosW) = true
+_adapts(::TSARKIMEX) = true
+_adapts(alg::TSImplicit) = alg.subtype == "bdf"
+_adapts(::TSGeneric) = nothing
+
 mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     petsclib::T
     f!::F
@@ -567,6 +576,10 @@ function SciMLBase.__solve(
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
             )
+            if (reltol !== nothing || abstol !== nothing) && _adapts(alg) === false
+                @warn "`$(_ts_type(alg))` has no embedded error estimate in PETSc, so " *
+                    "it steps at the requested dt and ignores reltol/abstol"
+            end
             if reltol !== nothing || abstol !== nothing
                 novec = LibPETSc.PetscVec{typeof(petsclib)}()
                 LibPETSc.TSSetTolerances(
