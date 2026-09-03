@@ -382,7 +382,13 @@ function SciMLBase.__solve(
     jac_fn = has_jac ? prob.f.jac : nothing
     jac_prototype = has_jac ? prob.f.jac_prototype : nothing
     uses_sparse_jac = jac_prototype isa SparseMatrixCSC
-    J0 = uses_sparse_jac ? SparseMatrixCSC{Float64, Int}(jac_prototype) : zeros(n, n)
+    J0 = if !has_jac
+        zeros(0, 0)
+    elseif uses_sparse_jac
+        SparseMatrixCSC{Float64, Int}(jac_prototype)
+    else
+        zeros(n, n)
+    end
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
         similar(u0), similar(u0), J0,
