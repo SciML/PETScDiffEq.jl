@@ -62,14 +62,6 @@ analytic Jacobians, and MPI — every solve currently runs on
 work-precision benchmarking against OrdinaryDiffEq.jl on stiff problems
 requires.
 
-## Relation to PETSc.jl
-
-Hendrik Ranocha drafted a SciML interface for PETSc TS as a package extension
-in [JuliaParallel/PETSc.jl#242](https://github.com/JuliaParallel/PETSc.jl/pull/242).
-This package is a separate implementation, written at his suggestion. See
-[SciML/OrdinaryDiffEq.jl#4451](https://github.com/SciML/OrdinaryDiffEq.jl/issues/4451)
-for the discussion.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
