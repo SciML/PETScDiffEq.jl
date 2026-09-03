@@ -6,7 +6,7 @@ using PETSc: PETSc
 using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
 
-export TSRK, TSRosW, TSImplicit, TSARKIMEX
+export TSRK, TSRosW, TSImplicit, TSARKIMEX, TSGeneric
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 
@@ -49,10 +49,23 @@ end
 TSARKIMEX(subtype::AbstractString = "3", petsc_options::AbstractVector{<:AbstractString} = String[]) =
     TSARKIMEX(String(subtype), String[String(o) for o in petsc_options])
 
+struct TSGeneric <: PETScTSAlgorithm
+    ts_type::String
+    explicit::Bool
+    petsc_options::Vector{String}
+end
+
+TSGeneric(
+    ts_type::AbstractString,
+    petsc_options::AbstractVector{<:AbstractString} = String[];
+    explicit::Bool = false,
+) = TSGeneric(String(ts_type), explicit, String[String(o) for o in petsc_options])
+
 _uses_ifunction(::TSRK) = false
 _uses_ifunction(::TSRosW) = true
 _uses_ifunction(::TSImplicit) = true
 _uses_ifunction(::TSARKIMEX) = true
+_uses_ifunction(alg::TSGeneric) = !alg.explicit
 
 mutable struct TSContext{F, F2, P, T}
     petsclib::T
@@ -205,6 +218,7 @@ _ts_type(::TSRK) = "rk"
 _ts_type(::TSRosW) = "rosw"
 _ts_type(alg::TSImplicit) = alg.subtype
 _ts_type(::TSARKIMEX) = "arkimex"
+_ts_type(alg::TSGeneric) = alg.ts_type
 
 _set_subtype!(petsclib, ts, alg::TSRK) =
     _cstr(p -> LibPETSc.TSRKSetType(petsclib, ts, p), alg.subtype)
@@ -218,6 +232,7 @@ function _set_subtype!(petsclib, ts, alg::TSImplicit)
 end
 _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
     _cstr(p -> LibPETSc.TSARKIMEXSetType(petsclib, ts, p), alg.subtype)
+_set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 function SciMLBase.__solve(
         prob::SciMLBase.AbstractODEProblem,

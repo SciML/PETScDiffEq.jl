@@ -107,6 +107,31 @@ end
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.01)
     end
 
+    @testset "TSGeneric convergence order" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        exact = exp(-1.0)
+        cases = (
+            (
+                "euler", PETScDiffEq.TSGeneric(
+                    "euler", ["-ts_adapt_type", "none"]; explicit = true,
+                ), 1,
+            ),
+            ("alpha", PETScDiffEq.TSGeneric("alpha", ["-ts_adapt_type", "none"]), 2),
+        )
+        for (label, alg, expected_order) in cases
+            errs = Float64[]
+            for dt in (0.1, 0.05, 0.025, 0.0125)
+                sol = SciMLBase.solve(prob, alg; dt = dt)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                push!(errs, abs(sol.u[end][1] - exact))
+            end
+            orders = [log2(errs[i] / errs[i + 1]) for i in 1:(length(errs) - 1)]
+            @test all(o -> isapprox(o, expected_order; atol = 0.15), orders)
+        end
+        @test PETScDiffEq.TSGeneric("alpha").explicit == false
+        @test PETScDiffEq.TSGeneric("euler"; explicit = true).explicit == true
+    end
+
     @testset "Adaptive stepping" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         sol = SciMLBase.solve(
@@ -122,6 +147,7 @@ end
         for alg in (
                 PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
                 PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSARKIMEX("3"),
+                PETScDiffEq.TSGeneric("alpha"),
             )
             sol = SciMLBase.solve(prob, alg; dt = 0.01, reltol = 1.0e-8, abstol = 1.0e-10)
             @test sol.retcode == SciMLBase.ReturnCode.Success
@@ -136,6 +162,7 @@ end
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRosW("ra34pw2"))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSImplicit("beuler"))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX("3"))
+        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSGeneric("alpha"))
         @test_throws ArgumentError SciMLBase.solve(
             SciMLBase.ODEProblem(decay_oop, [1.0], (0.0, 1.0)),
             PETScDiffEq.TSRK("5dp"); dt = 0.1,
