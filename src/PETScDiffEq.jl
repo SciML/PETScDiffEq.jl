@@ -91,6 +91,9 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     missing_diag::Vector{Int}
     W::Matrix{Float64}
     idx0::Vector{LibPETSc.PetscInt}
+    row_cols0::Vector{Vector{LibPETSc.PetscInt}}
+    row_src::Vector{Vector{Int}}
+    row_buf::Vector{Vector{Float64}}
     J::JBUF
     ts::Vector{Float64}
     us::Vector{Vector{Float64}}
@@ -99,12 +102,63 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     save_everystep::Bool
     work::V
     nf::Int
+    njacs::Int
     err::Union{Nothing, Any}
 end
 
 _record!(ctx, t, ua) = (push!(ctx.ts, Float64(t)); push!(ctx.us, Vector{Float64}(ua)))
 
 _mass(ctx, i, j) = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
+
+function _fill_rows!(ctx, shift, n)
+    @inbounds for i in 1:n
+        cols = ctx.row_cols0[i]
+        src = ctx.row_src[i]
+        buf = ctx.row_buf[i]
+        for k in eachindex(cols)
+            j = Int(cols[k]) + 1
+            jv = src[k] == 0 ? 0.0 : ctx.J.nzval[src[k]]
+            buf[k] = shift * _mass(ctx, i, j) - jv
+        end
+    end
+    return nothing
+end
+
+function _setrows!(ctx, A, n)
+    one_ = LibPETSc.PetscInt(1)
+    @inbounds for i in 1:n
+        cols = ctx.row_cols0[i]
+        isempty(cols) && continue
+        LibPETSc.MatSetValues(
+            ctx.petsclib, A, one_, LibPETSc.PetscInt[i - 1],
+            LibPETSc.PetscInt(length(cols)), cols, ctx.row_buf[i],
+            LibPETSc.INSERT_VALUES,
+        )
+    end
+    return nothing
+end
+
+function _row_structure(J::SparseMatrixCSC, n)
+    cols = [Int[] for _ in 1:n]
+    src = [Int[] for _ in 1:n]
+    for j in 1:n, k in J.colptr[j]:(J.colptr[j + 1] - 1)
+        i = J.rowval[k]
+        push!(cols[i], j)
+        push!(src[i], k)
+    end
+    for i in 1:n
+        if !(i in cols[i])
+            push!(cols[i], i)
+            push!(src[i], 0)
+        end
+        perm = sortperm(cols[i])
+        cols[i] = cols[i][perm]
+        src[i] = src[i][perm]
+    end
+    cols0 = [LibPETSc.PetscInt[c - 1 for c in cols[i]] for i in 1:n]
+    buf = [zeros(length(cols[i])) for i in 1:n]
+    return cols0, src, buf
+end
 
 function _setblock!(ctx, A, n)
     return LibPETSc.MatSetValues(
@@ -157,6 +211,7 @@ function _split_rhs!(
             ctx.f2!(ctx.du, ctx.u, ctx.p, t)
             copyto!(fa, ctx.du)
         end
+        ctx.nf += 1
     catch e
         ctx.err = e
         return LibPETSc.PetscErrorCode(1)
@@ -191,6 +246,7 @@ function _ifunction!(
                 @. fa = ctx.mudot - ctx.du
             end
         end
+        ctx.nf += 1
     catch e
         ctx.err = e
         return LibPETSc.PetscErrorCode(1)
@@ -219,6 +275,7 @@ function _ijacobian!(
             copyto!(ctx.u, xa)
         end
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
+        ctx.njacs += 1
         n = length(ctx.u)
         # One batched MatSetValues beats n^2 single-entry ccalls by orders of
         # magnitude. PETSc reads the block row-major, so entry (i,j) is stored
@@ -260,26 +317,16 @@ function _sparse_ijacobian!(
             copyto!(ctx.u, xa)
         end
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
+        ctx.njacs += 1
         n = length(ctx.u)
-        # A diagonal entry the ODE Jacobian does not store still needs its
-        # `shift*M` term; entries it does store get both contributions below,
-        # so only the missing ones are written here.
-        for i in ctx.missing_diag
-            A[i, i] = shift * _mass(ctx, i, i)
-        end
-        for j in 1:n, k in ctx.J.colptr[j]:(ctx.J.colptr[j + 1] - 1)
-            i = ctx.J.rowval[k]
-            A[i, j] = shift * _mass(ctx, i, j) - ctx.J.nzval[k]
-        end
+        # One MatSetValues per row rather than one per stored entry. The row
+        # structure is the prototype's pattern unioned with the diagonal, which
+        # is what was preallocated, and it never changes.
+        _fill_rows!(ctx, shift, n)
+        _setrows!(ctx, A, n)
         PETSc.assemble!(A)
         if B.ptr != A.ptr
-            for i in ctx.missing_diag
-                B[i, i] = shift * _mass(ctx, i, i)
-            end
-            for j in 1:n, k in ctx.J.colptr[j]:(ctx.J.colptr[j + 1] - 1)
-                i = ctx.J.rowval[k]
-                B[i, j] = shift * _mass(ctx, i, j) - ctx.J.nzval[k]
-            end
+            _setrows!(ctx, B, n)
             PETSc.assemble!(B)
         end
     catch e
@@ -514,12 +561,15 @@ function SciMLBase.__solve(
     W0 = has_jac && !uses_sparse_jac ? zeros(n, n) : zeros(0, 0)
     idx0 = has_jac && !uses_sparse_jac ?
         LibPETSc.PetscInt[i - 1 for i in 1:n] : LibPETSc.PetscInt[]
+    row_cols0, row_src, row_buf = uses_sparse_jac ? _row_structure(J0, n) :
+        (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
-        similar(u0), similar(u0), similar(u0), M, missing_diag, W0, idx0, J0,
+        similar(u0), similar(u0), similar(u0), M, missing_diag, W0, idx0,
+        row_cols0, row_src, row_buf, J0,
         Float64[], Vector{Float64}[],
         saveat_times, 1, save_everystep,
-        PETSc.VecSeq(petsclib, n), 0, nothing,
+        PETSc.VecSeq(petsclib, n), 0, 0, nothing,
     )
 
     ts = LibPETSc.TS(petsclib)
@@ -662,7 +712,7 @@ function SciMLBase.__solve(
         SciMLBase.ReturnCode.Failure
     end
     stats = SciMLBase.DEStats(
-        ctx.nf, -1, -1, -1, -1, nnonliniter, nnonlinfail, -1, -1, -1,
+        ctx.nf, -1, -1, -1, ctx.njacs, nnonliniter, nnonlinfail, -1, -1, -1,
         nsteps, nreject, 0.0,
     )
     return SciMLBase.build_solution(
