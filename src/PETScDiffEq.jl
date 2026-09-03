@@ -79,6 +79,7 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     u::Vector{Float64}
     mudot::Vector{Float64}
     M::Union{Nothing, Matrix{Float64}}
+    missing_diag::Vector{Int}
     J::JBUF
     ts::Vector{Float64}
     us::Vector{Vector{Float64}}
@@ -91,6 +92,10 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
 end
 
 _record!(ctx, t, ua) = (push!(ctx.ts, Float64(t)); push!(ctx.us, Vector{Float64}(ua)))
+
+_mass(ctx, i, j) = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
+
+_stored(A::SparseMatrixCSC, i, j) = any(==(i), @view A.rowval[A.colptr[j]:(A.colptr[j + 1] - 1)])
 
 function _rhs!(
         ::LibPETSc.CTS,
@@ -198,14 +203,12 @@ function _ijacobian!(
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
         n = length(ctx.u)
         for j in 1:n, i in 1:n
-            m = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
-            A[i, j] = shift * m - ctx.J[i, j]
+            A[i, j] = shift * _mass(ctx, i, j) - ctx.J[i, j]
         end
         PETSc.assemble!(A)
         if B.ptr != A.ptr
             for j in 1:n, i in 1:n
-                m = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
-                B[i, j] = shift * m - ctx.J[i, j]
+                B[i, j] = shift * _mass(ctx, i, j) - ctx.J[i, j]
             end
             PETSc.assemble!(B)
         end
@@ -238,24 +241,24 @@ function _sparse_ijacobian!(
         end
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
         n = length(ctx.u)
-        # The diagonal always gets a `shift*I` contribution, whether or not
-        # the ODE Jacobian has a stored entry there, so it is set first and
-        # then overwritten below wherever the ODE Jacobian also contributes.
-        for i in 1:n
-            A[i, i] = shift
+        # A diagonal entry the ODE Jacobian does not store still needs its
+        # `shift*M` term; entries it does store get both contributions below,
+        # so only the missing ones are written here.
+        for i in ctx.missing_diag
+            A[i, i] = shift * _mass(ctx, i, i)
         end
         for j in 1:n, k in ctx.J.colptr[j]:(ctx.J.colptr[j + 1] - 1)
             i = ctx.J.rowval[k]
-            A[i, j] = (i == j ? shift : 0.0) - ctx.J.nzval[k]
+            A[i, j] = shift * _mass(ctx, i, j) - ctx.J.nzval[k]
         end
         PETSc.assemble!(A)
         if B.ptr != A.ptr
-            for i in 1:n
-                B[i, i] = shift
+            for i in ctx.missing_diag
+                B[i, i] = shift * _mass(ctx, i, i)
             end
             for j in 1:n, k in ctx.J.colptr[j]:(ctx.J.colptr[j + 1] - 1)
                 i = ctx.J.rowval[k]
-                B[i, j] = (i == j ? shift : 0.0) - ctx.J.nzval[k]
+                B[i, j] = shift * _mass(ctx, i, j) - ctx.J.nzval[k]
             end
             PETSc.assemble!(B)
         end
@@ -442,6 +445,16 @@ function SciMLBase.__solve(
 
     f1 = is_split ? prob.f.f1.f : prob.f.f
     f2 = is_split ? prob.f.f2.f : nothing
+    for g in (f1, f2)
+        # An AbstractSciMLOperator ignores the f(du,u,p,t) call this package
+        # makes, leaving the derivative buffer untouched rather than erroring.
+        g isa SciMLBase.AbstractSciMLOperator && throw(
+            ArgumentError(
+                "PETScDiffEq does not support an operator-valued right-hand side; " *
+                    "supply a function f!(du, u, p, t)",
+            ),
+        )
+    end
     has_jac = _uses_ifunction(alg) && !is_split && prob.f.jac !== nothing
     jac_fn = has_jac ? prob.f.jac : nothing
     jac_prototype = has_jac ? prob.f.jac_prototype : nothing
@@ -461,9 +474,20 @@ function SciMLBase.__solve(
         pushfirst!(saveat_times, t0)
     end
     M = has_mass ? Matrix{Float64}(mass_matrix) : nothing
+    if M !== nothing && uses_sparse_jac &&
+            any(M[i, j] != 0 for i in 1:n, j in 1:n if i != j)
+        throw(
+            ArgumentError(
+                "PETScDiffEq supports a jac_prototype only with a diagonal mass " *
+                    "matrix; the off-diagonal entries have no preallocated slot",
+            ),
+        )
+    end
+    missing_diag = uses_sparse_jac ?
+        [i for i in 1:n if !_stored(J0, i, i)] : Int[]
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
-        similar(u0), similar(u0), similar(u0), M, J0,
+        similar(u0), similar(u0), similar(u0), M, missing_diag, J0,
         Float64[], Vector{Float64}[],
         saveat_times, 1, save_everystep,
         PETSc.VecSeq(petsclib, n), 0, nothing,

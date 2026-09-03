@@ -2,6 +2,7 @@ using PETScDiffEq
 using SciMLBase
 using LinearAlgebra
 using Logging
+using SciMLOperators
 using SparseArrays
 using Test
 
@@ -491,6 +492,43 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 prob, PETScDiffEq.TSGeneric("euler"; explicit = true); dt = 0.01,
             )
         end
+
+        @testset "with a sparse jac_prototype" begin
+            proto = sparse([1, 2], [1, 2], [1.0, 1.0], 2, 2)
+            sparse_prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    scaled!; mass_matrix = M, jac = scaled_jac!, jac_prototype = proto,
+                ), [1.0, 1.0], (0.0, 1.0),
+            )
+            sol = SciMLBase.solve(
+                sparse_prob, PETScDiffEq.TSImplicit("bdf");
+                dt = 0.005, reltol = 1.0e-11, abstol = 1.0e-13,
+            )
+            @test isapprox(sol.u[end][1], exp(-0.5); atol = 1.0e-6)
+
+            offdiag = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    scaled!; mass_matrix = [2.0 0.5; 0.0 1.0], jac = scaled_jac!,
+                    jac_prototype = proto,
+                ), [1.0, 1.0], (0.0, 1.0),
+            )
+            @test_throws ArgumentError SciMLBase.solve(
+                offdiag, PETScDiffEq.TSImplicit("bdf"); dt = 0.005,
+            )
+        end
+    end
+
+    @testset "An operator-valued right-hand side is rejected" begin
+        A = SciMLOperators.MatrixOperator([-1.0 0.0; 0.0 -2.0])
+        zero!(du, u, p, t) = (du .= 0.0; nothing)
+        @test_throws ArgumentError SciMLBase.solve(
+            SciMLBase.ODEProblem(SciMLBase.ODEFunction(A), [1.0, 1.0], (0.0, 1.0)),
+            PETScDiffEq.TSImplicit("bdf"); dt = 0.01,
+        )
+        @test_throws ArgumentError SciMLBase.solve(
+            SciMLBase.SplitODEProblem(A, zero!, [1.0, 1.0], (0.0, 1.0)),
+            PETScDiffEq.TSARKIMEX("3"); dt = 0.01,
+        )
     end
 
     @testset "adaptive = false gives fixed steps" begin
