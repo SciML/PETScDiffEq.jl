@@ -72,6 +72,41 @@ end
             ["-ts_bdf_order", "3"]
     end
 
+    @testset "TSARKIMEX convergence order" begin
+        exact = exp(-1.0)
+        errs = Float64[]
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for dt in (0.1, 0.05, 0.025, 0.0125)
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSARKIMEX("3", ["-ts_adapt_type", "none"]); dt = dt,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            push!(errs, abs(sol.u[end][1] - exact))
+        end
+        orders = [log2(errs[i] / errs[i + 1]) for i in 1:(length(errs) - 1)]
+        @test all(o -> isapprox(o, 3; atol = 0.15), orders)
+    end
+
+    @testset "TSARKIMEX IMEX split" begin
+        stiff!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
+        forcing!(du, u, p, t) = (du[1] = 1.0; nothing)
+        exact(t) = (1.0 - 1 / 50) * exp(-50t) + 1 / 50
+
+        prob = SciMLBase.SplitODEProblem(stiff!, forcing!, [1.0], (0.0, 0.1))
+        errs = Float64[]
+        for dt in (0.01, 0.005, 0.0025, 0.00125)
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSARKIMEX("3", ["-ts_adapt_type", "none"]); dt = dt,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            push!(errs, abs(sol.u[end][1] - exact(0.1)))
+        end
+        orders = [log2(errs[i] / errs[i + 1]) for i in 1:(length(errs) - 1)]
+        @test all(o -> isapprox(o, 3; atol = 0.2), orders)
+
+        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.01)
+    end
+
     @testset "Adaptive stepping" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         sol = SciMLBase.solve(
@@ -86,7 +121,7 @@ end
         prob = SciMLBase.ODEProblem(lotka_volterra!, [1.0, 1.0], (0.0, 5.0), p)
         for alg in (
                 PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
-                PETScDiffEq.TSImplicit("bdf"),
+                PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSARKIMEX("3"),
             )
             sol = SciMLBase.solve(prob, alg; dt = 0.01, reltol = 1.0e-8, abstol = 1.0e-10)
             @test sol.retcode == SciMLBase.ReturnCode.Success
@@ -100,6 +135,7 @@ end
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRosW("ra34pw2"))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSImplicit("beuler"))
+        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX("3"))
         @test_throws ArgumentError SciMLBase.solve(
             SciMLBase.ODEProblem(decay_oop, [1.0], (0.0, 1.0)),
             PETScDiffEq.TSRK("5dp"); dt = 0.1,

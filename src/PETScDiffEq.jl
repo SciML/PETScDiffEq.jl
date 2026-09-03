@@ -6,7 +6,7 @@ using PETSc: PETSc
 using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
 
-export TSRK, TSRosW, TSImplicit
+export TSRK, TSRosW, TSImplicit, TSARKIMEX
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 
@@ -41,13 +41,23 @@ TSImplicit(subtype::AbstractString, petsc_options::AbstractVector{<:AbstractStri
 TSImplicit(subtype::AbstractString, theta::Real, petsc_options::AbstractVector{<:AbstractString}) =
     TSImplicit(String(subtype), Float64(theta), String[String(o) for o in petsc_options])
 
+struct TSARKIMEX <: PETScTSAlgorithm
+    subtype::String
+    petsc_options::Vector{String}
+end
+
+TSARKIMEX(subtype::AbstractString = "3", petsc_options::AbstractVector{<:AbstractString} = String[]) =
+    TSARKIMEX(String(subtype), String[String(o) for o in petsc_options])
+
 _uses_ifunction(::TSRK) = false
 _uses_ifunction(::TSRosW) = true
 _uses_ifunction(::TSImplicit) = true
+_uses_ifunction(::TSARKIMEX) = true
 
-mutable struct TSContext{F, P, T}
+mutable struct TSContext{F, F2, P, T}
     petsclib::T
     f!::F
+    f2!::F2
     p::P
     du::Vector{Float64}
     u::Vector{Float64}
@@ -80,6 +90,31 @@ function _rhs!(
 end
 
 const RHS_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
+function _split_rhs!(
+        ::LibPETSc.CTS,
+        t::LibPETSc.PetscReal,
+        x_ptr::LibPETSc.CVec,
+        f_ptr::LibPETSc.CVec,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
+    f = PETSc.VecPtr(ctx.petsclib, f_ptr, false)
+    try
+        PETSc.withlocalarray!((x, f); read = (true, false), write = (false, true)) do xa, fa
+            copyto!(ctx.u, xa)
+            ctx.f2!(ctx.du, ctx.u, ctx.p, t)
+            copyto!(fa, ctx.du)
+        end
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(1)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+const SPLIT_RHS_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _ifunction!(
         ::LibPETSc.CTS,
@@ -140,6 +175,11 @@ function __init__()
         LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
     )
+    SPLIT_RHS_PTR[] = @cfunction(
+        _split_rhs!,
+        LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+    )
     MONITOR_PTR[] = @cfunction(
         _monitor!,
         LibPETSc.PetscErrorCode,
@@ -164,6 +204,7 @@ end
 _ts_type(::TSRK) = "rk"
 _ts_type(::TSRosW) = "rosw"
 _ts_type(alg::TSImplicit) = alg.subtype
+_ts_type(::TSARKIMEX) = "arkimex"
 
 _set_subtype!(petsclib, ts, alg::TSRK) =
     _cstr(p -> LibPETSc.TSRKSetType(petsclib, ts, p), alg.subtype)
@@ -175,6 +216,8 @@ function _set_subtype!(petsclib, ts, alg::TSImplicit)
     end
     return nothing
 end
+_set_subtype!(petsclib, ts, alg::TSARKIMEX) =
+    _cstr(p -> LibPETSc.TSARKIMEXSetType(petsclib, ts, p), alg.subtype)
 
 function SciMLBase.__solve(
         prob::SciMLBase.AbstractODEProblem,
@@ -190,6 +233,9 @@ function SciMLBase.__solve(
     prob.u0 isa AbstractVector{<:Real} ||
         throw(ArgumentError("PETScDiffEq requires a real AbstractVector u0"))
     dt === nothing && throw(ArgumentError("PETScDiffEq requires an initial dt"))
+    is_split = prob.f isa SciMLBase.SplitFunction
+    is_split && !(alg isa TSARKIMEX) &&
+        throw(ArgumentError("PETScDiffEq only supports SplitODEProblem with TSARKIMEX"))
 
     t0, tf = Float64(prob.tspan[1]), Float64(prob.tspan[2])
     t0 < tf || throw(ArgumentError("PETScDiffEq requires tspan[1] < tspan[2]"))
@@ -200,8 +246,10 @@ function SciMLBase.__solve(
     petsclib = PETSc.getlib(PetscScalar = Float64)
     PETSc.initialized(petsclib) || PETSc.initialize(petsclib)
 
+    f1 = is_split ? prob.f.f1.f : prob.f.f
+    f2 = is_split ? prob.f.f2.f : nothing
     ctx = TSContext(
-        petsclib, prob.f.f, prob.p,
+        petsclib, f1, f2, prob.p,
         similar(u0), similar(u0),
         Float64[], Vector{Float64}[], nothing,
     )
@@ -231,6 +279,9 @@ function SciMLBase.__solve(
                 LibPETSc.TSSetIFunction(petsclib, ts, nothing, IFUNCTION_PTR[], ctxptr)
             else
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, RHS_PTR[], ctxptr)
+            end
+            if is_split
+                LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, SPLIT_RHS_PTR[], ctxptr)
             end
             LibPETSc.TSMonitorSet(petsclib, ts, MONITOR_PTR[], ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
