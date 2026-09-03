@@ -71,6 +71,24 @@ them the step size is fixed. Only in-place, real-valued, forward-time
 solve relies on PETSc's own fallback, so pass `["-snes_fd"]` in
 `petsc_options` on problems where that fallback is not enough.
 
+## Saving
+
+`saveat`, `save_everystep`, `save_start` and `save_end` behave as they do
+elsewhere in SciML. `saveat` values that fall inside a step are produced with
+`TSInterpolate`, so they carry the integrator's own order rather than a linear
+fallback between stored steps.
+
+```julia
+sol = SciMLBase.solve(prob, TSRK("5dp"); dt = 0.1, saveat = [0.3, 0.7])
+sol.t    # [0.0, 0.3, 0.7, 1.0]
+```
+
+`sol.stats` reports `nf`, `naccept`, `nreject`, `nnonliniter` and
+`nnonlinconvfail`; the remaining `DEStats` fields stay at the `-1` "unknown"
+sentinel. Keywords this package cannot honour (`tstops`, `save_idxs`,
+`d_discontinuities`, `callback`, `dense`) emit a warning rather than being
+silently dropped.
+
 ## Scope
 
 PETSc's linear (KSP) and nonlinear (SNES) solvers are already reachable from
@@ -81,8 +99,9 @@ any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
 Not yet implemented: the `init`/`step!`/`solve!` integrator interface,
-an analytic Jacobian for `SplitODEProblem`, and MPI — every solve currently
-runs on `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
+continuous/dense output (`sol(t)` falls back to linear interpolation between
+saved points), `tstops`, `save_idxs`, callbacks, an analytic Jacobian for
+`SplitODEProblem`, and MPI — every solve currently runs on `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
 supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`
 (Kronecker AIJ) matrix, not the plain AIJ this package builds, so it needs
 its own dedicated setup. `TSGeneric("radau5")` fails for a different,

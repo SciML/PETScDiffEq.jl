@@ -1,9 +1,14 @@
 using PETScDiffEq
 using SciMLBase
+using Logging
 using SparseArrays
 using Test
 
-decay!(du, u, p, t) = (du[1] = -u[1]; nothing)
+decay!(du, u, p, t) = (
+    @inbounds for i in eachindex(du)
+        du[i] = -u[i]
+    end; nothing
+)
 decay_oop(u, p, t) = -u
 
 function lotka_volterra!(du, u, p, t)
@@ -344,6 +349,83 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test all(isfinite, sol.u[end])
             @test all(>(0), sol.u[end])
         end
+    end
+
+    @testset "Saving controls" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
+        exact(t) = exp(-t)
+
+        @testset "save_everystep" begin
+            every = SciMLBase.solve(prob, alg; dt = 0.1)
+            @test length(every.t) == 11
+            ends = SciMLBase.solve(prob, alg; dt = 0.1, save_everystep = false)
+            @test ends.t == [0.0, 1.0]
+            @test abs(ends.u[end][1] - exact(1.0)) < 1.0e-7
+        end
+
+        @testset "saveat hits the requested times" begin
+            scalar = SciMLBase.solve(prob, alg; dt = 0.1, saveat = 0.25)
+            @test scalar.t ≈ [0.0, 0.25, 0.5, 0.75, 1.0]
+            vec = SciMLBase.solve(prob, alg; dt = 0.1, saveat = [0.3, 0.7])
+            @test vec.t ≈ [0.0, 0.3, 0.7, 1.0]
+            # interpolated points must carry the solver's accuracy, not a
+            # linear fallback between stored steps
+            for sol in (scalar, vec), i in eachindex(sol.t)
+                @test abs(sol.u[i][1] - exact(sol.t[i])) < 1.0e-7
+            end
+        end
+
+        @testset "save_start and save_end" begin
+            nostart = SciMLBase.solve(
+                prob, alg; dt = 0.1, saveat = [0.3, 0.7], save_start = false,
+            )
+            @test nostart.t ≈ [0.3, 0.7, 1.0]
+            noend = SciMLBase.solve(
+                prob, alg; dt = 0.1, save_everystep = false, save_end = false,
+            )
+            @test noend.t ≈ [0.0]
+        end
+
+        @testset "final state is the solution at tf, not a stale duplicate" begin
+            sol = SciMLBase.solve(prob, alg; dt = 0.1, save_everystep = false)
+            @test sol.t[end] ≈ 1.0
+            @test abs(sol.u[end][1] - exact(1.0)) < 1.0e-7
+        end
+    end
+
+    @testset "Solution statistics" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        sol = SciMLBase.solve(
+            prob, PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"]); dt = 0.1,
+        )
+        @test sol.stats !== nothing
+        @test sol.stats.nf > 0
+        @test sol.stats.naccept == 10
+        @test sol.stats.nreject == 0
+    end
+
+    @testset "Unsupported keywords warn rather than being dropped" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
+        @test_logs (:warn,) match_mode = :any SciMLBase.solve(
+            prob, alg; dt = 0.1, tstops = [0.55],
+        )
+        @test_logs (:warn,) match_mode = :any SciMLBase.solve(
+            prob, alg; dt = 0.1, save_idxs = [1],
+        )
+        @test_logs min_level = Logging.Warn SciMLBase.solve(prob, alg; dt = 0.1)
+    end
+
+    @testset "No Jacobian buffer is allocated when none is used" begin
+        # An explicit method never forms a Jacobian, so a solve must not pay
+        # for a dense n-by-n buffer. At n = 500 that buffer would be ~1.9 MiB.
+        n = 500
+        prob = SciMLBase.ODEProblem(decay!, ones(n), (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
+        run() = SciMLBase.solve(prob, alg; dt = 0.1, save_everystep = false)
+        run()
+        @test (@allocated run()) < 800 * 1024
     end
 
     @testset "Input validation" begin

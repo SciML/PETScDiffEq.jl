@@ -68,7 +68,7 @@ _uses_ifunction(::TSImplicit) = true
 _uses_ifunction(::TSARKIMEX) = true
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
-mutable struct TSContext{F, F2, JAC, JBUF, P, T}
+mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     petsclib::T
     f!::F
     f2!::F2
@@ -79,8 +79,15 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T}
     J::JBUF
     ts::Vector{Float64}
     us::Vector{Vector{Float64}}
+    saveat::Vector{Float64}
+    saveat_idx::Int
+    save_everystep::Bool
+    work::V
+    nf::Int
     err::Union{Nothing, Any}
 end
+
+_record!(ctx, t, ua) = (push!(ctx.ts, Float64(t)); push!(ctx.us, Vector{Float64}(ua)))
 
 function _rhs!(
         ::LibPETSc.CTS,
@@ -98,6 +105,7 @@ function _rhs!(
             ctx.f!(ctx.du, ctx.u, ctx.p, t)
             copyto!(fa, ctx.du)
         end
+        ctx.nf += 1
     catch e
         ctx.err = e
         return LibPETSc.PetscErrorCode(1)
@@ -251,8 +259,8 @@ end
 const SPARSE_IJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _monitor!(
-        ::LibPETSc.CTS,
-        ::LibPETSc.PetscInt,
+        ts_ptr::LibPETSc.CTS,
+        step::LibPETSc.PetscInt,
         t::LibPETSc.PetscReal,
         x_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
@@ -260,9 +268,30 @@ function _monitor!(
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     try
-        PETSc.withlocalarray!(x; read = true, write = false) do xa
-            push!(ctx.ts, Float64(t))
-            push!(ctx.us, Vector{Float64}(xa))
+        if isempty(ctx.saveat)
+            if ctx.save_everystep || step == 0
+                PETSc.withlocalarray!(xa -> _record!(ctx, t, xa), x; read = true, write = false)
+            end
+        else
+            ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
+            tol = 100 * eps(max(one(Float64), abs(Float64(t))))
+            while ctx.saveat_idx <= length(ctx.saveat) &&
+                    ctx.saveat[ctx.saveat_idx] <= Float64(t) + tol
+                want = ctx.saveat[ctx.saveat_idx]
+                # Before any step has been taken there is nothing to interpolate
+                # from, and the incoming vector is already the initial state.
+                if step == 0 || abs(want - Float64(t)) <= tol
+                    PETSc.withlocalarray!(
+                        xa -> _record!(ctx, want, xa), x; read = true, write = false,
+                    )
+                else
+                    LibPETSc.TSInterpolate(ctx.petsclib, ts, want, ctx.work)
+                    PETSc.withlocalarray!(
+                        wa -> _record!(ctx, want, wa), ctx.work; read = true, write = false,
+                    )
+                end
+                ctx.saveat_idx += 1
+            end
         end
     catch e
         ctx.err = e
@@ -349,6 +378,8 @@ _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
     _cstr(p -> LibPETSc.TSARKIMEXSetType(petsclib, ts, p), alg.subtype)
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
+const UNSUPPORTED_KWARGS = (:tstops, :save_idxs, :d_discontinuities, :callback, :dense)
+
 function SciMLBase.__solve(
         prob::SciMLBase.AbstractODEProblem,
         alg::PETScTSAlgorithm;
@@ -356,8 +387,17 @@ function SciMLBase.__solve(
         reltol = nothing,
         abstol = nothing,
         maxiters = 1000000,
+        saveat = Float64[],
+        save_everystep = true,
+        save_start = true,
+        save_end = true,
         kwargs...,
     )
+    for key in UNSUPPORTED_KWARGS
+        if haskey(kwargs, key)
+            @warn "PETScDiffEq does not support `$key` and is ignoring it"
+        end
+    end
     SciMLBase.isinplace(prob) ||
         throw(ArgumentError("PETScDiffEq requires an in-place ODEProblem, f!(du, u, p, t)"))
     prob.u0 isa AbstractVector{<:Real} ||
@@ -389,10 +429,19 @@ function SciMLBase.__solve(
     else
         zeros(n, n)
     end
+    saveat_times = saveat isa Number ?
+        collect(Float64, t0:Float64(saveat):tf) : sort!(Vector{Float64}(collect(saveat)))
+    filter!(t -> t0 - eps(tf) <= t <= tf + eps(tf), saveat_times)
+    if !isempty(saveat_times) && save_start &&
+            saveat_times[1] > t0 + 100 * eps(max(one(Float64), abs(tf)))
+        pushfirst!(saveat_times, t0)
+    end
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
         similar(u0), similar(u0), J0,
-        Float64[], Vector{Float64}[], nothing,
+        Float64[], Vector{Float64}[],
+        saveat_times, 1, save_everystep,
+        PETSc.VecSeq(petsclib, n), 0, nothing,
     )
 
     ts = LibPETSc.TS(petsclib)
@@ -401,6 +450,10 @@ function SciMLBase.__solve(
     opts = PETSc.Options(petsclib)
     pushed = false
     nsteps = 0
+    nreject = 0
+    nnonliniter = 0
+    nnonlinfail = 0
+    uend = copy(u0)
     tend = t0
 
     try
@@ -470,27 +523,45 @@ function SciMLBase.__solve(
         ctx.err === nothing || throw(ctx.err)
         tend = Float64(LibPETSc.TSGetSolveTime(petsclib, ts))
         nsteps = Int(LibPETSc.TSGetStepNumber(petsclib, ts))
+        nreject = Int(LibPETSc.TSGetStepRejections(petsclib, ts))
+        nnonliniter = Int(LibPETSc.TSGetSNESIterations(petsclib, ts))
+        nnonlinfail = Int(LibPETSc.TSGetSNESFailures(petsclib, ts))
+        uend = PETSc.withlocalarray!(
+            ua -> Vector{Float64}(ua), u; read = true, write = false,
+        )
     finally
         pushed && pop!(opts)
         opts.ptr == C_NULL || PETSc.destroy(opts)
         jac_mat.ptr == C_NULL || PETSc.destroy(jac_mat)
+        ctx.work.ptr == C_NULL || PETSc.destroy(ctx.work)
         u.ptr == C_NULL || PETSc.destroy(u)
         ts.ptr == C_NULL || LibPETSc.TSDestroy(petsclib, ts)
     end
 
-    if isempty(ctx.ts) || ctx.ts[end] < tend
+    tol = 100 * eps(max(one(Float64), abs(tf)))
+    if save_end && (isempty(ctx.ts) || ctx.ts[end] < tend - tol)
         push!(ctx.ts, tend)
-        push!(ctx.us, copy(ctx.us[end]))
+        push!(ctx.us, uend)
+    end
+    if !save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= tol
+        popfirst!(ctx.ts)
+        popfirst!(ctx.us)
     end
 
-    retcode = if tend >= tf - 100 * eps(tf)
+    retcode = if tend >= tf - tol
         SciMLBase.ReturnCode.Success
     elseif nsteps >= maxiters
         SciMLBase.ReturnCode.MaxIters
     else
         SciMLBase.ReturnCode.Failure
     end
-    return SciMLBase.build_solution(prob, alg, ctx.ts, ctx.us; retcode = retcode)
+    stats = SciMLBase.DEStats(
+        ctx.nf, -1, -1, -1, -1, nnonliniter, nnonlinfail, -1, -1, -1,
+        nsteps, nreject, 0.0,
+    )
+    return SciMLBase.build_solution(
+        prob, alg, ctx.ts, ctx.us; retcode = retcode, stats = stats,
+    )
 end
 
 end
