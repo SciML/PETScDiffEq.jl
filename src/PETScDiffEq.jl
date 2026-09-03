@@ -6,7 +6,7 @@ using PETSc: PETSc
 using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
 
-export TSRK
+export TSRK, TSRosW
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 
@@ -17,6 +17,17 @@ end
 
 TSRK(subtype::AbstractString = "5dp", petsc_options::AbstractVector{<:AbstractString} = String[]) =
     TSRK(String(subtype), String[String(o) for o in petsc_options])
+
+struct TSRosW <: PETScTSAlgorithm
+    subtype::String
+    petsc_options::Vector{String}
+end
+
+TSRosW(subtype::AbstractString = "ra34pw2", petsc_options::AbstractVector{<:AbstractString} = String[]) =
+    TSRosW(String(subtype), String[String(o) for o in petsc_options])
+
+_uses_ifunction(::TSRK) = false
+_uses_ifunction(::TSRosW) = true
 
 mutable struct TSContext{F, P, T}
     petsclib::T
@@ -54,6 +65,35 @@ end
 
 const RHS_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
+function _ifunction!(
+        ::LibPETSc.CTS,
+        t::LibPETSc.PetscReal,
+        x_ptr::LibPETSc.CVec,
+        xdot_ptr::LibPETSc.CVec,
+        f_ptr::LibPETSc.CVec,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
+    xdot = PETSc.VecPtr(ctx.petsclib, xdot_ptr, false)
+    f = PETSc.VecPtr(ctx.petsclib, f_ptr, false)
+    try
+        PETSc.withlocalarray!(
+            (x, xdot, f); read = (true, true, false), write = (false, false, true),
+        ) do xa, xda, fa
+            copyto!(ctx.u, xa)
+            ctx.f!(ctx.du, ctx.u, ctx.p, t)
+            @. fa = xda - ctx.du
+        end
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(1)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+const IFUNCTION_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
 function _monitor!(
         ::LibPETSc.CTS,
         ::LibPETSc.PetscInt,
@@ -89,6 +129,14 @@ function __init__()
         LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, LibPETSc.PetscInt, LibPETSc.PetscReal, LibPETSc.CVec, Ptr{Cvoid})
     )
+    IFUNCTION_PTR[] = @cfunction(
+        _ifunction!,
+        LibPETSc.PetscErrorCode,
+        (
+            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
+            LibPETSc.CVec, Ptr{Cvoid},
+        )
+    )
     return nothing
 end
 
@@ -98,9 +146,12 @@ function _cstr(f::F, s::AbstractString) where {F}
 end
 
 _ts_type(::TSRK) = "rk"
+_ts_type(::TSRosW) = "rosw"
 
 _set_subtype!(petsclib, ts, alg::TSRK) =
     _cstr(p -> LibPETSc.TSRKSetType(petsclib, ts, p), alg.subtype)
+_set_subtype!(petsclib, ts, alg::TSRosW) =
+    _cstr(p -> LibPETSc.TSRosWSetType(petsclib, ts, p), alg.subtype)
 
 function SciMLBase.__solve(
         prob::SciMLBase.AbstractODEProblem,
@@ -153,7 +204,11 @@ function SciMLBase.__solve(
 
         ctxptr = pointer_from_objref(ctx)
         GC.@preserve ctx begin
-            LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, RHS_PTR[], ctxptr)
+            if _uses_ifunction(alg)
+                LibPETSc.TSSetIFunction(petsclib, ts, nothing, IFUNCTION_PTR[], ctxptr)
+            else
+                LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, RHS_PTR[], ctxptr)
+            end
             LibPETSc.TSMonitorSet(petsclib, ts, MONITOR_PTR[], ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
             LibPETSc.TSSetTimeStep(petsclib, ts, Float64(dt))

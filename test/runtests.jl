@@ -29,6 +29,21 @@ end
         end
     end
 
+    @testset "TSRosW convergence order" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        exact = exp(-1.0)
+        errs = Float64[]
+        for dt in (0.1, 0.05, 0.025, 0.0125)
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRosW("ra34pw2", ["-ts_adapt_type", "none"]); dt = dt,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            push!(errs, abs(sol.u[end][1] - exact))
+        end
+        orders = [log2(errs[i] / errs[i + 1]) for i in 1:(length(errs) - 1)]
+        @test all(o -> isapprox(o, 3; atol = 0.15), orders)
+    end
+
     @testset "Adaptive stepping" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         sol = SciMLBase.solve(
@@ -41,17 +56,18 @@ end
     @testset "System of equations" begin
         p = (1.5, 1.0, 3.0, 1.0)
         prob = SciMLBase.ODEProblem(lotka_volterra!, [1.0, 1.0], (0.0, 5.0), p)
-        sol = SciMLBase.solve(
-            prob, PETScDiffEq.TSRK("5dp"); dt = 0.01, reltol = 1.0e-8, abstol = 1.0e-10,
-        )
-        @test sol.retcode == SciMLBase.ReturnCode.Success
-        @test all(isfinite, sol.u[end])
-        @test all(>(0), sol.u[end])
+        for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"))
+            sol = SciMLBase.solve(prob, alg; dt = 0.01, reltol = 1.0e-8, abstol = 1.0e-10)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test all(isfinite, sol.u[end])
+            @test all(>(0), sol.u[end])
+        end
     end
 
     @testset "Input validation" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"))
+        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRosW("ra34pw2"))
         @test_throws ArgumentError SciMLBase.solve(
             SciMLBase.ODEProblem(decay_oop, [1.0], (0.0, 1.0)),
             PETScDiffEq.TSRK("5dp"); dt = 0.1,
