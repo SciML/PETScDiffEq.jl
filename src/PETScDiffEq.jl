@@ -6,7 +6,7 @@ using PETSc: PETSc
 using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
 
-export TSRK, TSRosW
+export TSRK, TSRosW, TSImplicit
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 
@@ -26,8 +26,24 @@ end
 TSRosW(subtype::AbstractString = "ra34pw2", petsc_options::AbstractVector{<:AbstractString} = String[]) =
     TSRosW(String(subtype), String[String(o) for o in petsc_options])
 
+struct TSImplicit <: PETScTSAlgorithm
+    subtype::String
+    theta::Union{Nothing, Float64}
+    petsc_options::Vector{String}
+end
+
+TSImplicit(subtype::AbstractString = "beuler") =
+    TSImplicit(String(subtype), nothing, String[])
+TSImplicit(subtype::AbstractString, theta::Real) =
+    TSImplicit(String(subtype), Float64(theta), String[])
+TSImplicit(subtype::AbstractString, petsc_options::AbstractVector{<:AbstractString}) =
+    TSImplicit(String(subtype), nothing, String[String(o) for o in petsc_options])
+TSImplicit(subtype::AbstractString, theta::Real, petsc_options::AbstractVector{<:AbstractString}) =
+    TSImplicit(String(subtype), Float64(theta), String[String(o) for o in petsc_options])
+
 _uses_ifunction(::TSRK) = false
 _uses_ifunction(::TSRosW) = true
+_uses_ifunction(::TSImplicit) = true
 
 mutable struct TSContext{F, P, T}
     petsclib::T
@@ -147,11 +163,18 @@ end
 
 _ts_type(::TSRK) = "rk"
 _ts_type(::TSRosW) = "rosw"
+_ts_type(alg::TSImplicit) = alg.subtype
 
 _set_subtype!(petsclib, ts, alg::TSRK) =
     _cstr(p -> LibPETSc.TSRKSetType(petsclib, ts, p), alg.subtype)
 _set_subtype!(petsclib, ts, alg::TSRosW) =
     _cstr(p -> LibPETSc.TSRosWSetType(petsclib, ts, p), alg.subtype)
+function _set_subtype!(petsclib, ts, alg::TSImplicit)
+    if alg.subtype == "theta" && alg.theta !== nothing
+        LibPETSc.TSThetaSetTheta(petsclib, ts, alg.theta)
+    end
+    return nothing
+end
 
 function SciMLBase.__solve(
         prob::SciMLBase.AbstractODEProblem,
