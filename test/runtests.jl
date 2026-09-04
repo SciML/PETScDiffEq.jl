@@ -573,6 +573,52 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test capped.stats.naccept > free.stats.naccept
     end
 
+    @testset "Subtype setters take effect" begin
+        # Each non-default subtype has a different order from its family's
+        # default, so a setter that silently did nothing would fail here.
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        exact = exp(-1.0)
+        function finest_order(alg)
+            errs = [
+                abs(SciMLBase.solve(prob, alg; dt = dt, adaptive = false).u[end][1] - exact)
+                    for dt in (0.05, 0.025, 0.0125)
+            ]
+            return log2(errs[end - 1] / errs[end])
+        end
+        @test isapprox(finest_order(PETScDiffEq.TSRosW("2m")), 2; atol = 0.15)
+        @test isapprox(finest_order(PETScDiffEq.TSRosW("ra34pw2")), 3; atol = 0.15)
+        @test isapprox(finest_order(PETScDiffEq.TSARKIMEX("2e")), 2; atol = 0.15)
+        @test isapprox(finest_order(PETScDiffEq.TSARKIMEX("3")), 3; atol = 0.15)
+        @test isapprox(finest_order(PETScDiffEq.TSImplicit("theta", 1.0)), 1; atol = 0.15)
+        @test isapprox(finest_order(PETScDiffEq.TSImplicit("theta", 0.5)), 2; atol = 0.15)
+    end
+
+    @testset "PETSc options that alter stepping" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+
+        @testset "interpolated final time keeps sol.t sorted and inside tspan" begin
+            for dt in (0.3, 0.7)
+                sol = SciMLBase.solve(
+                    prob, PETScDiffEq.TSRK("5dp", ["-ts_exact_final_time", "interpolate"]);
+                    dt = dt,
+                )
+                @test issorted(sol.t)
+                @test sol.t[end] ≈ 1.0
+                @test maximum(sol.t) <= 1.0 + 1.0e-12
+                @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-4
+            end
+        end
+
+        @testset "a cancelled monitor still yields the final state" begin
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp", ["-ts_monitor_cancel"]); dt = 0.1,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.t == [1.0]
+            @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-4
+        end
+    end
+
     @testset "Only methods with an error estimate adapt" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         steps(alg, rt) = SciMLBase.solve(
