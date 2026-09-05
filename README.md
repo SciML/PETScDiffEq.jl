@@ -185,8 +185,13 @@ sol.t    # [0.0, 0.3, 0.7, 1.0]
 `dtmin` and `dtmax` bound the controller's step size. `sol.stats` reports
 `nf`, `naccept`, `nreject`, `nnonliniter` and `nnonlinconvfail`; the remaining
 `DEStats` fields stay at the `-1` "unknown" sentinel. Keywords this package
-cannot honour, `save_idxs` and `isoutofdomain` among them, emit a warning
-rather than being silently dropped.
+cannot honour, `d_discontinuities` and `isoutofdomain` among them, emit a
+warning rather than being silently dropped.
+
+`save_idxs` keeps only the named components of the state, as an index vector
+or a single index; the saved state stays a vector either way. The derivative
+behind the dense interpolant is still taken from the whole state and then cut
+down, and a blow-up in a component you are not saving is still reported.
 
 `sol(t)` interpolates. By default, when every step is saved and no `saveat`
 is given, the solution carries a cubic Hermite interpolant built from the
@@ -233,9 +238,8 @@ third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: `VectorContinuousCallback`, `save_idxs`,
-and MPI; every solve currently runs on
-`MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
+Not yet implemented: `VectorContinuousCallback` and MPI; every solve
+currently runs on `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
 supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`
 (Kronecker AIJ) matrix, not the plain AIJ this package builds, so it needs
 its own dedicated setup. `TSGeneric("radau5")` fails for a different,

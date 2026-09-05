@@ -346,6 +346,65 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "save_idxs" begin
+        function pair!(du, u, p, t)
+            du[1] = -u[1]
+            return du[2] = -2u[2]
+        end
+        prob = SciMLBase.ODEProblem(pair!, [1.0, 1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp")
+        tols = (reltol = 1.0e-9, abstol = 1.0e-11)
+
+        @testset "keeps only the named components" begin
+            full = SciMLBase.solve(prob, alg; dt = 0.1, tols...)
+            one = @test_logs min_level = Logging.Warn SciMLBase.solve(
+                prob, alg; dt = 0.1, save_idxs = [2], tols...,
+            )
+            @test length(one.u[1]) == 1
+            @test one.t == full.t
+            @test all(one.u[i][1] == full.u[i][2] for i in eachindex(one.t))
+            @test one.stats.nf == full.stats.nf
+        end
+
+        @testset "dense output keeps the matching derivative" begin
+            sol = SciMLBase.solve(prob, alg; dt = 0.1, save_idxs = [2], tols...)
+            @test sol.dense
+            @test length(sol.interp.du) == length(sol.u)
+            @test sol.interp.du[3] ≈ -2 .* sol.u[3]
+            @test abs(sol(0.55)[1] - exp(-2 * 0.55)) < 1.0e-7
+        end
+
+        @testset "a single index and saveat" begin
+            one = SciMLBase.solve(prob, alg; dt = 0.1, save_idxs = 1, tols...)
+            @test length(one.u[1]) == 1
+            @test abs(one.u[end][1] - exp(-1)) < 1.0e-7
+            at = SciMLBase.solve(prob, alg; dt = 0.1, saveat = 0.25, save_idxs = [2], tols...)
+            @test at.t == [0.0, 0.25, 0.5, 0.75, 1.0]
+            @test abs(at.u[3][1] - exp(-1.0)) < 1.0e-7
+        end
+
+        @testset "a blow-up in an unsaved component is still Unstable" begin
+            function mixed!(du, u, p, t)
+                du[1] = u[1]^2
+                return du[2] = -u[2]
+            end
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(mixed!, [1.0, 1.0], (0.0, 5.0)), alg;
+                dt = 0.1, adaptive = false, save_idxs = [2],
+            )
+            @test all(isfinite, sol.u[end])
+            @test sol.retcode == SciMLBase.ReturnCode.Unstable
+        end
+
+        @testset "an index outside the state is rejected" begin
+            for bad in ([0], [3], Int[])
+                @test_throws ArgumentError SciMLBase.solve(
+                    prob, alg; dt = 0.1, save_idxs = bad,
+                )
+            end
+        end
+    end
+
     @testset "out-of-place problems" begin
         oop(u, p, t) = -u
         prob = SciMLBase.ODEProblem(oop, [1.0], (0.0, 1.0))
@@ -1057,10 +1116,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         alg = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
         @test_logs (:warn,) match_mode = :any SciMLBase.solve(
-            prob, alg; dt = 0.1, save_idxs = [1],
+            prob, alg; dt = 0.1, isoutofdomain = (u, p, t) -> false,
         )
         @test_logs (:warn,) match_mode = :any SciMLBase.solve(
-            prob, alg; dt = 0.1, save_idxs = [1],
+            prob, alg; dt = 0.1, d_discontinuities = [0.5],
         )
         @test_logs min_level = Logging.Warn SciMLBase.solve(prob, alg; dt = 0.1)
     end

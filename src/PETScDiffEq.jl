@@ -103,6 +103,7 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     saveat_idx::Int
     save_everystep::Bool
     dense::Bool
+    save_idxs::Union{Nothing, Vector{Int}}
     work::V
     nf::Int
     njacs::Int
@@ -110,12 +111,17 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
 end
 
 function _record!(ctx, t, x)
-    u = Vector{Float64}(x)
+    full = Vector{Float64}(x)
+    idxs = ctx.save_idxs
     push!(ctx.ts, Float64(t))
-    push!(ctx.us, u)
-    ctx.dense && push!(ctx.dus, _derivative(ctx, Float64(t), u))
+    # The derivative comes from the whole state even when only part is kept.
+    ctx.dense && push!(ctx.dus, _select(_derivative(ctx, Float64(t), full), idxs))
+    push!(ctx.us, _select(full, idxs))
     return nothing
 end
+
+_select(u, ::Nothing) = u
+_select(u, idxs::Vector{Int}) = u[idxs]
 
 function _derivative(ctx, t, u)
     du = similar(u)
@@ -520,7 +526,7 @@ _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 const UNSUPPORTED_KWARGS = (
-    :save_idxs, :d_discontinuities, :isoutofdomain,
+    :d_discontinuities, :isoutofdomain,
     :unstable_check, :internalnorm, :calck, :force_dtmin, :alias_u0, :sensealg,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
 )
@@ -571,6 +577,7 @@ function _setup(
         save_start = true,
         save_end = true,
         dense = nothing,
+        save_idxs = nothing,
         kwargs...,
     )
     for key in UNSUPPORTED_KWARGS
@@ -657,6 +664,16 @@ function _setup(
         LibPETSc.PetscInt[i - 1 for i in 1:n] : LibPETSc.PetscInt[]
     row_cols0, row_src, row_buf = uses_sparse_jac ? _row_structure(J0, n) :
         (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
+    kept = if save_idxs === nothing
+        nothing
+    else
+        v = save_idxs isa Integer ? [Int(save_idxs)] : Vector{Int}(collect(save_idxs))
+        isempty(v) && throw(ArgumentError("`save_idxs` must name at least one component"))
+        all(i -> 1 <= i <= n, v) || throw(
+            ArgumentError("`save_idxs` has an index outside 1:$n"),
+        )
+        v
+    end
     dense_out = dense === nothing ? (save_everystep && isempty(saveat_times) && !has_mass) :
         Bool(dense)
     if dense_out && has_mass
@@ -672,7 +689,7 @@ function _setup(
         similar(u0), similar(u0), similar(u0), M, missing_diag, W0, idx0,
         row_cols0, row_src, row_buf, J0,
         Float64[], Vector{Float64}[], Vector{Float64}[],
-        saveat_times, 1, save_everystep, dense_out,
+        saveat_times, 1, save_everystep, dense_out, kept,
         PETSc.VecSeq(petsclib, n), 0, 0, nothing,
     )
     h = TSHandles(
@@ -795,7 +812,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
         ctx.dense && popfirst!(ctx.dus)
     end
 
-    finite = isempty(ctx.us) || all(isfinite, ctx.us[end])
+    finite = all(isfinite, uend)
     retcode = if !finite
         SciMLBase.ReturnCode.Unstable
     elseif tend >= tf - tol
