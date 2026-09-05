@@ -347,6 +347,110 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "TSIRK" begin
+        proto = sparse([1], [1], [1.0], 1, 1)
+        prob = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; jac = decay_jac!, jac_prototype = proto),
+            [1.0], (0.0, 1.0),
+        )
+
+        @testset "order is twice the stage count" begin
+            # Gauss-Legendre collocation. Setting the stage count without
+            # rebuilding the tableau integrates something else silently, so
+            # these orders are the guard on that.
+            for nstages in (1, 2, 3)
+                errs = [
+                    abs(
+                        SciMLBase.solve(
+                            prob, PETScDiffEq.TSIRK(nstages); dt = dt, adaptive = false,
+                        ).u[end][1] - exp(-1),
+                    ) for dt in (0.2, 0.1, 0.05)
+                ]
+                orders = [log2(errs[i] / errs[i + 1]) for i in 1:2]
+                @test all(o -> isapprox(o, 2 * nstages; atol = 0.2), orders)
+            end
+        end
+
+        @testset "a dense jac works too" begin
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),
+                ), PETScDiffEq.TSIRK(); dt = 0.1, adaptive = false,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test abs(sol.u[end][1] - exp(-1)) < 1.0e-10
+        end
+
+        @testset "the analytic Jacobian is what it solves with" begin
+            wrong = SciMLBase.solve(
+                SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(decay!; jac = decay_wrong_jac!), [1.0], (0.0, 1.0),
+                ), PETScDiffEq.TSIRK(); dt = 0.1, adaptive = false,
+            )
+            # Unlike the other implicit families, a wrong Jacobian here does not
+            # fail to converge; it reports success and answers wrongly, which is
+            # what makes it a usable control.
+            @test wrong.retcode == SciMLBase.ReturnCode.Success
+            @test abs(wrong.u[end][1] - exp(-1)) > 1.0e-3
+            right = SciMLBase.solve(prob, PETScDiffEq.TSIRK(); dt = 0.1, adaptive = false)
+            @test abs(right.u[end][1] - exp(-1)) < 1.0e-10
+            @test right.stats.njacs > 0
+        end
+
+        @testset "it says what it needs" begin
+            @test_throws ArgumentError SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSIRK();
+                dt = 0.1,
+            )
+            # PETSc would drift further from the answer as dt shrinks instead.
+            @test_throws ArgumentError SciMLBase.solve(
+                SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(
+                        decay!; jac = decay_jac!, mass_matrix = fill(2.0, 1, 1),
+                    ), [1.0], (0.0, 1.0),
+                ), PETScDiffEq.TSIRK(); dt = 0.05,
+            )
+        end
+
+        @testset "fixed step, so a tolerance warns" begin
+            @test_logs (:warn,) match_mode = :any SciMLBase.solve(
+                prob, PETScDiffEq.TSIRK(); dt = 0.1, reltol = 1.0e-8,
+            )
+        end
+
+        @testset "the default preconditioner can be overridden" begin
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSIRK(3, ["-pc_type", "none"]); dt = 0.1,
+                adaptive = false,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test abs(sol.u[end][1] - exp(-1)) < 1.0e-10
+        end
+
+        @testset "a stiff system through the integrator" begin
+            function stiff!(du, u, p, t)
+                du[1] = -1000 * (u[1] - cos(t))
+                return du[2] = -u[2]
+            end
+            function stiff_jac!(J, u, p, t)
+                J[1, 1] = -1000.0
+                return J[2, 2] = -1.0
+            end
+            sol = SciMLBase.solve!(
+                SciMLBase.init(
+                    SciMLBase.ODEProblem(
+                        SciMLBase.ODEFunction(
+                            stiff!; jac = stiff_jac!,
+                            jac_prototype = sparse([1, 2], [1, 2], [1.0, 1.0], 2, 2),
+                        ), [1.0, 1.0], (0.0, 0.1),
+                    ), PETScDiffEq.TSIRK(); dt = 1.0e-3, adaptive = false,
+                ),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test abs(sol.u[end][2] - exp(-0.1)) < 1.0e-10
+        end
+    end
+
     @testset "who is warned about a tolerance" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         for alg in (
@@ -381,7 +485,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         # docstring there even for a name that has none.
         lines = split(read(joinpath(@__DIR__, "..", "src", "PETScDiffEq.jl"), String), '\n')
         exported = filter(!=(:PETScDiffEq), names(PETScDiffEq))
-        @test length(exported) == 6
+        @test length(exported) == 7
         for n in exported
             i = findfirst(l -> occursin(Regex("^(mutable )?struct \\Q$(n)\\E\\b"), l), lines)
             @test i !== nothing

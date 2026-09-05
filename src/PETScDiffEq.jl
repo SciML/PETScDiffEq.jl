@@ -9,7 +9,7 @@ using SciMLBase: SciMLBase
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
     sparse
 
-export TSRK, TSRosW, TSImplicit, TSARKIMEX, TSGeneric, PETScIntegrator
+export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSGeneric, PETScIntegrator
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 
@@ -83,6 +83,38 @@ TSImplicit(subtype::AbstractString, theta::Real, petsc_options::AbstractVector{<
     TSImplicit(String(subtype), Float64(theta), String[String(o) for o in petsc_options])
 
 """
+    TSIRK(nstages = 3, petsc_options = String[])
+
+Gauss-Legendre implicit Runge-Kutta from PETSc's `TSIRK`, of order `2 *
+nstages`: one stage is the implicit midpoint rule at order 2, two stages give
+order 4 and three give order 6. Measured at each of those.
+
+Fixed step: PETSc gives this family no embedded error estimate, so it steps at
+the `dt` you give and warns if you pass a tolerance.
+
+Needs an `ODEFunction` `jac`, and says so rather than letting PETSc fail, since
+it solves all stages as one coupled system whose matrix it cannot build from a
+finite-difference fallback. That coupled matrix is a Kronecker product with the
+Jacobian, which has no LU factorisation, so this algorithm defaults to
+`-pc_type pbjacobi`; your own `petsc_options` are parsed afterwards and win.
+
+A wrong Jacobian is not caught here. Where the other implicit families fail to
+converge, this one reports success and returns a wrong answer, so check a
+hand-written `jac` against a finite-difference solve before trusting it.
+
+A mass matrix is rejected. PETSc's coupled-stage matrix assumes `dF/du̇ = I`,
+and with a non-identity mass matrix the answer drifts further from the true one
+as `dt` shrinks instead of failing, which is worse than an error.
+"""
+struct TSIRK <: PETScTSAlgorithm
+    nstages::Int
+    petsc_options::Vector{String}
+end
+
+TSIRK(nstages::Integer = 3, petsc_options::AbstractVector{<:AbstractString} = String[]) =
+    TSIRK(Int(nstages), String[String(o) for o in petsc_options])
+
+"""
     TSARKIMEX(subtype = "3", petsc_options = String[])
 
 Additive Runge-Kutta IMEX from PETSc's `TSARKIMEX`. `subtype` is a PETSc
@@ -130,6 +162,7 @@ TSGeneric(
 _uses_ifunction(::TSRK) = false
 _uses_ifunction(::TSRosW) = true
 _uses_ifunction(::TSImplicit) = true
+_uses_ifunction(::TSIRK) = true
 _uses_ifunction(::TSARKIMEX) = true
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
@@ -138,6 +171,7 @@ _uses_ifunction(alg::TSGeneric) = !alg.explicit
 # which is the honest answer for an arbitrary TSGeneric type.
 _adapts(::TSRK) = true
 _adapts(::TSRosW) = true
+_adapts(::TSIRK) = false
 _adapts(::TSARKIMEX) = true
 _adapts(alg::TSImplicit) = alg.subtype == "bdf"
 _adapts(::TSGeneric) = nothing
@@ -571,6 +605,7 @@ end
 _ts_type(::TSRK) = "rk"
 _ts_type(::TSRosW) = "rosw"
 _ts_type(alg::TSImplicit) = alg.subtype
+_ts_type(::TSIRK) = "irk"
 _ts_type(::TSARKIMEX) = "arkimex"
 _ts_type(alg::TSGeneric) = alg.ts_type
 
@@ -584,9 +619,21 @@ function _set_subtype!(petsclib, ts, alg::TSImplicit)
     end
     return nothing
 end
+function _set_subtype!(petsclib, ts, alg::TSIRK)
+    LibPETSc.TSIRKSetNumStages(petsclib, ts, LibPETSc.PetscInt(alg.nstages))
+    # Setting the stage count alone leaves the tableau built for the previous
+    # one, which integrates something else without complaining.
+    _cstr(p -> LibPETSc.TSIRKSetType(petsclib, ts, p), "gauss")
+    return nothing
+end
 _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
     _cstr(p -> LibPETSc.TSARKIMEXSetType(petsclib, ts, p), alg.subtype)
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
+
+_default_options(::PETScTSAlgorithm) = String[]
+# A Kronecker-product coupled-stage matrix has no LU factorisation, so the
+# preconditioner PETSc would otherwise pick cannot be set up.
+_default_options(::TSIRK) = ["-pc_type", "pbjacobi"]
 
 const UNSUPPORTED_KWARGS = (
     :d_discontinuities, :isoutofdomain,
@@ -680,6 +727,15 @@ function _setup(
             ),
         )
     end
+    if has_mass && alg isa TSIRK
+        throw(
+            ArgumentError(
+                "PETScDiffEq does not support a mass matrix with TSIRK; PETSc's " *
+                    "coupled-stage matrix assumes dF/du_dot = I, and the answer drifts " *
+                    "further from the true one as dt shrinks rather than failing",
+            ),
+        )
+    end
     if has_mass && is_split
         throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
     end
@@ -709,6 +765,15 @@ function _setup(
     f1 = _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
     has_jac = _uses_ifunction(alg) && prob.f.jac !== nothing
+    if alg isa TSIRK && !has_jac
+        throw(
+            ArgumentError(
+                "TSIRK needs an analytic Jacobian; give the ODEFunction a `jac`, since " *
+                    "PETSc builds its coupled-stage matrix from one and has no " *
+                    "finite-difference fallback for it",
+            ),
+        )
+    end
     jac_fn = has_jac ? _as_inplace_jac(prob.f.jac, iip) : nothing
     jac_prototype = has_jac ? prob.f.jac_prototype : nothing
     uses_sparse_jac = jac_prototype isa SparseMatrixCSC
@@ -838,7 +903,7 @@ function _setup(
                 )
             end
             # A user's own PETSc options are parsed last, so they win.
-            effective_options = String[]
+            effective_options = copy(_default_options(alg))
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
             dtmin === nothing ||
                 append!(effective_options, ["-ts_adapt_dt_min", string(Float64(dtmin))])

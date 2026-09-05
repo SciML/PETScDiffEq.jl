@@ -11,6 +11,8 @@ verified against their documented order:
 - `TSRosW`, linearly implicit Rosenbrock-W (`"ra34pw2"` order 3)
 - `TSImplicit`, fully implicit `"beuler"` (order 1), `"cn"` (order 2),
   `"theta"` (order 2 at the default `theta = 0.5`), and `"bdf"`
+- `TSIRK`, Gauss-Legendre implicit Runge-Kutta, order `2 * nstages`
+  (verified at orders 2, 4 and 6 for one, two and three stages)
 - `TSARKIMEX`, additive Runge-Kutta IMEX (`"3"` order 3), for a
   `SplitODEProblem` `u' = f1(u,p,t) + f2(u,p,t)` with `f1` stiff/implicit and
   `f2` non-stiff/explicit
@@ -104,6 +106,32 @@ does not declare is rejected rather than silently misplacing later entries.
 Without an `ODEFunction` `jac` (see above), every implicit solve relies on
 PETSc's own fallback, so pass `["-snes_fd"]` in `petsc_options` on problems
 where that fallback is not enough.
+
+## Implicit Runge-Kutta
+
+`TSIRK(nstages)` is PETSc's Gauss-Legendre collocation family, order `2 *
+nstages`, so three stages give a sixth-order A-stable method with no direct
+equivalent among the usual Julia defaults.
+
+```julia
+jac_prob = SciMLBase.ODEProblem(
+    SciMLBase.ODEFunction(f!; jac = jac!, jac_prototype = proto), [1.0], (0.0, 1.0),
+)
+sol = SciMLBase.solve(jac_prob, TSIRK(3); dt = 0.05)
+```
+
+It solves every stage as one coupled system, which has three consequences. It
+needs a `jac` and says so, because PETSc cannot build that coupled matrix from
+a finite-difference fallback. The coupled matrix is a Kronecker product that
+has no LU factorisation, so this algorithm defaults to `-pc_type pbjacobi`,
+which your own `petsc_options` override. And a mass matrix is rejected: PETSc
+assumes `dF/du'` is the identity there, and with a non-identity mass matrix the
+answer drifts further from the true one as `dt` shrinks rather than failing.
+
+PETSc gives this family no embedded error estimate, so it takes the `dt` you
+give and warns if you pass a tolerance. A wrong `jac` is not caught here
+either: where the other implicit families fail to converge, this one reports
+success and answers wrongly.
 
 ## Mass matrices
 
@@ -247,15 +275,14 @@ differences (92 microseconds against 1067).
 PETSc's linear (KSP) and nonlinear (SNES) solvers are already reachable from
 SciML through LinearSolve.jl and NonlinearSolve.jl. This package covers the
 third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
-`cn`, `theta`, `bdf`, `arkimex`) is covered above, and `TSGeneric` reaches
+`cn`, `theta`, `bdf`, `irk`, `arkimex`) is covered above, and `TSGeneric` reaches
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: MPI; every solve currently runs on `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
-supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`
-(Kronecker AIJ) matrix, not the plain AIJ this package builds, so it needs
-its own dedicated setup. `TSGeneric("radau5")` fails for a different,
-unexamined reason.
+Not yet implemented: MPI; every solve currently runs on `MPI.COMM_SELF`.
+`TSGeneric("radau5")` fails because `radau5` is not registered in the PETSc
+that PETSc_jll ships: it is an external package PETSc has to be configured
+with, so it is missing rather than broken.
 
 ## License
 
