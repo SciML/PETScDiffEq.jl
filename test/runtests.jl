@@ -4,6 +4,7 @@ using LinearAlgebra
 using Logging
 using SciMLOperators
 using SparseArrays
+using DiffEqCallbacks: PresetTimeCallback
 using Test
 
 decay!(du, u, p, t) = (
@@ -326,6 +327,94 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
             @test SciMLBase.has_reinit(integ)
             SciMLBase.terminate!(integ)
+        end
+    end
+
+    @testset "tstops" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+
+        @testset "solve lands on every stop exactly" begin
+            for (alg, kw) in (
+                    (PETScDiffEq.TSRK("5dp"), (reltol = 1.0e-8, abstol = 1.0e-10)),
+                    (PETScDiffEq.TSRK("5dp"), (adaptive = false,)),
+                    (PETScDiffEq.TSImplicit("bdf"), (reltol = 1.0e-8, abstol = 1.0e-10)),
+                )
+                sol = @test_logs min_level = Logging.Warn SciMLBase.solve(
+                    prob, alg; dt = 0.1, tstops = [0.55, 0.25], kw...,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test 0.25 in sol.t
+                @test 0.55 in sol.t
+                @test issorted(sol.t)
+                @test sol.t[end] == 1.0
+                @test abs(sol.u[end][1] - exp(-1)) < 1.0e-5
+            end
+        end
+
+        @testset "a fixed dt resumes after the stop" begin
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, tstops = [0.25],
+            )
+            i = findfirst(==(0.25), sol.t)
+            @test i !== nothing
+            @test sol.t[i + 1] - sol.t[i] ≈ 0.1
+            @test sol.t[i - 1] < 0.25
+        end
+
+        @testset "stops outside the span are ignored" begin
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, tstops = [0.0, 1.0, 1.5],
+            )
+            @test sol.t[end] == 1.0
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+        end
+
+        @testset "integrator queue" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            @test !SciMLBase.has_tstop(integ)
+            SciMLBase.add_tstop!(integ, 0.33)
+            SciMLBase.add_tstop!(integ, 0.33)
+            SciMLBase.add_tstop!(integ, 0.15)
+            @test SciMLBase.has_tstop(integ)
+            @test SciMLBase.first_tstop(integ) == 0.15
+            @test integ.tstops == [0.15, 0.33]
+            @test SciMLBase.pop_tstop!(integ) == 0.15
+            while integ.t < 0.33
+                SciMLBase.step!(integ)
+            end
+            @test integ.t == 0.33
+            @test !SciMLBase.has_tstop(integ)
+            @test_throws ArgumentError SciMLBase.add_tstop!(integ, 0.1)
+            SciMLBase.terminate!(integ)
+        end
+
+        @testset "PresetTimeCallback" begin
+            expected(t) = t < 0.5 ? exp(-t) : (exp(-0.5) + 1) * exp(-(t - 0.5))
+            hits = Float64[]
+            cb = PresetTimeCallback([0.5], integ -> (push!(hits, integ.t); integ.u[1] += 1.0))
+            for (alg, tol) in (
+                    (PETScDiffEq.TSRK("5dp"), 1.0e-5), (PETScDiffEq.TSImplicit("bdf"), 5.0e-3),
+                )
+                empty!(hits)
+                sol = SciMLBase.solve(
+                    prob, alg; dt = 0.1, reltol = 1.0e-8, abstol = 1.0e-10, callback = cb,
+                )
+                @test hits == [0.5]
+                @test 0.5 in sol.t
+                @test abs(sol.u[end][1] - expected(1.0)) < tol
+                @test abs(sol(0.75)[1] - expected(0.75)) < tol
+            end
+        end
+
+        @testset "reinit! restores the stops given to init" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, tstops = [0.25])
+            @test 0.25 in SciMLBase.solve!(integ).t
+            SciMLBase.reinit!(integ)
+            @test 0.25 in SciMLBase.solve!(integ).t
+            SciMLBase.reinit!(integ; tstops = [0.4])
+            sol = SciMLBase.solve!(integ)
+            @test 0.4 in sol.t
+            @test !(0.25 in sol.t)
         end
     end
 
@@ -659,7 +748,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         alg = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
         @test_logs (:warn,) match_mode = :any SciMLBase.solve(
-            prob, alg; dt = 0.1, tstops = [0.55],
+            prob, alg; dt = 0.1, save_idxs = [1],
         )
         @test_logs (:warn,) match_mode = :any SciMLBase.solve(
             prob, alg; dt = 0.1, save_idxs = [1],

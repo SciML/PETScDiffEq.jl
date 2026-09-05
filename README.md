@@ -139,7 +139,14 @@ written back into PETSc's solution vector with `TSRestartStep`, so a multistep
 method drops the history it took before the jump. `ContinuousCallback` is
 rejected, since it needs root finding on the interpolant.
 
-`reinit!(integ, u0; t0, tf, erase_sol, saveat, reinit_callbacks,
+`tstops` makes the integration land on the given times exactly, through
+`solve` and the integrator alike, and `add_tstop!`, `has_tstop`, `first_tstop`
+and `pop_tstop!` manage them while stepping, so `PresetTimeCallback` from
+DiffEqCallbacks works. PETSc reaches a stop by rebalancing the last two steps
+before it rather than shortening only the last one; a fixed `dt` resumes after
+the stop.
+
+`reinit!(integ, u0; t0, tf, erase_sol, saveat, tstops, reinit_callbacks,
 initialize_save)` restarts an integrator. It rebuilds the PETSc objects from
 the keywords given to `init`, so the restarted solve is identical to a fresh
 one, `dt` starts again at the value given to `init`, and it works on an
@@ -166,8 +173,8 @@ sol.t    # [0.0, 0.3, 0.7, 1.0]
 `dtmin` and `dtmax` bound the controller's step size. `sol.stats` reports
 `nf`, `naccept`, `nreject`, `nnonliniter` and `nnonlinconvfail`; the remaining
 `DEStats` fields stay at the `-1` "unknown" sentinel. Keywords this package
-cannot honour, `tstops`, `save_idxs` and `isoutofdomain` among them, emit a
-warning rather than being silently dropped.
+cannot honour, `save_idxs` and `isoutofdomain` among them, emit a warning
+rather than being silently dropped.
 
 `sol(t)` interpolates. By default, when every step is saved and no `saveat`
 is given, the solution carries a cubic Hermite interpolant built from the
@@ -214,7 +221,7 @@ third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: `ContinuousCallback`, `tstops`, `save_idxs`,
+Not yet implemented: `ContinuousCallback`, `save_idxs`,
 and MPI; every solve currently runs on
 `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
 supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`

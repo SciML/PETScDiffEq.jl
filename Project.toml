@@ -13,6 +13,7 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [compat]
 DiffEqBase = "7"
+DiffEqCallbacks = "4"
 LinearAlgebra = "1"
 MPI = "0.20"
 PETSc = "0.4.10"
@@ -21,9 +22,10 @@ SparseArrays = "1"
 julia = "1.10"
 
 [extras]
+DiffEqCallbacks = "459566f4-90b8-5000-8ac3-15dfb0a30def"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 SciMLOperators = "c0aeaf25-5076-4817-a8d5-81caf7dfa961"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Logging", "SciMLOperators", "Test"]
+test = ["DiffEqCallbacks", "Logging", "SciMLOperators", "Test"]

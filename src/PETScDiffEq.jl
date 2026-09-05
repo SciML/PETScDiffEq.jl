@@ -481,7 +481,7 @@ _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 const UNSUPPORTED_KWARGS = (
-    :tstops, :save_idxs, :d_discontinuities, :isoutofdomain,
+    :save_idxs, :d_discontinuities, :isoutofdomain,
     :unstable_check, :internalnorm, :calck, :force_dtmin, :alias_u0, :sensealg,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
 )
@@ -777,10 +777,12 @@ end
 
 function SciMLBase.__solve(
         prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm;
-        callback = nothing, kwargs...,
+        callback = nothing, tstops = (), kwargs...,
     )
-    if callback !== nothing
-        return SciMLBase.solve!(SciMLBase.__init(prob, alg; callback = callback, kwargs...))
+    if callback !== nothing || !isempty(tstops)
+        return SciMLBase.solve!(
+            SciMLBase.__init(prob, alg; callback = callback, tstops = tstops, kwargs...),
+        )
     end
     h = _setup(prob, alg; kwargs...)
     ctx, pl = h.ctx, h.petsclib
@@ -821,6 +823,9 @@ mutable struct PETScIntegrator{Alg, P, H, Pr, CB} <:
     prob::Pr
     callbacks::CB
     kwargs::Any
+    tstops::Vector{Float64}
+    tstops_cache::Vector{Float64}
+    dtcache::Float64
     sol::Any
     finished::Bool
     derivative_discontinuity::Bool
@@ -890,23 +895,42 @@ end
 
 function SciMLBase.__init(
         prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm;
-        callback = nothing, kwargs...,
+        callback = nothing, tstops = (), kwargs...,
     )
     callbacks = _discrete_callbacks(callback)
     h = _setup(prob, alg; kwargs...)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
     _initial_save!(h)
+    stops = _tstops(tstops, h.t0, h.tf)
+    dt0 = Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
     integ = PETScIntegrator(
-        alg, copy(h.u0), copy(h.u0), h.t0, h.t0,
-        Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts)), 1.0,
-        prob.p, h, prob, callbacks, NamedTuple(kwargs), _initial_solution(prob, alg, h),
-        false, false,
+        alg, copy(h.u0), copy(h.u0), h.t0, h.t0, dt0, 1.0,
+        prob.p, h, prob, callbacks, NamedTuple(kwargs), stops, copy(stops), dt0,
+        _initial_solution(prob, alg, h), false, false,
     )
     for cb in callbacks
         cb.initialize(cb, integ.u, integ.t, integ)
     end
     return integ
 end
+
+function _tstops(tstops, t0, tf)
+    stops = sort!(unique!(Vector{Float64}(collect(Float64, tstops))))
+    filter!(t -> t0 < t < tf, stops)
+    return stops
+end
+
+function SciMLBase.add_tstop!(integ::PETScIntegrator, t)
+    t = Float64(t)
+    t < integ.t &&
+        throw(ArgumentError("cannot add a tstop at $t, behind the current time $(integ.t)"))
+    i = searchsortedfirst(integ.tstops, t)
+    (i <= length(integ.tstops) && integ.tstops[i] == t) || insert!(integ.tstops, i, t)
+    return nothing
+end
+SciMLBase.has_tstop(integ::PETScIntegrator) = !isempty(integ.tstops)
+SciMLBase.first_tstop(integ::PETScIntegrator) = integ.tstops[1]
+SciMLBase.pop_tstop!(integ::PETScIntegrator) = popfirst!(integ.tstops)
 
 function _initial_save!(h::TSHandles)
     ctx = h.ctx
@@ -935,8 +959,8 @@ _initial_solution(prob, alg, h::TSHandles) = SciMLBase.build_solution(
 function SciMLBase.reinit!(
         integ::PETScIntegrator, u0 = integ.prob.u0;
         t0 = integ.prob.tspan[1], tf = integ.prob.tspan[2],
-        erase_sol = true, saveat = nothing, reinit_callbacks = true,
-        initialize_save = true,
+        erase_sol = true, saveat = nothing, tstops = integ.tstops_cache,
+        reinit_callbacks = true, initialize_save = true,
     )
     old = integ.h
     _destroy!(old)
@@ -956,6 +980,9 @@ function SciMLBase.reinit!(
     integ.t = h.t0
     integ.tprev = h.t0
     integ.dt = Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
+    integ.dtcache = integ.dt
+    integ.tstops = _tstops(tstops, h.t0, h.tf)
+    integ.tstops_cache = copy(integ.tstops)
     integ.finished = false
     integ.derivative_discontinuity = false
     integ.sol = _initial_solution(integ.prob, integ.alg, h)
@@ -998,6 +1025,12 @@ function SciMLBase.step!(integ::PETScIntegrator)
     ctx, pl = h.ctx, h.petsclib
     copyto!(integ.uprev, integ.u)
     integ.tprev = integ.t
+    tol = 100 * eps(max(one(Float64), abs(h.tf)))
+    # PETSc lands on its max time exactly, rebalancing the last two steps to
+    # get there, but keeps the shortened step afterwards; the cached dt is the
+    # last step size chosen while no stop was in the way.
+    stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
+    LibPETSc.TSSetMaxTime(pl, h.ts, stop === nothing ? h.tf : stop)
     GC.@preserve ctx begin
         try
             LibPETSc.TSStep(pl, h.ts)
@@ -1012,8 +1045,18 @@ function SciMLBase.step!(integ::PETScIntegrator)
     end
     integ.t = Float64(LibPETSc.TSGetTime(pl, h.ts))
     integ.dt = Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
+    if stop === nothing
+        integ.dtcache = integ.dt
+    elseif integ.t >= stop - tol
+        integ.t = stop
+        LibPETSc.TSSetTime(pl, h.ts, stop)
+        LibPETSc.TSSetTimeStep(pl, h.ts, integ.dtcache)
+        integ.dt = integ.dtcache
+    end
+    while !isempty(integ.tstops) && integ.tstops[1] <= integ.t + tol
+        popfirst!(integ.tstops)
+    end
     PETSc.withlocalarray!(ua -> copyto!(integ.u, ua), h.u; read = true, write = false)
-    tol = 100 * eps(max(one(Float64), abs(h.tf)))
     if isempty(ctx.saveat)
         if ctx.save_everystep
             _record!(ctx, integ.t, integ.u)
