@@ -7,14 +7,14 @@ interface alongside OrdinaryDiffEq.jl, Sundials.jl and ODEInterfaceDiffEq.jl.
 This package is under construction. Five algorithm types are implemented and
 verified against their documented order:
 
-- `PETSc.TSRK`, explicit Runge-Kutta (`"3bs"` order 3, `"5dp"` order 5)
-- `PETSc.TSRosW`, linearly implicit Rosenbrock-W (`"ra34pw2"` order 3)
-- `PETSc.TSImplicit`, fully implicit `"beuler"` (order 1), `"cn"` (order 2),
+- `TSRK`, explicit Runge-Kutta (`"3bs"` order 3, `"5dp"` order 5)
+- `TSRosW`, linearly implicit Rosenbrock-W (`"ra34pw2"` order 3)
+- `TSImplicit`, fully implicit `"beuler"` (order 1), `"cn"` (order 2),
   `"theta"` (order 2 at the default `theta = 0.5`), and `"bdf"`
-- `PETSc.TSARKIMEX`, additive Runge-Kutta IMEX (`"3"` order 3), for a
+- `TSARKIMEX`, additive Runge-Kutta IMEX (`"3"` order 3), for a
   `SplitODEProblem` `u' = f1(u,p,t) + f2(u,p,t)` with `f1` stiff/implicit and
   `f2` non-stiff/explicit
-- `PETSc.TSGeneric`, a pass-through to any other PETSc TS type by name.
+- `TSGeneric`, a pass-through to any other PETSc TS type by name.
   Only `"euler"` (order 1) and `"alpha"` (order 2) are tested here. Pass
   `explicit = true` for a type that registers an RHS function rather than an
   IFunction. A TS type that needs its own subtype call, `"glee"` and `"glle"`
@@ -22,7 +22,7 @@ verified against their documented order:
   nothing and the solve returns the initial condition.
 
 ```julia
-using PETSc, PETScDiffEq, SciMLBase
+using PETScDiffEq, SciMLBase
 
 f!(du, u, p, t) = (du[1] = -u[1]; nothing)
 prob = SciMLBase.ODEProblem(f!, [1.0], (0.0, 1.0))
@@ -87,18 +87,23 @@ may be a vector, one entry per component, which is handed to PETSc as its
 own per-component tolerance vector rather than being collapsed to a scalar.
 
 Only `TSRK`, `TSRosW`, `TSARKIMEX` and `TSImplicit("bdf")` carry an embedded
-error estimate, so only those adapt. `"beuler"`, `"cn"`, `"theta"` and
-PETSc types such as `"alpha"` and `"euler"` have none: they step at the `dt`
-you give and ignore `reltol`/`abstol` entirely. Passing tolerances to one of
-those emits a warning rather than quietly doing nothing.
+error estimate, so only those adapt. `TSImplicit("beuler")`, `"cn"` and
+`"theta"` have none: they step at the `dt` you give and ignore
+`reltol`/`abstol` entirely, and passing a tolerance to one of them emits a
+warning rather than quietly doing nothing. A `TSGeneric` type is not warned
+about either way, since whether an arbitrary named type adapts is not
+something this package knows.
+
 Real-valued, forward-time `ODEProblem`s are accepted, and `SplitODEProblem`
 only by `TSARKIMEX`. An out-of-place `f(u, p, t)` is wrapped into the in-place
 form PETSc needs, so it costs one array per evaluation and the saved states
 come back as plain `Vector{Float64}` whatever `u0` was; an out-of-place `jac`
 is wrapped the same way, and one that returns an entry the `jac_prototype`
-does not declare is rejected rather than silently misplacing later entries. Without an `ODEFunction` `jac` (see above), every implicit
-solve relies on PETSc's own fallback, so pass `["-snes_fd"]` in
-`petsc_options` on problems where that fallback is not enough.
+does not declare is rejected rather than silently misplacing later entries.
+
+Without an `ODEFunction` `jac` (see above), every implicit solve relies on
+PETSc's own fallback, so pass `["-snes_fd"]` in `petsc_options` on problems
+where that fallback is not enough.
 
 ## Mass matrices
 
@@ -134,8 +139,8 @@ integ.t, integ.u
 sol = SciMLBase.solve!(integ)
 ```
 
-`saveat`, `save_everystep`, `save_start` and `save_end` behave as they do for
-`solve`, interpolating with `TSInterpolate` inside the step just taken.
+The saving keywords below behave the same way through the integrator, with
+`saveat` points inside the step just taken produced by `TSInterpolate`.
 
 `DiscreteCallback`, `ContinuousCallback` and a `CallbackSet` of them work,
 through both `solve` and the integrator: the condition is checked after every
@@ -170,6 +175,7 @@ initialize_save)` restarts an integrator. It rebuilds the PETSc objects from
 the keywords given to `init`, so the restarted solve is identical to a fresh
 one, `dt` starts again at the value given to `init`, and it works on an
 integrator that has already finished.
+
 PETSc resources are released when the integration finishes, or on
 `terminate!(integ)`, which stops early with `ReturnCode.Terminated`. Finish
 or terminate every integrator you start: one dropped part-way is released by

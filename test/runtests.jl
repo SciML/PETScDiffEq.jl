@@ -347,6 +347,29 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "who is warned about a tolerance" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for alg in (
+                PETScDiffEq.TSImplicit("beuler"), PETScDiffEq.TSImplicit("cn"),
+                PETScDiffEq.TSImplicit("theta"),
+            )
+            @test_logs (:warn,) match_mode = :any SciMLBase.solve(
+                prob, alg; dt = 0.05, reltol = 1.0e-6,
+            )
+        end
+        for alg in (
+                PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRK("5dp"),
+                PETScDiffEq.TSRosW("ra34pw2"),
+                # An arbitrary named type may or may not adapt, so saying
+                # nothing is the honest answer.
+                PETScDiffEq.TSGeneric("alpha"),
+            )
+            @test_logs min_level = Logging.Warn SciMLBase.solve(
+                prob, alg; dt = 0.05, reltol = 1.0e-6,
+            )
+        end
+    end
+
     @testset "Aqua" begin
         Aqua.test_all(PETScDiffEq; ambiguities = false)
         Aqua.test_ambiguities(PETScDiffEq)
