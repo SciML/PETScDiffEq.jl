@@ -347,6 +347,46 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "a solve that never uses the Jacobian is called out" begin
+        prob = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),
+        )
+        plain = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+
+        # "glee" is explicit. Driven through the implicit path PETSc reports
+        # success and returns u0, which is the case worth catching.
+        quiet = SciMLBase.solve(
+            prob, PETScDiffEq.TSGeneric("glee"); dt = 0.1, adaptive = false,
+        )
+        @test quiet.u[end] == [1.0]
+        @test quiet.stats.njacs == 0
+        @test_logs (:warn,) match_mode = :any SciMLBase.solve(
+            prob, PETScDiffEq.TSGeneric("glee"); dt = 0.1, adaptive = false,
+        )
+
+        @testset "and the same type is fine when told it is explicit" begin
+            sol = SciMLBase.solve(
+                plain, PETScDiffEq.TSGeneric("glee"; explicit = true); dt = 0.1,
+                adaptive = false,
+            )
+            @test abs(sol.u[end][1] - exp(-1)) < 1.0e-3
+        end
+
+        @testset "no implicit method that works trips it" begin
+            for alg in (
+                    PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSImplicit("cn"),
+                    PETScDiffEq.TSRosW("ra34pw2"), PETScDiffEq.TSARKIMEX("3"),
+                    PETScDiffEq.TSIRK(2), PETScDiffEq.TSGeneric("glle"),
+                    PETScDiffEq.TSGeneric("alpha"),
+                )
+                sol = @test_logs min_level = Logging.Warn SciMLBase.solve(
+                    prob, alg; dt = 0.1, adaptive = false,
+                )
+                @test sol.stats.njacs > 0
+            end
+        end
+    end
+
     @testset "TSIRK" begin
         proto = sparse([1], [1], [1.0], 1, 1)
         prob = SciMLBase.ODEProblem(

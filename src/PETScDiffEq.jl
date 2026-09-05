@@ -970,6 +970,14 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     else
         SciMLBase.ReturnCode.Failure
     end
+    # An explicit PETSc type driven through the implicit path reports success
+    # and returns the initial condition. It never calls the Jacobian, which
+    # every method that really solves implicitly does on its first step.
+    if h.jac_mat !== nothing && st.nsteps > 0 && ctx.njacs == 0
+        @warn "`$(_ts_type(alg))` took $(st.nsteps) steps without ever calling the " *
+            "Jacobian this package gave PETSc, so it is not solving implicitly and the " *
+            "result should not be trusted; an explicit PETSc type needs `explicit = true`"
+    end
     stats = SciMLBase.DEStats(
         ctx.nf, -1, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
         st.nsteps, st.nreject, 0.0,

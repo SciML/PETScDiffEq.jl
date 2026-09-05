@@ -19,9 +19,9 @@ verified against their documented order:
 - `TSGeneric`, a pass-through to any other PETSc TS type by name.
   Only `"euler"` (order 1) and `"alpha"` (order 2) are tested here. Pass
   `explicit = true` for a type that registers an RHS function rather than an
-  IFunction. A TS type that needs its own subtype call, `"glee"` and `"glle"`
-  among them, will not work through this pass-through: PETSc integrates
-  nothing and the solve returns the initial condition.
+  IFunction. Getting that wrong is usually a PETSc error, but not always:
+  `"glee"` without it reports success and hands back the initial condition, so
+  this package warns when a solve never calls the Jacobian it installed.
 
 ```julia
 using PETScDiffEq, SciMLBase
