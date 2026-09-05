@@ -820,6 +820,7 @@ mutable struct PETScIntegrator{Alg, P, H, Pr, CB} <:
     h::H
     prob::Pr
     callbacks::CB
+    kwargs::Any
     sol::Any
     finished::Bool
     derivative_discontinuity::Bool
@@ -893,8 +894,22 @@ function SciMLBase.__init(
     )
     callbacks = _discrete_callbacks(callback)
     h = _setup(prob, alg; kwargs...)
-    ctx = h.ctx
     LibPETSc.TSSetUp(h.petsclib, h.ts)
+    _initial_save!(h)
+    integ = PETScIntegrator(
+        alg, copy(h.u0), copy(h.u0), h.t0, h.t0,
+        Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts)), 1.0,
+        prob.p, h, prob, callbacks, NamedTuple(kwargs), _initial_solution(prob, alg, h),
+        false, false,
+    )
+    for cb in callbacks
+        cb.initialize(cb, integ.u, integ.t, integ)
+    end
+    return integ
+end
+
+function _initial_save!(h::TSHandles)
+    ctx = h.ctx
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
     if isempty(ctx.saveat)
         if h.save_start
@@ -906,19 +921,54 @@ function SciMLBase.__init(
             ctx.saveat_idx += 1
         end
     end
-    sol = SciMLBase.build_solution(
-        prob, alg, ctx.ts, ctx.us; retcode = SciMLBase.ReturnCode.Default,
-        dense = ctx.dense, interp = _interp(ctx),
+    return nothing
+end
+
+_initial_solution(prob, alg, h::TSHandles) = SciMLBase.build_solution(
+    prob, alg, h.ctx.ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
+    dense = h.ctx.dense, interp = _interp(h.ctx),
+)
+
+# A reinitialised integrator gets fresh PETSc objects built from the keywords
+# given to `init`, so its solve is identical to a fresh one and it works even
+# after the previous solve released them.
+function SciMLBase.reinit!(
+        integ::PETScIntegrator, u0 = integ.prob.u0;
+        t0 = integ.prob.tspan[1], tf = integ.prob.tspan[2],
+        erase_sol = true, saveat = nothing, reinit_callbacks = true,
+        initialize_save = true,
     )
-    integ = PETScIntegrator(
-        alg, copy(h.u0), copy(h.u0), h.t0, h.t0,
-        Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts)), 1.0,
-        prob.p, h, prob, callbacks, sol, false, false,
-    )
-    for cb in callbacks
-        cb.initialize(cb, integ.u, integ.t, integ)
+    old = integ.h
+    _destroy!(old)
+    prob = SciMLBase.remake(integ.prob; u0 = u0, tspan = (t0, tf))
+    setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
+    h = _setup(prob, integ.alg; setup_kwargs...)
+    LibPETSc.TSSetUp(h.petsclib, h.ts)
+    if !erase_sol
+        append!(h.ctx.ts, old.ctx.ts)
+        append!(h.ctx.us, old.ctx.us)
+        h.ctx.dense && append!(h.ctx.dus, old.ctx.dus)
     end
-    return integ
+    initialize_save && _initial_save!(h)
+    integ.h = h
+    integ.u = copy(h.u0)
+    integ.uprev = copy(h.u0)
+    integ.t = h.t0
+    integ.tprev = h.t0
+    integ.dt = Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
+    integ.finished = false
+    integ.derivative_discontinuity = false
+    integ.sol = _initial_solution(integ.prob, integ.alg, h)
+    if reinit_callbacks
+        for cb in integ.callbacks
+            cb.initialize(cb, integ.u, integ.t, integ)
+        end
+    end
+    return nothing
+end
+
+@static if isdefined(SciMLBase, :has_reinit)
+    SciMLBase.has_reinit(::PETScIntegrator) = true
 end
 
 function _finish!(integ::PETScIntegrator, retcode = nothing)

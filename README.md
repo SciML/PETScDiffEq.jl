@@ -138,6 +138,12 @@ both `solve` and the integrator: the condition is checked after every step,
 written back into PETSc's solution vector with `TSRestartStep`, so a multistep
 method drops the history it took before the jump. `ContinuousCallback` is
 rejected, since it needs root finding on the interpolant.
+
+`reinit!(integ, u0; t0, tf, erase_sol, saveat, reinit_callbacks,
+initialize_save)` restarts an integrator. It rebuilds the PETSc objects from
+the keywords given to `init`, so the restarted solve is identical to a fresh
+one, `dt` starts again at the value given to `init`, and it works on an
+integrator that has already finished.
 PETSc resources are released when the integration finishes, or on
 `terminate!(integ)`, which stops early with `ReturnCode.Terminated`. Finish
 or terminate every integrator you start: one dropped part-way is released by
@@ -208,7 +214,7 @@ third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: `reinit!`, `ContinuousCallback`, `tstops`, `save_idxs`,
+Not yet implemented: `ContinuousCallback`, `tstops`, `save_idxs`,
 and MPI; every solve currently runs on
 `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
 supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`

@@ -238,6 +238,97 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "reinit!" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"))
+            fresh = SciMLBase.solve(prob, alg; dt = 0.1)
+            integ = SciMLBase.init(prob, alg; dt = 0.1)
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            SciMLBase.reinit!(integ)
+            @test integ.t == 0.0
+            @test integ.u == [1.0]
+            @test length(integ.sol.t) == 1
+            again = SciMLBase.solve!(integ)
+            @test again.t == fresh.t
+            @test again.u == fresh.u
+            @test again.stats.nf == fresh.stats.nf
+            @test again.stats.naccept == fresh.stats.naccept
+
+            @testset "after the integrator has finished" begin
+                SciMLBase.reinit!(integ)
+                @test !integ.finished
+                third = SciMLBase.solve!(integ)
+                @test third.u == fresh.u
+                @test third.stats.nf == fresh.stats.nf
+            end
+        end
+
+        @testset "new state and span" begin
+            alg = PETScDiffEq.TSRK("5dp")
+            integ = SciMLBase.init(prob, alg; dt = 0.1, reltol = 1.0e-8, abstol = 1.0e-10)
+            SciMLBase.solve!(integ)
+            SciMLBase.reinit!(integ, [2.0]; t0 = 1.0, tf = 2.5)
+            sol = SciMLBase.solve!(integ)
+            @test sol.t[1] == 1.0
+            @test sol.u[1] == [2.0]
+            @test sol.t[end] == 2.5
+            @test abs(sol.u[end][1] - 2exp(-1.5)) < 1.0e-6
+            @test sol.dense
+            @test abs(sol(1.75)[1] - 2exp(-0.75)) < 1.0e-6
+        end
+
+        @testset "erase_sol = false keeps the earlier points" begin
+            alg = PETScDiffEq.TSRK("5dp")
+            integ = SciMLBase.init(prob, alg; dt = 0.1, adaptive = false)
+            first = SciMLBase.solve!(integ)
+            n = length(first.t)
+            SciMLBase.reinit!(integ, first.u[end]; t0 = 1.0, tf = 2.0, erase_sol = false)
+            sol = SciMLBase.solve!(integ)
+            @test length(sol.t) == 2n
+            @test sol.t[1:n] == first.t
+            @test sol.t[n + 1] == 1.0
+            @test length(sol.interp.du) == length(sol.u)
+        end
+
+        @testset "saveat can be replaced" begin
+            alg = PETScDiffEq.TSRK("5dp")
+            integ = SciMLBase.init(prob, alg; dt = 0.1, saveat = 0.5)
+            @test SciMLBase.solve!(integ).t == [0.0, 0.5, 1.0]
+            SciMLBase.reinit!(integ; saveat = 0.25)
+            @test SciMLBase.solve!(integ).t == [0.0, 0.25, 0.5, 0.75, 1.0]
+        end
+
+        @testset "callbacks are initialised again unless told not to" begin
+            n_init = Ref(0)
+            cb = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> false, integ -> nothing;
+                initialize = (c, u, t, integ) -> (n_init[] += 1; nothing),
+            )
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = cb)
+            @test n_init[] == 1
+            SciMLBase.reinit!(integ)
+            @test n_init[] == 2
+            SciMLBase.reinit!(integ; reinit_callbacks = false)
+            @test n_init[] == 2
+            SciMLBase.terminate!(integ)
+        end
+
+        @testset "initialize_save = false leaves the start out" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            SciMLBase.reinit!(integ; initialize_save = false)
+            @test isempty(integ.sol.t)
+            sol = SciMLBase.solve!(integ)
+            @test sol.t[1] > 0.0
+        end
+
+        if isdefined(SciMLBase, :has_reinit)
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            @test SciMLBase.has_reinit(integ)
+            SciMLBase.terminate!(integ)
+        end
+    end
+
     @testset "SplitODEProblem uses the analytic Jacobian of f1" begin
         stiff!(du, u, p, t) = (du[1] = -1000.0 * (u[1] - cos(t)); nothing)
         forcing!(du, u, p, t) = (du[1] = -sin(t); nothing)
