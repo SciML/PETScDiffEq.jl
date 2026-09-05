@@ -13,6 +13,20 @@ export TSRK, TSRosW, TSImplicit, TSARKIMEX, TSGeneric, PETScIntegrator
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 
+"""
+    TSRK(subtype = "5dp", petsc_options = String[])
+
+Explicit Runge-Kutta from PETSc's `TSRK`. `subtype` is a PETSc `TSRKType`
+without its prefix, such as `"3bs"`, `"5dp"`, `"5f"` or `"5bs"`.
+
+Adapts on its embedded error estimate, so `reltol` and `abstol` apply. Being
+explicit it never forms a Jacobian and ignores an `ODEFunction`'s `jac`, and
+it cannot carry a mass matrix.
+
+`petsc_options` are command-line style tokens passed to PETSc for this solve,
+for example `["-ts_adapt_type", "none"]`. They are parsed after the options
+this package sets, so they win.
+"""
 struct TSRK <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
@@ -21,6 +35,16 @@ end
 TSRK(subtype::AbstractString = "5dp", petsc_options::AbstractVector{<:AbstractString} = String[]) =
     TSRK(String(subtype), String[String(o) for o in petsc_options])
 
+"""
+    TSRosW(subtype = "ra34pw2", petsc_options = String[])
+
+Rosenbrock-W from PETSc's `TSROSW`. `subtype` is a PETSc `TSRosWType` without
+its prefix, such as `"2m"`, `"ra34pw2"`, `"ra3pw"` or `"sandu3"`.
+
+Adapts on its embedded error estimate. Linearly implicit, so it uses an
+`ODEFunction`'s `jac` when one is given and PETSc's finite-difference
+fallback otherwise, and it accepts a mass matrix.
+"""
 struct TSRosW <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
@@ -29,6 +53,20 @@ end
 TSRosW(subtype::AbstractString = "ra34pw2", petsc_options::AbstractVector{<:AbstractString} = String[]) =
     TSRosW(String(subtype), String[String(o) for o in petsc_options])
 
+"""
+    TSImplicit(subtype = "beuler")
+    TSImplicit(subtype, theta)
+    TSImplicit(subtype, [theta,] petsc_options)
+
+Fully implicit methods from PETSc: `"beuler"`, `"cn"`, `"theta"` and `"bdf"`.
+`theta` sets the parameter of the theta method, where `0.5` is Crank-Nicolson
+and `1.0` is backward Euler.
+
+Only `"bdf"` carries an embedded error estimate and adapts; the others step at
+the `dt` you give and warn if you pass a tolerance. All of them use an
+`ODEFunction`'s `jac` when one is given and accept a mass matrix, which makes
+a singular mass matrix an index-1 differential-algebraic problem.
+"""
 struct TSImplicit <: PETScTSAlgorithm
     subtype::String
     theta::Union{Nothing, Float64}
@@ -44,6 +82,18 @@ TSImplicit(subtype::AbstractString, petsc_options::AbstractVector{<:AbstractStri
 TSImplicit(subtype::AbstractString, theta::Real, petsc_options::AbstractVector{<:AbstractString}) =
     TSImplicit(String(subtype), Float64(theta), String[String(o) for o in petsc_options])
 
+"""
+    TSARKIMEX(subtype = "3", petsc_options = String[])
+
+Additive Runge-Kutta IMEX from PETSc's `TSARKIMEX`. `subtype` is a PETSc
+`TSARKIMEXType` without its prefix, such as `"2e"`, `"3"`, `"4"` or `"5"`.
+
+Takes a `SplitODEProblem` whose `f1` is integrated implicitly and whose `f2`
+is integrated explicitly, and uses `f1`'s Jacobian when the problem carries
+one. A plain `ODEProblem` is treated as fully implicit with the explicit part
+left at zero, which is PETSc's own default. Adapts on its embedded error
+estimate.
+"""
 struct TSARKIMEX <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
@@ -52,6 +102,19 @@ end
 TSARKIMEX(subtype::AbstractString = "3", petsc_options::AbstractVector{<:AbstractString} = String[]) =
     TSARKIMEX(String(subtype), String[String(o) for o in petsc_options])
 
+"""
+    TSGeneric(ts_type, petsc_options = String[]; explicit = false)
+
+Any other PETSc `TSType` by name. An implicit one such as `"alpha"` works with
+the default; an explicit one such as `"euler"` or `"ssp"` needs
+`explicit = true`, since PETSc then wants the right-hand side rather than the
+implicit residual. Getting that wrong is a PETSc error, not a silent wrong
+answer. An explicit type also ignores a `jac` and rejects a mass matrix.
+
+Whether the named type adapts is not known here, so no tolerance warning is
+issued for it. Only `"euler"` and `"alpha"` have been run through this
+package's own convergence tests.
+"""
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
     explicit::Bool
@@ -886,6 +949,18 @@ function SciMLBase.__solve(
     return _assemble(prob, alg, h, tend, uend, st)
 end
 
+"""
+    PETScIntegrator
+
+The integrator `SciMLBase.init` returns for a PETSc TS algorithm. Step it with
+`step!`, run it to the end with `solve!`, stop it early with `terminate!` and
+restart it with `reinit!`. Between steps `u`, `uprev`, `t`, `tprev` and `dt`
+are readable, and `add_tstop!` schedules a time to land on exactly.
+
+Finish or terminate every integrator you start. One dropped part-way holds
+PETSc objects whose finalizers run at process exit, after MPI has shut down,
+which makes the process exit non-zero.
+"""
 mutable struct PETScIntegrator{Alg, P, H, Pr, CB, CC} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, Vector{Float64}, Float64}
     alg::Alg

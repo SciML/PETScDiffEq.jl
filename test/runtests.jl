@@ -346,6 +346,40 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "the exported names are documented" begin
+        for n in names(PETScDiffEq)
+            n === :PETScDiffEq && continue
+            doc = string(Base.doc(getfield(PETScDiffEq, n)))
+            @test !occursin("No documentation found", doc)
+        end
+    end
+
+    @testset "every subtype the docstrings name actually runs" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 0.1))
+        runs(alg) = SciMLBase.solve(prob, alg; dt = 0.01, adaptive = false).retcode ==
+            SciMLBase.ReturnCode.Success
+        for st in ("3bs", "5dp", "5f", "5bs")
+            @test runs(PETScDiffEq.TSRK(st))
+        end
+        for st in ("2m", "ra34pw2", "ra3pw", "sandu3")
+            @test runs(PETScDiffEq.TSRosW(st))
+        end
+        for st in ("2e", "3", "4", "5")
+            @test runs(PETScDiffEq.TSARKIMEX(st))
+        end
+        for st in ("beuler", "cn", "theta", "bdf")
+            @test runs(PETScDiffEq.TSImplicit(st))
+        end
+        @test runs(PETScDiffEq.TSGeneric("alpha"))
+        # PETSc wants the right-hand side for these, not the implicit residual.
+        for st in ("euler", "ssp")
+            @test runs(PETScDiffEq.TSGeneric(st; explicit = true))
+            @test_throws Exception SciMLBase.solve(
+                prob, PETScDiffEq.TSGeneric(st); dt = 0.01, adaptive = false,
+            )
+        end
+    end
+
     @testset "VectorContinuousCallback" begin
         function two!(du, u, p, t)
             du[1] = -u[1]
