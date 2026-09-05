@@ -4,6 +4,7 @@ using LinearAlgebra
 using Logging
 using SciMLOperators
 using SparseArrays
+using Aqua
 using DiffEqCallbacks: PresetTimeCallback
 using Test
 
@@ -344,6 +345,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test SciMLBase.has_reinit(integ)
             SciMLBase.terminate!(integ)
         end
+    end
+
+    @testset "Aqua" begin
+        Aqua.test_all(PETScDiffEq; ambiguities = false)
+        Aqua.test_ambiguities(PETScDiffEq)
     end
 
     @testset "the exported names carry a docstring" begin
