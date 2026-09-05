@@ -142,9 +142,10 @@ rejected, since it needs root finding on the interpolant.
 `tstops` makes the integration land on the given times exactly, through
 `solve` and the integrator alike, and `add_tstop!`, `has_tstop`, `first_tstop`
 and `pop_tstop!` manage them while stepping, so `PresetTimeCallback` from
-DiffEqCallbacks works. PETSc reaches a stop by rebalancing the last two steps
-before it rather than shortening only the last one; a fixed `dt` resumes after
-the stop.
+DiffEqCallbacks works. The step that reaches a stop is shortened to land on it
+and the previous step size resumes afterwards, so stops may sit closer together
+than `dt`. A stop beyond the problem's `tspan` is refused, since this package
+cannot integrate past it.
 
 `reinit!(integ, u0; t0, tf, erase_sol, saveat, tstops, reinit_callbacks,
 initialize_save)` restarts an integrator. It rebuilds the PETSc objects from

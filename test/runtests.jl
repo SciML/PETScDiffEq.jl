@@ -292,6 +292,23 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test length(sol.interp.du) == length(sol.u)
         end
 
+        @testset "erase_sol = false across a change of saving" begin
+            alg = PETScDiffEq.TSRK("5dp")
+            integ = SciMLBase.init(prob, alg; dt = 0.1, saveat = 0.5)
+            kept = SciMLBase.solve!(integ)
+            @test !kept.dense
+            SciMLBase.reinit!(
+                integ, kept.u[end]; t0 = 1.0, tf = 2.0, saveat = Float64[],
+                erase_sol = false,
+            )
+            sol = SciMLBase.solve!(integ)
+            @test sol.dense
+            # The kept points saved no derivatives; a Hermite interpolant needs one each.
+            @test length(sol.interp.du) == length(sol.u)
+            @test abs(sol(0.25)[1] - exp(-0.25)) < 1.0e-3
+            @test abs(sol(1.5)[1] - kept.u[end][1] * exp(-0.5)) < 1.0e-5
+        end
+
         @testset "saveat can be replaced" begin
             alg = PETScDiffEq.TSRK("5dp")
             integ = SciMLBase.init(prob, alg; dt = 0.1, saveat = 0.5)
@@ -361,6 +378,29 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test sol.t[i - 1] < 0.25
         end
 
+        @testset "stops closer together than dt" begin
+            for kw in ((adaptive = false,), (reltol = 1.0e-8, abstol = 1.0e-10))
+                sol = SciMLBase.solve(
+                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.4, tstops = [0.15, 0.17], kw...,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test 0.15 in sol.t
+                @test 0.17 in sol.t
+                @test sol.t[end] == 1.0
+                @test maximum(
+                    abs(sol.u[i][1] - exp(-sol.t[i])) for i in eachindex(sol.t)
+                ) < 1.0e-3
+            end
+        end
+
+        @testset "a stop nearer than dt from the start" begin
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.4, adaptive = false, tstops = [0.05],
+            )
+            @test sol.t[1:2] == [0.0, 0.05]
+            @test sol.t[3] ≈ 0.45
+        end
+
         @testset "stops outside the span are ignored" begin
             sol = SciMLBase.solve(
                 prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, tstops = [0.0, 1.0, 1.5],
@@ -385,6 +425,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test integ.t == 0.33
             @test !SciMLBase.has_tstop(integ)
             @test_throws ArgumentError SciMLBase.add_tstop!(integ, 0.1)
+            @test_throws ArgumentError SciMLBase.add_tstop!(integ, 1.5)
             SciMLBase.terminate!(integ)
         end
 

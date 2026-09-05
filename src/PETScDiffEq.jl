@@ -924,6 +924,12 @@ function SciMLBase.add_tstop!(integ::PETScIntegrator, t)
     t = Float64(t)
     t < integ.t &&
         throw(ArgumentError("cannot add a tstop at $t, behind the current time $(integ.t)"))
+    t > integ.h.tf && throw(
+        ArgumentError(
+            "cannot add a tstop at $t, beyond the final time $(integ.h.tf); " *
+                "PETScDiffEq cannot integrate past the problem's tspan",
+        ),
+    )
     i = searchsortedfirst(integ.tstops, t)
     (i <= length(integ.tstops) && integ.tstops[i] == t) || insert!(integ.tstops, i, t)
     return nothing
@@ -971,7 +977,17 @@ function SciMLBase.reinit!(
     if !erase_sol
         append!(h.ctx.ts, old.ctx.ts)
         append!(h.ctx.us, old.ctx.us)
-        h.ctx.dense && append!(h.ctx.dus, old.ctx.dus)
+        if h.ctx.dense
+            if old.ctx.dense
+                append!(h.ctx.dus, old.ctx.dus)
+            else
+                # A Hermite interpolant needs a derivative for every point it
+                # holds, and the kept run saved none.
+                for (t, u) in zip(old.ctx.ts, old.ctx.us)
+                    push!(h.ctx.dus, _derivative(h.ctx, t, u))
+                end
+            end
+        end
     end
     initialize_save && _initial_save!(h)
     integ.h = h
@@ -1026,11 +1042,19 @@ function SciMLBase.step!(integ::PETScIntegrator)
     copyto!(integ.uprev, integ.u)
     integ.tprev = integ.t
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
-    # PETSc lands on its max time exactly, rebalancing the last two steps to
-    # get there, but keeps the shortened step afterwards; the cached dt is the
-    # last step size chosen while no stop was in the way.
+    while !isempty(integ.tstops) && integ.tstops[1] <= integ.t + tol
+        popfirst!(integ.tstops)
+    end
+    # PETSc lands on its max time exactly but keeps the shortened step
+    # afterwards; the cached dt is the last one chosen with no stop in the way.
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
     LibPETSc.TSSetMaxTime(pl, h.ts, stop === nothing ? h.tf : stop)
+    # A step reaching past the max time makes TSAdaptChoose fail with
+    # "bad hmax", so the step onto a stop is shortened here, not by PETSc.
+    if stop !== nothing && integ.dt > stop - integ.t
+        integ.dt = stop - integ.t
+        LibPETSc.TSSetTimeStep(pl, h.ts, integ.dt)
+    end
     GC.@preserve ctx begin
         try
             LibPETSc.TSStep(pl, h.ts)
