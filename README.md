@@ -128,6 +128,13 @@ sol = SciMLBase.solve!(integ)
 
 `saveat`, `save_everystep`, `save_start` and `save_end` behave as they do for
 `solve`, interpolating with `TSInterpolate` inside the step just taken.
+
+`DiscreteCallback` and a `CallbackSet` of discrete callbacks work, through
+both `solve` and the integrator: the condition is checked after every step,
+`affect!` may change `integ.u` or call `terminate!`, and the changed state is
+written back into PETSc's solution vector with `TSRestartStep`, so a multistep
+method drops the history it took before the jump. `ContinuousCallback` is
+rejected, since it needs root finding on the interpolant.
 PETSc resources are released when the integration finishes, or on
 `terminate!(integ)`, which stops early with `ReturnCode.Terminated`. Finish
 or terminate every integrator you start: one dropped part-way is released by
@@ -190,8 +197,7 @@ third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: callbacks and `reinit!` through the integrator
-interface, continuous/dense output (`sol(t)` falls back to linear interpolation between
+Not yet implemented: `reinit!`, `ContinuousCallback`, continuous/dense output (`sol(t)` falls back to linear interpolation between
 saved points), `tstops`, `save_idxs`, an analytic Jacobian for
 `SplitODEProblem`, and MPI — every solve currently runs on `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
 supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`

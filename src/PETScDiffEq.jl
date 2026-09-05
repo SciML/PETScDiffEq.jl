@@ -459,7 +459,7 @@ _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 const UNSUPPORTED_KWARGS = (
-    :tstops, :save_idxs, :d_discontinuities, :callback, :dense, :isoutofdomain,
+    :tstops, :save_idxs, :d_discontinuities, :dense, :isoutofdomain,
     :unstable_check, :internalnorm, :calck, :force_dtmin, :alias_u0, :sensealg,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
 )
@@ -741,8 +741,12 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
 end
 
 function SciMLBase.__solve(
-        prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm; kwargs...,
+        prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm;
+        callback = nothing, kwargs...,
     )
+    if callback !== nothing
+        return SciMLBase.solve!(SciMLBase.__init(prob, alg; callback = callback, kwargs...))
+    end
     h = _setup(prob, alg; kwargs...)
     ctx, pl = h.ctx, h.petsclib
     tend, uend, st = h.t0, copy(h.u0), nothing
@@ -768,7 +772,7 @@ function SciMLBase.__solve(
     return _assemble(prob, alg, h, tend, uend, st)
 end
 
-mutable struct PETScIntegrator{Alg, P, H, Pr} <:
+mutable struct PETScIntegrator{Alg, P, H, Pr, CB} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, Vector{Float64}, Float64}
     alg::Alg
     u::Vector{Float64}
@@ -780,13 +784,80 @@ mutable struct PETScIntegrator{Alg, P, H, Pr} <:
     p::P
     h::H
     prob::Pr
+    callbacks::CB
     sol::Any
     finished::Bool
+    derivative_discontinuity::Bool
+end
+
+_discrete_callbacks(::Nothing) = ()
+_discrete_callbacks(cb::SciMLBase.DiscreteCallback) = (cb,)
+function _discrete_callbacks(cb::SciMLBase.CallbackSet)
+    isempty(cb.continuous_callbacks) || throw(
+        ArgumentError(
+            "PETScDiffEq supports DiscreteCallback only; a ContinuousCallback needs " *
+                "root finding on the interpolant, which is not implemented",
+        ),
+    )
+    return Tuple(cb.discrete_callbacks)
+end
+_discrete_callbacks(::SciMLBase.AbstractContinuousCallback) = throw(
+    ArgumentError(
+        "PETScDiffEq supports DiscreteCallback only; a ContinuousCallback needs " *
+            "root finding on the interpolant, which is not implemented",
+    ),
+)
+
+function SciMLBase.derivative_discontinuity!(integ::PETScIntegrator, bool::Bool)
+    integ.derivative_discontinuity = bool
+    return nothing
+end
+
+SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
+function SciMLBase.get_proposed_dt(integ::PETScIntegrator)
+    integ.finished && return integ.dt
+    return Float64(LibPETSc.TSGetTimeStep(integ.h.petsclib, integ.h.ts))
+end
+function SciMLBase.set_proposed_dt!(integ::PETScIntegrator, dt)
+    integ.finished || LibPETSc.TSSetTimeStep(integ.h.petsclib, integ.h.ts, Float64(dt))
+    return nothing
+end
+function SciMLBase.savevalues!(integ::PETScIntegrator)
+    push!(integ.h.ctx.ts, integ.t)
+    push!(integ.h.ctx.us, copy(integ.u))
+    return nothing
+end
+
+function _apply_callbacks!(integ::PETScIntegrator)
+    h = integ.h
+    ctx = h.ctx
+    for cb in integ.callbacks
+        integ.finished && return nothing
+        cb.condition(integ.u, integ.t, integ) || continue
+        # An affect! is assumed to change the state unless it says otherwise
+        # through derivative_discontinuity!(integ, false).
+        integ.derivative_discontinuity = true
+        cb.affect!(integ)
+        integ.finished && return nothing
+        if integ.derivative_discontinuity
+            # The changed state has to reach PETSc's own solution vector, and a
+            # multistep method must drop history taken before the jump.
+            PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+            LibPETSc.TSRestartStep(h.petsclib, h.ts)
+        end
+        if cb.save_positions[2] && ctx.save_everystep && isempty(ctx.saveat)
+            push!(ctx.ts, integ.t)
+            push!(ctx.us, copy(integ.u))
+        end
+    end
+    return nothing
 end
 
 function SciMLBase.__init(
-        prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm; kwargs...,
+        prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm;
+        callback = nothing, kwargs...,
     )
+    callbacks = _discrete_callbacks(callback)
     h = _setup(prob, alg; kwargs...)
     ctx = h.ctx
     LibPETSc.TSSetUp(h.petsclib, h.ts)
@@ -806,16 +877,23 @@ function SciMLBase.__init(
     sol = SciMLBase.build_solution(
         prob, alg, ctx.ts, ctx.us; retcode = SciMLBase.ReturnCode.Default,
     )
-    return PETScIntegrator(
+    integ = PETScIntegrator(
         alg, copy(h.u0), copy(h.u0), h.t0, h.t0,
         Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts)), 1.0,
-        prob.p, h, prob, sol, false,
+        prob.p, h, prob, callbacks, sol, false, false,
     )
+    for cb in callbacks
+        cb.initialize(cb, integ.u, integ.t, integ)
+    end
+    return integ
 end
 
 function _finish!(integ::PETScIntegrator, retcode = nothing)
     integ.finished && return nothing
     h = integ.h
+    for cb in integ.callbacks
+        cb.finalize(cb, integ.u, integ.t, integ)
+    end
     st = _read_stats(h)
     sol = _assemble(integ.prob, integ.alg, h, integ.t, copy(integ.u), st)
     integ.sol = retcode === nothing ? sol : SciMLBase.solution_new_retcode(sol, retcode)
@@ -875,6 +953,8 @@ function SciMLBase.step!(integ::PETScIntegrator)
             ctx.saveat_idx += 1
         end
     end
+    _apply_callbacks!(integ)
+    integ.finished && return nothing
     if !all(isfinite, integ.u) || integ.t >= h.tf - tol ||
             Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
         _finish!(integ)

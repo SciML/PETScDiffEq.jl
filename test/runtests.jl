@@ -739,6 +739,111 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
         end
 
+        @testset "DiscreteCallback" begin
+            fired = Ref(false)
+            jump = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> t >= 0.5 && !fired[],
+                integ -> (integ.u[1] += 1.0; fired[] = true; nothing),
+            )
+            # exp(-t) until the jump, then (exp(-0.5) + 1) exp(-(t - 0.5)) after it
+            expected(t) = t < 0.5 ? exp(-t) : (exp(-0.5) + 1.0) * exp(-(t - 0.5))
+
+            @testset "affect! changes the state PETSc integrates from" begin
+                for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"))
+                    fired[] = false
+                    sol = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, callback = jump)
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test fired[]
+                    @test abs(sol.u[end][1] - expected(1.0)) < 5.0e-3
+                    # save_positions defaults to (true, true): both sides of the jump
+                    i = findfirst(==(0.5), sol.t)
+                    @test i !== nothing && sol.t[i + 1] == 0.5
+                    @test sol.u[i + 1][1] ≈ sol.u[i][1] + 1.0
+                end
+            end
+
+            @testset "solve with a callback equals solve! on init" begin
+                fired[] = false
+                a = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = jump)
+                fired[] = false
+                b = SciMLBase.solve!(
+                    SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = jump),
+                )
+                @test a.t == b.t
+                @test all(x == y for (x, y) in zip(a.u, b.u))
+            end
+
+            @testset "terminate! from affect!" begin
+                stop = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t >= 0.3, integ -> SciMLBase.terminate!(integ),
+                )
+                sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = stop)
+                @test sol.retcode == SciMLBase.ReturnCode.Terminated
+                @test sol.t[end] ≈ 0.3
+            end
+
+            @testset "initialize and finalize hooks run once" begin
+                n_init = Ref(0)
+                n_fin = Ref(0)
+                hooked = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> false, integ -> nothing;
+                    initialize = (cb, u, t, integ) -> (n_init[] += 1; nothing),
+                    finalize = (cb, u, t, integ) -> (n_fin[] += 1; nothing),
+                )
+                SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = hooked)
+                @test n_init[] == 1
+                @test n_fin[] == 1
+            end
+
+            @testset "a CallbackSet of discrete callbacks works" begin
+                fired[] = false
+                cbs = SciMLBase.CallbackSet(jump)
+                sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = cbs)
+                @test fired[]
+                @test abs(sol.u[end][1] - expected(1.0)) < 1.0e-6
+            end
+
+            @testset "an affect! that declares no change is not written back" begin
+                touched = Ref(0)
+                quiet = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> true,
+                    integ -> (touched[] += 1; SciMLBase.derivative_discontinuity!(integ, false)),
+                )
+                ref = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf"); dt = 0.1, adaptive = false)
+                sol = SciMLBase.solve(
+                    prob, PETScDiffEq.TSImplicit("bdf"); dt = 0.1, adaptive = false,
+                    callback = quiet, save_everystep = false,
+                )
+                @test touched[] == 10
+                # no TSRestartStep, so BDF keeps its history and the answer is unchanged
+                @test sol.u[end] == ref.u[end]
+            end
+
+            @testset "proposed dt and savevalues! hooks" begin
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+                @test SciMLBase.get_proposed_dt(integ) ≈ 0.1
+                SciMLBase.set_proposed_dt!(integ, 0.05)
+                SciMLBase.step!(integ)
+                @test integ.t ≈ 0.05
+                @test SciMLBase.get_dt(integ) ≈ 0.05
+                n = length(integ.sol.t)
+                SciMLBase.savevalues!(integ)
+                @test length(integ.sol.t) == n + 1
+                @test integ.sol.t[end] ≈ 0.05
+                SciMLBase.solve!(integ)
+            end
+
+            @testset "a ContinuousCallback is rejected up front" begin
+                cc = SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.5, integ -> nothing)
+                @test_throws ArgumentError SciMLBase.init(
+                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = cc,
+                )
+                @test_throws ArgumentError SciMLBase.solve(
+                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = SciMLBase.CallbackSet(cc, jump),
+                )
+            end
+        end
+
         @testset "repeated init/solve! cycles do not crash" begin
             for _ in 1:30
                 integ = SciMLBase.init(prob, PETScDiffEq.TSImplicit("bdf"); dt = 0.1)
