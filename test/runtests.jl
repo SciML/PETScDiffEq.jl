@@ -719,10 +719,24 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test SciMLBase.done(integ)
         end
 
-        @testset "saveat is rejected up front" begin
-            @test_throws ArgumentError SciMLBase.init(
-                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, saveat = 0.25,
-            )
+        @testset "saveat matches solve exactly" begin
+            # The accuracy bound is per method: 5dp resolves exp(-t) to 1e-7 at
+            # dt = 0.1, second-order BDF only to about 1e-3.
+            for (alg, kw, tol) in (
+                    (PETScDiffEq.TSRK("5dp"), (; saveat = 0.25), 1.0e-7),
+                    (PETScDiffEq.TSRK("5dp"), (; saveat = [0.3, 0.7]), 1.0e-7),
+                    (PETScDiffEq.TSRK("5dp"), (; saveat = [0.3, 0.7], save_start = false), 1.0e-7),
+                    (PETScDiffEq.TSImplicit("bdf"), (; saveat = [0.15, 0.85]), 5.0e-3),
+                )
+                ref = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, kw...)
+                integ = SciMLBase.init(prob, alg; dt = 0.1, adaptive = false, kw...)
+                sol = SciMLBase.solve!(integ)
+                @test sol.t == ref.t
+                @test all(a == b for (a, b) in zip(sol.u, ref.u))
+                for i in eachindex(sol.t)
+                    @test abs(sol.u[i][1] - exp(-sol.t[i])) < tol
+                end
+            end
         end
 
         @testset "repeated init/solve! cycles do not crash" begin

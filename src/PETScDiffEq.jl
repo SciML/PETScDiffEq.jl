@@ -789,14 +789,19 @@ function SciMLBase.__init(
     )
     h = _setup(prob, alg; kwargs...)
     ctx = h.ctx
-    if !isempty(ctx.saveat)
-        _destroy!(h)
-        throw(ArgumentError("PETScDiffEq's integrator interface does not support saveat yet"))
-    end
     LibPETSc.TSSetUp(h.petsclib, h.ts)
-    if h.save_start
-        push!(ctx.ts, h.t0)
-        push!(ctx.us, copy(h.u0))
+    tol = 100 * eps(max(one(Float64), abs(h.tf)))
+    if isempty(ctx.saveat)
+        if h.save_start
+            push!(ctx.ts, h.t0)
+            push!(ctx.us, copy(h.u0))
+        end
+    else
+        while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= h.t0 + tol
+            push!(ctx.ts, ctx.saveat[ctx.saveat_idx])
+            push!(ctx.us, copy(h.u0))
+            ctx.saveat_idx += 1
+        end
     end
     sol = SciMLBase.build_solution(
         prob, alg, ctx.ts, ctx.us; retcode = SciMLBase.ReturnCode.Default,
@@ -847,11 +852,29 @@ function SciMLBase.step!(integ::PETScIntegrator)
     integ.t = Float64(LibPETSc.TSGetTime(pl, h.ts))
     integ.dt = Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
     PETSc.withlocalarray!(ua -> copyto!(integ.u, ua), h.u; read = true, write = false)
-    if ctx.save_everystep
-        push!(ctx.ts, integ.t)
-        push!(ctx.us, copy(integ.u))
-    end
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
+    if isempty(ctx.saveat)
+        if ctx.save_everystep
+            push!(ctx.ts, integ.t)
+            push!(ctx.us, copy(integ.u))
+        end
+    else
+        while ctx.saveat_idx <= length(ctx.saveat) &&
+                ctx.saveat[ctx.saveat_idx] <= integ.t + tol
+            want = ctx.saveat[ctx.saveat_idx]
+            if abs(want - integ.t) <= tol
+                push!(ctx.ts, want)
+                push!(ctx.us, copy(integ.u))
+            else
+                LibPETSc.TSInterpolate(pl, h.ts, want, ctx.work)
+                PETSc.withlocalarray!(
+                    wa -> (push!(ctx.ts, want); push!(ctx.us, Vector{Float64}(wa))),
+                    ctx.work; read = true, write = false,
+                )
+            end
+            ctx.saveat_idx += 1
+        end
+    end
     if !all(isfinite, integ.u) || integ.t >= h.tf - tol ||
             Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
         _finish!(integ)
