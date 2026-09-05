@@ -204,6 +204,7 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     save_idxs::Union{Nothing, Vector{Int}}
     work::V
     nf::Int
+    nf2::Int
     njacs::Int
     err::Union{Nothing, Any}
 end
@@ -228,7 +229,8 @@ function _derivative(ctx, t, u)
         ctx.f2!(ctx.du, u, ctx.p, t)
         du .+= ctx.du
     end
-    ctx.nf += ctx.f2! === nothing ? 1 : 2
+    ctx.nf += 1
+    ctx.f2! === nothing || (ctx.nf2 += 1)
     return du
 end
 
@@ -376,7 +378,7 @@ function _split_rhs!(
             ctx.f2!(ctx.du, ctx.u, ctx.p, t)
             copyto!(fa, ctx.du)
         end
-        ctx.nf += 1
+        ctx.nf2 += 1
     catch e
         ctx.err = e
         return LibPETSc.PetscErrorCode(1)
@@ -835,7 +837,7 @@ function _setup(
         row_cols0, row_src, row_buf, J0,
         Float64[], Vector{Float64}[], Vector{Float64}[],
         saveat_times, 1, save_everystep, dense_out, kept,
-        PETSc.VecSeq(petsclib, n), 0, 0, nothing,
+        PETSc.VecSeq(petsclib, n), 0, 0, 0, nothing,
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing,
@@ -979,7 +981,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
             "result should not be trusted; an explicit PETSc type needs `explicit = true`"
     end
     stats = SciMLBase.DEStats(
-        ctx.nf, -1, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
+        ctx.nf, ctx.nf2, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
         st.nsteps, st.nreject, 0.0,
     )
     return SciMLBase.build_solution(

@@ -383,6 +383,60 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "EnsembleProblem" begin
+        function decay_p!(du, u, p, t)
+            return du[1] = -p[1] * u[1]
+        end
+        prob = SciMLBase.ODEProblem(decay_p!, [1.0], (0.0, 1.0), [1.0])
+        vary(p, ctx) = SciMLBase.remake(p; p = [Float64(ctx.sim_id)])
+        eprob = SciMLBase.EnsembleProblem(prob; prob_func = vary)
+
+        @testset "$name" for (name, alg, ens, n, tol) in (
+                (
+                    "explicit, serial", PETScDiffEq.TSRK("5dp"),
+                    SciMLBase.EnsembleSerial(), 4, 1.0e-8,
+                ),
+                (
+                    "explicit, threaded", PETScDiffEq.TSRK("5dp"),
+                    SciMLBase.EnsembleThreads(), 4, 1.0e-8,
+                ),
+                (
+                    "implicit, serial", PETScDiffEq.TSImplicit("bdf"),
+                    SciMLBase.EnsembleSerial(), 3, 1.0e-5,
+                ),
+            )
+            sim = SciMLBase.solve(
+                eprob, alg, ens; trajectories = n, dt = 0.01, reltol = 1.0e-10,
+                abstol = 1.0e-12,
+            )
+            @test length(sim.u) == n
+            @test all(s -> s.retcode == SciMLBase.ReturnCode.Success, sim.u)
+            # Each trajectory carries its own decay rate.
+            @test all(abs(sim.u[i].u[end][1] - exp(-i)) < tol for i in 1:n)
+        end
+    end
+
+    @testset "nf2 counts the explicit part of a split problem" begin
+        function stiff!(du, u, p, t)
+            return du[1] = -1000.0 * (u[1] - cos(t))
+        end
+        function forcing!(du, u, p, t)
+            return du[1] = -sin(t)
+        end
+        split = SciMLBase.solve(
+            SciMLBase.SplitODEProblem(stiff!, forcing!, [1.0], (0.0, 0.1)),
+            PETScDiffEq.TSARKIMEX("3"); dt = 1.0e-3,
+        )
+        @test split.stats.nf > 0
+        @test split.stats.nf2 > 0
+        plain = SciMLBase.solve(
+            SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+            dt = 0.1,
+        )
+        @test plain.stats.nf > 0
+        @test plain.stats.nf2 == 0
+    end
+
     @testset "TSIRK" begin
         proto = sparse([1], [1], [1.0], 1, 1)
         prob = SciMLBase.ODEProblem(
