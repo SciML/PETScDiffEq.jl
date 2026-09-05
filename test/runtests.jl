@@ -619,6 +619,120 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "Integrator interface" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+
+        @testset "init, step! and solve! reproduce solve exactly" begin
+            for alg in (
+                    PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"),
+                    PETScDiffEq.TSRosW("ra34pw2"),
+                )
+                ref = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false)
+                integ = SciMLBase.init(prob, alg; dt = 0.1, adaptive = false)
+                @test integ isa PETScDiffEq.PETScIntegrator
+                @test integ.t == 0.0
+                @test integ.u == [1.0]
+                @test integ.sol.retcode == SciMLBase.ReturnCode.Default
+                @test !SciMLBase.done(integ)
+
+                SciMLBase.step!(integ)
+                @test integ.t ≈ ref.t[2]
+                @test integ.u ≈ ref.u[2]
+                @test integ.tprev == 0.0
+                @test integ.uprev == [1.0]
+
+                sol = SciMLBase.solve!(integ)
+                @test SciMLBase.done(integ)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.t == ref.t
+                @test all(a == b for (a, b) in zip(sol.u, ref.u))
+                @test sol.stats.naccept == ref.stats.naccept
+            end
+        end
+
+        @testset "step!(integ, dt) advances through the generic loop" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            SciMLBase.step!(integ, 0.3)
+            @test integ.t ≈ 0.3
+            @test !SciMLBase.done(integ)
+            SciMLBase.solve!(integ)
+        end
+
+        @testset "terminate! stops early and releases the solver" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            SciMLBase.terminate!(integ)
+            @test SciMLBase.done(integ)
+            @test integ.sol.retcode == SciMLBase.ReturnCode.Terminated
+            @test integ.sol.t[end] ≈ 0.2
+            @test length(integ.sol.t) == 3
+            @test integ.h.destroyed
+            SciMLBase.step!(integ)
+            @test integ.t ≈ 0.2
+        end
+
+        @testset "stepping past the end is a no-op" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            SciMLBase.solve!(integ)
+            t_end = integ.t
+            SciMLBase.step!(integ)
+            @test integ.t == t_end
+            @test SciMLBase.done(integ)
+        end
+
+        @testset "save_everystep = false keeps only the endpoints" begin
+            integ = SciMLBase.init(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false,
+                save_everystep = false,
+            )
+            sol = SciMLBase.solve!(integ)
+            @test sol.t == [0.0, 1.0]
+            @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-7
+        end
+
+        @testset "a blow-up finishes as Unstable" begin
+            blowup!(du, u, p, t) = (du[1] = u[1]^2; nothing)
+            integ = SciMLBase.init(
+                SciMLBase.ODEProblem(blowup!, [1.0], (0.0, 5.0)),
+                PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false,
+            )
+            sol = SciMLBase.solve!(integ)
+            @test SciMLBase.done(integ)
+            @test sol.retcode == SciMLBase.ReturnCode.Unstable
+        end
+
+        @testset "a user exception surfaces from step! and finishes the integrator" begin
+            boom!(du, u, p, t) = (t > 0.25 && error("user rhs failed"); du[1] = -u[1]; nothing)
+            integ = SciMLBase.init(
+                SciMLBase.ODEProblem(boom!, [1.0], (0.0, 1.0)),
+                PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false,
+            )
+            err = try
+                SciMLBase.solve!(integ)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("user rhs failed", err.msg)
+            @test SciMLBase.done(integ)
+        end
+
+        @testset "saveat is rejected up front" begin
+            @test_throws ArgumentError SciMLBase.init(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, saveat = 0.25,
+            )
+        end
+
+        @testset "repeated init/solve! cycles do not crash" begin
+            for _ in 1:30
+                integ = SciMLBase.init(prob, PETScDiffEq.TSImplicit("bdf"); dt = 0.1)
+                @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
+            end
+        end
+    end
+
     @testset "Only methods with an error estimate adapt" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         steps(alg, rt) = SciMLBase.solve(

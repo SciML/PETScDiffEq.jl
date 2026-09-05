@@ -111,6 +111,29 @@ An explicit algorithm cannot apply `M` without inverting it, so `TSRK` and an
 explicit `TSGeneric` reject a non-identity mass matrix rather than silently
 integrating `u' = f`. A mass matrix on a `SplitODEProblem` is also rejected.
 
+## Integrator interface
+
+`init`, `step!`, `solve!` and `done` work, and drive PETSc one `TSStep` at a
+time. `step!(integ)` takes one step; `step!(integ, dt)` steps until `integ.t`
+has advanced by `dt`; `solve!` runs to the end and returns the same
+`ODESolution` that `solve` would. `integ.t`, `integ.u`, `integ.tprev`,
+`integ.uprev` and `integ.dt` are readable between steps.
+
+```julia
+integ = SciMLBase.init(prob, TSRK("5dp"); dt = 0.1)
+SciMLBase.step!(integ)
+integ.t, integ.u
+sol = SciMLBase.solve!(integ)
+```
+
+The integrator saves every accepted step and does not take `saveat` yet.
+PETSc resources are released when the integration finishes, or on
+`terminate!(integ)`, which stops early with `ReturnCode.Terminated`. Finish
+or terminate every integrator you start: one dropped part-way is released by
+a finalizer, and if that finalizer only runs at process exit, after MPI has
+shut down, PETSc.jl's own object finalizers print an MPI warning and the
+process exits non-zero.
+
 ## Saving
 
 `saveat`, `save_everystep`, `save_start` and `save_end` behave as they do
@@ -166,9 +189,9 @@ third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: the `init`/`step!`/`solve!` integrator interface,
-continuous/dense output (`sol(t)` falls back to linear interpolation between
-saved points), `tstops`, `save_idxs`, callbacks, an analytic Jacobian for
+Not yet implemented: `saveat`, callbacks and `reinit!` through the integrator
+interface, continuous/dense output (`sol(t)` falls back to linear interpolation between
+saved points), `tstops`, `save_idxs`, an analytic Jacobian for
 `SplitODEProblem`, and MPI — every solve currently runs on `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
 supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`
 (Kronecker AIJ) matrix, not the plain AIJ this package builds, so it needs

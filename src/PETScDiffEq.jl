@@ -8,7 +8,7 @@ using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, sparse
 
-export TSRK, TSRosW, TSImplicit, TSARKIMEX, TSGeneric
+export TSRK, TSRosW, TSImplicit, TSARKIMEX, TSGeneric, PETScIntegrator
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 
@@ -464,7 +464,38 @@ const UNSUPPORTED_KWARGS = (
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
 )
 
-function SciMLBase.__solve(
+mutable struct TSHandles{CTX, T}
+    ctx::CTX
+    petsclib::T
+    ts::Any
+    u::Any
+    jac_mat::Any
+    opts::Any
+    t0::Float64
+    tf::Float64
+    u0::Vector{Float64}
+    maxiters::Int
+    save_start::Bool
+    save_end::Bool
+    destroyed::Bool
+end
+
+function _destroy!(h::TSHandles)
+    h.destroyed && return nothing
+    h.destroyed = true
+    # Once PETSc has finalized (at process exit) its objects are already gone
+    # and calling into it reaches MPI after MPI has shut down, so an integrator
+    # collected late must not try to free anything.
+    (PETSc.finalized(h.petsclib) || MPI.Finalized()) && return nothing
+    h.opts === nothing || PETSc.destroy(h.opts)
+    h.jac_mat === nothing || PETSc.destroy(h.jac_mat)
+    h.ctx.work.ptr == C_NULL || PETSc.destroy(h.ctx.work)
+    h.u === nothing || PETSc.destroy(h.u)
+    h.ts === nothing || LibPETSc.TSDestroy(h.petsclib, h.ts)
+    return nothing
+end
+
+function _setup(
         prob::SciMLBase.AbstractODEProblem,
         alg::PETScTSAlgorithm;
         dt = nothing,
@@ -571,26 +602,21 @@ function SciMLBase.__solve(
         saveat_times, 1, save_everystep,
         PETSc.VecSeq(petsclib, n), 0, 0, nothing,
     )
-
-    ts = LibPETSc.TS(petsclib)
-    u = LibPETSc.PetscVec(petsclib)
-    jac_mat = LibPETSc.PetscMat(petsclib)
-    opts = PETSc.Options(petsclib)
-    pushed = false
-    nsteps = 0
-    nreject = 0
-    nnonliniter = 0
-    nnonlinfail = 0
-    uend = copy(u0)
-    tend = t0
+    h = TSHandles(
+        ctx, petsclib, nothing, nothing, nothing, nothing,
+        t0, tf, u0, Int(maxiters), save_start, save_end, false,
+    )
+    finalizer(_destroy!, h)
 
     try
-        ts = LibPETSc.TSCreate(petsclib, MPI.COMM_SELF)
+        h.ts = LibPETSc.TSCreate(petsclib, MPI.COMM_SELF)
+        ts = h.ts
         LibPETSc.TSSetProblemType(petsclib, ts, LibPETSc.TS_NONLINEAR)
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
         _set_subtype!(petsclib, ts, alg)
 
-        u = PETSc.VecSeq(petsclib, n)
+        h.u = PETSc.VecSeq(petsclib, n)
+        u = h.u
         PETSc.withlocalarray!(u; read = false, write = true) do ua
             copyto!(ua, u0)
         end
@@ -608,14 +634,14 @@ function SciMLBase.__solve(
             end
             if has_jac && uses_sparse_jac
                 pattern = _jacobian_pattern(J0, n)
-                jac_mat = PETSc.MatSeqAIJWithArrays(petsclib, MPI.COMM_SELF, pattern)
+                h.jac_mat = PETSc.MatSeqAIJWithArrays(petsclib, MPI.COMM_SELF, pattern)
                 LibPETSc.TSSetIJacobian(
-                    petsclib, ts, jac_mat, jac_mat, SPARSE_IJACOBIAN_PTR[], ctxptr,
+                    petsclib, ts, h.jac_mat, h.jac_mat, SPARSE_IJACOBIAN_PTR[], ctxptr,
                 )
             elseif has_jac
-                jac_mat = PETSc.MatSeqAIJ(petsclib, n, n, n)
+                h.jac_mat = PETSc.MatSeqAIJ(petsclib, n, n, n)
                 LibPETSc.TSSetIJacobian(
-                    petsclib, ts, jac_mat, jac_mat, IJACOBIAN_PTR[], ctxptr,
+                    petsclib, ts, h.jac_mat, h.jac_mat, IJACOBIAN_PTR[], ctxptr,
                 )
             end
             LibPETSc.TSMonitorSet(petsclib, ts, MONITOR_PTR[], ctxptr)
@@ -648,43 +674,37 @@ function SciMLBase.__solve(
             append!(effective_options, alg.petsc_options)
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
-                opts = PETSc.Options(petsclib; parsed...)
-                push!(opts)
-                pushed = true
-            end
-            LibPETSc.TSSetFromOptions(petsclib, ts)
-            if pushed
-                pop!(opts)
-                pushed = false
-            end
-            try
-                LibPETSc.TSSolve(petsclib, ts, u)
-            catch
-                # A callback that threw reports failure to PETSc, which raises a
-                # PetscError here. The user's own exception is the useful one.
-                ctx.err === nothing && rethrow()
+                h.opts = PETSc.Options(petsclib; parsed...)
+                push!(h.opts)
+                try
+                    LibPETSc.TSSetFromOptions(petsclib, ts)
+                finally
+                    pop!(h.opts)
+                end
+            else
+                LibPETSc.TSSetFromOptions(petsclib, ts)
             end
         end
-
-        ctx.err === nothing || throw(ctx.err)
-        tend = Float64(LibPETSc.TSGetSolveTime(petsclib, ts))
-        nsteps = Int(LibPETSc.TSGetStepNumber(petsclib, ts))
-        nreject = Int(LibPETSc.TSGetStepRejections(petsclib, ts))
-        nnonliniter = Int(LibPETSc.TSGetSNESIterations(petsclib, ts))
-        nnonlinfail = Int(LibPETSc.TSGetSNESFailures(petsclib, ts))
-        uend = PETSc.withlocalarray!(
-            ua -> Vector{Float64}(ua), u; read = true, write = false,
-        )
-    finally
-        pushed && pop!(opts)
-        opts.ptr == C_NULL || PETSc.destroy(opts)
-        jac_mat.ptr == C_NULL || PETSc.destroy(jac_mat)
-        ctx.work.ptr == C_NULL || PETSc.destroy(ctx.work)
-        u.ptr == C_NULL || PETSc.destroy(u)
-        ts.ptr == C_NULL || LibPETSc.TSDestroy(petsclib, ts)
+    catch
+        _destroy!(h)
+        rethrow()
     end
+    return h
+end
 
-    tol = 100 * eps(max(one(Float64), abs(tf)))
+function _read_stats(h::TSHandles)
+    pl, ts = h.petsclib, h.ts
+    return (
+        nsteps = Int(LibPETSc.TSGetStepNumber(pl, ts)),
+        nreject = Int(LibPETSc.TSGetStepRejections(pl, ts)),
+        nnonliniter = Int(LibPETSc.TSGetSNESIterations(pl, ts)),
+        nnonlinfail = Int(LibPETSc.TSGetSNESFailures(pl, ts)),
+    )
+end
+
+function _assemble(prob, alg, h::TSHandles, tend, uend, st)
+    ctx = h.ctx
+    tf, t0, tol = h.tf, h.t0, 100 * eps(max(one(Float64), abs(h.tf)))
     # `-ts_exact_final_time interpolate` steps past tf and then interpolates
     # back, so the monitor reports an overshoot point mid-sequence, not last.
     keep = findall(t -> t <= tf + tol, ctx.ts)
@@ -692,11 +712,11 @@ function SciMLBase.__solve(
         ctx.ts = ctx.ts[keep]
         ctx.us = ctx.us[keep]
     end
-    if save_end && (isempty(ctx.ts) || ctx.ts[end] < tend - tol)
+    if h.save_end && (isempty(ctx.ts) || ctx.ts[end] < tend - tol)
         push!(ctx.ts, tend)
         push!(ctx.us, uend)
     end
-    if !save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= tol
+    if !h.save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= tol
         popfirst!(ctx.ts)
         popfirst!(ctx.us)
     end
@@ -706,18 +726,146 @@ function SciMLBase.__solve(
         SciMLBase.ReturnCode.Unstable
     elseif tend >= tf - tol
         SciMLBase.ReturnCode.Success
-    elseif nsteps >= maxiters
+    elseif st.nsteps >= h.maxiters
         SciMLBase.ReturnCode.MaxIters
     else
         SciMLBase.ReturnCode.Failure
     end
     stats = SciMLBase.DEStats(
-        ctx.nf, -1, -1, -1, ctx.njacs, nnonliniter, nnonlinfail, -1, -1, -1,
-        nsteps, nreject, 0.0,
+        ctx.nf, -1, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
+        st.nsteps, st.nreject, 0.0,
     )
     return SciMLBase.build_solution(
         prob, alg, ctx.ts, ctx.us; retcode = retcode, stats = stats,
     )
 end
+
+function SciMLBase.__solve(
+        prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm; kwargs...,
+    )
+    h = _setup(prob, alg; kwargs...)
+    ctx, pl = h.ctx, h.petsclib
+    tend, uend, st = h.t0, copy(h.u0), nothing
+    try
+        GC.@preserve ctx begin
+            try
+                LibPETSc.TSSolve(pl, h.ts, h.u)
+            catch
+                # A callback that threw reports failure to PETSc, which raises a
+                # PetscError here. The user's own exception is the useful one.
+                ctx.err === nothing && rethrow()
+            end
+        end
+        ctx.err === nothing || throw(ctx.err)
+        tend = Float64(LibPETSc.TSGetSolveTime(pl, h.ts))
+        st = _read_stats(h)
+        uend = PETSc.withlocalarray!(
+            ua -> Vector{Float64}(ua), h.u; read = true, write = false,
+        )
+    finally
+        _destroy!(h)
+    end
+    return _assemble(prob, alg, h, tend, uend, st)
+end
+
+mutable struct PETScIntegrator{Alg, P, H, Pr} <:
+    SciMLBase.AbstractODEIntegrator{Alg, true, Vector{Float64}, Float64}
+    alg::Alg
+    u::Vector{Float64}
+    uprev::Vector{Float64}
+    t::Float64
+    tprev::Float64
+    dt::Float64
+    tdir::Float64
+    p::P
+    h::H
+    prob::Pr
+    sol::Any
+    finished::Bool
+end
+
+function SciMLBase.__init(
+        prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm; kwargs...,
+    )
+    h = _setup(prob, alg; kwargs...)
+    ctx = h.ctx
+    if !isempty(ctx.saveat)
+        _destroy!(h)
+        throw(ArgumentError("PETScDiffEq's integrator interface does not support saveat yet"))
+    end
+    LibPETSc.TSSetUp(h.petsclib, h.ts)
+    if h.save_start
+        push!(ctx.ts, h.t0)
+        push!(ctx.us, copy(h.u0))
+    end
+    sol = SciMLBase.build_solution(
+        prob, alg, ctx.ts, ctx.us; retcode = SciMLBase.ReturnCode.Default,
+    )
+    return PETScIntegrator(
+        alg, copy(h.u0), copy(h.u0), h.t0, h.t0,
+        Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts)), 1.0,
+        prob.p, h, prob, sol, false,
+    )
+end
+
+function _finish!(integ::PETScIntegrator, retcode = nothing)
+    integ.finished && return nothing
+    h = integ.h
+    st = _read_stats(h)
+    sol = _assemble(integ.prob, integ.alg, h, integ.t, copy(integ.u), st)
+    integ.sol = retcode === nothing ? sol : SciMLBase.solution_new_retcode(sol, retcode)
+    integ.finished = true
+    _destroy!(h)
+    return nothing
+end
+
+function SciMLBase.terminate!(
+        integ::PETScIntegrator, retcode = SciMLBase.ReturnCode.Terminated,
+    )
+    _finish!(integ, retcode)
+    return nothing
+end
+
+function SciMLBase.step!(integ::PETScIntegrator)
+    integ.finished && return nothing
+    h = integ.h
+    ctx, pl = h.ctx, h.petsclib
+    copyto!(integ.uprev, integ.u)
+    integ.tprev = integ.t
+    GC.@preserve ctx begin
+        try
+            LibPETSc.TSStep(pl, h.ts)
+        catch
+            ctx.err === nothing && rethrow()
+        end
+    end
+    if ctx.err !== nothing
+        err = ctx.err
+        _finish!(integ)
+        throw(err)
+    end
+    integ.t = Float64(LibPETSc.TSGetTime(pl, h.ts))
+    integ.dt = Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
+    PETSc.withlocalarray!(ua -> copyto!(integ.u, ua), h.u; read = true, write = false)
+    if ctx.save_everystep
+        push!(ctx.ts, integ.t)
+        push!(ctx.us, copy(integ.u))
+    end
+    tol = 100 * eps(max(one(Float64), abs(h.tf)))
+    if !all(isfinite, integ.u) || integ.t >= h.tf - tol ||
+            Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
+        _finish!(integ)
+    end
+    return nothing
+end
+
+function SciMLBase.solve!(integ::PETScIntegrator)
+    while !integ.finished
+        SciMLBase.step!(integ)
+    end
+    return integ.sol
+end
+
+SciMLBase.done(integ::PETScIntegrator) = integ.finished
 
 end
