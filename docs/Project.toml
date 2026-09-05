@@ -1,0 +1,6 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+PETScDiffEq = "0a65194f-a16f-47d0-900e-080c22068669"
+
+[compat]
+Documenter = "1"
