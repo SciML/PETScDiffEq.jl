@@ -6,7 +6,8 @@ using MPI: MPI
 using PETSc: PETSc
 using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
-using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, sparse
+using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
+    sparse
 
 export TSRK, TSRosW, TSImplicit, TSARKIMEX, TSGeneric, PETScIntegrator
 
@@ -190,6 +191,44 @@ function _setblock!(ctx, A, n)
 end
 
 _stored(A::SparseMatrixCSC, i, j) = any(==(i), @view A.rowval[A.colptr[j]:(A.colptr[j + 1] - 1)])
+
+_as_inplace(f, iip::Bool) = iip ? f : (du, u, p, t) -> (du .= f(u, p, t); nothing)
+_as_inplace_jac(j, iip::Bool) = iip ? j :
+    (J, u, p, t) -> (_copy_jac!(J, j(u, p, t)); nothing)
+
+_copy_jac!(J::AbstractMatrix, A) = (copyto!(J, A); nothing)
+
+# The sparse buffer's nonzero positions were captured at setup, so writing an
+# entry the prototype never declared would silently misplace every later one.
+function _setstored!(J::SparseMatrixCSC, i, j, v)
+    r = J.colptr[j]:(J.colptr[j + 1] - 1)
+    k = findfirst(==(i), @view J.rowval[r])
+    k === nothing && throw(
+        ArgumentError(
+            "the Jacobian has an entry at ($i, $j) that the jac_prototype does not " *
+                "declare; add it to the prototype",
+        ),
+    )
+    J.nzval[first(r) + k - 1] = v
+    return nothing
+end
+
+function _copy_jac!(J::SparseMatrixCSC, A::SparseMatrixCSC)
+    fill!(J.nzval, 0.0)
+    rows, vals = rowvals(A), nonzeros(A)
+    @inbounds for j in axes(A, 2), k in nzrange(A, j)
+        _setstored!(J, rows[k], j, vals[k])
+    end
+    return nothing
+end
+
+function _copy_jac!(J::SparseMatrixCSC, A::AbstractMatrix)
+    fill!(J.nzval, 0.0)
+    @inbounds for j in axes(A, 2), i in axes(A, 1)
+        iszero(A[i, j]) || _setstored!(J, i, j, A[i, j])
+    end
+    return nothing
+end
 
 function _rhs!(
         ::LibPETSc.CTS,
@@ -539,8 +578,6 @@ function _setup(
             @warn "PETScDiffEq does not support `$key` and is ignoring it"
         end
     end
-    SciMLBase.isinplace(prob) ||
-        throw(ArgumentError("PETScDiffEq requires an in-place ODEProblem, f!(du, u, p, t)"))
     prob.u0 isa AbstractVector{<:Real} ||
         throw(ArgumentError("PETScDiffEq requires a real AbstractVector u0"))
     dt === nothing && throw(ArgumentError("PETScDiffEq requires an initial dt"))
@@ -570,6 +607,7 @@ function _setup(
     petsclib = PETSc.getlib(PetscScalar = Float64)
     PETSc.initialized(petsclib) || PETSc.initialize(petsclib)
 
+    iip = SciMLBase.isinplace(prob)
     f1 = is_split ? prob.f.f1.f : prob.f.f
     f2 = is_split ? prob.f.f2.f : nothing
     for g in (f1, f2)
@@ -582,8 +620,10 @@ function _setup(
             ),
         )
     end
+    f1 = _as_inplace(f1, iip)
+    f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
     has_jac = _uses_ifunction(alg) && prob.f.jac !== nothing
-    jac_fn = has_jac ? prob.f.jac : nothing
+    jac_fn = has_jac ? _as_inplace_jac(prob.f.jac, iip) : nothing
     jac_prototype = has_jac ? prob.f.jac_prototype : nothing
     uses_sparse_jac = jac_prototype isa SparseMatrixCSC
     J0 = if !has_jac

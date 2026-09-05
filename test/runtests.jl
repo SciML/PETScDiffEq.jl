@@ -12,7 +12,6 @@ decay!(du, u, p, t) = (
         du[i] = -u[i]
     end; nothing
 )
-decay_oop(u, p, t) = -u
 
 function lotka_volterra!(du, u, p, t)
     a, b, c, d = p
@@ -344,6 +343,94 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
             @test SciMLBase.has_reinit(integ)
             SciMLBase.terminate!(integ)
+        end
+    end
+
+    @testset "out-of-place problems" begin
+        oop(u, p, t) = -u
+        prob = SciMLBase.ODEProblem(oop, [1.0], (0.0, 1.0))
+        inplace = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+
+        @testset "matches the in-place formulation exactly" begin
+            for alg in (
+                    PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"),
+                    PETScDiffEq.TSRosW("ra34pw2"),
+                )
+                a = SciMLBase.solve(prob, alg; dt = 0.05, reltol = 1.0e-9, abstol = 1.0e-11)
+                b = SciMLBase.solve(inplace, alg; dt = 0.05, reltol = 1.0e-9, abstol = 1.0e-11)
+                @test a.retcode == SciMLBase.ReturnCode.Success
+                @test a.t == b.t
+                @test a.u == b.u
+                @test a.stats.nf == b.stats.nf
+                @test abs(a.u[end][1] - exp(-1)) < 1.0e-6
+            end
+        end
+
+        @testset "an out-of-place jac is used" begin
+            ojac(u, p, t) = fill(-1.0, 1, 1)
+            owrong(u, p, t) = fill(100.0, 1, 1)
+            good = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(oop; jac = ojac), [1.0], (0.0, 1.0),
+            )
+            sol = SciMLBase.solve(good, PETScDiffEq.TSImplicit("bdf"); dt = 0.05)
+            @test sol.stats.njacs > 0
+            @test abs(sol.u[end][1] - exp(-1)) < 1.0e-2
+            bad = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(oop; jac = owrong), [1.0], (0.0, 1.0),
+            )
+            @test_throws Exception SciMLBase.solve(
+                bad, PETScDiffEq.TSImplicit("cn"); dt = 0.05,
+            )
+        end
+
+        @testset "with a sparse jac_prototype" begin
+            pair(u, p, t) = [-1000 * (u[1] - cos(t)), -u[2]]
+            pjac(u, p, t) = sparse([1, 2], [1, 2], [-1000.0, -1.0], 2, 2)
+            outside(u, p, t) = sparse([1, 1, 2], [1, 2, 2], [-1000.0, 7.0, -1.0], 2, 2)
+            proto = sparse([1, 2], [1, 2], [1.0, 1.0], 2, 2)
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(pair; jac = pjac, jac_prototype = proto),
+                    [1.0, 1.0], (0.0, 0.1),
+                ), PETScDiffEq.TSImplicit("bdf"); dt = 1.0e-3,
+            )
+            @test sol.stats.njacs > 0
+            @test abs(sol.u[end][2] - exp(-0.1)) < 1.0e-4
+            # Widening the buffer would misplace every entry stored after it.
+            @test_throws ArgumentError SciMLBase.solve(
+                SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(pair; jac = outside, jac_prototype = proto),
+                    [1.0, 1.0], (0.0, 0.1),
+                ), PETScDiffEq.TSImplicit("bdf"); dt = 1.0e-3,
+            )
+        end
+
+        @testset "split, callbacks and the integrator" begin
+            split = SciMLBase.SplitODEProblem(
+                (u, p, t) -> [-1000 * (u[1] - cos(t))], (u, p, t) -> [-sin(t)],
+                [1.0], (0.0, 0.1),
+            )
+            s = SciMLBase.solve(split, PETScDiffEq.TSARKIMEX("3"); dt = 1.0e-3)
+            @test s.retcode == SciMLBase.ReturnCode.Success
+            @test abs(s.u[end][1] - cos(0.1)) < 1.0e-3
+
+            hits = Float64[]
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5,
+                integ -> (push!(hits, integ.t); integ.u[1] += 1.0),
+            )
+            long = SciMLBase.ODEProblem(oop, [1.0], (0.0, 2.0))
+            SciMLBase.solve(
+                long, PETScDiffEq.TSRK("5dp"); dt = 0.1, reltol = 1.0e-10,
+                abstol = 1.0e-12, callback = cb,
+            )
+            @test length(hits) == 2
+            @test abs(hits[1] - log(2.0)) < 1.0e-9
+
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            SciMLBase.step!(integ)
+            SciMLBase.reinit!(integ)
+            @test abs(SciMLBase.solve!(integ).u[end][1] - exp(-1)) < 1.0e-5
         end
     end
 
@@ -1491,10 +1578,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSImplicit("beuler"))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX("3"))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSGeneric("alpha"))
-        @test_throws ArgumentError SciMLBase.solve(
-            SciMLBase.ODEProblem(decay_oop, [1.0], (0.0, 1.0)),
-            PETScDiffEq.TSRK("5dp"); dt = 0.1,
-        )
         @test_throws ArgumentError SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0)),
             PETScDiffEq.TSRK("5dp"); dt = 0.1,

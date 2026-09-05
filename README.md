@@ -89,9 +89,12 @@ error estimate, so only those adapt. `"beuler"`, `"cn"`, `"theta"` and
 PETSc types such as `"alpha"` and `"euler"` have none: they step at the `dt`
 you give and ignore `reltol`/`abstol` entirely. Passing tolerances to one of
 those emits a warning rather than quietly doing nothing.
-Only in-place, real-valued, forward-time
-`ODEProblem`s are accepted, and `SplitODEProblem` is accepted only by
-`TSARKIMEX`. Without an `ODEFunction` `jac` (see above), every implicit
+Real-valued, forward-time `ODEProblem`s are accepted, and `SplitODEProblem`
+only by `TSARKIMEX`. An out-of-place `f(u, p, t)` is wrapped into the in-place
+form PETSc needs, so it costs one array per evaluation and the saved states
+come back as plain `Vector{Float64}` whatever `u0` was; an out-of-place `jac`
+is wrapped the same way, and one that returns an entry the `jac_prototype`
+does not declare is rejected rather than silently misplacing later entries. Without an `ODEFunction` `jac` (see above), every implicit
 solve relies on PETSc's own fallback, so pass `["-snes_fd"]` in
 `petsc_options` on problems where that fallback is not enough.
 
