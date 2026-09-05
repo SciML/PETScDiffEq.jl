@@ -47,6 +47,7 @@ sol = SciMLBase.solve(prob, TSRK("5dp"); dt = 0.01, abstol = 1e-8, reltol = 1e-8
 - `TSImplicit(subtype)`, backward Euler, Crank-Nicolson, theta and BDF
 - `TSIRK(nstages)`, Gauss-Legendre implicit Runge-Kutta of order `2 * nstages`
 - `TSARKIMEX(subtype)`, additive Runge-Kutta IMEX, for a `SplitODEProblem`
+- `TSDAE(subtype)`, the same implicit methods applied to a `DAEProblem`
 - `TSGeneric(ts_type)`, a pass-through to any other PETSc `TSType` by name
 
 Each has a docstring covering its subtypes, whether it adapts and what it requires, so
@@ -63,7 +64,8 @@ may be a vector of per-component tolerances), `saveat`, `save_everystep`, `save_
 `save_end`, `save_idxs`, `dense`, `callback` and `tstops`. Keywords it cannot honour emit
 a warning rather than being silently dropped.
 
-`ODEProblem` and `SplitODEProblem` are supported, in place or out of place, along with
+`ODEProblem`, `SplitODEProblem` and `DAEProblem` are supported, in place or out of
+place, along with
 `ODEFunction`'s `jac`, `jac_prototype` and `mass_matrix`. Supply a `jac_prototype` for
 anything sparse: without one the Jacobian is dense and forces a dense factorization.
 

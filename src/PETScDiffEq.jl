@@ -10,9 +10,12 @@ using SciMLOperators: SciMLOperators
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
     sparse
 
-export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSGeneric, PETScIntegrator
+export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSDAE, TSGeneric, PETScIntegrator
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
+abstract type PETScTSDAEAlgorithm <: SciMLBase.AbstractDAEAlgorithm end
+
+const AnyPETScTS = Union{PETScTSAlgorithm, PETScTSDAEAlgorithm}
 
 """
     TSRK(subtype = "5dp", petsc_options = String[])
@@ -116,6 +119,28 @@ TSIRK(nstages::Integer = 3, petsc_options::AbstractVector{<:AbstractString} = St
     TSIRK(Int(nstages), String[String(o) for o in petsc_options])
 
 """
+    TSDAE(subtype = "bdf", petsc_options = String[])
+
+Fully implicit methods applied to a `DAEProblem`, whose residual `G(t, u, u') = 0`
+is exactly the form PETSc's `IFunction` takes. `subtype` is `"beuler"`, `"cn"`,
+`"theta"` or `"bdf"`, as for [`TSImplicit`](@ref).
+
+A `DAEFunction`'s `jac(J, du, u, p, gamma, t)` is `gamma * dG/du' + dG/du`,
+which is what PETSc's `IJacobian` wants whole, so it is passed straight through
+and `gamma` is PETSc's shift. Without one PETSc differences the residual.
+
+Only `"bdf"` adapts; the others step at the `dt` you give. `du0` is not used,
+since PETSc derives the initial derivative itself.
+"""
+struct TSDAE <: PETScTSDAEAlgorithm
+    subtype::String
+    petsc_options::Vector{String}
+end
+
+TSDAE(subtype::AbstractString = "bdf", petsc_options::AbstractVector{<:AbstractString} = String[]) =
+    TSDAE(String(subtype), String[String(o) for o in petsc_options])
+
+"""
     TSARKIMEX(subtype = "3", petsc_options = String[])
 
 Additive Runge-Kutta IMEX from PETSc's `TSARKIMEX`. `subtype` is a PETSc
@@ -164,6 +189,7 @@ _uses_ifunction(::TSRK) = false
 _uses_ifunction(::TSRosW) = true
 _uses_ifunction(::TSImplicit) = true
 _uses_ifunction(::TSIRK) = true
+_uses_ifunction(::TSDAE) = true
 _uses_ifunction(::TSARKIMEX) = true
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
@@ -173,6 +199,7 @@ _uses_ifunction(alg::TSGeneric) = !alg.explicit
 _adapts(::TSRK) = true
 _adapts(::TSRosW) = true
 _adapts(::TSIRK) = false
+_adapts(alg::TSDAE) = alg.subtype == "bdf"
 _adapts(::TSARKIMEX) = true
 _adapts(alg::TSImplicit) = alg.subtype == "bdf"
 _adapts(::TSGeneric) = nothing
@@ -187,6 +214,7 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     u::Vector{Float64}
     mudot::Vector{Float64}
     M::Union{Nothing, Matrix{Float64}}
+    dae::Bool
     missing_diag::Vector{Int}
     W::Matrix{Float64}
     idx0::Vector{LibPETSc.PetscInt}
@@ -239,6 +267,21 @@ _interp(ctx) = ctx.dense ? SciMLBase.HermiteInterpolation(ctx.ts, ctx.us, ctx.du
 
 _mass(ctx, i, j) = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
 
+# A DAE Jacobian is `shift * dG/du_dot + dG/du`, which is what PETSc wants
+# whole, so it is filled in place of the `shift * M - J` an ODE builds.
+function _call_jac!(ctx, xdot_ptr, shift, t)
+    if ctx.dae
+        xdot = PETSc.VecPtr(ctx.petsclib, xdot_ptr, false)
+        PETSc.withlocalarray!(xdot; read = true, write = false) do xda
+            copyto!(ctx.mudot, xda)
+        end
+        ctx.jac!(ctx.J, ctx.mudot, ctx.u, ctx.p, Float64(shift), Float64(t))
+    else
+        ctx.jac!(ctx.J, ctx.u, ctx.p, t)
+    end
+    return nothing
+end
+
 function _fill_rows!(ctx, shift, n)
     @inbounds for i in 1:n
         cols = ctx.row_cols0[i]
@@ -247,7 +290,7 @@ function _fill_rows!(ctx, shift, n)
         for k in eachindex(cols)
             j = Int(cols[k]) + 1
             jv = src[k] == 0 ? 0.0 : ctx.J.nzval[src[k]]
-            buf[k] = shift * _mass(ctx, i, j) - jv
+            buf[k] = ctx.dae ? jv : shift * _mass(ctx, i, j) - jv
         end
     end
     return nothing
@@ -405,12 +448,18 @@ function _ifunction!(
             (x, xdot, f); read = (true, true, false), write = (false, false, true),
         ) do xa, xda, fa
             copyto!(ctx.u, xa)
-            ctx.f!(ctx.du, ctx.u, ctx.p, t)
-            if ctx.M === nothing
-                @. fa = xda - ctx.du
+            if ctx.dae
+                copyto!(ctx.mudot, xda)
+                ctx.f!(ctx.du, ctx.mudot, ctx.u, ctx.p, t)
+                copyto!(fa, ctx.du)
             else
-                mul!(ctx.mudot, ctx.M, xda)
-                @. fa = ctx.mudot - ctx.du
+                ctx.f!(ctx.du, ctx.u, ctx.p, t)
+                if ctx.M === nothing
+                    @. fa = xda - ctx.du
+                else
+                    mul!(ctx.mudot, ctx.M, xda)
+                    @. fa = ctx.mudot - ctx.du
+                end
             end
         end
         ctx.nf += 1
@@ -427,7 +476,7 @@ function _ijacobian!(
         ::LibPETSc.CTS,
         t::LibPETSc.PetscReal,
         x_ptr::LibPETSc.CVec,
-        ::LibPETSc.CVec,
+        xdot_ptr::LibPETSc.CVec,
         shift::LibPETSc.PetscReal,
         A_ptr::LibPETSc.CMat,
         B_ptr::LibPETSc.CMat,
@@ -441,14 +490,14 @@ function _ijacobian!(
         PETSc.withlocalarray!(x; read = true, write = false) do xa
             copyto!(ctx.u, xa)
         end
-        ctx.jac!(ctx.J, ctx.u, ctx.p, t)
+        _call_jac!(ctx, xdot_ptr, shift, t)
         ctx.njacs += 1
         n = length(ctx.u)
         # One batched MatSetValues beats n^2 single-entry ccalls by orders of
         # magnitude. PETSc reads the block row-major, so entry (i,j) is stored
         # at W[j,i] and `vec` then yields the order PETSc wants.
         @inbounds for j in 1:n, i in 1:n
-            ctx.W[j, i] = shift * _mass(ctx, i, j) - ctx.J[i, j]
+            ctx.W[j, i] = ctx.dae ? ctx.J[i, j] : shift * _mass(ctx, i, j) - ctx.J[i, j]
         end
         _setblock!(ctx, A, n)
         PETSc.assemble!(A)
@@ -469,7 +518,7 @@ function _sparse_ijacobian!(
         ::LibPETSc.CTS,
         t::LibPETSc.PetscReal,
         x_ptr::LibPETSc.CVec,
-        ::LibPETSc.CVec,
+        xdot_ptr::LibPETSc.CVec,
         shift::LibPETSc.PetscReal,
         A_ptr::LibPETSc.CMat,
         B_ptr::LibPETSc.CMat,
@@ -483,7 +532,7 @@ function _sparse_ijacobian!(
         PETSc.withlocalarray!(x; read = true, write = false) do xa
             copyto!(ctx.u, xa)
         end
-        ctx.jac!(ctx.J, ctx.u, ctx.p, t)
+        _call_jac!(ctx, xdot_ptr, shift, t)
         ctx.njacs += 1
         n = length(ctx.u)
         # One MatSetValues per row rather than one per stored entry. The row
@@ -609,6 +658,7 @@ _ts_type(::TSRK) = "rk"
 _ts_type(::TSRosW) = "rosw"
 _ts_type(alg::TSImplicit) = alg.subtype
 _ts_type(::TSIRK) = "irk"
+_ts_type(alg::TSDAE) = alg.subtype
 _ts_type(::TSARKIMEX) = "arkimex"
 _ts_type(alg::TSGeneric) = alg.ts_type
 
@@ -631,9 +681,10 @@ function _set_subtype!(petsclib, ts, alg::TSIRK)
 end
 _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
     _cstr(p -> LibPETSc.TSARKIMEXSetType(petsclib, ts, p), alg.subtype)
+_set_subtype!(petsclib, ts, ::TSDAE) = nothing
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
-_default_options(::PETScTSAlgorithm) = String[]
+_default_options(::AnyPETScTS) = String[]
 # A Kronecker-product coupled-stage matrix has no LU factorisation, so PETSc's
 # default preconditioner cannot be set up for it.
 _default_options(::TSIRK) = ["-pc_type", "pbjacobi"]
@@ -691,9 +742,11 @@ function _tolvec(h::TSHandles, petsclib, tol, n, name)
     return v
 end
 
+const SupportedProblem = Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}
+
 function _setup(
-        prob::SciMLBase.AbstractODEProblem,
-        alg::PETScTSAlgorithm;
+        prob::SupportedProblem,
+        alg::AnyPETScTS;
         dt = nothing,
         reltol = nothing,
         abstol = nothing,
@@ -720,7 +773,8 @@ function _setup(
     is_split = prob.f isa SciMLBase.SplitFunction
     is_split && !(alg isa TSARKIMEX) &&
         throw(ArgumentError("PETScDiffEq only supports SplitODEProblem with TSARKIMEX"))
-    mass_matrix = prob.f.mass_matrix
+    is_dae = prob isa SciMLBase.AbstractDAEProblem
+    mass_matrix = is_dae ? nothing : prob.f.mass_matrix
     has_mass = !(mass_matrix === nothing || mass_matrix == LinearAlgebra.I)
     if has_mass && !_uses_ifunction(alg)
         throw(
@@ -754,6 +808,8 @@ function _setup(
 
     iip = SciMLBase.isinplace(prob)
     f1 = is_split ? prob.f.f1.f : prob.f.f
+    is_dae && !iip &&
+        throw(ArgumentError("PETScDiffEq requires an in-place DAEProblem residual"))
     f2 = is_split ? prob.f.f2.f : nothing
     for g in (f1, f2)
         # An AbstractSciMLOperator ignores the f(du,u,p,t) call this package
@@ -765,7 +821,7 @@ function _setup(
             ),
         )
     end
-    f1 = _as_inplace(f1, iip)
+    f1 = is_dae ? f1 : _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
     has_jac = _uses_ifunction(alg) && prob.f.jac !== nothing
     if alg isa TSIRK && !has_jac
@@ -777,7 +833,7 @@ function _setup(
             ),
         )
     end
-    jac_fn = has_jac ? _as_inplace_jac(prob.f.jac, iip) : nothing
+    jac_fn = has_jac ? (is_dae ? prob.f.jac : _as_inplace_jac(prob.f.jac, iip)) : nothing
     jac_prototype = has_jac ? prob.f.jac_prototype : nothing
     uses_sparse_jac = jac_prototype isa SparseMatrixCSC
     J0 = if !has_jac
@@ -821,8 +877,8 @@ function _setup(
         )
         v
     end
-    dense_out = dense === nothing ? (save_everystep && isempty(saveat_times) && !has_mass) :
-        Bool(dense)
+    dense_out = dense === nothing ?
+        (save_everystep && isempty(saveat_times) && !has_mass && !is_dae) : Bool(dense)
     if dense_out && has_mass
         throw(
             ArgumentError(
@@ -831,9 +887,17 @@ function _setup(
             ),
         )
     end
+    if dense_out && is_dae
+        throw(
+            ArgumentError(
+                "PETScDiffEq cannot produce dense output for a DAEProblem; a residual " *
+                    "gives no derivative to build a Hermite interpolant from",
+            ),
+        )
+    end
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
-        similar(u0), similar(u0), similar(u0), M, missing_diag, W0, idx0,
+        similar(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0, idx0,
         row_cols0, row_src, row_buf, J0,
         Float64[], Vector{Float64}[], Vector{Float64}[],
         saveat_times, 1, save_everystep, dense_out, kept,
@@ -991,7 +1055,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
 end
 
 function SciMLBase.__solve(
-        prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm;
+        prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), kwargs...,
     )
     if callback !== nothing || !isempty(tstops)
@@ -1286,7 +1350,7 @@ function _apply_callbacks!(integ::PETScIntegrator)
 end
 
 function SciMLBase.__init(
-        prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm;
+        prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), kwargs...,
     )
     callbacks, continuous = _split_callbacks(callback)

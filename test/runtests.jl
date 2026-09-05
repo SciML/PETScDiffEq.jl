@@ -383,6 +383,101 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "DAEProblem" begin
+        # u1' = -u1 with the algebraic constraint u2 = u1, so both are exp(-t).
+        # Integrating the second row as an ODE instead would give cosh(1).
+        function resid!(r, du, u, p, t)
+            r[1] = du[1] + u[1]
+            return r[2] = u[2] - u[1]
+        end
+        function dae_jac!(J, du, u, p, gamma, t)
+            J[1, 1] = gamma + 1.0
+            J[1, 2] = 0.0
+            J[2, 1] = -1.0
+            return J[2, 2] = 1.0
+        end
+        function wrong_dae_jac!(J, du, u, p, gamma, t)
+            J[1, 1] = 99.0
+            J[1, 2] = 0.0
+            J[2, 1] = 5.0
+            return J[2, 2] = 3.0
+        end
+        u0, du0, tspan = [1.0, 1.0], [-1.0, -1.0], (0.0, 1.0)
+        withjac = SciMLBase.DAEFunction(resid!; jac = dae_jac!)
+
+        @testset "both components solve, with and without a jac" begin
+            for (f, name) in ((SciMLBase.DAEFunction(resid!), "no jac"), (withjac, "jac"))
+                for (subtype, tol) in (("bdf", 1.0e-6), ("cn", 1.0e-6), ("beuler", 1.0e-3))
+                    sol = SciMLBase.solve(
+                        SciMLBase.DAEProblem(f, du0, u0, tspan), PETScDiffEq.TSDAE(subtype);
+                        dt = 1.0e-3, adaptive = false,
+                    )
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test abs(sol.u[end][1] - exp(-1)) < tol
+                    @test abs(sol.u[end][2] - exp(-1)) < tol
+                end
+            end
+        end
+
+        @testset "the analytic Jacobian reaches PETSc" begin
+            plain = SciMLBase.solve(
+                SciMLBase.DAEProblem(SciMLBase.DAEFunction(resid!), du0, u0, tspan),
+                PETScDiffEq.TSDAE(); dt = 1.0e-3, adaptive = false,
+            )
+            given = SciMLBase.solve(
+                SciMLBase.DAEProblem(withjac, du0, u0, tspan), PETScDiffEq.TSDAE();
+                dt = 1.0e-3, adaptive = false,
+            )
+            @test plain.stats.njacs == 0
+            @test given.stats.njacs > 0
+            @test_throws Exception SciMLBase.solve(
+                SciMLBase.DAEProblem(
+                    SciMLBase.DAEFunction(resid!; jac = wrong_dae_jac!), du0, u0, tspan,
+                ), PETScDiffEq.TSDAE(); dt = 1.0e-3, adaptive = false,
+            )
+        end
+
+        @testset "backward Euler is first order on the residual" begin
+            errs = [
+                abs(
+                    SciMLBase.solve(
+                        SciMLBase.DAEProblem(withjac, du0, u0, tspan),
+                        PETScDiffEq.TSDAE("beuler"); dt = dt, adaptive = false,
+                    ).u[end][1] - exp(-1),
+                ) for dt in (0.02, 0.01, 0.005)
+            ]
+            orders = [log2(errs[i] / errs[i + 1]) for i in 1:2]
+            @test all(o -> isapprox(o, 1; atol = 0.1), orders)
+        end
+
+        @testset "what a DAE cannot ask for" begin
+            prob = SciMLBase.DAEProblem(withjac, du0, u0, tspan)
+            # An ODE algorithm and a DAEProblem are an incompatible pairing.
+            @test_throws Exception SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 1.0e-3,
+            )
+            # A residual gives no derivative for a Hermite interpolant.
+            @test_throws ArgumentError SciMLBase.solve(
+                prob, PETScDiffEq.TSDAE(); dt = 1.0e-3, dense = true,
+            )
+            @test !SciMLBase.solve(prob, PETScDiffEq.TSDAE(); dt = 1.0e-3).dense
+        end
+
+        @testset "saving and the integrator work as for an ODE" begin
+            prob = SciMLBase.DAEProblem(withjac, du0, u0, tspan)
+            at = SciMLBase.solve(
+                prob, PETScDiffEq.TSDAE(); dt = 1.0e-3, adaptive = false, saveat = 0.25,
+            )
+            @test at.t == [0.0, 0.25, 0.5, 0.75, 1.0]
+            @test abs(at.u[3][1] - exp(-0.5)) < 1.0e-6
+            integ = SciMLBase.init(prob, PETScDiffEq.TSDAE(); dt = 1.0e-3, adaptive = false)
+            SciMLBase.step!(integ)
+            @test integ.t > 0.0
+            sol = SciMLBase.solve!(integ)
+            @test abs(sol.u[end][1] - exp(-1)) < 1.0e-6
+        end
+    end
+
     @testset "EnsembleProblem" begin
         function decay_p!(du, u, p, t)
             return du[1] = -p[1] * u[1]
@@ -561,7 +656,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         # reports a docstring even for a name that has none.
         lines = split(read(joinpath(@__DIR__, "..", "src", "PETScDiffEq.jl"), String), '\n')
         exported = filter(!=(:PETScDiffEq), names(PETScDiffEq))
-        @test length(exported) == 7
+        @test length(exported) == 8
         for n in exported
             i = findfirst(l -> occursin(Regex("^(mutable )?struct \\Q$(n)\\E\\b"), l), lines)
             @test i !== nothing

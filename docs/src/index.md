@@ -44,7 +44,8 @@ may be a vector of per-component tolerances), `saveat`, `save_everystep`, `save_
 `save_end`, `save_idxs`, `dense`, `callback` and `tstops`. Keywords it cannot honour emit
 a warning rather than being silently dropped.
 
-`ODEProblem` and `SplitODEProblem` are supported, in place or out of place, along with
+`ODEProblem`, `SplitODEProblem` and `DAEProblem` are supported, in place or out of
+place, along with
 `ODEFunction`'s `jac`, `jac_prototype` and `mass_matrix`. Supply a `jac_prototype` for
 anything sparse: without one the Jacobian is dense and forces a dense factorization.
 
@@ -70,6 +71,7 @@ TSRosW
 TSImplicit
 TSIRK
 TSARKIMEX
+TSDAE
 TSGeneric
 PETScIntegrator
 ```
