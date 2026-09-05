@@ -346,6 +346,117 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "VectorContinuousCallback" begin
+        function two!(du, u, p, t)
+            du[1] = -u[1]
+            return du[2] = -2u[2]
+        end
+        prob = SciMLBase.ODEProblem(two!, [1.0, 1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp")
+        tols = (dt = 0.05, reltol = 1.0e-10, abstol = 1.0e-12)
+
+        @testset "each component gets its own root" begin
+            events = Tuple{Float64, Vector{Int8}}[]
+            cb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out[1] = u[1] - 0.5; out[2] = u[2] - 0.5; nothing),
+                (integ, mask) -> push!(events, (integ.t, Vector{Int8}(mask))), 2,
+            )
+            sol = SciMLBase.solve(prob, alg; tols..., callback = cb)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test length(events) == 2
+            # exp(-2t) reaches 1/2 first, at half the time exp(-t) does.
+            @test abs(events[1][1] - log(2.0) / 2) < 1.0e-9
+            @test events[1][2] == Int8[0, -1]
+            @test abs(events[2][1] - log(2.0)) < 1.0e-9
+            @test events[2][2] == Int8[-1, 0]
+        end
+
+        @testset "components crossing together share one event" begin
+            decay = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+            events = Tuple{Float64, Vector{Int8}}[]
+            cb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out[1] = u[1] - 0.5; out[2] = u[1] - 0.5; nothing),
+                (integ, mask) -> push!(events, (integ.t, Vector{Int8}(mask))), 2,
+            )
+            SciMLBase.solve(decay, alg; tols..., callback = cb)
+            @test length(events) == 1
+            @test abs(events[1][1] - log(2.0)) < 1.0e-9
+            @test events[1][2] == Int8[-1, -1]
+        end
+
+        @testset "the mask carries the crossing direction" begin
+            function osc!(du, u, p, t)
+                du[1] = u[2]
+                return du[2] = -u[1]
+            end
+            events = Tuple{Float64, Vector{Int8}}[]
+            cb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out[1] = u[1]; nothing),
+                (integ, mask) -> push!(events, (integ.t, Vector{Int8}(mask))), 1,
+            )
+            SciMLBase.solve(
+                SciMLBase.ODEProblem(osc!, [0.0, 1.0], (0.0, 7.0)), alg; tols...,
+                callback = cb,
+            )
+            @test length(events) == 2
+            @test abs(events[1][1] - pi) < 1.0e-9
+            @test events[1][2] == Int8[-1]
+            @test abs(events[2][1] - 2pi) < 1.0e-9
+            @test events[2][2] == Int8[1]
+        end
+
+        @testset "affect! may change the state and terminate" begin
+            cb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out[1] = u[1] - 0.5; out[2] = u[2] - 0.5; nothing),
+                (integ, mask) -> (
+                    mask[1] != 0 ? SciMLBase.terminate!(integ) :
+                        (integ.u[2] += 1.0)
+                ), 2,
+            )
+            sol = SciMLBase.solve(prob, alg; tols..., callback = cb)
+            @test sol.retcode == SciMLBase.ReturnCode.Terminated
+            @test abs(sol.t[end] - log(2.0)) < 1.0e-9
+            # Lifted at its own earlier crossing, the second component reaches
+            # 3/4 by the time the first one triggers, where it would be 1/4.
+            @test abs(sol.u[end][2] - 0.75) < 1.0e-7
+        end
+
+        @testset "beside the other callback kinds in a CallbackSet" begin
+            events, hits, ticks = Int[], Float64[], Float64[]
+            vec = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out[1] = u[2] - 0.5; nothing),
+                (integ, mask) -> push!(events, 1), 1,
+            )
+            scalar = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5, integ -> push!(hits, integ.t),
+            )
+            discrete = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> true, integ -> push!(ticks, integ.t),
+            )
+            sol = SciMLBase.solve(
+                prob, alg; tols...,
+                callback = SciMLBase.CallbackSet(vec, scalar, discrete),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test length(events) == 1
+            @test length(hits) == 1 && abs(hits[1] - log(2.0)) < 1.0e-9
+            @test !isempty(ticks)
+        end
+
+        @testset "save_positions brackets the event" begin
+            cb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out[1] = u[1] - 0.5; nothing),
+                (integ, mask) -> (integ.u[1] += 1.0), 1,
+            )
+            sol = SciMLBase.solve(prob, alg; tols..., callback = cb)
+            i = findfirst(t -> abs(t - log(2.0)) < 1.0e-9, sol.t)
+            @test i !== nothing
+            @test sol.t[i + 1] == sol.t[i]
+            @test abs(sol.u[i][1] - 0.5) < 1.0e-8
+            @test abs(sol.u[i + 1][1] - 1.5) < 1.0e-8
+        end
+    end
+
     @testset "vector tolerances" begin
         function two!(du, u, p, t)
             du[1] = -u[1]
@@ -711,16 +822,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test abs(hits[1] - 0.7) < 1.0e-8
         end
 
-        @testset "VectorContinuousCallback is rejected" begin
-            vcb = SciMLBase.VectorContinuousCallback(
-                (out, u, t, integ) -> (out[1] = u[1] - 0.5), (integ, idx) -> nothing, 1,
-            )
+        @testset "an unsupported callback kind is rejected" begin
+            struct OddCallback <: SciMLBase.AbstractContinuousCallback end
             @test_throws ArgumentError SciMLBase.solve(
-                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = vcb,
-            )
-            @test_throws ArgumentError SciMLBase.solve(
-                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1,
-                callback = SciMLBase.CallbackSet(vcb),
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = OddCallback(),
             )
         end
     end

@@ -922,10 +922,11 @@ function _split_callbacks(cb::SciMLBase.CallbackSet)
 end
 _split_callbacks(cb::SciMLBase.AbstractContinuousCallback) = (_check_continuous(cb); ((), (cb,)))
 _check_continuous(::SciMLBase.ContinuousCallback) = nothing
+_check_continuous(::SciMLBase.VectorContinuousCallback) = nothing
 _check_continuous(cb) = throw(
     ArgumentError(
-        "PETScDiffEq does not support $(typeof(cb).name.name); use a ContinuousCallback " *
-            "or a DiscreteCallback",
+        "PETScDiffEq does not support $(typeof(cb).name.name); use a ContinuousCallback, " *
+            "a VectorContinuousCallback or a DiscreteCallback",
     ),
 )
 
@@ -949,33 +950,50 @@ function SciMLBase.savevalues!(integ::PETScIntegrator)
     return nothing
 end
 
-function _condition_at(integ::PETScIntegrator, cb, t::Float64)
-    t == integ.t && return cb.condition(integ.u, t, integ)
-    t == integ.tprev && return cb.condition(integ.uprev, t, integ)
+function _state_at(integ::PETScIntegrator, t::Float64)
+    t == integ.t && return integ.u
+    t == integ.tprev && return integ.uprev
     h = integ.h
     LibPETSc.TSInterpolate(h.petsclib, h.ts, t, h.ctx.work)
     PETSc.withlocalarray!(
         a -> copyto!(integ.ucache, a), h.ctx.work; read = true, write = false,
     )
-    return cb.condition(integ.ucache, t, integ)
+    return integ.ucache
+end
+
+_ncond(::SciMLBase.ContinuousCallback) = 1
+_ncond(cb::SciMLBase.VectorContinuousCallback) = cb.len
+
+function _fill_conditions!(out, integ::PETScIntegrator, cb::SciMLBase.ContinuousCallback, t)
+    out[1] = cb.condition(_state_at(integ, t), t, integ)
+    return out
+end
+
+function _fill_conditions!(
+        out, integ::PETScIntegrator, cb::SciMLBase.VectorContinuousCallback, t,
+    )
+    cb.condition(out, _state_at(integ, t), t, integ)
+    return out
 end
 
 # SciMLBase's rule: a crossing counts only if the handler for its direction
-# exists, and a condition that starts at zero is not a crossing.
-function _is_event(prev, next, cb)
+# exists, and a condition that starts at zero is not a crossing. A vector
+# callback has one handler for every direction, so only the zero rule applies.
+function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
     return (
         (prev < 0 && cb.affect! !== nothing) || (prev > 0 && cb.affect_neg! !== nothing)
     ) && prev * next <= 0
 end
+_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev * next <= 0
 
-function _bisect_root(integ::PETScIntegrator, cb, lo, hi, slo, shi)
+function _bisect_root(integ::PETScIntegrator, cb, lo, hi, slo, i::Int, buf)
     while true
         mid = lo + (hi - lo) / 2
         (mid <= lo || mid >= hi || hi - lo <= cb.abstol) && break
-        smid = _condition_at(integ, cb, mid)
+        smid = _fill_conditions!(buf, integ, cb, mid)[i]
         smid == 0 && return mid
         if slo * smid <= 0
-            hi, shi = mid, smid
+            hi = mid
         else
             lo, slo = mid, smid
         end
@@ -983,7 +1001,19 @@ function _bisect_root(integ::PETScIntegrator, cb, lo, hi, slo, shi)
     return cb.rootfind === SciMLBase.RightRootFind ? hi : lo
 end
 
-function _find_root(integ::PETScIntegrator, cb)
+# What gets handed to the user: the crossing direction for a scalar callback,
+# and SciMLBase's per-component mask for a vector one, where +1 is a crossing
+# from negative to positive and -1 the other way.
+_crossing(::SciMLBase.ContinuousCallback, s0, keep, m) = s0[1]
+function _crossing(::SciMLBase.VectorContinuousCallback, s0, keep, m)
+    mask = zeros(Int8, m)
+    for i in keep
+        mask[i] = s0[i] < 0 ? Int8(1) : Int8(-1)
+    end
+    return mask
+end
+
+function _find_event(integ::PETScIntegrator, cb)
     t0, t1 = integ.tprev, integ.t
     t1 > t0 || return nothing
     # A step starting at an event would otherwise rediscover that same root,
@@ -992,19 +1022,46 @@ function _find_root(integ::PETScIntegrator, cb)
         t0 += Float64(cb.repeat_nudge) * (t1 - t0)
         t0 < t1 || return nothing
     end
-    s0 = t0 == integ.tprev ? cb.condition(integ.uprev, t0, integ) :
-        _condition_at(integ, cb, t0)
+    m = _ncond(cb)
+    s0 = Vector{Float64}(undef, m)
+    sk = Vector{Float64}(undef, m)
+    _fill_conditions!(s0, integ, cb, t0)
     if cb.rootfind === SciMLBase.NoRootFind
-        return _is_event(s0, cb.condition(integ.u, t1, integ), cb) ? t1 : nothing
+        _fill_conditions!(sk, integ, cb, t1)
+        hit = [i for i in 1:m if _is_event(s0[i], sk[i], cb)]
+        return isempty(hit) ? nothing : (t1, _crossing(cb, s0, hit, m))
     end
-    lo, slo = t0, s0
+    lo = t0
     n = max(cb.interp_points, 1)
     for k in 1:n
         tk = k == n ? t1 : t0 + (t1 - t0) * (k / n)
-        sk = _condition_at(integ, cb, tk)
-        _is_event(slo, sk, cb) && return _bisect_root(integ, cb, lo, tk, slo, sk)
-        lo, slo = tk, sk
+        _fill_conditions!(sk, integ, cb, tk)
+        hit = [i for i in 1:m if _is_event(s0[i], sk[i], cb)]
+        if !isempty(hit)
+            roots = [_bisect_root(integ, cb, lo, tk, s0[i], i, sk) for i in hit]
+            first_root = minimum(roots)
+            keep = [hit[j] for j in eachindex(hit) if roots[j] <= first_root + cb.abstol]
+            return (first_root, _crossing(cb, s0, keep, m))
+        end
+        copyto!(s0, sk)
+        lo = tk
     end
+    return nothing
+end
+
+function _fire!(integ::PETScIntegrator, cb::SciMLBase.ContinuousCallback, prevsign)
+    if prevsign < 0
+        cb.affect! === nothing ? (integ.derivative_discontinuity = false) : cb.affect!(integ)
+    else
+        cb.affect_neg! === nothing ? (integ.derivative_discontinuity = false) :
+            cb.affect_neg!(integ)
+    end
+    return nothing
+end
+
+function _fire!(integ::PETScIntegrator, cb::SciMLBase.VectorContinuousCallback, mask)
+    cb.affect! === nothing ? (integ.derivative_discontinuity = false) :
+        cb.affect!(integ, mask)
     return nothing
 end
 
@@ -1032,26 +1089,21 @@ end
 # rather than where PETSc stopped.
 function _apply_continuous_callbacks!(integ::PETScIntegrator, dt::Float64)
     isempty(integ.continuous) && return false
-    best, best_cb = nothing, nothing
+    best, best_cb, best_crossing = nothing, nothing, nothing
     for cb in integ.continuous
-        root = _find_root(integ, cb)
-        root === nothing && continue
-        if best === nothing || root < best
-            best, best_cb = root, cb
+        found = _find_event(integ, cb)
+        found === nothing && continue
+        if best === nothing || found[1] < best
+            best, best_cb, best_crossing = found[1], cb, found[2]
         end
     end
     best === nothing && return false
     ctx = integ.h.ctx
-    sign_before = _condition_at(integ, best_cb, integ.tprev)
     _save_step!(integ, best, false)
     _rollback!(integ, best, dt, true)
     best_cb.save_positions[1] && _record!(ctx, integ.t, integ.u)
     integ.derivative_discontinuity = true
-    if sign_before < 0
-        best_cb.affect!(integ)
-    else
-        best_cb.affect_neg!(integ)
-    end
+    _fire!(integ, best_cb, best_crossing)
     integ.finished && return true
     _rollback!(integ, integ.t, dt, false)
     integ.event_t = integ.t

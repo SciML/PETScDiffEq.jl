@@ -149,8 +149,13 @@ step that crossed, rolls the integrator back to the root, applies `affect!` or
 there. `rootfind`, `interp_points`, `abstol`, `repeat_nudge` and
 `save_positions` are honoured. On a bouncing ball the first bounce is located
 to machine precision and each flight is the restitution coefficient times the
-one before it. `VectorContinuousCallback` is rejected, since it needs one root
-per component.
+one before it.
+
+`VectorContinuousCallback` works the same way, one root per component. Its
+`affect!(integ, mask)` receives SciMLBase's per-component mask, `+1` where the
+condition crossed from negative to positive, `-1` the other way and `0` where
+it did not cross. Components crossing at the same time arrive as one event
+with several entries set.
 
 `tstops` makes the integration land on the given times exactly, through
 `solve` and the integrator alike, and `add_tstop!`, `has_tstop`, `first_tstop`
@@ -240,8 +245,7 @@ third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: `VectorContinuousCallback` and MPI; every solve
-currently runs on `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
+Not yet implemented: MPI; every solve currently runs on `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
 supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`
 (Kronecker AIJ) matrix, not the plain AIJ this package builds, so it needs
 its own dedicated setup. `TSGeneric("radau5")` fails for a different,
