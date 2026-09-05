@@ -544,6 +544,7 @@ mutable struct TSHandles{CTX, T}
     maxiters::Int
     save_start::Bool
     save_end::Bool
+    tolvecs::Vector{Any}
     destroyed::Bool
 end
 
@@ -556,10 +557,25 @@ function _destroy!(h::TSHandles)
     (PETSc.finalized(h.petsclib) || MPI.Finalized()) && return nothing
     h.opts === nothing || PETSc.destroy(h.opts)
     h.jac_mat === nothing || PETSc.destroy(h.jac_mat)
+    for v in h.tolvecs
+        v.ptr == C_NULL || PETSc.destroy(v)
+    end
     h.ctx.work.ptr == C_NULL || PETSc.destroy(h.ctx.work)
     h.u === nothing || PETSc.destroy(h.u)
     h.ts === nothing || LibPETSc.TSDestroy(h.petsclib, h.ts)
     return nothing
+end
+
+_tolscalar(tol, default) = tol === nothing || tol isa AbstractVector ? default : Float64(tol)
+
+function _tolvec(h::TSHandles, petsclib, tol, n, name)
+    tol isa AbstractVector || return nothing
+    length(tol) == n ||
+        throw(ArgumentError("`$name` has length $(length(tol)), but the state has $n"))
+    all(t -> t >= 0, tol) || throw(ArgumentError("`$name` has a negative entry"))
+    v = PETSc.VecSeq(petsclib, Vector{Float64}(collect(tol)))
+    push!(h.tolvecs, v)
+    return v
 end
 
 function _setup(
@@ -694,7 +710,7 @@ function _setup(
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing,
-        t0, tf, u0, Int(maxiters), save_start, save_end, false,
+        t0, tf, u0, Int(maxiters), save_start, save_end, Any[], false,
     )
     finalizer(_destroy!, h)
 
@@ -748,10 +764,14 @@ function _setup(
             end
             if reltol !== nothing || abstol !== nothing
                 novec = LibPETSc.PetscVec{typeof(petsclib)}()
+                # PETSc prefers the per-component vector when one is attached,
+                # so the scalar beside it is only the fallback.
+                avec = _tolvec(h, petsclib, abstol, n, "abstol")
+                rvec = _tolvec(h, petsclib, reltol, n, "reltol")
                 LibPETSc.TSSetTolerances(
                     petsclib, ts,
-                    abstol === nothing ? 1.0e-6 : Float64(abstol), novec,
-                    reltol === nothing ? 1.0e-3 : Float64(reltol), novec,
+                    _tolscalar(abstol, 1.0e-6), avec === nothing ? novec : avec,
+                    _tolscalar(reltol, 1.0e-3), rvec === nothing ? novec : rvec,
                 )
             end
             # A user's own PETSc options are parsed last, so they win.

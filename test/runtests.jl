@@ -346,6 +346,57 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "vector tolerances" begin
+        function two!(du, u, p, t)
+            du[1] = -u[1]
+            return du[2] = -1000 * u[2]
+        end
+        prob = SciMLBase.ODEProblem(two!, [1.0, 1.0], (0.0, 0.1))
+        alg = PETScDiffEq.TSRK("5dp")
+        steps(kw) = SciMLBase.solve(prob, alg; dt = 1.0e-4, reltol = 1.0e-3, kw...)
+
+        @testset "a vector of equal entries matches the scalar" begin
+            a = SciMLBase.solve(prob, alg; dt = 1.0e-4, reltol = 1.0e-8, abstol = 1.0e-10)
+            b = SciMLBase.solve(
+                prob, alg; dt = 1.0e-4, reltol = [1.0e-8, 1.0e-8],
+                abstol = [1.0e-10, 1.0e-10],
+            )
+            @test a.t == b.t
+            @test a.u == b.u
+            @test a.stats.naccept == b.stats.naccept
+        end
+
+        @testset "the entries apply per component" begin
+            # Only the stiff second component carries error worth controlling.
+            slow = steps((abstol = [1.0e-12, 1.0],))
+            stiff = steps((abstol = [1.0, 1.0e-12],))
+            loose = steps((abstol = [1.0, 1.0],))
+            @test slow.stats.naccept == loose.stats.naccept
+            @test stiff.stats.naccept > loose.stats.naccept
+            @test abs(stiff.u[end][2] - exp(-100)) < 1.0e-10
+            @test abs(slow.u[end][2] - exp(-100)) > 1.0e-3
+        end
+
+        @testset "a bad tolerance vector is rejected" begin
+            @test_throws ArgumentError SciMLBase.solve(
+                prob, alg; dt = 1.0e-4, abstol = [1.0e-6],
+            )
+            @test_throws ArgumentError SciMLBase.solve(
+                prob, alg; dt = 1.0e-4, reltol = [1.0e-6, 1.0e-6, 1.0e-6],
+            )
+            @test_throws ArgumentError SciMLBase.solve(
+                prob, alg; dt = 1.0e-4, abstol = [1.0e-6, -1.0],
+            )
+        end
+
+        @testset "a non-adaptive method still warns" begin
+            @test_logs (:warn,) match_mode = :any SciMLBase.solve(
+                prob, PETScDiffEq.TSImplicit("beuler"); dt = 1.0e-3,
+                abstol = [1.0e-10, 1.0e-10],
+            )
+        end
+    end
+
     @testset "save_idxs" begin
         function pair!(du, u, p, t)
             du[1] = -u[1]
