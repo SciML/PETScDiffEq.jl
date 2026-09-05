@@ -809,7 +809,7 @@ function SciMLBase.__solve(
     return _assemble(prob, alg, h, tend, uend, st)
 end
 
-mutable struct PETScIntegrator{Alg, P, H, Pr, CB} <:
+mutable struct PETScIntegrator{Alg, P, H, Pr, CB, CC} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, Vector{Float64}, Float64}
     alg::Alg
     u::Vector{Float64}
@@ -822,6 +822,9 @@ mutable struct PETScIntegrator{Alg, P, H, Pr, CB} <:
     h::H
     prob::Pr
     callbacks::CB
+    continuous::CC
+    ucache::Vector{Float64}
+    event_t::Float64
     kwargs::Any
     tstops::Vector{Float64}
     tstops_cache::Vector{Float64}
@@ -831,21 +834,21 @@ mutable struct PETScIntegrator{Alg, P, H, Pr, CB} <:
     derivative_discontinuity::Bool
 end
 
-_discrete_callbacks(::Nothing) = ()
-_discrete_callbacks(cb::SciMLBase.DiscreteCallback) = (cb,)
-function _discrete_callbacks(cb::SciMLBase.CallbackSet)
-    isempty(cb.continuous_callbacks) || throw(
-        ArgumentError(
-            "PETScDiffEq supports DiscreteCallback only; a ContinuousCallback needs " *
-                "root finding on the interpolant, which is not implemented",
-        ),
-    )
-    return Tuple(cb.discrete_callbacks)
+_split_callbacks(::Nothing) = ((), ())
+_split_callbacks(cb::SciMLBase.DiscreteCallback) = ((cb,), ())
+_split_callbacks(cb::SciMLBase.ContinuousCallback) = ((), (cb,))
+function _split_callbacks(cb::SciMLBase.CallbackSet)
+    for c in cb.continuous_callbacks
+        _check_continuous(c)
+    end
+    return (cb.discrete_callbacks, cb.continuous_callbacks)
 end
-_discrete_callbacks(::SciMLBase.AbstractContinuousCallback) = throw(
+_split_callbacks(cb::SciMLBase.AbstractContinuousCallback) = (_check_continuous(cb); ((), (cb,)))
+_check_continuous(::SciMLBase.ContinuousCallback) = nothing
+_check_continuous(cb) = throw(
     ArgumentError(
-        "PETScDiffEq supports DiscreteCallback only; a ContinuousCallback needs " *
-            "root finding on the interpolant, which is not implemented",
+        "PETScDiffEq does not support $(typeof(cb).name.name); use a ContinuousCallback " *
+            "or a DiscreteCallback",
     ),
 )
 
@@ -867,6 +870,116 @@ function SciMLBase.savevalues!(integ::PETScIntegrator)
     push!(integ.h.ctx.ts, integ.t)
     push!(integ.h.ctx.us, copy(integ.u))
     return nothing
+end
+
+function _condition_at(integ::PETScIntegrator, cb, t::Float64)
+    t == integ.t && return cb.condition(integ.u, t, integ)
+    t == integ.tprev && return cb.condition(integ.uprev, t, integ)
+    h = integ.h
+    LibPETSc.TSInterpolate(h.petsclib, h.ts, t, h.ctx.work)
+    PETSc.withlocalarray!(
+        a -> copyto!(integ.ucache, a), h.ctx.work; read = true, write = false,
+    )
+    return cb.condition(integ.ucache, t, integ)
+end
+
+# SciMLBase's rule: a crossing counts only if the handler for its direction
+# exists, and a condition that starts at zero is not a crossing.
+function _is_event(prev, next, cb)
+    return (
+        (prev < 0 && cb.affect! !== nothing) || (prev > 0 && cb.affect_neg! !== nothing)
+    ) && prev * next <= 0
+end
+
+function _bisect_root(integ::PETScIntegrator, cb, lo, hi, slo, shi)
+    while true
+        mid = lo + (hi - lo) / 2
+        (mid <= lo || mid >= hi || hi - lo <= cb.abstol) && break
+        smid = _condition_at(integ, cb, mid)
+        smid == 0 && return mid
+        if slo * smid <= 0
+            hi, shi = mid, smid
+        else
+            lo, slo = mid, smid
+        end
+    end
+    return cb.rootfind === SciMLBase.RightRootFind ? hi : lo
+end
+
+function _find_root(integ::PETScIntegrator, cb)
+    t0, t1 = integ.tprev, integ.t
+    t1 > t0 || return nothing
+    # A step starting at an event would otherwise rediscover that same root,
+    # which stalls a callback whose affect! leaves the state alone.
+    if integ.event_t == t0
+        t0 += Float64(cb.repeat_nudge) * (t1 - t0)
+        t0 < t1 || return nothing
+    end
+    s0 = t0 == integ.tprev ? cb.condition(integ.uprev, t0, integ) :
+        _condition_at(integ, cb, t0)
+    if cb.rootfind === SciMLBase.NoRootFind
+        return _is_event(s0, cb.condition(integ.u, t1, integ), cb) ? t1 : nothing
+    end
+    lo, slo = t0, s0
+    n = max(cb.interp_points, 1)
+    for k in 1:n
+        tk = k == n ? t1 : t0 + (t1 - t0) * (k / n)
+        sk = _condition_at(integ, cb, tk)
+        _is_event(slo, sk, cb) && return _bisect_root(integ, cb, lo, tk, slo, sk)
+        lo, slo = tk, sk
+    end
+    return nothing
+end
+
+# The state is put back into PETSc's own vector and the stepper restarted, so a
+# multistep method drops history taken across the event.
+function _rollback!(integ::PETScIntegrator, t::Float64, dt::Float64, interpolate::Bool)
+    h = integ.h
+    pl = h.petsclib
+    if interpolate && t != integ.t
+        LibPETSc.TSInterpolate(pl, h.ts, t, h.ctx.work)
+        PETSc.withlocalarray!(
+            a -> copyto!(integ.u, a), h.ctx.work; read = true, write = false,
+        )
+    end
+    integ.t = t
+    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    LibPETSc.TSSetTime(pl, h.ts, t)
+    LibPETSc.TSSetTimeStep(pl, h.ts, dt)
+    LibPETSc.TSRestartStep(pl, h.ts)
+    integ.dt = dt
+    return nothing
+end
+
+# Returns whether an event was applied, in which case the step ends at the root
+# rather than where PETSc stopped.
+function _apply_continuous_callbacks!(integ::PETScIntegrator, dt::Float64)
+    isempty(integ.continuous) && return false
+    best, best_cb = nothing, nothing
+    for cb in integ.continuous
+        root = _find_root(integ, cb)
+        root === nothing && continue
+        if best === nothing || root < best
+            best, best_cb = root, cb
+        end
+    end
+    best === nothing && return false
+    ctx = integ.h.ctx
+    sign_before = _condition_at(integ, best_cb, integ.tprev)
+    _save_step!(integ, best, false)
+    _rollback!(integ, best, dt, true)
+    best_cb.save_positions[1] && _record!(ctx, integ.t, integ.u)
+    integ.derivative_discontinuity = true
+    if sign_before < 0
+        best_cb.affect!(integ)
+    else
+        best_cb.affect_neg!(integ)
+    end
+    integ.finished && return true
+    _rollback!(integ, integ.t, dt, false)
+    integ.event_t = integ.t
+    best_cb.save_positions[2] && _record!(ctx, integ.t, integ.u)
+    return true
 end
 
 function _apply_callbacks!(integ::PETScIntegrator)
@@ -897,7 +1010,7 @@ function SciMLBase.__init(
         prob::SciMLBase.AbstractODEProblem, alg::PETScTSAlgorithm;
         callback = nothing, tstops = (), kwargs...,
     )
-    callbacks = _discrete_callbacks(callback)
+    callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; kwargs...)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
     _initial_save!(h)
@@ -905,10 +1018,10 @@ function SciMLBase.__init(
     dt0 = Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
     integ = PETScIntegrator(
         alg, copy(h.u0), copy(h.u0), h.t0, h.t0, dt0, 1.0,
-        prob.p, h, prob, callbacks, NamedTuple(kwargs), stops, copy(stops), dt0,
-        _initial_solution(prob, alg, h), false, false,
+        prob.p, h, prob, callbacks, continuous, copy(h.u0), NaN, NamedTuple(kwargs),
+        stops, copy(stops), dt0, _initial_solution(prob, alg, h), false, false,
     )
-    for cb in callbacks
+    for cb in (callbacks..., continuous...)
         cb.initialize(cb, integ.u, integ.t, integ)
     end
     return integ
@@ -1000,10 +1113,11 @@ function SciMLBase.reinit!(
     integ.tstops = _tstops(tstops, h.t0, h.tf)
     integ.tstops_cache = copy(integ.tstops)
     integ.finished = false
+    integ.event_t = NaN
     integ.derivative_discontinuity = false
     integ.sol = _initial_solution(integ.prob, integ.alg, h)
     if reinit_callbacks
-        for cb in integ.callbacks
+        for cb in (integ.callbacks..., integ.continuous...)
             cb.initialize(cb, integ.u, integ.t, integ)
         end
     end
@@ -1017,7 +1131,7 @@ end
 function _finish!(integ::PETScIntegrator, retcode = nothing)
     integ.finished && return nothing
     h = integ.h
-    for cb in integ.callbacks
+    for cb in (integ.callbacks..., integ.continuous...)
         cb.finalize(cb, integ.u, integ.t, integ)
     end
     st = _read_stats(h)
@@ -1035,10 +1149,34 @@ function SciMLBase.terminate!(
     return nothing
 end
 
+function _save_step!(integ::PETScIntegrator, upto::Float64, endpoint::Bool)
+    h = integ.h
+    ctx, pl = h.ctx, h.petsclib
+    tol = 100 * eps(max(one(Float64), abs(h.tf)))
+    if isempty(ctx.saveat)
+        endpoint && ctx.save_everystep && _record!(ctx, upto, integ.u)
+    else
+        while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= upto + tol
+            want = ctx.saveat[ctx.saveat_idx]
+            if abs(want - integ.t) <= tol
+                _record!(ctx, want, integ.u)
+            else
+                LibPETSc.TSInterpolate(pl, h.ts, want, ctx.work)
+                PETSc.withlocalarray!(
+                    wa -> _record!(ctx, want, wa), ctx.work; read = true, write = false,
+                )
+            end
+            ctx.saveat_idx += 1
+        end
+    end
+    return nothing
+end
+
 function SciMLBase.step!(integ::PETScIntegrator)
     integ.finished && return nothing
     h = integ.h
     ctx, pl = h.ctx, h.petsclib
+    dtprev = integ.dt
     copyto!(integ.uprev, integ.u)
     integ.tprev = integ.t
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
@@ -1048,11 +1186,12 @@ function SciMLBase.step!(integ::PETScIntegrator)
     # PETSc lands on its max time exactly but keeps the shortened step
     # afterwards; the cached dt is the last one chosen with no stop in the way.
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
-    LibPETSc.TSSetMaxTime(pl, h.ts, stop === nothing ? h.tf : stop)
+    target = stop === nothing ? h.tf : stop
+    LibPETSc.TSSetMaxTime(pl, h.ts, target)
     # A step reaching past the max time makes TSAdaptChoose fail with
-    # "bad hmax", so the step onto a stop is shortened here, not by PETSc.
-    if stop !== nothing && integ.dt > stop - integ.t
-        integ.dt = stop - integ.t
+    # "bad hmax", so the step onto the target is shortened here, not by PETSc.
+    if integ.dt > target - integ.t
+        integ.dt = target - integ.t
         LibPETSc.TSSetTimeStep(pl, h.ts, integ.dt)
     end
     GC.@preserve ctx begin
@@ -1081,28 +1220,13 @@ function SciMLBase.step!(integ::PETScIntegrator)
         popfirst!(integ.tstops)
     end
     PETSc.withlocalarray!(ua -> copyto!(integ.u, ua), h.u; read = true, write = false)
-    if isempty(ctx.saveat)
-        if ctx.save_everystep
-            _record!(ctx, integ.t, integ.u)
-        end
-    else
-        while ctx.saveat_idx <= length(ctx.saveat) &&
-                ctx.saveat[ctx.saveat_idx] <= integ.t + tol
-            want = ctx.saveat[ctx.saveat_idx]
-            if abs(want - integ.t) <= tol
-                _record!(ctx, want, integ.u)
-            else
-                LibPETSc.TSInterpolate(pl, h.ts, want, ctx.work)
-                PETSc.withlocalarray!(
-                    wa -> _record!(ctx, want, wa),
-                    ctx.work; read = true, write = false,
-                )
-            end
-            ctx.saveat_idx += 1
-        end
-    end
-    _apply_callbacks!(integ)
+    fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing
+    if !fired
+        _save_step!(integ, integ.t, true)
+        _apply_callbacks!(integ)
+        integ.finished && return nothing
+    end
     if !all(isfinite, integ.u) || integ.t >= h.tf - tol ||
             Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
         _finish!(integ)

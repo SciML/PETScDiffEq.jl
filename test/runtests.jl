@@ -347,6 +347,187 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "ContinuousCallback" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 2.0))
+        # exp(-t) hits 1/2 at log 2; the affect! lifts it to 3/2, which hits 1/2 at log 6.
+        jump(hits) = SciMLBase.ContinuousCallback(
+            (u, t, integ) -> u[1] - 0.5, integ -> (push!(hits, integ.t); integ.u[1] += 1.0),
+        )
+        after(t) = 1.5 * exp(-(t - log(6.0)))
+
+        @testset "roots are located on the interpolant" begin
+            for (alg, tol) in (
+                    (PETScDiffEq.TSRK("5dp"), 1.0e-9),
+                    (PETScDiffEq.TSRosW("ra34pw2"), 1.0e-9),
+                    (PETScDiffEq.TSImplicit("bdf"), 1.0e-5),
+                )
+                hits = Float64[]
+                sol = SciMLBase.solve(
+                    prob, alg; dt = 0.1, reltol = 1.0e-10, abstol = 1.0e-12,
+                    callback = jump(hits),
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test length(hits) == 2
+                @test abs(hits[1] - log(2.0)) < tol
+                @test abs(hits[2] - log(6.0)) < tol
+                @test abs(sol.u[end][1] - after(2.0)) < tol
+            end
+        end
+
+        @testset "a bouncing ball" begin
+            function ball!(du, u, p, t)
+                du[1] = u[2]
+                return du[2] = -9.81
+            end
+            bounces = Float64[]
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1],
+                integ -> (push!(bounces, integ.t); integ.u[2] = -0.9 * integ.u[2]),
+            )
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(ball!, [1.0, 0.0], (0.0, 3.0)), PETScDiffEq.TSRK("5dp");
+                dt = 0.05, reltol = 1.0e-10, abstol = 1.0e-12, callback = cb,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test length(bounces) == 4
+            @test abs(bounces[1] - sqrt(2 / 9.81)) < 1.0e-12
+            # Each flight is 0.9 of the one before it, the restitution coefficient.
+            gaps = diff(bounces)
+            @test all(isapprox(0.9; atol = 1.0e-6), gaps[2:end] ./ gaps[1:(end - 1)])
+            @test minimum(u[1] for u in sol.u) > -1.0e-10
+        end
+
+        @testset "crossing direction picks the handler" begin
+            function osc!(du, u, p, t)
+                du[1] = u[2]
+                return du[2] = -u[1]
+            end
+            ups, downs = Float64[], Float64[]
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1], integ -> push!(ups, integ.t),
+                integ -> push!(downs, integ.t),
+            )
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(osc!, [0.0, 1.0], (0.0, 7.0)), PETScDiffEq.TSRK("5dp");
+                dt = 0.05, reltol = 1.0e-10, abstol = 1.0e-12, callback = cb,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            # An affect! that changes nothing must still fire once per crossing.
+            @test length(downs) == 1 && abs(downs[1] - pi) < 1.0e-9
+            @test length(ups) == 1 && abs(ups[1] - 2pi) < 1.0e-9
+        end
+
+        @testset "solve matches solve! on the integrator" begin
+            h1, h2 = Float64[], Float64[]
+            a = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = jump(h1))
+            b = SciMLBase.solve!(
+                SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = jump(h2)),
+            )
+            @test h1 == h2
+            @test a.t == b.t
+            @test a.u == b.u
+        end
+
+        @testset "save_positions brackets the event" begin
+            hits = Float64[]
+            both = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = jump(hits))
+            @test count(==(hits[1]), both.t) == 2
+            i = findfirst(==(hits[1]), both.t)
+            @test abs(both.u[i][1] - 0.5) < 1.0e-8
+            @test abs(both.u[i + 1][1] - 1.5) < 1.0e-8
+
+            quiet = Float64[]
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5,
+                integ -> (push!(quiet, integ.t); integ.u[1] += 1.0);
+                save_positions = (false, false),
+            )
+            none = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = cb)
+            @test quiet == hits
+            @test !(hits[1] in none.t)
+        end
+
+        @testset "dense output across the event" begin
+            hits = Float64[]
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, reltol = 1.0e-10, abstol = 1.0e-12,
+                callback = jump(hits),
+            )
+            @test sol.dense
+            @test length(sol.interp.du) == length(sol.u)
+            @test abs(sol(hits[1])[1] - 0.5) < 1.0e-8
+            @test abs(sol(hits[1]; continuity = :right)[1] - 1.5) < 1.0e-8
+            @test abs(sol(1.9)[1] - after(1.9)) < 1.0e-6
+        end
+
+        @testset "terminate! from a continuous affect!" begin
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5, integ -> SciMLBase.terminate!(integ),
+            )
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, reltol = 1.0e-10, abstol = 1.0e-12,
+                callback = cb,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Terminated
+            @test abs(sol.t[end] - log(2.0)) < 1.0e-9
+            @test abs(sol.u[end][1] - 0.5) < 1.0e-8
+        end
+
+        @testset "initialize and finalize run" begin
+            n_init, n_final = Ref(0), Ref(0)
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5, integ -> nothing;
+                initialize = (c, u, t, integ) -> (n_init[] += 1; nothing),
+                finalize = (c, u, t, integ) -> (n_final[] += 1; nothing),
+            )
+            SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = cb)
+            @test n_init[] == 1
+            @test n_final[] == 1
+        end
+
+        @testset "in a CallbackSet beside a discrete callback" begin
+            hits, ticks = Float64[], Float64[]
+            discrete = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> true, integ -> push!(ticks, integ.t),
+            )
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, reltol = 1.0e-10, abstol = 1.0e-12,
+                callback = SciMLBase.CallbackSet(jump(hits), discrete),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test length(hits) == 2
+            @test !isempty(ticks)
+            @test abs(sol.u[end][1] - after(2.0)) < 1.0e-8
+        end
+
+        @testset "rootfind = NoRootFind fires at the step end" begin
+            hits = Float64[]
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5,
+                integ -> (push!(hits, integ.t); integ.u[1] += 1.0);
+                rootfind = SciMLBase.NoRootFind,
+            )
+            SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = cb)
+            @test !isempty(hits)
+            # exp(-t) is first below 1/2 at the step ending at 0.7.
+            @test hits[1] > log(2.0)
+            @test abs(hits[1] - 0.7) < 1.0e-8
+        end
+
+        @testset "VectorContinuousCallback is rejected" begin
+            vcb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out[1] = u[1] - 0.5), (integ, idx) -> nothing, 1,
+            )
+            @test_throws ArgumentError SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = vcb,
+            )
+            @test_throws ArgumentError SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1,
+                callback = SciMLBase.CallbackSet(vcb),
+            )
+        end
+    end
+
     @testset "tstops" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
 
@@ -1189,15 +1370,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 SciMLBase.solve!(integ)
             end
 
-            @testset "a ContinuousCallback is rejected up front" begin
-                cc = SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.5, integ -> nothing)
-                @test_throws ArgumentError SciMLBase.init(
-                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = cc,
-                )
-                @test_throws ArgumentError SciMLBase.solve(
-                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = SciMLBase.CallbackSet(cc, jump),
-                )
-            end
         end
 
         @testset "repeated init/solve! cycles do not crash" begin

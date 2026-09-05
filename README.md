@@ -132,12 +132,20 @@ sol = SciMLBase.solve!(integ)
 `saveat`, `save_everystep`, `save_start` and `save_end` behave as they do for
 `solve`, interpolating with `TSInterpolate` inside the step just taken.
 
-`DiscreteCallback` and a `CallbackSet` of discrete callbacks work, through
-both `solve` and the integrator: the condition is checked after every step,
-`affect!` may change `integ.u` or call `terminate!`, and the changed state is
-written back into PETSc's solution vector with `TSRestartStep`, so a multistep
-method drops the history it took before the jump. `ContinuousCallback` is
-rejected, since it needs root finding on the interpolant.
+`DiscreteCallback`, `ContinuousCallback` and a `CallbackSet` of them work,
+through both `solve` and the integrator: the condition is checked after every
+step, `affect!` may change `integ.u` or call `terminate!`, and the changed
+state is written back into PETSc's solution vector with `TSRestartStep`, so a
+multistep method drops the history it took before the jump.
+
+`ContinuousCallback` locates its event by bisecting `TSInterpolate` inside the
+step that crossed, rolls the integrator back to the root, applies `affect!` or
+`affect_neg!` according to the crossing direction, and restarts the stepper
+there. `rootfind`, `interp_points`, `abstol`, `repeat_nudge` and
+`save_positions` are honoured. On a bouncing ball the first bounce is located
+to machine precision and each flight is the restitution coefficient times the
+one before it. `VectorContinuousCallback` is rejected, since it needs one root
+per component.
 
 `tstops` makes the integration land on the given times exactly, through
 `solve` and the integrator alike, and `add_tstop!`, `has_tstop`, `first_tstop`
@@ -222,7 +230,7 @@ third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: `ContinuousCallback`, `save_idxs`,
+Not yet implemented: `VectorContinuousCallback`, `save_idxs`,
 and MPI; every solve currently runs on
 `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
 supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`
