@@ -559,7 +559,7 @@ function _setup(
             ),
         )
     end
-    has_jac = _uses_ifunction(alg) && !is_split && prob.f.jac !== nothing
+    has_jac = _uses_ifunction(alg) && prob.f.jac !== nothing
     jac_fn = has_jac ? prob.f.jac : nothing
     jac_prototype = has_jac ? prob.f.jac_prototype : nothing
     uses_sparse_jac = jac_prototype isa SparseMatrixCSC

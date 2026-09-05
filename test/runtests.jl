@@ -157,6 +157,60 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.01)
     end
 
+    @testset "SplitODEProblem uses the analytic Jacobian of f1" begin
+        stiff!(du, u, p, t) = (du[1] = -1000.0 * (u[1] - cos(t)); nothing)
+        forcing!(du, u, p, t) = (du[1] = -sin(t); nothing)
+        stiff_jac!(J, u, p, t) = (J[1, 1] = -1000.0; nothing)
+        # +5000 flips the sign of shift*I - J, so Newton walks away from the root.
+        stiff_wrong_jac!(J, u, p, t) = (J[1, 1] = 5000.0; nothing)
+        alg = PETScDiffEq.TSARKIMEX("3", ["-ts_adapt_type", "none"])
+        tspan = (0.0, 0.1)
+        split(f1) = SciMLBase.SplitODEProblem(f1, forcing!, [1.0], tspan)
+
+        plain = SciMLBase.solve(split(stiff!), alg; dt = 1.0e-3)
+        withjac = SciMLBase.solve(
+            split(SciMLBase.ODEFunction(stiff!; jac = stiff_jac!)), alg; dt = 1.0e-3,
+        )
+        onsplit = SciMLBase.solve(
+            SciMLBase.SplitODEProblem(
+                SciMLBase.SplitFunction{true}(stiff!, forcing!; jac = stiff_jac!),
+                [1.0], tspan,
+            ),
+            alg; dt = 1.0e-3,
+        )
+        @test plain.stats.njacs == 0
+        @test withjac.stats.njacs > 0
+        @test withjac.stats.nf < plain.stats.nf
+        @test withjac.retcode == SciMLBase.ReturnCode.Success
+        @test abs(withjac.u[end][1] - cos(0.1)) < 1.0e-6
+        @test withjac.u[end] ≈ plain.u[end] atol = 1.0e-10
+        @test onsplit.stats.njacs == withjac.stats.njacs
+        @test onsplit.u[end] == withjac.u[end]
+
+        @test_throws Exception SciMLBase.solve(
+            split(SciMLBase.ODEFunction(stiff!; jac = stiff_wrong_jac!)), alg; dt = 1.0e-3,
+        )
+
+        @testset "with a sparse jac_prototype" begin
+            stiff2!(du, u, p, t) = (
+                du[1] = -1000.0 * (u[1] - cos(t)); du[2] = -2000.0 * (u[2] - sin(t)); nothing
+            )
+            forcing2!(du, u, p, t) = (du[1] = -sin(t); du[2] = cos(t); nothing)
+            jac2!(J, u, p, t) = (J[1, 1] = -1000.0; J[2, 2] = -2000.0; nothing)
+            proto = sparse([1, 2], [1, 2], [1.0, 1.0], 2, 2)
+            sol = SciMLBase.solve(
+                SciMLBase.SplitODEProblem(
+                    SciMLBase.ODEFunction(stiff2!; jac = jac2!, jac_prototype = proto),
+                    forcing2!, [1.0, 0.0], tspan,
+                ),
+                alg; dt = 1.0e-3,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.stats.njacs > 0
+            @test maximum(abs.(sol.u[end] .- [cos(0.1), sin(0.1)])) < 1.0e-6
+        end
+    end
+
     @testset "TSGeneric convergence order" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         exact = exp(-1.0)

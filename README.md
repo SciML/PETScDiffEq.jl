@@ -54,8 +54,11 @@ sol = SciMLBase.solve(sparse_jac_prob, TSImplicit("bdf"); dt = 0.05)
 
 An `ODEFunction`'s `jac` is used automatically by every implicit algorithm
 (`TSRosW`, `TSImplicit`, `TSARKIMEX`'s implicit part, and a non-explicit
-`TSGeneric`) when the problem is not split. `TSRK` and an explicit
-`TSGeneric` ignore `jac`, since they never form one.
+`TSGeneric`). `TSRK` and an explicit `TSGeneric` ignore `jac`, since they
+never form one. On a `SplitODEProblem` the `jac` is the Jacobian of `f1`, the
+implicit part, following SciMLBase's `SplitFunction` convention; give it either
+on the `SplitFunction` itself or on an `ODEFunction` wrapping `f1`, and
+`TSARKIMEX` uses it for its implicit stages. Without it PETSc differences `f1`.
 
 A `SparseMatrixCSC` `jac_prototype` is used as the PETSc matrix's sparsity
 pattern, so `jac!` only has to fill the pattern's own nonzero entries; the
@@ -198,8 +201,8 @@ any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
 Not yet implemented: `reinit!`, `ContinuousCallback`, continuous/dense output (`sol(t)` falls back to linear interpolation between
-saved points), `tstops`, `save_idxs`, an analytic Jacobian for
-`SplitODEProblem`, and MPI — every solve currently runs on `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
+saved points), `tstops`, `save_idxs`, and MPI; every solve currently runs on
+`MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
 supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`
 (Kronecker AIJ) matrix, not the plain AIJ this package builds, so it needs
 its own dedicated setup. `TSGeneric("radau5")` fails for a different,
