@@ -346,11 +346,18 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
-    @testset "the exported names are documented" begin
-        for n in names(PETScDiffEq)
-            n === :PETScDiffEq && continue
-            doc = string(Base.doc(getfield(PETScDiffEq, n)))
-            @test !occursin("No documentation found", doc)
+    @testset "the exported names carry a docstring" begin
+        # Read the source rather than ask the doc system: `Base.doc` and
+        # `Docs.doc(::Binding)` both throw on 1.12, and `@doc` reports a
+        # docstring there even for a name that has none.
+        lines = split(read(joinpath(@__DIR__, "..", "src", "PETScDiffEq.jl"), String), '\n')
+        exported = filter(!=(:PETScDiffEq), names(PETScDiffEq))
+        @test length(exported) == 6
+        for n in exported
+            i = findfirst(l -> occursin(Regex("^(mutable )?struct \\Q$(n)\\E\\b"), l), lines)
+            @test i !== nothing
+            i === nothing && continue
+            @test strip(lines[i - 1]) == "\"\"\""
         end
     end
 
