@@ -97,16 +97,38 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     J::JBUF
     ts::Vector{Float64}
     us::Vector{Vector{Float64}}
+    dus::Vector{Vector{Float64}}
     saveat::Vector{Float64}
     saveat_idx::Int
     save_everystep::Bool
+    dense::Bool
     work::V
     nf::Int
     njacs::Int
     err::Union{Nothing, Any}
 end
 
-_record!(ctx, t, ua) = (push!(ctx.ts, Float64(t)); push!(ctx.us, Vector{Float64}(ua)))
+function _record!(ctx, t, x)
+    u = Vector{Float64}(x)
+    push!(ctx.ts, Float64(t))
+    push!(ctx.us, u)
+    ctx.dense && push!(ctx.dus, _derivative(ctx, Float64(t), u))
+    return nothing
+end
+
+function _derivative(ctx, t, u)
+    du = similar(u)
+    ctx.f!(du, u, ctx.p, t)
+    if ctx.f2! !== nothing
+        ctx.f2!(ctx.du, u, ctx.p, t)
+        du .+= ctx.du
+    end
+    ctx.nf += ctx.f2! === nothing ? 1 : 2
+    return du
+end
+
+_interp(ctx) = ctx.dense ? SciMLBase.HermiteInterpolation(ctx.ts, ctx.us, ctx.dus) :
+    SciMLBase.LinearInterpolation(ctx.ts, ctx.us)
 
 _mass(ctx, i, j) = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
 
@@ -459,7 +481,7 @@ _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 const UNSUPPORTED_KWARGS = (
-    :tstops, :save_idxs, :d_discontinuities, :dense, :isoutofdomain,
+    :tstops, :save_idxs, :d_discontinuities, :isoutofdomain,
     :unstable_check, :internalnorm, :calck, :force_dtmin, :alias_u0, :sensealg,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
 )
@@ -509,6 +531,7 @@ function _setup(
         save_everystep = true,
         save_start = true,
         save_end = true,
+        dense = nothing,
         kwargs...,
     )
     for key in UNSUPPORTED_KWARGS
@@ -594,12 +617,22 @@ function _setup(
         LibPETSc.PetscInt[i - 1 for i in 1:n] : LibPETSc.PetscInt[]
     row_cols0, row_src, row_buf = uses_sparse_jac ? _row_structure(J0, n) :
         (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
+    dense_out = dense === nothing ? (save_everystep && isempty(saveat_times) && !has_mass) :
+        Bool(dense)
+    if dense_out && has_mass
+        throw(
+            ArgumentError(
+                "PETScDiffEq cannot produce dense output with a mass matrix; " *
+                    "the saved derivative would have to be M \\ f(u)",
+            ),
+        )
+    end
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
         similar(u0), similar(u0), similar(u0), M, missing_diag, W0, idx0,
         row_cols0, row_src, row_buf, J0,
-        Float64[], Vector{Float64}[],
-        saveat_times, 1, save_everystep,
+        Float64[], Vector{Float64}[], Vector{Float64}[],
+        saveat_times, 1, save_everystep, dense_out,
         PETSc.VecSeq(petsclib, n), 0, 0, nothing,
     )
     h = TSHandles(
@@ -711,14 +744,15 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     if length(keep) != length(ctx.ts)
         ctx.ts = ctx.ts[keep]
         ctx.us = ctx.us[keep]
+        ctx.dense && (ctx.dus = ctx.dus[keep])
     end
     if h.save_end && (isempty(ctx.ts) || ctx.ts[end] < tend - tol)
-        push!(ctx.ts, tend)
-        push!(ctx.us, uend)
+        _record!(ctx, tend, uend)
     end
     if !h.save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= tol
         popfirst!(ctx.ts)
         popfirst!(ctx.us)
+        ctx.dense && popfirst!(ctx.dus)
     end
 
     finite = isempty(ctx.us) || all(isfinite, ctx.us[end])
@@ -737,6 +771,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     )
     return SciMLBase.build_solution(
         prob, alg, ctx.ts, ctx.us; retcode = retcode, stats = stats,
+        dense = ctx.dense, interp = _interp(ctx),
     )
 end
 
@@ -846,8 +881,7 @@ function _apply_callbacks!(integ::PETScIntegrator)
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
         end
         if cb.save_positions[2] && ctx.save_everystep && isempty(ctx.saveat)
-            push!(ctx.ts, integ.t)
-            push!(ctx.us, copy(integ.u))
+            _record!(ctx, integ.t, integ.u)
         end
     end
     return nothing
@@ -864,18 +898,17 @@ function SciMLBase.__init(
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
     if isempty(ctx.saveat)
         if h.save_start
-            push!(ctx.ts, h.t0)
-            push!(ctx.us, copy(h.u0))
+            _record!(ctx, h.t0, h.u0)
         end
     else
         while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= h.t0 + tol
-            push!(ctx.ts, ctx.saveat[ctx.saveat_idx])
-            push!(ctx.us, copy(h.u0))
+            _record!(ctx, ctx.saveat[ctx.saveat_idx], h.u0)
             ctx.saveat_idx += 1
         end
     end
     sol = SciMLBase.build_solution(
         prob, alg, ctx.ts, ctx.us; retcode = SciMLBase.ReturnCode.Default,
+        dense = ctx.dense, interp = _interp(ctx),
     )
     integ = PETScIntegrator(
         alg, copy(h.u0), copy(h.u0), h.t0, h.t0,
@@ -933,20 +966,18 @@ function SciMLBase.step!(integ::PETScIntegrator)
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
     if isempty(ctx.saveat)
         if ctx.save_everystep
-            push!(ctx.ts, integ.t)
-            push!(ctx.us, copy(integ.u))
+            _record!(ctx, integ.t, integ.u)
         end
     else
         while ctx.saveat_idx <= length(ctx.saveat) &&
                 ctx.saveat[ctx.saveat_idx] <= integ.t + tol
             want = ctx.saveat[ctx.saveat_idx]
             if abs(want - integ.t) <= tol
-                push!(ctx.ts, want)
-                push!(ctx.us, copy(integ.u))
+                _record!(ctx, want, integ.u)
             else
                 LibPETSc.TSInterpolate(pl, h.ts, want, ctx.work)
                 PETSc.withlocalarray!(
-                    wa -> (push!(ctx.ts, want); push!(ctx.us, Vector{Float64}(wa))),
+                    wa -> _record!(ctx, want, wa),
                     ctx.work; read = true, write = false,
                 )
             end

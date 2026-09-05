@@ -160,9 +160,17 @@ sol.t    # [0.0, 0.3, 0.7, 1.0]
 `dtmin` and `dtmax` bound the controller's step size. `sol.stats` reports
 `nf`, `naccept`, `nreject`, `nnonliniter` and `nnonlinconvfail`; the remaining
 `DEStats` fields stay at the `-1` "unknown" sentinel. Keywords this package
-cannot honour, `tstops`, `save_idxs`, `callback`, `dense` and
-`isoutofdomain` among them, emit a warning rather than being silently
-dropped.
+cannot honour, `tstops`, `save_idxs` and `isoutofdomain` among them, emit a
+warning rather than being silently dropped.
+
+`sol(t)` interpolates. By default, when every step is saved and no `saveat`
+is given, the solution carries a cubic Hermite interpolant built from the
+saved states and one extra `f` evaluation per saved point, counted in
+`sol.stats.nf`. This is how Sundials.jl does it too, since PETSc's own
+`TSInterpolate` only covers the step in flight. Pass `dense = false` to skip
+the extra evaluations and fall back to linear interpolation, or `dense = true`
+to get Hermite through `saveat` points. Dense output is not available with a
+mass matrix.
 
 ## Performance
 
@@ -200,8 +208,8 @@ third layer, TS. Every dedicated PETSc TS family (`rk`, `rosw`, `beuler`,
 any other named type, `mprk` included, though only `"euler"` and `"alpha"`
 have been run through this package's own convergence tests.
 
-Not yet implemented: `reinit!`, `ContinuousCallback`, continuous/dense output (`sol(t)` falls back to linear interpolation between
-saved points), `tstops`, `save_idxs`, and MPI; every solve currently runs on
+Not yet implemented: `reinit!`, `ContinuousCallback`, `tstops`, `save_idxs`,
+and MPI; every solve currently runs on
 `MPI.COMM_SELF`. `TSIRK` still fails even with a `jac_prototype`
 supplied: PETSc factorizes its coupled-stage Jacobian as a `seqkaij`
 (Kronecker AIJ) matrix, not the plain AIJ this package builds, so it needs

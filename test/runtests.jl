@@ -157,6 +157,87 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.01)
     end
 
+    @testset "dense output" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp")
+        sol = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false)
+        lin = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, dense = false)
+        @test sol.dense
+        @test !lin.dense
+        @test sol.interp isa SciMLBase.HermiteInterpolation
+        @test lin.interp isa SciMLBase.LinearInterpolation
+        @test length(sol.interp.du) == length(sol.u)
+        @test sol.stats.nf == lin.stats.nf + length(sol.u)
+        @test abs(sol(0.55)[1] - exp(-0.55)) < 1.0e-6
+        @test abs(lin(0.55)[1] - exp(-0.55)) > 1.0e-4
+        @test abs(sol(0.55, Val{1})[1] + exp(-0.55)) < 1.0e-4
+        @test sol(sol.t[4]) == sol.u[4]
+
+        @testset "through the integrator" begin
+            isol = SciMLBase.solve!(SciMLBase.init(prob, alg; dt = 0.1, adaptive = false))
+            @test isol.dense
+            @test isol(0.55) == sol(0.55)
+        end
+
+        @testset "off by default with saveat, on by request" begin
+            s = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, saveat = 0.25)
+            @test !s.dense
+            d = SciMLBase.solve(
+                prob, alg; dt = 0.1, adaptive = false, saveat = 0.25, dense = true,
+            )
+            @test d.dense
+            @test length(d.interp.du) == length(d.u)
+            @test abs(d(0.6)[1] - exp(-0.6)) < 1.0e-4
+            @test abs(s(0.6)[1] - exp(-0.6)) > 1.0e-3
+        end
+
+        @testset "off with save_everystep = false" begin
+            s = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, save_everystep = false)
+            @test !s.dense
+        end
+
+        @testset "split problems save f1 + f2" begin
+            stiff!(du, u, p, t) = (du[1] = -1000.0 * (u[1] - cos(t)); nothing)
+            forcing!(du, u, p, t) = (du[1] = -sin(t); nothing)
+            sprob = SciMLBase.SplitODEProblem(stiff!, forcing!, [1.0], (0.0, 0.1))
+            s = SciMLBase.solve(
+                sprob, PETScDiffEq.TSARKIMEX("3", ["-ts_adapt_type", "none"]); dt = 0.01,
+            )
+            @test s.dense
+            k = 5
+            uk, tk = s.u[k][1], s.t[k]
+            f1 = -1000.0 * (uk - cos(tk))
+            f2 = -sin(tk)
+            @test s.interp.du[k][1] ≈ f1 + f2 atol = 1.0e-12
+            @test !(s.interp.du[k][1] ≈ f1)
+            @test abs(s(0.055)[1] - cos(0.055)) < 1.0e-4
+        end
+
+        @testset "not available with a mass matrix" begin
+            mprob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0], (0.0, 1.0),
+            )
+            s = SciMLBase.solve(mprob, PETScDiffEq.TSImplicit("bdf"); dt = 0.1)
+            @test !s.dense
+            @test_throws ArgumentError SciMLBase.solve(
+                mprob, PETScDiffEq.TSImplicit("bdf"); dt = 0.1, dense = true,
+            )
+        end
+
+        @testset "the post-callback point carries the post-jump derivative" begin
+            fired = Ref(false)
+            jump = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> t >= 0.5 && !fired[],
+                integ -> (integ.u[1] += 1.0; fired[] = true),
+            )
+            s = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, callback = jump)
+            i = findfirst(==(0.5), s.t)
+            @test i !== nothing && s.t[i + 1] == 0.5
+            @test s.interp.du[i] ≈ -s.u[i]
+            @test s.interp.du[i + 1] ≈ -s.u[i + 1]
+        end
+    end
+
     @testset "SplitODEProblem uses the analytic Jacobian of f1" begin
         stiff!(du, u, p, t) = (du[1] = -1000.0 * (u[1] - cos(t)); nothing)
         forcing!(du, u, p, t) = (du[1] = -sin(t); nothing)
