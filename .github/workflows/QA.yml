@@ -1,0 +1,40 @@
+name: "QA"
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  qa:
+    name: "QA"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.10', '1']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - name: "Instantiate test/qa"
+        run: |
+          julia --project=test/qa -e '
+            using Pkg
+            Pkg.develop(path=".")
+            Pkg.instantiate()'
+      - name: "Run QA tests"
+        run: julia --project=test/qa test/qa/qa.jl

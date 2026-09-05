@@ -6,6 +6,7 @@ using MPI: MPI
 using PETSc: PETSc
 using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
+using SciMLOperators: SciMLOperators
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
     sparse
 
@@ -755,7 +756,7 @@ function _setup(
     for g in (f1, f2)
         # An AbstractSciMLOperator ignores the f(du,u,p,t) call this package
         # makes, leaving the derivative buffer untouched rather than erroring.
-        g isa SciMLBase.AbstractSciMLOperator && throw(
+        g isa SciMLOperators.AbstractSciMLOperator && throw(
             ArgumentError(
                 "PETScDiffEq does not support an operator-valued right-hand side; " *
                     "supply a function f!(du, u, p, t)",

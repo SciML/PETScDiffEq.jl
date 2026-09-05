@@ -5,3 +5,4 @@ Manifest.toml
 *.jl.*.cov
 *.jl.mem
 .DS_Store
+test/qa/Manifest.toml
