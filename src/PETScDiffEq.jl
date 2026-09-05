@@ -167,8 +167,8 @@ _uses_ifunction(::TSARKIMEX) = true
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
 # Only these PETSc TS families carry an embedded error estimate. The rest step
-# at the requested dt and ignore any tolerance. `nothing` means "not known",
-# which is the honest answer for an arbitrary TSGeneric type.
+# at the requested dt and ignore any tolerance. `nothing` means the answer is
+# not known, which is the case for an arbitrary TSGeneric type.
 _adapts(::TSRK) = true
 _adapts(::TSRosW) = true
 _adapts(::TSIRK) = false
@@ -621,8 +621,8 @@ function _set_subtype!(petsclib, ts, alg::TSImplicit)
 end
 function _set_subtype!(petsclib, ts, alg::TSIRK)
     LibPETSc.TSIRKSetNumStages(petsclib, ts, LibPETSc.PetscInt(alg.nstages))
-    # Setting the stage count alone leaves the tableau built for the previous
-    # one, which integrates something else without complaining.
+    # The tableau is built from the stage count, so it needs rebuilding
+    # whenever that count changes.
     _cstr(p -> LibPETSc.TSIRKSetType(petsclib, ts, p), "gauss")
     return nothing
 end
@@ -631,8 +631,8 @@ _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 _default_options(::PETScTSAlgorithm) = String[]
-# A Kronecker-product coupled-stage matrix has no LU factorisation, so the
-# preconditioner PETSc would otherwise pick cannot be set up.
+# A Kronecker-product coupled-stage matrix has no LU factorisation, so PETSc's
+# default preconditioner cannot be set up for it.
 _default_options(::TSIRK) = ["-pc_type", "pbjacobi"]
 
 const UNSUPPORTED_KWARGS = (
@@ -970,9 +970,8 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     else
         SciMLBase.ReturnCode.Failure
     end
-    # An explicit PETSc type driven through the implicit path reports success
-    # and returns the initial condition. It never calls the Jacobian, which
-    # every method that really solves implicitly does on its first step.
+    # A method that solves implicitly calls the Jacobian on its first step.
+    # One that never calls it is not solving implicitly, whatever it reports.
     if h.jac_mat !== nothing && st.nsteps > 0 && ctx.njacs == 0
         @warn "`$(_ts_type(alg))` took $(st.nsteps) steps without ever calling the " *
             "Jacobian this package gave PETSc, so it is not solving implicitly and the " *
@@ -1164,8 +1163,8 @@ end
 function _find_event(integ::PETScIntegrator, cb)
     t0, t1 = integ.tprev, integ.t
     t1 > t0 || return nothing
-    # A step starting at an event would otherwise rediscover that same root,
-    # which stalls a callback whose affect! leaves the state alone.
+    # The search starts past a root the previous step ended on. Without that it
+    # finds the same root again and a callback that changes nothing stalls.
     if integ.event_t == t0
         t0 += Float64(cb.repeat_nudge) * (t1 - t0)
         t0 < t1 || return nothing
@@ -1465,8 +1464,8 @@ function SciMLBase.step!(integ::PETScIntegrator)
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
     target = stop === nothing ? h.tf : stop
     LibPETSc.TSSetMaxTime(pl, h.ts, target)
-    # A step reaching past the max time makes TSAdaptChoose fail with
-    # "bad hmax", so the step onto the target is shortened here, not by PETSc.
+    # TSAdaptChoose rejects a step that reaches past the max time, so the step
+    # onto the target is shortened here rather than by PETSc.
     if integ.dt > target - integ.t
         integ.dt = target - integ.t
         LibPETSc.TSSetTimeStep(pl, h.ts, integ.dt)

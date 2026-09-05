@@ -303,7 +303,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
             sol = SciMLBase.solve!(integ)
             @test sol.dense
-            # The kept points saved no derivatives; a Hermite interpolant needs one each.
             @test length(sol.interp.du) == length(sol.u)
             @test abs(sol(0.25)[1] - exp(-0.25)) < 1.0e-3
             @test abs(sol(1.5)[1] - kept.u[end][1] * exp(-0.5)) < 1.0e-5
@@ -353,8 +352,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
         plain = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
 
-        # "glee" is explicit. Driven through the implicit path PETSc reports
-        # success and returns u0, which is the case worth catching.
+        # "glee" is an explicit method.
         quiet = SciMLBase.solve(
             prob, PETScDiffEq.TSGeneric("glee"); dt = 0.1, adaptive = false,
         )
@@ -395,9 +393,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
 
         @testset "order is twice the stage count" begin
-            # Gauss-Legendre collocation. Setting the stage count without
-            # rebuilding the tableau integrates something else silently, so
-            # these orders are the guard on that.
             for nstages in (1, 2, 3)
                 errs = [
                     abs(
@@ -427,9 +422,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     SciMLBase.ODEFunction(decay!; jac = decay_wrong_jac!), [1.0], (0.0, 1.0),
                 ), PETScDiffEq.TSIRK(); dt = 0.1, adaptive = false,
             )
-            # Unlike the other implicit families, a wrong Jacobian here does not
-            # fail to converge; it reports success and answers wrongly, which is
-            # what makes it a usable control.
             @test wrong.retcode == SciMLBase.ReturnCode.Success
             @test abs(wrong.u[end][1] - exp(-1)) > 1.0e-3
             right = SciMLBase.solve(prob, PETScDiffEq.TSIRK(); dt = 0.1, adaptive = false)
@@ -442,7 +434,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSIRK();
                 dt = 0.1,
             )
-            # PETSc would drift further from the answer as dt shrinks instead.
             @test_throws ArgumentError SciMLBase.solve(
                 SciMLBase.ODEProblem(
                     SciMLBase.ODEFunction(
@@ -504,8 +495,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         for alg in (
                 PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRK("5dp"),
                 PETScDiffEq.TSRosW("ra34pw2"),
-                # An arbitrary named type may or may not adapt, so saying
-                # nothing is the honest answer.
+                # An arbitrary named type may or may not adapt.
                 PETScDiffEq.TSGeneric("alpha"),
             )
             @test_logs min_level = Logging.Warn SciMLBase.solve(
@@ -520,9 +510,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "the exported names carry a docstring" begin
-        # Read the source rather than ask the doc system: `Base.doc` and
-        # `Docs.doc(::Binding)` both throw on 1.12, and `@doc` reports a
-        # docstring there even for a name that has none.
+        # `Base.doc` is not available on every supported version, and `@doc`
+        # reports a docstring even for a name that has none.
         lines = split(read(joinpath(@__DIR__, "..", "src", "PETScDiffEq.jl"), String), '\n')
         exported = filter(!=(:PETScDiffEq), names(PETScDiffEq))
         @test length(exported) == 7
@@ -630,8 +619,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             sol = SciMLBase.solve(prob, alg; tols..., callback = cb)
             @test sol.retcode == SciMLBase.ReturnCode.Terminated
             @test abs(sol.t[end] - log(2.0)) < 1.0e-9
-            # Lifted at its own earlier crossing, the second component reaches
-            # 3/4 by the time the first one triggers, where it would be 1/4.
+            # Lifted at its own earlier crossing, the second component is at 3/4
+            # when the first triggers, against 1/4 without the lift.
             @test abs(sol.u[end][2] - 0.75) < 1.0e-7
         end
 
@@ -831,7 +820,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
             @test sol.stats.njacs > 0
             @test abs(sol.u[end][2] - exp(-0.1)) < 1.0e-4
-            # Widening the buffer would misplace every entry stored after it.
             @test_throws ArgumentError SciMLBase.solve(
                 SciMLBase.ODEProblem(
                     SciMLBase.ODEFunction(pair; jac = outside, jac_prototype = proto),
@@ -1627,8 +1615,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "Subtype setters take effect" begin
-        # Each non-default subtype has a different order from its family's
-        # default, so a setter that silently did nothing would fail here.
+        # Each subtype here differs in order from its family's default.
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         exact = exp(-1.0)
         function finest_order(alg)
@@ -1972,8 +1959,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "Requested subtypes actually take effect" begin
-        # Each of these differs in order from its family's PETSc default, so a
-        # dropped subtype call shows up as the wrong convergence order.
+        # Each of these differs in order from its family's PETSc default.
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         exact = exp(-1.0)
         function measured_order(alg)
