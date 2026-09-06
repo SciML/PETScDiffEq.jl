@@ -213,6 +213,7 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     du::Vector{Float64}
     u::Vector{Float64}
     mudot::Vector{Float64}
+    resid::Vector{Float64}
     M::Union{Nothing, Matrix{Float64}}
     dae::Bool
     missing_diag::Vector{Int}
@@ -271,10 +272,7 @@ _mass(ctx, i, j) = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
 # whole, so it is filled in place of the `shift * M - J` an ODE builds.
 function _call_jac!(ctx, xdot_ptr, shift, t)
     if ctx.dae
-        xdot = PETSc.VecPtr(ctx.petsclib, xdot_ptr, false)
-        PETSc.withlocalarray!(xdot; read = true, write = false) do xda
-            copyto!(ctx.mudot, xda)
-        end
+        _readvec!(ctx.mudot, ctx.petsclib, PETSc.VecPtr(ctx.petsclib, xdot_ptr, false))
         ctx.jac!(ctx.J, ctx.mudot, ctx.u, ctx.p, Float64(shift), Float64(t))
     else
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
@@ -379,6 +377,30 @@ function _copy_jac!(J::SparseMatrixCSC, A::AbstractMatrix)
     return nothing
 end
 
+# PETSc's own array accessor picks a device type and allocates on every call,
+# which on a small right-hand side costs more than the derivative it is fetching.
+function _readvec!(dest::Vector{Float64}, pl, v)
+    a = LibPETSc.VecGetArrayRead(pl, v)
+    try
+        copyto!(dest, a)
+    finally
+        LibPETSc.VecRestoreArrayRead(pl, v, a)
+    end
+    return dest
+end
+
+function _writevec!(pl, v, src::Vector{Float64})
+    a = LibPETSc.VecGetArrayWrite(pl, v)
+    try
+        copyto!(a, src)
+    finally
+        LibPETSc.VecRestoreArrayWrite(pl, v, a)
+    end
+    return nothing
+end
+
+# The context reaches these callbacks as an untyped pointer, so each one hands
+# straight off to a body that compiles for the concrete context type.
 function _rhs!(
         ::LibPETSc.CTS,
         t::LibPETSc.PetscReal,
@@ -387,14 +409,15 @@ function _rhs!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
-    f = PETSc.VecPtr(ctx.petsclib, f_ptr, false)
+    return _rhs_body!(ctx, t, x_ptr, f_ptr)
+end
+
+function _rhs_body!(ctx, t, x_ptr, f_ptr)
+    pl = ctx.petsclib
     try
-        PETSc.withlocalarray!((x, f); read = (true, false), write = (false, true)) do xa, fa
-            copyto!(ctx.u, xa)
-            ctx.f!(ctx.du, ctx.u, ctx.p, t)
-            copyto!(fa, ctx.du)
-        end
+        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        ctx.f!(ctx.du, ctx.u, ctx.p, t)
+        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), ctx.du)
         ctx.nf += 1
     catch e
         ctx.err = e
@@ -413,14 +436,15 @@ function _split_rhs!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
-    f = PETSc.VecPtr(ctx.petsclib, f_ptr, false)
+    return _split_rhs_body!(ctx, t, x_ptr, f_ptr)
+end
+
+function _split_rhs_body!(ctx, t, x_ptr, f_ptr)
+    pl = ctx.petsclib
     try
-        PETSc.withlocalarray!((x, f); read = (true, false), write = (false, true)) do xa, fa
-            copyto!(ctx.u, xa)
-            ctx.f2!(ctx.du, ctx.u, ctx.p, t)
-            copyto!(fa, ctx.du)
-        end
+        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        ctx.f2!(ctx.du, ctx.u, ctx.p, t)
+        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), ctx.du)
         ctx.nf2 += 1
     catch e
         ctx.err = e
@@ -440,28 +464,26 @@ function _ifunction!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
-    xdot = PETSc.VecPtr(ctx.petsclib, xdot_ptr, false)
-    f = PETSc.VecPtr(ctx.petsclib, f_ptr, false)
+    return _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
+end
+
+function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
+    pl = ctx.petsclib
     try
-        PETSc.withlocalarray!(
-            (x, xdot, f); read = (true, true, false), write = (false, false, true),
-        ) do xa, xda, fa
-            copyto!(ctx.u, xa)
-            if ctx.dae
-                copyto!(ctx.mudot, xda)
-                ctx.f!(ctx.du, ctx.mudot, ctx.u, ctx.p, t)
-                copyto!(fa, ctx.du)
+        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        udot = _readvec!(ctx.mudot, pl, PETSc.VecPtr(pl, xdot_ptr, false))
+        if ctx.dae
+            ctx.f!(ctx.resid, udot, ctx.u, ctx.p, t)
+        else
+            ctx.f!(ctx.du, ctx.u, ctx.p, t)
+            if ctx.M === nothing
+                @. ctx.resid = udot - ctx.du
             else
-                ctx.f!(ctx.du, ctx.u, ctx.p, t)
-                if ctx.M === nothing
-                    @. fa = xda - ctx.du
-                else
-                    mul!(ctx.mudot, ctx.M, xda)
-                    @. fa = ctx.mudot - ctx.du
-                end
+                mul!(ctx.resid, ctx.M, udot)
+                @. ctx.resid = ctx.resid - ctx.du
             end
         end
+        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), ctx.resid)
         ctx.nf += 1
     catch e
         ctx.err = e
@@ -487,9 +509,7 @@ function _ijacobian!(
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
-        PETSc.withlocalarray!(x; read = true, write = false) do xa
-            copyto!(ctx.u, xa)
-        end
+        _readvec!(ctx.u, ctx.petsclib, x)
         _call_jac!(ctx, xdot_ptr, shift, t)
         ctx.njacs += 1
         n = length(ctx.u)
@@ -529,9 +549,7 @@ function _sparse_ijacobian!(
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
-        PETSc.withlocalarray!(x; read = true, write = false) do xa
-            copyto!(ctx.u, xa)
-        end
+        _readvec!(ctx.u, ctx.petsclib, x)
         _call_jac!(ctx, xdot_ptr, shift, t)
         ctx.njacs += 1
         n = length(ctx.u)
@@ -566,7 +584,7 @@ function _monitor!(
     try
         if isempty(ctx.saveat)
             if ctx.save_everystep || step == 0
-                PETSc.withlocalarray!(xa -> _record!(ctx, t, xa), x; read = true, write = false)
+                _record!(ctx, t, _readvec!(ctx.u, ctx.petsclib, x))
             end
         else
             ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
@@ -577,14 +595,10 @@ function _monitor!(
                 # Before any step has been taken there is nothing to interpolate
                 # from, and the incoming vector is already the initial state.
                 if step == 0 || abs(want - Float64(t)) <= tol
-                    PETSc.withlocalarray!(
-                        xa -> _record!(ctx, want, xa), x; read = true, write = false,
-                    )
+                    _record!(ctx, want, _readvec!(ctx.u, ctx.petsclib, x))
                 else
                     LibPETSc.TSInterpolate(ctx.petsclib, ts, want, ctx.work)
-                    PETSc.withlocalarray!(
-                        wa -> _record!(ctx, want, wa), ctx.work; read = true, write = false,
-                    )
+                    _record!(ctx, want, _readvec!(ctx.u, ctx.petsclib, ctx.work))
                 end
                 ctx.saveat_idx += 1
             end
@@ -897,7 +911,8 @@ function _setup(
     end
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
-        similar(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0, idx0,
+        similar(u0), similar(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0,
+        idx0,
         row_cols0, row_src, row_buf, J0,
         Float64[], Vector{Float64}[], Vector{Float64}[],
         saveat_times, 1, save_everystep, dense_out, kept,
@@ -1169,9 +1184,7 @@ function _state_at(integ::PETScIntegrator, t::Float64)
     t == integ.tprev && return integ.uprev
     h = integ.h
     LibPETSc.TSInterpolate(h.petsclib, h.ts, t, h.ctx.work)
-    PETSc.withlocalarray!(
-        a -> copyto!(integ.ucache, a), h.ctx.work; read = true, write = false,
-    )
+    _readvec!(integ.ucache, h.petsclib, h.ctx.work)
     return integ.ucache
 end
 
@@ -1562,7 +1575,7 @@ function SciMLBase.step!(integ::PETScIntegrator)
     while !isempty(integ.tstops) && integ.tstops[1] <= integ.t + tol
         popfirst!(integ.tstops)
     end
-    PETSc.withlocalarray!(ua -> copyto!(integ.u, ua), h.u; read = true, write = false)
+    _readvec!(integ.u, pl, h.u)
     fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing
     if !fired
