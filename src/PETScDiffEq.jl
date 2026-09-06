@@ -326,16 +326,22 @@ function _fill_rows!(ctx, shift, n)
     return nothing
 end
 
+# PETSc stores a SeqAIJ row by ascending column, which is the order
+# `_row_structure` builds, so the per-row buffers concatenate straight into the
+# matrix's own value array and no per-row call is needed.
 function _setrows!(ctx, A, n)
-    one_ = LibPETSc.PetscInt(1)
-    @inbounds for i in 1:n
-        cols = ctx.row_cols0[i]
-        isempty(cols) && continue
-        LibPETSc.MatSetValues(
-            ctx.petsclib, A, one_, LibPETSc.PetscInt[i - 1],
-            LibPETSc.PetscInt(length(cols)), cols, ctx.row_buf[i],
-            LibPETSc.INSERT_VALUES,
-        )
+    vals = LibPETSc.MatSeqAIJGetArray(ctx.petsclib, A)
+    try
+        k = 1
+        @inbounds for i in 1:n
+            buf = ctx.row_buf[i]
+            for v in buf
+                vals[k] = v
+                k += 1
+            end
+        end
+    finally
+        LibPETSc.MatSeqAIJRestoreArray(ctx.petsclib, A, vals)
     end
     return nothing
 end
@@ -537,6 +543,10 @@ function _ijacobian!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    return _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+end
+
+function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
@@ -577,6 +587,10 @@ function _sparse_ijacobian!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    return _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+end
+
+function _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
@@ -612,6 +626,10 @@ function _monitor!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    return _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
+end
+
+function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     try
         if isempty(ctx.saveat)
