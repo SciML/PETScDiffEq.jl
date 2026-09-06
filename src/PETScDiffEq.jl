@@ -152,16 +152,25 @@ A `DAEFunction`'s `jac(J, du, u, p, gamma, t)` is `gamma * dG/du' + dG/du`,
 which is what PETSc's `IJacobian` wants whole, so it is passed straight through
 and `gamma` is PETSc's shift. Without one PETSc differences the residual.
 
+`order` sets the BDF order, 1 through 6, and carries the same warning as
+[`TSImplicit`](@ref): PETSc's own default is 2.
+
 Only `"bdf"` adapts; the others step at the `dt` you give. `du0` is not used,
 since PETSc derives the initial derivative itself.
 """
 struct TSDAE <: PETScTSDAEAlgorithm
     subtype::String
+    order::Union{Nothing, Int}
     petsc_options::Vector{String}
 end
 
-TSDAE(subtype::AbstractString = "bdf", petsc_options::AbstractVector{<:AbstractString} = String[]) =
-    TSDAE(String(subtype), String[String(o) for o in petsc_options])
+TSDAE(
+    subtype::AbstractString = "bdf",
+    petsc_options::AbstractVector{<:AbstractString} = String[];
+    order = nothing,
+) = TSDAE(
+    String(subtype), _bdf_order(subtype, order), String[String(o) for o in petsc_options],
+)
 
 """
     TSARKIMEX(subtype = "3", petsc_options = String[])
@@ -721,7 +730,12 @@ function _set_subtype!(petsclib, ts, alg::TSIRK)
 end
 _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
     _cstr(p -> LibPETSc.TSARKIMEXSetType(petsclib, ts, p), alg.subtype)
-_set_subtype!(petsclib, ts, ::TSDAE) = nothing
+function _set_subtype!(petsclib, ts, alg::TSDAE)
+    if alg.order !== nothing
+        LibPETSc.TSBDFSetOrder(petsclib, ts, LibPETSc.PetscInt(alg.order))
+    end
+    return nothing
+end
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 _default_options(::AnyPETScTS) = String[]

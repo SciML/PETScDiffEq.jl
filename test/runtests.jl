@@ -476,6 +476,17 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
         end
 
+        @testset "the BDF order carries to the DAE side" begin
+            steps(alg) = SciMLBase.solve(
+                SciMLBase.DAEProblem(withjac, du0, u0, tspan), alg;
+                dt = 1.0e-3, reltol = 1.0e-8, abstol = 1.0e-10,
+            ).stats.naccept
+            @test steps(PETScDiffEq.TSDAE("bdf"; order = 5)) <
+                steps(PETScDiffEq.TSDAE("bdf")) / 2
+            @test_throws ArgumentError PETScDiffEq.TSDAE("beuler"; order = 3)
+            @test_throws ArgumentError PETScDiffEq.TSDAE("bdf"; order = 9)
+        end
+
         @testset "backward Euler is first order on the residual" begin
             errs = [
                 abs(
