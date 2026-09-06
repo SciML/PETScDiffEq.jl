@@ -44,14 +44,15 @@ sol = SciMLBase.solve(prob, TSRK("5dp"); dt = 0.01, abstol = 1e-8, reltol = 1e-8
 
 - `TSRK(subtype)`, explicit Runge-Kutta
 - `TSRosW(subtype)`, linearly implicit Rosenbrock-W
-- `TSImplicit(subtype)`, backward Euler, Crank-Nicolson, theta and BDF
+- `TSImplicit(subtype; order)`, backward Euler, Crank-Nicolson, theta and BDF
 - `TSIRK(nstages)`, Gauss-Legendre implicit Runge-Kutta of order `2 * nstages`
 - `TSARKIMEX(subtype)`, additive Runge-Kutta IMEX, for a `SplitODEProblem`
 - `TSDAE(subtype)`, the same implicit methods applied to a `DAEProblem`
 - `TSGeneric(ts_type)`, a pass-through to any other PETSc `TSType` by name
 
 Each has a docstring covering its subtypes, whether it adapts and what it requires, so
-`?TSRosW` at the REPL is the reference. Every solver takes `petsc_options`, a vector of
+`?TSRosW` at the REPL is the reference. One default worth knowing: PETSc's BDF is order 2,
+so pass `TSImplicit("bdf"; order = 5)` when comparing against a higher-order method. Every solver takes `petsc_options`, a vector of
 command-line style tokens passed to PETSc for that solve, which are parsed after the
 options this package sets and so take precedence.
 

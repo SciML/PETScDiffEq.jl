@@ -66,6 +66,10 @@ Fully implicit methods from PETSc: `"beuler"`, `"cn"`, `"theta"` and `"bdf"`.
 `theta` sets the parameter of the theta method, where `0.5` is Crank-Nicolson
 and `1.0` is backward Euler.
 
+`order` sets the BDF order, 1 through 6. PETSc's own default is 2, which on a
+stiff problem can cost an order of magnitude in steps against a higher-order
+method, so raise it when comparing against one.
+
 Only `"bdf"` carries an embedded error estimate and adapts; the others step at
 the `dt` you give and warn if you pass a tolerance. All of them use an
 `ODEFunction`'s `jac` when one is given and accept a mass matrix, which makes
@@ -74,17 +78,36 @@ a singular mass matrix an index-1 differential-algebraic problem.
 struct TSImplicit <: PETScTSAlgorithm
     subtype::String
     theta::Union{Nothing, Float64}
+    order::Union{Nothing, Int}
     petsc_options::Vector{String}
 end
 
-TSImplicit(subtype::AbstractString = "beuler") =
-    TSImplicit(String(subtype), nothing, String[])
-TSImplicit(subtype::AbstractString, theta::Real) =
-    TSImplicit(String(subtype), Float64(theta), String[])
-TSImplicit(subtype::AbstractString, petsc_options::AbstractVector{<:AbstractString}) =
-    TSImplicit(String(subtype), nothing, String[String(o) for o in petsc_options])
-TSImplicit(subtype::AbstractString, theta::Real, petsc_options::AbstractVector{<:AbstractString}) =
-    TSImplicit(String(subtype), Float64(theta), String[String(o) for o in petsc_options])
+function _bdf_order(subtype, order)
+    order === nothing && return nothing
+    subtype == "bdf" ||
+        throw(ArgumentError("`order` applies to TSImplicit(\"bdf\"), not \"$subtype\""))
+    1 <= order <= 6 || throw(ArgumentError("PETSc supports BDF orders 1 through 6"))
+    return Int(order)
+end
+
+TSImplicit(subtype::AbstractString = "beuler"; order = nothing) =
+    TSImplicit(String(subtype), nothing, _bdf_order(subtype, order), String[])
+TSImplicit(subtype::AbstractString, theta::Real; order = nothing) =
+    TSImplicit(String(subtype), Float64(theta), _bdf_order(subtype, order), String[])
+TSImplicit(
+    subtype::AbstractString, petsc_options::AbstractVector{<:AbstractString};
+    order = nothing,
+) = TSImplicit(
+    String(subtype), nothing, _bdf_order(subtype, order),
+    String[String(o) for o in petsc_options],
+)
+TSImplicit(
+    subtype::AbstractString, theta::Real,
+    petsc_options::AbstractVector{<:AbstractString}; order = nothing,
+) = TSImplicit(
+    String(subtype), Float64(theta), _bdf_order(subtype, order),
+    String[String(o) for o in petsc_options],
+)
 
 """
     TSIRK(nstages = 3, petsc_options = String[])
@@ -683,6 +706,9 @@ _set_subtype!(petsclib, ts, alg::TSRosW) =
 function _set_subtype!(petsclib, ts, alg::TSImplicit)
     if alg.subtype == "theta" && alg.theta !== nothing
         LibPETSc.TSThetaSetTheta(petsclib, ts, alg.theta)
+    end
+    if alg.order !== nothing
+        LibPETSc.TSBDFSetOrder(petsclib, ts, LibPETSc.PetscInt(alg.order))
     end
     return nothing
 end

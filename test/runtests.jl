@@ -383,6 +383,45 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "BDF order" begin
+        prob = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),
+        )
+        kw = (dt = 1.0e-3, reltol = 1.0e-8, abstol = 1.0e-10)
+
+        @testset "the keyword matches the PETSc option" begin
+            a = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf"; order = 5); kw...)
+            b = SciMLBase.solve(
+                prob, PETScDiffEq.TSImplicit("bdf", ["-ts_bdf_order", "5"]); kw...,
+            )
+            @test a.t == b.t
+            @test a.u == b.u
+        end
+
+        @testset "it changes the integration" begin
+            # PETSc defaults to order 2, which costs steps against a higher order.
+            low = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf"; order = 1); kw...)
+            high = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf"; order = 5); kw...)
+            @test low.stats.naccept > high.stats.naccept
+            @test abs(high.u[end][1] - exp(-1)) < 1.0e-6
+            @test abs(low.u[end][1] - exp(-1)) < 1.0e-4
+        end
+
+        @testset "only bdf takes an order, and only 1 through 6" begin
+            @test_throws ArgumentError PETScDiffEq.TSImplicit("theta"; order = 3)
+            @test_throws ArgumentError PETScDiffEq.TSImplicit("bdf"; order = 0)
+            @test_throws ArgumentError PETScDiffEq.TSImplicit("bdf"; order = 7)
+        end
+
+        @testset "the positional constructors are unchanged" begin
+            @test PETScDiffEq.TSImplicit().subtype == "beuler"
+            @test PETScDiffEq.TSImplicit("theta", 0.3).theta == 0.3
+            @test length(PETScDiffEq.TSImplicit("bdf", ["-x", "1"]).petsc_options) == 2
+            @test PETScDiffEq.TSImplicit("theta", 0.3, ["-x", "1"]).theta == 0.3
+            @test PETScDiffEq.TSImplicit("bdf").order === nothing
+        end
+    end
+
     @testset "DAEProblem" begin
         # u1' = -u1 with the algebraic constraint u2 = u1, so both are exp(-t).
         # Integrating the second row as an ODE instead would give cosh(1).
