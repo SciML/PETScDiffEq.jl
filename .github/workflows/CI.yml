@@ -24,12 +24,23 @@ jobs:
       matrix:
         version: ['1.10', '1']
         os: [ubuntu-latest]
+        include:
+          - version: '1'
+            os: ubuntu-latest
+            arch: x86
     steps:
       - uses: actions/checkout@v7
+      - name: Install 32-bit runtime libraries (i386)
+        if: matrix.arch == 'x86'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libc6:i386 libstdc++6:i386 libgcc-s1:i386 libatomic1:i386
       - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
-          arch: x64
+          arch: ${{ matrix.arch || 'x64' }}
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
