@@ -3,6 +3,7 @@ using SciMLBase
 using LinearAlgebra
 using Logging
 using SparseArrays
+using DiffEqCallbacks
 using DiffEqCallbacks: PresetTimeCallback
 using Test
 
@@ -469,11 +470,12 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
             @test plain.stats.njacs == 0
             @test given.stats.njacs > 0
-            @test_throws Exception SciMLBase.solve(
+            @test SciMLBase.solve(
                 SciMLBase.DAEProblem(
                     SciMLBase.DAEFunction(resid!; jac = wrong_dae_jac!), du0, u0, tspan,
-                ), PETScDiffEq.TSDAE(); dt = 1.0e-3, adaptive = false,
-            )
+                ), PETScDiffEq.TSDAE("bdf", ["-ts_max_snes_failures", "1"]); dt = 1.0e-3,
+                adaptive = false,
+            ).retcode != SciMLBase.ReturnCode.Success
         end
 
         @testset "the BDF order carries to the DAE side" begin
@@ -580,6 +582,91 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
         @test plain.stats.nf > 0
         @test plain.stats.nf2 == 0
+    end
+
+    @testset "a solver failure is a retcode, a misuse is an error" begin
+        blow!(du, u, p, t) = (du[1] = -1.0e6 * (exp(u[1]) - 1); nothing)
+        stiff = SciMLBase.ODEProblem(blow!, [20.0], (0.0, 10.0))
+        sol = SciMLBase.solve(
+            stiff, PETScDiffEq.TSImplicit("beuler"); dt = 1.0, adaptive = false,
+        )
+        @test sol.retcode == SciMLBase.ReturnCode.Failure
+        @test sol.t[end] > 0.0
+
+        integ = SciMLBase.init(
+            stiff, PETScDiffEq.TSImplicit("beuler"); dt = 1.0, adaptive = false,
+        )
+        n = 0
+        while !SciMLBase.done(integ) && n < 100
+            SciMLBase.step!(integ)
+            n += 1
+        end
+        # A step PETSc cannot take returns without advancing, which used to spin
+        # this loop forever.
+        @test SciMLBase.done(integ)
+        @test integ.sol.retcode == SciMLBase.ReturnCode.Failure
+
+        # Choosing an explicit type through the implicit path is a misuse, and
+        # stays an exception rather than a quiet failure code.
+        plain = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        @test_throws Exception SciMLBase.solve(
+            plain, PETScDiffEq.TSGeneric("euler"); dt = 0.01, adaptive = false,
+        )
+
+        # A user's own exception still reaches the caller unchanged.
+        boom!(du, u, p, t) = error("boom")
+        @test_throws "boom" SciMLBase.solve(
+            SciMLBase.ODEProblem(boom!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+            dt = 0.1,
+        )
+    end
+
+    @testset "the standard DiffEqCallbacks work" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        faster = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = -2u[1]; nothing), [1.0], (0.0, 1.0))
+        tol = (dt = 0.05, reltol = 1.0e-8, abstol = 1.0e-10)
+
+        @testset "$name" for (name, pr, cb) in (
+                ("StepsizeLimiter", prob, DiffEqCallbacks.StepsizeLimiter((u, p, t) -> 0.05)),
+                ("AutoAbstol", prob, DiffEqCallbacks.AutoAbstol()),
+                ("PeriodicCallback", prob, DiffEqCallbacks.PeriodicCallback(i -> nothing, 0.2)),
+                (
+                    "IterativeCallback", prob,
+                    DiffEqCallbacks.IterativeCallback(i -> i.t + 0.3, i -> nothing),
+                ),
+                (
+                    "TerminateSteadyState", faster,
+                    DiffEqCallbacks.TerminateSteadyState(1.0e-6, 1.0e-6),
+                ),
+                (
+                    "PresetTimeCallback", prob,
+                    DiffEqCallbacks.PresetTimeCallback([0.4], i -> nothing),
+                ),
+            )
+            sol = SciMLBase.solve(pr, PETScDiffEq.TSRK("5dp"); tol..., callback = cb)
+            @test sol.retcode in
+                (SciMLBase.ReturnCode.Success, SciMLBase.ReturnCode.Terminated)
+        end
+
+        @testset "the pieces those callbacks reach for" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            SciMLBase.step!(integ)
+            @test SciMLBase.isadaptive(integ)
+            @test length(SciMLBase.get_tmp_cache(integ)) >= 2
+            # What the callbacks actually ask of it.
+            @test integ.f isa SciMLBase.AbstractODEFunction
+            @test SciMLBase.isinplace(integ.f)
+            @test integ.opts.abstol isa Real
+            @test SciMLBase.get_du(integ)[1] ≈ -integ.u[1]
+            mid = (integ.tprev + integ.t) / 2
+            @test abs(integ(mid)[1] - exp(-mid)) < 1.0e-6
+            # PETSc interpolates only inside the step it just took.
+            @test_throws ArgumentError integ(integ.t + 1.0)
+            SciMLBase.add_saveat!(integ, 0.55)
+            SciMLBase.set_proposed_dt!(integ, 0.05)
+            sol = SciMLBase.solve!(integ)
+            @test 0.55 in sol.t
+        end
     end
 
     @testset "audit regressions" begin
@@ -1129,9 +1216,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             bad = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(oop; jac = owrong), [1.0], (0.0, 1.0),
             )
-            @test_throws Exception SciMLBase.solve(
-                bad, PETScDiffEq.TSImplicit("cn"); dt = 0.05,
-            )
+            @test SciMLBase.solve(
+                bad, PETScDiffEq.TSImplicit("cn", ["-ts_max_snes_failures", "1"]); dt = 0.05,
+            ).retcode != SciMLBase.ReturnCode.Success
         end
 
         @testset "with a sparse jac_prototype" begin
@@ -1501,9 +1588,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test onsplit.stats.njacs == withjac.stats.njacs
         @test onsplit.u[end] == withjac.u[end]
 
-        @test_throws Exception SciMLBase.solve(
-            split(SciMLBase.ODEFunction(stiff!; jac = stiff_wrong_jac!)), alg; dt = 1.0e-3,
-        )
+        @test SciMLBase.solve(
+            split(SciMLBase.ODEFunction(stiff!; jac = stiff_wrong_jac!)),
+            PETScDiffEq.TSARKIMEX("3", ["-ts_max_snes_failures", "1"]); dt = 1.0e-3,
+        ).retcode != SciMLBase.ReturnCode.Success
 
         @testset "with a sparse jac_prototype" begin
             stiff2!(du, u, p, t) = (
@@ -1589,9 +1677,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a wrong Jacobian breaks Newton convergence" begin
-            @test_throws Exception SciMLBase.solve(
-                wrong_prob, PETScDiffEq.TSImplicit("cn"); dt = 0.05,
-            )
+            @test SciMLBase.solve(
+                wrong_prob, PETScDiffEq.TSImplicit("cn", ["-ts_max_snes_failures", "1"]); dt = 0.05,
+            ).retcode != SciMLBase.ReturnCode.Success
         end
 
         @testset "ignored by algorithms that don't use IFunction" begin
@@ -1713,9 +1801,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 ),
                 [1.0], (0.0, 1.0),
             )
-            @test_throws Exception SciMLBase.solve(
-                wrong_prob, PETScDiffEq.TSImplicit("cn"); dt = 0.05,
-            )
+            @test SciMLBase.solve(
+                wrong_prob, PETScDiffEq.TSImplicit("cn", ["-ts_max_snes_failures", "1"]); dt = 0.05,
+            ).retcode != SciMLBase.ReturnCode.Success
         end
     end
 
