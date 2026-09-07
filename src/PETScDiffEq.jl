@@ -295,6 +295,9 @@ function _derivative(ctx, t, u)
     return du
 end
 
+_saved(ctx, u) = ctx.save_idxs === nothing ? Vector{Float64}(u) :
+    Float64[u[i] for i in ctx.save_idxs]
+
 _interp(ctx) = ctx.dense ? SciMLBase.HermiteInterpolation(ctx.ts, ctx.us, ctx.dus) :
     SciMLBase.LinearInterpolation(ctx.ts, ctx.us)
 
@@ -781,6 +784,7 @@ mutable struct TSHandles{CTX, T}
     save_start::Bool
     save_end::Bool
     tolvecs::Vector{Any}
+    tolbufs::Vector{Vector{Float64}}
     destroyed::Bool
 end
 
@@ -809,7 +813,11 @@ function _tolvec(h::TSHandles, petsclib, tol, n, name)
     length(tol) == n ||
         throw(ArgumentError("`$name` has length $(length(tol)), but the state has $n"))
     all(t -> t >= 0, tol) || throw(ArgumentError("`$name` has a negative entry"))
-    v = PETSc.VecSeq(petsclib, Vector{Float64}(collect(tol)))
+    # PETSc borrows this array rather than copying it, and reads it on every
+    # adaptive step, so it has to outlive the handle.
+    buf = Vector{Float64}(collect(tol))
+    push!(h.tolbufs, buf)
+    v = PETSc.VecSeq(petsclib, buf)
     push!(h.tolvecs, v)
     return v
 end
@@ -978,7 +986,7 @@ function _setup(
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing,
-        t0, tf, u0, Int(maxiters), save_start, save_end, Any[], false,
+        t0, tf, u0, Int(maxiters), save_start, save_end, Any[], Vector{Float64}[], false,
     )
     finalizer(_destroy!, h)
 
@@ -1045,9 +1053,9 @@ function _setup(
             # A user's own PETSc options are parsed last, so they win.
             effective_options = copy(_default_options(alg))
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
-            dtmin === nothing ||
+            (dtmin === nothing || dtmin == 0) ||
                 append!(effective_options, ["-ts_adapt_dt_min", string(Float64(dtmin))])
-            dtmax === nothing ||
+            (dtmax === nothing || isinf(dtmax)) ||
                 append!(effective_options, ["-ts_adapt_dt_max", string(Float64(dtmax))])
             append!(effective_options, alg.petsc_options)
             if !isempty(effective_options)
@@ -1091,7 +1099,10 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
         ctx.us = ctx.us[keep]
         ctx.dense && (ctx.dus = ctx.dus[keep])
     end
-    if h.save_end && (isempty(ctx.ts) || ctx.ts[end] < tend - tol)
+    if h.save_end && (
+            isempty(ctx.ts) || ctx.ts[end] < tend - tol ||
+                (ctx.ts[end] <= tend + tol && ctx.us[end] != _saved(ctx, uend))
+        )
         _record!(ctx, tend, uend)
     end
     if !h.save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= tol
@@ -1232,9 +1243,9 @@ function SciMLBase.set_proposed_dt!(integ::PETScIntegrator, dt)
     return nothing
 end
 function SciMLBase.savevalues!(integ::PETScIntegrator)
-    push!(integ.h.ctx.ts, integ.t)
-    push!(integ.h.ctx.us, copy(integ.u))
-    return nothing
+    integ.finished && return false
+    _record!(integ.h.ctx, integ.t, integ.u)
+    return true
 end
 
 function _state_at(integ::PETScIntegrator, t::Float64)
@@ -1413,9 +1424,7 @@ function _apply_callbacks!(integ::PETScIntegrator)
             PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
         end
-        if cb.save_positions[2] && ctx.save_everystep && isempty(ctx.saveat)
-            _record!(ctx, integ.t, integ.u)
-        end
+        cb.save_positions[2] && _record!(ctx, integ.t, integ.u)
     end
     return nothing
 end
@@ -1496,7 +1505,6 @@ function SciMLBase.reinit!(
         reinit_callbacks = true, initialize_save = true,
     )
     old = integ.h
-    _destroy!(old)
     prob = SciMLBase.remake(integ.prob; u0 = u0, tspan = (t0, tf))
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
     h = _setup(prob, integ.alg; setup_kwargs...)
@@ -1517,9 +1525,11 @@ function SciMLBase.reinit!(
         end
     end
     initialize_save && _initial_save!(h)
+    _destroy!(old)
     integ.h = h
     integ.u = copy(h.u0)
     integ.uprev = copy(h.u0)
+    integ.ucache = copy(h.u0)
     integ.t = h.t0
     integ.tprev = h.t0
     integ.dt = Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
@@ -1587,7 +1597,12 @@ function _save_step!(integ::PETScIntegrator, upto::Float64, endpoint::Bool)
 end
 
 function SciMLBase.step!(integ::PETScIntegrator)
-    integ.finished && return nothing
+    integ.finished && throw(
+        ArgumentError(
+            "this integrator has finished at t = $(integ.t) and cannot step further; " *
+                "call reinit! to restart it",
+        ),
+    )
     h = integ.h
     ctx, pl = h.ctx, h.petsclib
     dtprev = integ.dt
@@ -1630,17 +1645,15 @@ function SciMLBase.step!(integ::PETScIntegrator)
         LibPETSc.TSSetTimeStep(pl, h.ts, integ.dtcache)
         integ.dt = integ.dtcache
     end
+    _readvec!(integ.u, pl, h.u)
+    fired = _apply_continuous_callbacks!(integ, dtprev)
     while !isempty(integ.tstops) && integ.tstops[1] <= integ.t + tol
         popfirst!(integ.tstops)
     end
-    _readvec!(integ.u, pl, h.u)
-    fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing
-    if !fired
-        _save_step!(integ, integ.t, true)
-        _apply_callbacks!(integ)
-        integ.finished && return nothing
-    end
+    fired || _save_step!(integ, integ.t, true)
+    _apply_callbacks!(integ)
+    integ.finished && return nothing
     if !all(isfinite, integ.u) || integ.t >= h.tf - tol ||
             Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
         _finish!(integ)

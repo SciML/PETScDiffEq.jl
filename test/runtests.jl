@@ -582,6 +582,141 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test plain.stats.nf2 == 0
     end
 
+    @testset "audit regressions" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        ramp!(du, u, p, t) = (du[1] = 1.0; nothing)
+        ramp = SciMLBase.ODEProblem(ramp!, [0.0], (0.0, 1.0))
+
+        @testset "a per-component tolerance survives collection" begin
+            function noisy!(du, u, p, t)
+                for _ in 1:200
+                    v = fill(1.0e8, length(u))
+                    v[1] += t
+                end
+                @inbounds for k in eachindex(u)
+                    du[k] = -k * u[k]
+                end
+                return nothing
+            end
+            wide = SciMLBase.ODEProblem(noisy!, ones(8), (0.0, 1.0))
+            sol = SciMLBase.solve(
+                wide, PETScDiffEq.TSRK("5dp"); dt = 0.01, abstol = fill(1.0e-12, 8),
+                reltol = 1.0e-12,
+            )
+            @test maximum(abs.(sol.u[end] .- [exp(-k) for k in 1:8])) < 1.0e-10
+            @test sol.stats.naccept > 100
+        end
+
+        @testset "savevalues! keeps the interpolant consistent" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            SciMLBase.step!(integ)
+            SciMLBase.savevalues!(integ)
+            sol = SciMLBase.solve!(integ)
+            @test length(sol.interp.du) == length(sol.u)
+            @test abs(sol(0.15)[1] - exp(-0.15)) < 1.0e-6
+            @test isfinite(sol(0.95)[1])
+        end
+
+        @testset "a discrete jump is saved even with saveat" begin
+            fired = Ref(false)
+            cb = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> t >= 0.5 && !fired[],
+                integ -> (integ.u[1] += 1.0; fired[] = true),
+            )
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, saveat = 0.25,
+                callback = cb,
+            )
+            @test count(==(0.5), sol.t) == 2
+            @test abs(sol.u[findlast(==(0.5), sol.t)][1] - (exp(-0.5) + 1)) < 1.0e-6
+        end
+
+        @testset "a discrete callback still runs on an event step" begin
+            stopped = Ref(false)
+            set = SciMLBase.CallbackSet(
+                SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.55, integ -> nothing),
+                SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> u[1] >= 0.5499,
+                    integ -> (stopped[] = true; SciMLBase.terminate!(integ)),
+                ),
+            )
+            sol = SciMLBase.solve(
+                ramp, PETScDiffEq.TSRK("3bs"); dt = 0.1, adaptive = false, callback = set,
+            )
+            @test stopped[]
+            @test sol.t[end] < 0.56
+        end
+
+        @testset "terminate! keeps the state its affect! just set" begin
+            cb = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> t >= 0.5,
+                integ -> (integ.u[1] = -999.0; SciMLBase.terminate!(integ)),
+            )
+            sol = SciMLBase.solve(
+                ramp, PETScDiffEq.TSRK("3bs"); dt = 0.1, adaptive = false, callback = cb,
+            )
+            @test sol.u[end][1] == -999.0
+        end
+
+        @testset "a tstop rolled past by a root is not discarded" begin
+            hit = Ref(false)
+            set = SciMLBase.CallbackSet(
+                SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> u[1] - exp(-0.45), integ -> nothing,
+                ),
+                SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t == 0.5, integ -> (hit[] = true; integ.u[1] += 1.0),
+                ),
+            )
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.4, reltol = 1.0e-8, abstol = 1.0e-10,
+                tstops = [0.5], callback = set,
+            )
+            @test hit[]
+            @test abs(sol.u[end][1] - 0.9744101) < 1.0e-4
+        end
+
+        @testset "a failed reinit! leaves the integrator usable" begin
+            integ = SciMLBase.init(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, abstol = [1.0e-8], reltol = 1.0e-6,
+            )
+            SciMLBase.step!(integ)
+            @test_throws ArgumentError SciMLBase.reinit!(integ, [1.0, 2.0])
+            SciMLBase.step!(integ)
+            @test integ.t > 0.1
+            SciMLBase.terminate!(integ)
+        end
+
+        @testset "reinit! onto a different size resizes the interpolation cache" begin
+            wide = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du .= -u; nothing), ones(4), (0.0, 2.0),
+            )
+            integ = SciMLBase.init(
+                wide, PETScDiffEq.TSRK("5dp"); dt = 0.2,
+                callback = SciMLBase.ContinuousCallback(
+                    (u, t, i) -> sum(u) - 1.0, i -> nothing,
+                ),
+            )
+            SciMLBase.reinit!(integ, ones(2))
+            @test length(integ.ucache) == 2
+            sol = SciMLBase.solve!(integ)
+            @test length(sol.u[end]) == 2
+            @test all(isfinite, sol.u[end])
+        end
+
+        @testset "dtmax = Inf means no cap" begin
+            sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.01, dtmax = Inf)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.01, dtmin = 0.0,
+            ).retcode == SciMLBase.ReturnCode.Success
+            capped = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.01, dtmax = 0.05,
+            )
+            @test maximum(diff(capped.t)) <= 0.0501
+        end
+    end
+
     @testset "TSIRK" begin
         proto = sparse([1], [1], [1.0], 1, 1)
         prob = SciMLBase.ODEProblem(
@@ -1900,17 +2035,28 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test integ.sol.t[end] ≈ 0.2
             @test length(integ.sol.t) == 3
             @test integ.h.destroyed
-            SciMLBase.step!(integ)
+            @test_throws ArgumentError SciMLBase.step!(integ)
             @test integ.t ≈ 0.2
         end
 
-        @testset "stepping past the end is a no-op" begin
+        @testset "stepping past the end is refused" begin
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
             SciMLBase.solve!(integ)
             t_end = integ.t
-            SciMLBase.step!(integ)
+            @test_throws ArgumentError SciMLBase.step!(integ)
             @test integ.t == t_end
             @test SciMLBase.done(integ)
+        end
+
+        @testset "step!(integ, dt) terminates at the end of the span" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            for _ in 1:3
+                SciMLBase.step!(integ, 0.3)
+            end
+            @test integ.t == 1.0
+            # A silent no-op here spins SciMLBase's generic loop forever, since
+            # it advances only on `integ.t` and breaks only on a bad retcode.
+            @test_throws ArgumentError SciMLBase.step!(integ, 0.3)
         end
 
         @testset "save_everystep = false keeps only the endpoints" begin
