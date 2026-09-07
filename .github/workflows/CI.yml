@@ -13,7 +13,9 @@ concurrency:
 
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    # Explicit arch axis so include:x86 adds a new cell instead of merging into
+    # Julia 1 / ubuntu-latest (which would silently replace the x64 lane).
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -24,6 +26,7 @@ jobs:
       matrix:
         version: ['1.10', '1']
         os: [ubuntu-latest]
+        arch: [x64]
         include:
           - version: '1'
             os: ubuntu-latest
@@ -40,13 +43,14 @@ jobs:
       - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
-          arch: ${{ matrix.arch || 'x64' }}
+          arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1
+        if: matrix.arch == 'x64'
       - uses: codecov/codecov-action@v7
-        if: env.CODECOV_TOKEN != ''
+        if: matrix.arch == 'x64' && env.CODECOV_TOKEN != ''
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
