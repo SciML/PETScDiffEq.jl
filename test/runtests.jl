@@ -157,6 +157,32 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.01)
     end
 
+    @testset "an IMEX split whose explicit part reads u" begin
+        # u' = (a+b)u split into an implicit a*u and an explicit b*u.
+        halves(a, b) = SciMLBase.SplitODEProblem(
+            (du, u, p, t) -> (du[1] = a * u[1]; nothing),
+            (du, u, p, t) -> (du[1] = b * u[1]; nothing), [1.0], (0.0, 0.1),
+        )
+        alg = PETScDiffEq.TSARKIMEX("3", ["-ts_adapt_type", "none"])
+        errs = [
+            abs(SciMLBase.solve(halves(-50.0, -1.0), alg; dt = dt).u[end][1] - exp(-5.1))
+                for dt in (0.01, 0.005, 0.0025, 0.00125)
+        ]
+        orders = [log2(errs[i] / errs[i + 1]) for i in 1:(length(errs) - 1)]
+        @test all(o -> isapprox(o, 3; atol = 0.25), orders)
+        @test isapprox(orders[end], 3; atol = 0.15)
+
+        # The stiff half has to land on the implicit side: dt * 2000 is far
+        # outside any explicit stability region, so the reversed split diverges.
+        bounded = PETScDiffEq.TSARKIMEX(
+            "3", ["-ts_adapt_type", "none", "-ts_max_snes_failures", "1"],
+        )
+        @test SciMLBase.solve(halves(-2000.0, -1.0), bounded; dt = 0.01).retcode ==
+            SciMLBase.ReturnCode.Success
+        @test SciMLBase.solve(halves(-1.0, -2000.0), bounded; dt = 0.01).retcode !=
+            SciMLBase.ReturnCode.Success
+    end
+
     @testset "dense output" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         alg = PETScDiffEq.TSRK("5dp")
@@ -476,6 +502,67 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 ), PETScDiffEq.TSDAE("bdf", ["-ts_max_snes_failures", "1"]); dt = 1.0e-3,
                 adaptive = false,
             ).retcode != SciMLBase.ReturnCode.Success
+        end
+
+        @testset "the Jacobian is asked about the same point as the residual" begin
+            seen_r = Tuple{Float64, Vector{Float64}, Vector{Float64}}[]
+            seen_j = Tuple{Float64, Vector{Float64}, Vector{Float64}, Float64}[]
+            function recording_resid!(r, du, u, p, t)
+                push!(seen_r, (t, copy(u), copy(du)))
+                r[1] = du[1] + u[1]
+                return r[2] = u[2] - u[1]
+            end
+            function recording_jac!(J, du, u, p, gamma, t)
+                push!(seen_j, (t, copy(u), copy(du), gamma))
+                J[1, 1] = gamma + 1.0
+                J[1, 2] = 0.0
+                J[2, 1] = -1.0
+                return J[2, 2] = 1.0
+            end
+            recording = SciMLBase.DAEFunction(recording_resid!; jac = recording_jac!)
+            for dt in (0.1, 0.05)
+                empty!(seen_r)
+                empty!(seen_j)
+                SciMLBase.solve(
+                    SciMLBase.DAEProblem(recording, du0, u0, tspan),
+                    PETScDiffEq.TSDAE("beuler"); dt = dt, adaptive = false,
+                )
+                @test length(seen_j) == round(Int, 1.0 / dt)
+                @test all(
+                    j -> any(
+                        s -> s[1] == j[1] && s[2] == j[2] && s[3] == j[3], seen_r
+                    ), seen_j,
+                )
+                @test all(j -> isapprox(j[4], 1 / dt; rtol = 1.0e-9), seen_j)
+                @test extrema(j -> j[1], seen_j) == (dt, 1.0)
+            end
+        end
+
+        @testset "a Jacobian that depends on du" begin
+            # u' = -cbrt(u), so dG/du' is 3du^2 rather than a constant.
+            function cubic_resid!(r, du, u, p, t)
+                r[1] = du[1]^3 + u[1]
+                return r[2] = u[2] - u[1]
+            end
+            function cubic_jac!(J, du, u, p, gamma, t)
+                J[1, 1] = gamma * 3 * du[1]^2 + 1.0
+                J[1, 2] = 0.0
+                J[2, 1] = -1.0
+                return J[2, 2] = 1.0
+            end
+            cubic = SciMLBase.DAEProblem(
+                SciMLBase.DAEFunction(cubic_resid!; jac = cubic_jac!), du0, u0, tspan,
+            )
+            exact = (1 - 2 / 3)^1.5
+            errs = [
+                abs(
+                    SciMLBase.solve(
+                        cubic, PETScDiffEq.TSDAE("beuler"); dt = dt, adaptive = false,
+                    ).u[end][1] - exact,
+                ) for dt in (0.02, 0.01)
+            ]
+            @test errs[1] / errs[2] > 1.7
+            @test errs[2] < 2.0e-3
         end
 
         @testset "the BDF order carries to the DAE side" begin
