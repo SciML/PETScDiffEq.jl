@@ -709,6 +709,21 @@ function __init__()
     return nothing
 end
 
+# `LibPETSc.PetscInt` is a fixed `Int64` in PETSc.jl rather than a property of the
+# library that got loaded, so on a platform offering only 32-bit-index builds the
+# index vectors handed to PETSc would be the wrong width and nothing would say so.
+function _check_inttype(petsclib)
+    PETSc.inttype(petsclib) === LibPETSc.PetscInt || error(
+        "PETScDiffEq needs a PETSc built with $(LibPETSc.PetscInt) indices, but the " *
+            "library it loaded uses $(PETSc.inttype(petsclib))",
+    )
+    return nothing
+end
+
+# `maxiters = typemax(Int)` is how SciML spells "no limit", which does not fit a
+# PETSc built with 32-bit indices.
+_maxsteps(maxiters) = LibPETSc.PetscInt(min(maxiters, typemax(LibPETSc.PetscInt)))
+
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer)
     rows, cols, _ = findnz(jac_prototype)
     all_rows = vcat(rows, 1:n)
@@ -884,6 +899,7 @@ function _setup(
     n = length(u0)
 
     petsclib = PETSc.getlib(PetscScalar = Float64)
+    _check_inttype(petsclib)
     PETSc.initialized(petsclib) || PETSc.initialize(petsclib)
 
     iip = SciMLBase.isinplace(prob)
@@ -1030,7 +1046,7 @@ function _setup(
             LibPETSc.TSSetTime(petsclib, ts, t0)
             LibPETSc.TSSetTimeStep(petsclib, ts, Float64(dt))
             LibPETSc.TSSetMaxTime(petsclib, ts, tf)
-            LibPETSc.TSSetMaxSteps(petsclib, ts, LibPETSc.PetscInt(maxiters))
+            LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(maxiters))
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
             )

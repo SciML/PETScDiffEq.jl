@@ -183,6 +183,69 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.ReturnCode.Success
     end
 
+    @testset "maxiters that no PetscInt can hold" begin
+        # SciML spells "no limit" as typemax(Int), which overflows a 32-bit PetscInt.
+        @test PETScDiffEq._maxsteps(typemax(Int)) ==
+            typemax(PETScDiffEq.LibPETSc.PetscInt)
+        @test PETScDiffEq._maxsteps(100) == 100
+        @test PETScDiffEq._maxsteps(typemax(Int)) isa PETScDiffEq.LibPETSc.PetscInt
+        @test SciMLBase.solve(
+            SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+            dt = 0.1, maxiters = typemax(Int),
+        ).retcode == SciMLBase.ReturnCode.Success
+    end
+
+    @testset "the loaded PETSc has the index width the wrappers assume" begin
+        lib = PETScDiffEq.PETSc.getlib(PetscScalar = Float64)
+        @test PETScDiffEq._check_inttype(lib) === nothing
+        # The index vectors PETSc is handed are typed at precompile time from a
+        # constant, so a library with a different index width would corrupt silently.
+        @test PETScDiffEq.PETSc.inttype(lib) === PETScDiffEq.LibPETSc.PetscInt
+    end
+
+    @testset "which side of the bracket the root lands on" begin
+        rootprob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        # The condition falls through zero, so the left end of the bracket is
+        # still positive while the right end has already crossed.
+        function crossed(rootfind)
+            conds = Float64[]
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5,
+                integ -> (push!(conds, integ.u[1] - 0.5); nothing); rootfind = rootfind,
+            )
+            SciMLBase.solve(rootprob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = cb)
+            return conds
+        end
+        left, right = crossed(SciMLBase.LeftRootFind), crossed(SciMLBase.RightRootFind)
+        @test length(left) == 1
+        @test length(right) == 1
+        @test left[1] >= 0
+        @test right[1] <= 0
+        # Both ends are resolved to machine precision, not merely to the step.
+        @test abs(left[1]) < 1.0e-14
+        @test abs(right[1]) < 1.0e-14
+    end
+
+    @testset "save_idxs keeps the order it was asked for" begin
+        three!(du, u, p, t) = (
+            du[1] = -u[1]; du[2] = -2u[2]; du[3] = -3u[3]; nothing
+        )
+        sol = SciMLBase.solve(
+            SciMLBase.ODEProblem(three!, [1.0, 2.0, 3.0], (0.0, 1.0)),
+            PETScDiffEq.TSRK("5dp"); dt = 0.1, save_idxs = [3, 1],
+        )
+        @test sol.u[1] == [3.0, 1.0]
+        @test sol.u[end] ≈ [3exp(-3), exp(-1)] rtol = 1.0e-3
+    end
+
+    @testset "tstops at the ends of the span are dropped" begin
+        integ = SciMLBase.init(
+            SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+            dt = 0.1, tstops = [0.0, 0.5, 1.0],
+        )
+        @test integ.tstops == [0.5]
+    end
+
     @testset "dense output" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         alg = PETScDiffEq.TSRK("5dp")
