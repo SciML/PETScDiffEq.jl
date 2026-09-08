@@ -726,9 +726,12 @@ _maxsteps(maxiters) = LibPETSc.PetscInt(min(maxiters, typemax(LibPETSc.PetscInt)
 
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer)
     rows, cols, _ = findnz(jac_prototype)
-    all_rows = vcat(rows, 1:n)
-    all_cols = vcat(cols, 1:n)
-    return sparse(all_rows, all_cols, ones(length(all_rows)), n, n)
+    # PETSc's index width is not the platform's `Int`: a 32-bit Julia still loads a
+    # PETSc built with 64-bit indices, and the matrix it is handed has to match.
+    idx = LibPETSc.PetscInt
+    all_rows = convert(Vector{idx}, vcat(rows, 1:n))
+    all_cols = convert(Vector{idx}, vcat(cols, 1:n))
+    return sparse(all_rows, all_cols, ones(length(all_rows)), idx(n), idx(n))
 end
 
 function _cstr(f::F, s::AbstractString) where {F}
@@ -1022,7 +1025,7 @@ function _setup(
         row_cols0, row_src, row_buf, J0,
         Float64[], Vector{Float64}[], Vector{Float64}[],
         saveat_times, 1, save_everystep, dense_out, kept,
-        PETSc.VecSeq(petsclib, n), 0, 0, 0, nothing,
+        PETSc.VecSeq(petsclib, LibPETSc.PetscInt(n)), 0, 0, 0, nothing,
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing,
@@ -1038,7 +1041,7 @@ function _setup(
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
         _set_subtype!(petsclib, ts, alg)
 
-        h.u = PETSc.VecSeq(petsclib, n)
+        h.u = PETSc.VecSeq(petsclib, LibPETSc.PetscInt(n))
         u = h.u
         PETSc.withlocalarray!(u; read = false, write = true) do ua
             copyto!(ua, u0)
@@ -1062,7 +1065,8 @@ function _setup(
                     petsclib, ts, h.jac_mat, h.jac_mat, SPARSE_IJACOBIAN_PTR[], ctxptr,
                 )
             elseif has_jac
-                h.jac_mat = PETSc.MatSeqAIJ(petsclib, n, n, n)
+                np = LibPETSc.PetscInt(n)
+                h.jac_mat = PETSc.MatSeqAIJ(petsclib, np, np, np)
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, IJACOBIAN_PTR[], ctxptr,
                 )
