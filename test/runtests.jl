@@ -183,6 +183,21 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.ReturnCode.Success
     end
 
+    @testset "an integrator dropped part-way still exits cleanly" begin
+        # PETSc objects freed after MPI shuts down abort the process, so this can
+        # only be seen from the outside: the exit code is the assertion.
+        script = """
+        using PETScDiffEq, SciMLBase
+        f!(du, u, p, t) = (du[1] = -u[1]; nothing)
+        SciMLBase.init(
+            SciMLBase.ODEProblem(f!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+            dt = 0.1,
+        )
+        """
+        cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $script`
+        @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
+    end
+
     @testset "maxiters that no PetscInt can hold" begin
         # SciML spells "no limit" as typemax(Int), which overflows a 32-bit PetscInt.
         @test PETScDiffEq._maxsteps(typemax(Int)) ==

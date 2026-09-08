@@ -803,6 +803,29 @@ mutable struct TSHandles{CTX, T}
     destroyed::Bool
 end
 
+# Julia runs finalizers after `atexit` hooks, by which point MPI has shut down and
+# freeing a PETSc object aborts the process. Handles are tracked weakly so that an
+# integrator dropped part-way is still torn down while PETSc is alive.
+const LIVE_HANDLES = WeakKeyDict{Any, Nothing}()
+const EXIT_CLEANUP_ARMED = Ref(false)
+
+# PETSc.jl registers its own teardown when it initializes, which is later than this
+# module's `__init__`, and exit hooks run newest first. Arming here rather than in
+# `__init__` is what puts this one ahead of PETSc's.
+function _arm_exit_cleanup!()
+    EXIT_CLEANUP_ARMED[] && return nothing
+    EXIT_CLEANUP_ARMED[] = true
+    atexit(_destroy_live_handles!)
+    return nothing
+end
+
+function _destroy_live_handles!()
+    for h in collect(keys(LIVE_HANDLES))
+        _destroy!(h)
+    end
+    return nothing
+end
+
 function _destroy!(h::TSHandles)
     h.destroyed && return nothing
     h.destroyed = true
@@ -901,6 +924,7 @@ function _setup(
     petsclib = PETSc.getlib(PetscScalar = Float64)
     _check_inttype(petsclib)
     PETSc.initialized(petsclib) || PETSc.initialize(petsclib)
+    _arm_exit_cleanup!()
 
     iip = SciMLBase.isinplace(prob)
     f1 = is_split ? prob.f.f1.f : prob.f.f
@@ -1005,6 +1029,7 @@ function _setup(
         t0, tf, u0, Int(maxiters), save_start, save_end, Any[], Vector{Float64}[], false,
     )
     finalizer(_destroy!, h)
+    LIVE_HANDLES[h] = nothing
 
     try
         h.ts = LibPETSc.TSCreate(petsclib, MPI.COMM_SELF)
@@ -1227,10 +1252,6 @@ The integrator `SciMLBase.init` returns for a PETSc TS algorithm. Step it with
 `step!`, run it to the end with `solve!`, stop it early with `terminate!` and
 restart it with `reinit!`. Between steps `u`, `uprev`, `t`, `tprev` and `dt`
 are readable, and `add_tstop!` schedules a time to land on exactly.
-
-Finish or terminate every integrator you start. One dropped part-way holds
-PETSc objects whose finalizers run at process exit, after MPI has shut down,
-which makes the process exit non-zero.
 """
 mutable struct PETScIntegrator{Alg, P, H, Pr, CB, CC} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, Vector{Float64}, Float64}
