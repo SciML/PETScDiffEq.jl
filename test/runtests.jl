@@ -199,9 +199,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "maxiters that no PetscInt can hold" begin
-        # SciML spells "no limit" as typemax(Int), which overflows a 32-bit PetscInt.
+        # SciML spells "no limit" as typemax(Int), which need not fit a PetscInt.
+        # Which of the two is wider depends on the platform, so clamp to the smaller.
         @test PETScDiffEq._maxsteps(typemax(Int)) ==
-            typemax(PETScDiffEq.LibPETSc.PetscInt)
+            min(typemax(Int), typemax(PETScDiffEq.LibPETSc.PetscInt))
         @test PETScDiffEq._maxsteps(100) == 100
         @test PETScDiffEq._maxsteps(typemax(Int)) isa PETScDiffEq.LibPETSc.PetscInt
         @test SciMLBase.solve(
