@@ -198,6 +198,30 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
     end
 
+    @testset "running out of steps is MaxIters" begin
+        sol = SciMLBase.solve(
+            SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+            dt = 0.01, adaptive = false, maxiters = 5,
+        )
+        @test sol.retcode == SciMLBase.ReturnCode.MaxIters
+        @test sol.t[end] ≈ 0.05
+        @test sol.stats.naccept == 5
+    end
+
+    @testset "the nonlinear counters come from the solver, not the stepper" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        implicit = SciMLBase.solve(
+            prob, PETScDiffEq.TSImplicit("bdf"); dt = 0.01, adaptive = false,
+        )
+        @test implicit.stats.nnonliniter > implicit.stats.naccept
+        @test implicit.stats.nnonlinconvfail == 0
+        # An explicit method runs no nonlinear solve at all.
+        explicit = SciMLBase.solve(
+            prob, PETScDiffEq.TSRK("5dp"); dt = 0.01, adaptive = false,
+        )
+        @test explicit.stats.nnonliniter == 0
+    end
+
     @testset "maxiters that no PetscInt can hold" begin
         # SciML spells "no limit" as typemax(Int), which need not fit a PetscInt.
         # Which of the two is wider depends on the platform, so clamp to the smaller.
@@ -2047,6 +2071,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 prob, alg; dt = 0.1, saveat = [0.3, 0.7], save_start = false,
             )
             @test nostart.t ≈ [0.3, 0.7, 1.0]
+            # Without saveat the first saved point is t0 itself, which is the
+            # only case where it has to be dropped.
+            everystep = SciMLBase.solve(prob, alg; dt = 0.25, save_start = false)
+            @test everystep.t ≈ [0.25, 0.5, 0.75, 1.0]
             noend = SciMLBase.solve(
                 prob, alg; dt = 0.1, save_everystep = false, save_end = false,
             )
