@@ -1408,6 +1408,26 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
         end
 
+        @testset "copying into the sparse buffer" begin
+            declared = sparse([1, 1, 2], [1, 2, 2], [1.0, 1.0, 1.0], 2, 2)
+            J = copy(declared)
+            PETScDiffEq._copy_jac!(J, sparse([1, 1, 2], [1, 2, 2], [1.0, 7.0, 2.0], 2, 2))
+            @test J[1, 2] == 7.0
+            # The buffer is reused every step, so an entry the new Jacobian does
+            # not have must not keep the old one's value.
+            PETScDiffEq._copy_jac!(J, sparse([1, 2], [1, 2], [3.0, 4.0], 2, 2))
+            @test J[1, 1] == 3.0
+            @test J[2, 2] == 4.0
+            @test J[1, 2] == 0.0
+
+            # A dense Jacobian's zeros land where the prototype declares nothing,
+            # so they have to be skipped rather than written.
+            diagonly = sparse([1, 2], [1, 2], [1.0, 1.0], 2, 2)
+            PETScDiffEq._copy_jac!(diagonly, [5.0 0.0; 0.0 6.0])
+            @test diagonly[1, 1] == 5.0
+            @test diagonly[2, 2] == 6.0
+        end
+
         @testset "split, callbacks and the integrator" begin
             split = SciMLBase.SplitODEProblem(
                 (u, p, t) -> [-1000 * (u[1] - cos(t))], (u, p, t) -> [-sin(t)],
