@@ -2137,6 +2137,47 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
         end
 
+        @testset "a mass matrix that couples the components" begin
+            # M u' = -u with M = [2 0.5; 0 1] has the closed form
+            # u1 = 1.5exp(-t/2) - 0.5exp(-t), u2 = exp(-t).
+            coupled = [2.0 0.5; 0.0 1.0]
+            exact = [1.5exp(-0.5) - 0.5exp(-1.0), exp(-1.0)]
+            for f in (
+                    SciMLBase.ODEFunction(scaled!; mass_matrix = coupled),
+                    SciMLBase.ODEFunction(
+                        scaled!; mass_matrix = coupled, jac = scaled_jac!,
+                    ),
+                )
+                for alg in (
+                        PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW("ra34pw2"),
+                    )
+                    sol = SciMLBase.solve(
+                        SciMLBase.ODEProblem(f, [1.0, 1.0], (0.0, 1.0)), alg;
+                        dt = 0.005, reltol = 1.0e-11, abstol = 1.0e-13,
+                    )
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test isapprox(sol.u[end], exact; atol = 1.0e-6)
+                end
+            end
+        end
+
+        @testset "the mass matrix reaches the Jacobian, not just the residual" begin
+            # The residual multiplies by M directly, so dropping M's off-diagonal
+            # leaves the answer right and only W wrong, and Newton still finds the
+            # root. Under a strong coupling it stops finding it at all.
+            # M = [1 5; 0 1] gives u1 = (5t + 1)exp(-t), u2 = exp(-t).
+            strong = SciMLBase.ODEFunction(
+                scaled!; mass_matrix = [1.0 5.0; 0.0 1.0], jac = scaled_jac!,
+            )
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(strong, [1.0, 1.0], (0.0, 1.0)),
+                PETScDiffEq.TSImplicit("bdf", ["-ts_max_snes_failures", "1"]);
+                dt = 0.01, adaptive = false,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test isapprox(sol.u[end], [6exp(-1.0), exp(-1.0)]; atol = 1.0e-4)
+        end
+
         @testset "with a sparse jac_prototype" begin
             proto = sparse([1, 2], [1, 2], [1.0, 1.0], 2, 2)
             sparse_prob = SciMLBase.ODEProblem(
