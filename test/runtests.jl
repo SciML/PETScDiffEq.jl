@@ -474,95 +474,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
-    @testset "TSMPRK" begin
-        # u1' = -u1 on the slow side, u2' = -100u2 on the fast side.
-        two!(du, u, p, t) = (du[1] = -u[1]; du[2] = -100.0 * u[2]; nothing)
-        mprob = SciMLBase.ODEProblem(two!, [1.0, 1.0], (0.0, 1.0))
-
-        @testset "every supported subtype integrates the slow part" begin
-            for st in ("2a22", "2a32", "p2", "p3")
-                sol = SciMLBase.solve(
-                    mprob, PETScDiffEq.TSMPRK([1], st); dt = 0.001, adaptive = false,
-                )
-                @test sol.retcode == SciMLBase.ReturnCode.Success
-                @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-6
-                @test abs(sol.u[end][2]) < 1.0e-40
-            end
-        end
-
-        @testset "p3 is more accurate than p2" begin
-            err(st) = abs(
-                SciMLBase.solve(
-                    mprob, PETScDiffEq.TSMPRK([1], st); dt = 0.001, adaptive = false,
-                ).u[end][1] - exp(-1.0),
-            )
-            @test err("p3") < err("p2") / 100
-        end
-
-        @testset "which half is slow is the caller's to say" begin
-            # Naming component 2 slow puts the stiff row on the outer step, which
-            # a two-component problem still integrates correctly.
-            sol = SciMLBase.solve(
-                mprob, PETScDiffEq.TSMPRK([2]); dt = 0.001, adaptive = false,
-            )
-            @test sol.retcode == SciMLBase.ReturnCode.Success
-            @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-5
-        end
-
-        @testset "the index list is checked" begin
-            @test_throws ArgumentError PETScDiffEq.TSMPRK(Int[])
-            @test_throws ArgumentError PETScDiffEq.TSMPRK([0])
-            @test_throws ArgumentError PETScDiffEq.TSMPRK([1, 1])
-            @test PETScDiffEq.TSMPRK([2, 1]).slow == [1, 2]
-            @test_throws ArgumentError PETScDiffEq.TSMPRK([1], "2a23")
-            @test_throws ArgumentError PETScDiffEq.TSMPRK([1], "nonsense")
-            @test_throws ArgumentError SciMLBase.solve(
-                mprob, PETScDiffEq.TSMPRK([3]); dt = 0.01,
-            )
-            @test_throws ArgumentError SciMLBase.solve(
-                mprob, PETScDiffEq.TSMPRK([1, 2]); dt = 0.01,
-            )
-        end
-
-        @testset "a three-way split" begin
-            # u1 slow, u2 medium, u3 fast.
-            three!(du, u, p, t) = (
-                du[1] = -u[1]; du[2] = -10.0 * u[2]; du[3] = -100.0 * u[3]; nothing
-            )
-            tprob = SciMLBase.ODEProblem(three!, [1.0, 1.0, 1.0], (0.0, 1.0))
-            for st in ("2a23", "2a33")
-                sol = SciMLBase.solve(
-                    tprob, PETScDiffEq.TSMPRK([1], [2], st); dt = 0.001,
-                    adaptive = false,
-                )
-                @test sol.retcode == SciMLBase.ReturnCode.Success
-                @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-6
-                @test abs(sol.u[end][2] - exp(-10.0)) < 1.0e-6
-            end
-            @test PETScDiffEq.TSMPRK([1], [2]).medium == [2]
-        end
-
-        @testset "the subtype has to match the number of splits" begin
-            @test_throws ArgumentError PETScDiffEq.TSMPRK([1], "2a23")
-            @test_throws ArgumentError PETScDiffEq.TSMPRK([1], [2], "p2")
-            @test_throws ArgumentError PETScDiffEq.TSMPRK([1], [1], "2a23")
-            @test_throws ArgumentError PETScDiffEq.TSMPRK([1], [0], "2a23")
-            @test_throws ArgumentError SciMLBase.solve(
-                SciMLBase.ODEProblem(two!, [1.0, 1.0], (0.0, 1.0)),
-                PETScDiffEq.TSMPRK([1], [2], "2a23"); dt = 0.01,
-            )
-        end
-
-        @testset "explicit, so a mass matrix is refused" begin
-            @test_throws ArgumentError SciMLBase.solve(
-                SciMLBase.ODEProblem(
-                    SciMLBase.ODEFunction(two!; mass_matrix = [2.0 0.0; 0.0 1.0]),
-                    [1.0, 1.0], (0.0, 1.0),
-                ), PETScDiffEq.TSMPRK([1]); dt = 0.01,
-            )
-        end
-    end
-
     @testset "PETSc types this package cannot drive are refused" begin
         # Each of these is set up through a PETSc call this package does not make.
         # Given only a residual, PETSc reaches its solve with half a problem:
@@ -1220,7 +1131,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         # reports a docstring even for a name that has none.
         lines = split(read(joinpath(@__DIR__, "..", "src", "PETScDiffEq.jl"), String), '\n')
         exported = filter(!=(:PETScDiffEq), names(PETScDiffEq))
-        @test length(exported) == 9
+        @test length(exported) == 8
         for n in exported
             i = findfirst(l -> occursin(Regex("^(mutable )?struct \\Q$(n)\\E\\b"), l), lines)
             @test i !== nothing

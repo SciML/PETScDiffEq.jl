@@ -4,15 +4,13 @@ using DiffEqBase: DiffEqBase
 using LinearAlgebra: LinearAlgebra, mul!
 using MPI: MPI
 using PETSc: PETSc
-using Libdl: Libdl
 using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
 using SciMLOperators: SciMLOperators
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
     sparse
 
-export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSDAE, TSMPRK, TSGeneric,
-    PETScIntegrator
+export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSDAE, TSGeneric, PETScIntegrator
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 abstract type PETScTSDAEAlgorithm <: SciMLBase.AbstractDAEAlgorithm end
@@ -194,79 +192,6 @@ end
 TSARKIMEX(subtype::AbstractString = "3", petsc_options::AbstractVector{<:AbstractString} = String[]) =
     TSARKIMEX(String(subtype), String[String(o) for o in petsc_options])
 
-const _MPRK_TWO_WAY = ("2a22", "2a32", "p2", "p3")
-const _MPRK_THREE_WAY = ("2a23", "2a33")
-
-"""
-    TSMPRK(slow, subtype = "p2", petsc_options = String[])
-    TSMPRK(slow, medium, subtype = "2a23", petsc_options = String[])
-
-PETSc's multirate partitioned Runge-Kutta. `slow` lists the indices of the state
-that are integrated with the outer step; everything else is advanced on a smaller
-one. Both parts come from the problem's own `f`, which is evaluated in full and
-then read row by row, so nothing beyond the index list is asked of the caller.
-
-Passing a `medium` set as well splits the state three ways, which is what PETSc's
-`"2a23"` and `"2a33"` want. Whatever neither set names is the fast part.
-
-Explicit, so a mass matrix and an analytic Jacobian are both refused. Without a
-`medium` set `subtype` is one of `"2a22"`, `"2a32"`, `"p2"` or `"p3"`; with one it
-is `"2a23"` or `"2a33"`.
-"""
-struct TSMPRK <: PETScTSAlgorithm
-    slow::Vector{Int}
-    medium::Vector{Int}
-    subtype::String
-    petsc_options::Vector{String}
-
-    # The checks live here rather than in an outer constructor: the generated inner
-    # one is the more specific method for the concrete types a default argument
-    # expands to, so an outer one would be skipped exactly when it is not needed.
-    function TSMPRK(
-            slow::Vector{Int}, medium::Vector{Int}, subtype::String,
-            petsc_options::Vector{String},
-        )
-        isempty(slow) && throw(ArgumentError("`slow` needs at least one index"))
-        for (name, v) in (("slow", slow), ("medium", medium))
-            all(i -> i >= 1, v) || throw(ArgumentError("`$name` indices start at 1"))
-            length(unique(v)) == length(v) ||
-                throw(ArgumentError("`$name` repeats an index"))
-        end
-        isempty(intersect(slow, medium)) ||
-            throw(ArgumentError("`slow` and `medium` share an index"))
-        wanted = isempty(medium) ? _MPRK_TWO_WAY : _MPRK_THREE_WAY
-        subtype in wanted || throw(
-            ArgumentError(
-                isempty(medium) ?
-                    "`$subtype` needs a `medium` split as well; without one use " *
-                    join(map(t -> "\"$t\"", _MPRK_TWO_WAY), ", ") :
-                    "`$subtype` takes only two splits, so leave `medium` out; with " *
-                    "one use " * join(map(t -> "\"$t\"", _MPRK_THREE_WAY), " or "),
-            ),
-        )
-        return new(sort(slow), sort(medium), subtype, petsc_options)
-    end
-end
-
-TSMPRK(
-    slow::AbstractVector{<:Integer},
-    subtype::AbstractString = "p2",
-    petsc_options::AbstractVector{<:AbstractString} = String[],
-) = TSMPRK(
-    Vector{Int}(slow), Int[], String(subtype),
-    String[String(o) for o in petsc_options],
-)
-
-TSMPRK(
-    slow::AbstractVector{<:Integer},
-    medium::AbstractVector{<:Integer},
-    subtype::AbstractString = "2a23",
-    petsc_options::AbstractVector{<:AbstractString} = String[],
-) = TSMPRK(
-    Vector{Int}(slow), Vector{Int}(medium), String(subtype),
-    String[String(o) for o in petsc_options],
-)
-
 """
     TSGeneric(ts_type, petsc_options = String[]; explicit = false)
 
@@ -326,7 +251,6 @@ _uses_ifunction(::TSImplicit) = true
 _uses_ifunction(::TSIRK) = true
 _uses_ifunction(::TSDAE) = true
 _uses_ifunction(::TSARKIMEX) = true
-_uses_ifunction(::TSMPRK) = false
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
 # Only these PETSc TS families carry an embedded error estimate. The rest step
@@ -338,7 +262,6 @@ _adapts(::TSIRK) = false
 _adapts(alg::TSDAE) = alg.subtype == "bdf"
 _adapts(::TSARKIMEX) = true
 _adapts(alg::TSImplicit) = alg.subtype == "bdf"
-_adapts(::TSMPRK) = false
 _adapts(::TSGeneric) = nothing
 
 mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
@@ -369,9 +292,6 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     dense::Bool
     save_idxs::Union{Nothing, Vector{Int}}
     work::V
-    slow_idxs::Vector{Int}
-    medium_idxs::Vector{Int}
-    fast_idxs::Vector{Int}
     nf::Int
     nf2::Int
     njacs::Int
@@ -641,72 +561,6 @@ function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
-# MPRK asks for each part of the split separately. PETSc hands over the whole state
-# and wants back only that part's entries, so the user's `f` is evaluated in full and
-# the requested rows are copied out.
-function _mprk_part!(ctx, t, x_ptr, f_ptr, idxs)
-    pl = ctx.petsclib
-    try
-        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        ctx.f!(ctx.du, ctx.u, ctx.p, t)
-        ctx.nf += 1
-        sub = PETSc.VecPtr(pl, f_ptr, false)
-        vals = LibPETSc.VecGetArrayWrite(pl, sub)
-        try
-            @inbounds for (k, i) in enumerate(idxs)
-                vals[k] = ctx.du[i]
-            end
-        finally
-            LibPETSc.VecRestoreArrayWrite(pl, sub, vals)
-        end
-    catch e
-        ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
-    end
-    return LibPETSc.PetscErrorCode(0)
-end
-
-function _mprk_slow!(
-        ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
-        x_ptr::LibPETSc.CVec,
-        f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
-    )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _mprk_part!(ctx, t, x_ptr, f_ptr, ctx.slow_idxs)
-end
-
-function _mprk_medium!(
-        ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
-        x_ptr::LibPETSc.CVec,
-        f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
-    )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _mprk_part!(ctx, t, x_ptr, f_ptr, ctx.medium_idxs)
-end
-
-function _mprk_fast!(
-        ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
-        x_ptr::LibPETSc.CVec,
-        f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
-    )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _mprk_part!(ctx, t, x_ptr, f_ptr, ctx.fast_idxs)
-end
-
-const MPRK_SLOW_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-const MPRK_MEDIUM_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-const MPRK_FAST_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-# PETSc.jl wraps `TSRHSSplitSetRHSFunction` with an opaque function type and no room
-# for a context, so the symbol is called directly the way PETSc.jl itself does for
-# `TSSetRHSFunction`.
-const TSRHSSPLIT_SET_RHS = Ref{Ptr{Cvoid}}(C_NULL)
-
 const IFUNCTION_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _ijacobian!(
@@ -880,63 +734,12 @@ function __init__()
             LibPETSc.PetscReal, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid},
         )
     )
-    MPRK_SLOW_PTR[] = @cfunction(
-        _mprk_slow!,
-        LibPETSc.PetscErrorCode,
-        (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            Ptr{Cvoid},
-        )
-    )
-    MPRK_MEDIUM_PTR[] = @cfunction(
-        _mprk_medium!,
-        LibPETSc.PetscErrorCode,
-        (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            Ptr{Cvoid},
-        )
-    )
-    MPRK_FAST_PTR[] = @cfunction(
-        _mprk_fast!,
-        LibPETSc.PetscErrorCode,
-        (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            Ptr{Cvoid},
-        )
-    )
     return nothing
 end
 
 # `LibPETSc.PetscInt` is a fixed `Int64` in PETSc.jl rather than a property of the
 # library that got loaded, so on a platform offering only 32-bit-index builds the
 # index vectors handed to PETSc would be the wrong width and nothing would say so.
-function _split_rhs_symbol(petsclib)
-    TSRHSSPLIT_SET_RHS[] == C_NULL && (
-        TSRHSSPLIT_SET_RHS[] = Libdl.dlsym(
-            Libdl.dlopen(petsclib.petsc_library), :TSRHSSplitSetRHSFunction,
-        )
-    )
-    return TSRHSSPLIT_SET_RHS[]
-end
-
-# One part of the split: the rows `idxs` own, filled by `fptr`.
-function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr)
-    n = LibPETSc.PetscInt(length(idxs))
-    is = LibPETSc.ISCreateGeneral(
-        petsclib, MPI.COMM_SELF, n,
-        LibPETSc.PetscInt[i - 1 for i in idxs], LibPETSc.PETSC_COPY_VALUES,
-    )
-    LibPETSc.TSRHSSplitSetIS(petsclib, ts, name, is)
-    code = ccall(
-        _split_rhs_symbol(petsclib), LibPETSc.PetscErrorCode,
-        (LibPETSc.CTS, Cstring, LibPETSc.CVec, Ptr{Cvoid}, Ptr{Cvoid}),
-        ts, name, C_NULL, fptr, ctxptr,
-    )
-    iszero(code) ||
-        throw(ErrorException("TSRHSSplitSetRHSFunction(\"$name\") failed with $code"))
-    return nothing
-end
-
 function _check_inttype(petsclib)
     PETSc.inttype(petsclib) === LibPETSc.PetscInt || error(
         "PETScDiffEq needs a PETSc built with $(LibPETSc.PetscInt) indices, but the " *
@@ -984,7 +787,6 @@ _ts_type(alg::TSImplicit) = alg.subtype
 _ts_type(::TSIRK) = "irk"
 _ts_type(alg::TSDAE) = alg.subtype
 _ts_type(::TSARKIMEX) = "arkimex"
-_ts_type(::TSMPRK) = "mprk"
 _ts_type(alg::TSGeneric) = alg.ts_type
 
 _set_subtype!(petsclib, ts, alg::TSRK) =
@@ -1015,14 +817,12 @@ function _set_subtype!(petsclib, ts, alg::TSDAE)
     end
     return nothing
 end
-_set_subtype!(petsclib, ts, ::TSMPRK) = nothing
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 _default_options(::AnyPETScTS) = String[]
 # A Kronecker-product coupled-stage matrix has no LU factorisation, so PETSc's
 # default preconditioner cannot be set up for it.
 _default_options(::TSIRK) = ["-pc_type", "pbjacobi"]
-_default_options(alg::TSMPRK) = ["-ts_mprk_type", alg.subtype]
 
 const UNSUPPORTED_KWARGS = (
     :d_discontinuities, :isoutofdomain,
@@ -1166,20 +966,6 @@ function _setup(
     u0 = Vector{Float64}(vec(prob.u0))
     n = length(u0)
 
-    slow_idxs, medium_idxs, fast_idxs = if alg isa TSMPRK
-        named = vcat(alg.slow, alg.medium)
-        maximum(named) <= n || throw(
-            ArgumentError("`slow` or `medium` names index $(maximum(named)), but the state has $n"),
-        )
-        rest = setdiff(1:n, named)
-        isempty(rest) && throw(
-            ArgumentError("`slow` and `medium` cover the whole state, leaving nothing fast"),
-        )
-        alg.slow, alg.medium, rest
-    else
-        (Int[], Int[], Int[])
-    end
-
     petsclib = PETSc.getlib(PetscScalar = Float64)
     _check_inttype(petsclib)
     PETSc.initialized(petsclib) || PETSc.initialize(petsclib)
@@ -1281,7 +1067,7 @@ function _setup(
         row_cols0, row_src, row_buf, J0,
         Float64[], Vector{Float64}[], Vector{Float64}[],
         saveat_times, 1, save_everystep, dense_out, kept,
-        _vecseq(petsclib, n), slow_idxs, medium_idxs, fast_idxs, 0, 0, 0, nothing,
+        _vecseq(petsclib, n), 0, 0, 0, nothing,
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing,
@@ -1310,15 +1096,6 @@ function _setup(
                 LibPETSc.TSSetIFunction(petsclib, ts, nothing, IFUNCTION_PTR[], ctxptr)
             else
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, RHS_PTR[], ctxptr)
-            end
-            # MPRK steps the whole system as well as each part, so it needs the
-            # plain right-hand side above in addition to these.
-            if alg isa TSMPRK
-                _set_split!(petsclib, ts, "slow", slow_idxs, MPRK_SLOW_PTR[], ctxptr)
-                isempty(medium_idxs) || _set_split!(
-                    petsclib, ts, "medium", medium_idxs, MPRK_MEDIUM_PTR[], ctxptr,
-                )
-                _set_split!(petsclib, ts, "fast", fast_idxs, MPRK_FAST_PTR[], ctxptr)
             end
             if is_split
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, SPLIT_RHS_PTR[], ctxptr)
