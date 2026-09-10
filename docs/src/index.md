@@ -72,6 +72,7 @@ TSImplicit
 TSIRK
 TSARKIMEX
 TSDAE
+TSMPRK
 TSGeneric
 PETScIntegrator
 ```
