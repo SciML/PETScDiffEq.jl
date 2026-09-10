@@ -524,6 +524,35 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
         end
 
+        @testset "a three-way split" begin
+            # u1 slow, u2 medium, u3 fast.
+            three!(du, u, p, t) = (
+                du[1] = -u[1]; du[2] = -10.0 * u[2]; du[3] = -100.0 * u[3]; nothing
+            )
+            tprob = SciMLBase.ODEProblem(three!, [1.0, 1.0, 1.0], (0.0, 1.0))
+            for st in ("2a23", "2a33")
+                sol = SciMLBase.solve(
+                    tprob, PETScDiffEq.TSMPRK([1], [2], st); dt = 0.001,
+                    adaptive = false,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-6
+                @test abs(sol.u[end][2] - exp(-10.0)) < 1.0e-6
+            end
+            @test PETScDiffEq.TSMPRK([1], [2]).medium == [2]
+        end
+
+        @testset "the subtype has to match the number of splits" begin
+            @test_throws ArgumentError PETScDiffEq.TSMPRK([1], "2a23")
+            @test_throws ArgumentError PETScDiffEq.TSMPRK([1], [2], "p2")
+            @test_throws ArgumentError PETScDiffEq.TSMPRK([1], [1], "2a23")
+            @test_throws ArgumentError PETScDiffEq.TSMPRK([1], [0], "2a23")
+            @test_throws ArgumentError SciMLBase.solve(
+                SciMLBase.ODEProblem(two!, [1.0, 1.0], (0.0, 1.0)),
+                PETScDiffEq.TSMPRK([1], [2], "2a23"); dt = 0.01,
+            )
+        end
+
         @testset "explicit, so a mass matrix is refused" begin
             @test_throws ArgumentError SciMLBase.solve(
                 SciMLBase.ODEProblem(

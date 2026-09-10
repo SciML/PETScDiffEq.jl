@@ -194,43 +194,57 @@ end
 TSARKIMEX(subtype::AbstractString = "3", petsc_options::AbstractVector{<:AbstractString} = String[]) =
     TSARKIMEX(String(subtype), String[String(o) for o in petsc_options])
 
+const _MPRK_TWO_WAY = ("2a22", "2a32", "p2", "p3")
+const _MPRK_THREE_WAY = ("2a23", "2a33")
+
 """
     TSMPRK(slow, subtype = "p2", petsc_options = String[])
+    TSMPRK(slow, medium, subtype = "2a23", petsc_options = String[])
 
 PETSc's multirate partitioned Runge-Kutta. `slow` lists the indices of the state
 that are integrated with the outer step; everything else is advanced on a smaller
 one. Both parts come from the problem's own `f`, which is evaluated in full and
 then read row by row, so nothing beyond the index list is asked of the caller.
 
-Explicit, so a mass matrix and an analytic Jacobian are both refused. `subtype` is
-one of `"2a22"`, `"2a32"`, `"p2"` or `"p3"`. PETSc's `"2a23"` and `"2a33"` want a
-third `medium` split and are refused.
+Passing a `medium` set as well splits the state three ways, which is what PETSc's
+`"2a23"` and `"2a33"` want. Whatever neither set names is the fast part.
+
+Explicit, so a mass matrix and an analytic Jacobian are both refused. Without a
+`medium` set `subtype` is one of `"2a22"`, `"2a32"`, `"p2"` or `"p3"`; with one it
+is `"2a23"` or `"2a33"`.
 """
 struct TSMPRK <: PETScTSAlgorithm
     slow::Vector{Int}
+    medium::Vector{Int}
     subtype::String
     petsc_options::Vector{String}
 
-    # The check lives here rather than in an outer constructor: the generated inner
+    # The checks live here rather than in an outer constructor: the generated inner
     # one is the more specific method for the concrete types a default argument
     # expands to, so an outer one would be skipped exactly when it is not needed.
     function TSMPRK(
-            slow::Vector{Int}, subtype::String, petsc_options::Vector{String}
+            slow::Vector{Int}, medium::Vector{Int}, subtype::String,
+            petsc_options::Vector{String},
         )
         isempty(slow) && throw(ArgumentError("`slow` needs at least one index"))
-        all(i -> i >= 1, slow) || throw(ArgumentError("`slow` indices start at 1"))
-        length(unique(slow)) == length(slow) ||
-            throw(ArgumentError("`slow` repeats an index"))
-        subtype in ("2a22", "2a32", "p2", "p3") || throw(
+        for (name, v) in (("slow", slow), ("medium", medium))
+            all(i -> i >= 1, v) || throw(ArgumentError("`$name` indices start at 1"))
+            length(unique(v)) == length(v) ||
+                throw(ArgumentError("`$name` repeats an index"))
+        end
+        isempty(intersect(slow, medium)) ||
+            throw(ArgumentError("`slow` and `medium` share an index"))
+        wanted = isempty(medium) ? _MPRK_TWO_WAY : _MPRK_THREE_WAY
+        subtype in wanted || throw(
             ArgumentError(
-                subtype in ("2a23", "2a33") ?
-                    "`$subtype` wants a third `medium` split, which this package " *
-                    "does not build; use \"2a22\", \"2a32\", \"p2\" or \"p3\"" :
-                    "`$subtype` is not a TSMPRKType; use \"2a22\", \"2a32\", " *
-                    "\"p2\" or \"p3\"",
+                isempty(medium) ?
+                    "`$subtype` needs a `medium` split as well; without one use " *
+                    join(map(t -> "\"$t\"", _MPRK_TWO_WAY), ", ") :
+                    "`$subtype` takes only two splits, so leave `medium` out; with " *
+                    "one use " * join(map(t -> "\"$t\"", _MPRK_THREE_WAY), " or "),
             ),
         )
-        return new(sort(slow), subtype, petsc_options)
+        return new(sort(slow), sort(medium), subtype, petsc_options)
     end
 end
 
@@ -239,7 +253,18 @@ TSMPRK(
     subtype::AbstractString = "p2",
     petsc_options::AbstractVector{<:AbstractString} = String[],
 ) = TSMPRK(
-    Vector{Int}(slow), String(subtype), String[String(o) for o in petsc_options],
+    Vector{Int}(slow), Int[], String(subtype),
+    String[String(o) for o in petsc_options],
+)
+
+TSMPRK(
+    slow::AbstractVector{<:Integer},
+    medium::AbstractVector{<:Integer},
+    subtype::AbstractString = "2a23",
+    petsc_options::AbstractVector{<:AbstractString} = String[],
+) = TSMPRK(
+    Vector{Int}(slow), Vector{Int}(medium), String(subtype),
+    String[String(o) for o in petsc_options],
 )
 
 """
@@ -345,6 +370,7 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     save_idxs::Union{Nothing, Vector{Int}}
     work::V
     slow_idxs::Vector{Int}
+    medium_idxs::Vector{Int}
     fast_idxs::Vector{Int}
     nf::Int
     nf2::Int
@@ -651,6 +677,17 @@ function _mprk_slow!(
     return _mprk_part!(ctx, t, x_ptr, f_ptr, ctx.slow_idxs)
 end
 
+function _mprk_medium!(
+        ::LibPETSc.CTS,
+        t::LibPETSc.PetscReal,
+        x_ptr::LibPETSc.CVec,
+        f_ptr::LibPETSc.CVec,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    return _mprk_part!(ctx, t, x_ptr, f_ptr, ctx.medium_idxs)
+end
+
 function _mprk_fast!(
         ::LibPETSc.CTS,
         t::LibPETSc.PetscReal,
@@ -663,6 +700,7 @@ function _mprk_fast!(
 end
 
 const MPRK_SLOW_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+const MPRK_MEDIUM_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 const MPRK_FAST_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 # PETSc.jl wraps `TSRHSSplitSetRHSFunction` with an opaque function type and no room
 # for a context, so the symbol is called directly the way PETSc.jl itself does for
@@ -844,6 +882,14 @@ function __init__()
     )
     MPRK_SLOW_PTR[] = @cfunction(
         _mprk_slow!,
+        LibPETSc.PetscErrorCode,
+        (
+            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
+            Ptr{Cvoid},
+        )
+    )
+    MPRK_MEDIUM_PTR[] = @cfunction(
+        _mprk_medium!,
         LibPETSc.PetscErrorCode,
         (
             LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
@@ -1120,17 +1166,18 @@ function _setup(
     u0 = Vector{Float64}(vec(prob.u0))
     n = length(u0)
 
-    slow_idxs, fast_idxs = if alg isa TSMPRK
-        maximum(alg.slow) <= n || throw(
-            ArgumentError(
-                "`slow` names index $(maximum(alg.slow)), but the state has $n",
-            ),
+    slow_idxs, medium_idxs, fast_idxs = if alg isa TSMPRK
+        named = vcat(alg.slow, alg.medium)
+        maximum(named) <= n || throw(
+            ArgumentError("`slow` or `medium` names index $(maximum(named)), but the state has $n"),
         )
-        length(alg.slow) == n &&
-            throw(ArgumentError("`slow` covers the whole state, leaving nothing fast"))
-        alg.slow, setdiff(1:n, alg.slow)
+        rest = setdiff(1:n, named)
+        isempty(rest) && throw(
+            ArgumentError("`slow` and `medium` cover the whole state, leaving nothing fast"),
+        )
+        alg.slow, alg.medium, rest
     else
-        (Int[], Int[])
+        (Int[], Int[], Int[])
     end
 
     petsclib = PETSc.getlib(PetscScalar = Float64)
@@ -1234,7 +1281,7 @@ function _setup(
         row_cols0, row_src, row_buf, J0,
         Float64[], Vector{Float64}[], Vector{Float64}[],
         saveat_times, 1, save_everystep, dense_out, kept,
-        _vecseq(petsclib, n), slow_idxs, fast_idxs, 0, 0, 0, nothing,
+        _vecseq(petsclib, n), slow_idxs, medium_idxs, fast_idxs, 0, 0, 0, nothing,
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing,
@@ -1268,6 +1315,9 @@ function _setup(
             # plain right-hand side above in addition to these.
             if alg isa TSMPRK
                 _set_split!(petsclib, ts, "slow", slow_idxs, MPRK_SLOW_PTR[], ctxptr)
+                isempty(medium_idxs) || _set_split!(
+                    petsclib, ts, "medium", medium_idxs, MPRK_MEDIUM_PTR[], ctxptr,
+                )
                 _set_split!(petsclib, ts, "fast", fast_idxs, MPRK_FAST_PTR[], ctxptr)
             end
             if is_split
