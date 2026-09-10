@@ -204,6 +204,10 @@ answer. An explicit type also ignores a `jac` and rejects a mass matrix.
 Whether the named type adapts is not known here, so no tolerance warning is
 issued for it. Only `"euler"` and `"alpha"` have been run through this
 package's own convergence tests.
+
+`"alpha2"`, `"discgrad"`, `"eimex"`, `"mimex"` and `"mprk"` are refused: each is
+driven through a PETSc setup call this package does not make, and without it they
+crash or integrate to zero rather than saying anything.
 """
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
@@ -211,11 +215,35 @@ struct TSGeneric <: PETScTSAlgorithm
     petsc_options::Vector{String}
 end
 
-TSGeneric(
-    ts_type::AbstractString,
-    petsc_options::AbstractVector{<:AbstractString} = String[];
-    explicit::Bool = false,
-) = TSGeneric(String(ts_type), explicit, String[String(o) for o in petsc_options])
+# These PETSc types are driven through a setup call this package does not make, so
+# PETSc reaches its own solve with half a problem: `alpha2`, `discgrad` and `mimex`
+# take the process down with them, and `eimex` integrates to zero and reports success.
+const _NEEDS_OTHER_SETUP = Dict(
+    "alpha2" => "is for second-order systems and needs TSSetI2Function",
+    "discgrad" => "needs TSDiscGradSetFormulation",
+    "eimex" => "needs its own right-hand-side split, and integrates to zero without one",
+    "mimex" => "needs TSRHSSplit to declare its slow and fast parts",
+    "mprk" => "needs TSRHSSplit to declare its slow and fast parts",
+)
+
+# Handed an implicit residual these integrate nothing. `euler`, `ssp` and `rk` say so
+# through PETSc; `glee` returns the initial condition and reports success.
+const _EXPLICIT_ONLY = ("euler", "glee", "rk", "ssp")
+
+function TSGeneric(
+        ts_type::AbstractString,
+        petsc_options::AbstractVector{<:AbstractString} = String[];
+        explicit::Bool = false,
+    )
+    t = String(ts_type)
+    haskey(_NEEDS_OTHER_SETUP, t) && throw(
+        ArgumentError("PETScDiffEq cannot drive `$t`, which $(_NEEDS_OTHER_SETUP[t])"),
+    )
+    !explicit && t in _EXPLICIT_ONLY && throw(
+        ArgumentError("`$t` is an explicit PETSc type, so it needs `explicit = true`"),
+    )
+    return TSGeneric(t, explicit, String[String(o) for o in petsc_options])
+end
 
 _uses_ifunction(::TSRK) = false
 _uses_ifunction(::TSRosW) = true

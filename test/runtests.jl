@@ -474,21 +474,34 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "PETSc types this package cannot drive are refused" begin
+        # Each of these is set up through a PETSc call this package does not make.
+        # Given only a residual, PETSc reaches its solve with half a problem:
+        # alpha2, discgrad and mimex abort the process, eimex integrates to zero
+        # and reports success.
+        for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk")
+            @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
+            @test_throws ArgumentError PETScDiffEq.TSGeneric(t; explicit = true)
+        end
+
+        # Handed an implicit residual these integrate nothing at all. glee used to
+        # return the initial condition and report success.
+        for t in ("euler", "glee", "rk", "ssp")
+            @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
+            @test PETScDiffEq.TSGeneric(t; explicit = true).ts_type == t
+        end
+
+        # The implicit types are untouched.
+        for t in ("alpha", "beuler", "bdf", "cn", "dirk", "glle", "rosw", "theta")
+            @test PETScDiffEq.TSGeneric(t).ts_type == t
+        end
+    end
+
     @testset "a solve that never uses the Jacobian is called out" begin
         prob = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),
         )
         plain = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
-
-        # "glee" is an explicit method.
-        quiet = SciMLBase.solve(
-            prob, PETScDiffEq.TSGeneric("glee"); dt = 0.1, adaptive = false,
-        )
-        @test quiet.u[end] == [1.0]
-        @test quiet.stats.njacs == 0
-        @test_logs (:warn,) match_mode = :any SciMLBase.solve(
-            prob, PETScDiffEq.TSGeneric("glee"); dt = 0.1, adaptive = false,
-        )
 
         @testset "and the same type is fine when told it is explicit" begin
             sol = SciMLBase.solve(
