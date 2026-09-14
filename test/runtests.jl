@@ -3119,13 +3119,49 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "An adaptive solve picks its own first step" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for alg in (
+                PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
+                PETScDiffEq.TSARKIMEX("3"), PETScDiffEq.TSImplicit("bdf"),
+            )
+            tol = (reltol = 1.0e-8, abstol = 1.0e-10)
+            chosen = SciMLBase.solve(prob, alg; tol...)
+            given = SciMLBase.solve(prob, alg; dt = 0.01, tol...)
+            @test chosen.retcode == SciMLBase.ReturnCode.Success
+            err = abs(chosen.u[end][1] - exp(-1.0))
+            @test err < 2 * abs(given.u[end][1] - exp(-1.0))
+            @test err < 1.0e-5
+        end
+        # The values OrdinaryDiffEq's Tsit5 starts from on the same problems and tolerances.
+        fast!(du, u, p, t) = (du[1] = -1.0e4 * u[1]; nothing)
+        forced!(du, u, p, t) = (du[1] = -u[1] + cos(t); nothing)
+        for (f, span, tol, expected) in (
+                (decay!, (0.0, 1.0), (abstol = 1.0e-6, reltol = 1.0e-3), 0.10001999200479662),
+                (fast!, (0.0, 1.0), (abstol = 1.0e-6, reltol = 1.0e-3), 9.999999999999999e-5),
+                (forced!, (2.0, 0.0), (abstol = 1.0e-8, reltol = 1.0e-6), -0.023477000945526193),
+            )
+            integ = SciMLBase.init(SciMLBase.ODEProblem(f, [1.0], span), PETScDiffEq.TSRK("5dp"); tol...)
+            @test isapprox(integ.dt, expected; rtol = 1.0e-12)
+            SciMLBase.solve!(integ)
+            @test integ.sol.retcode == SciMLBase.ReturnCode.Success
+        end
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0], (0.0, 1.0),
+        )
+        @test SciMLBase.init(mass, PETScDiffEq.TSRosW("ra34pw2")).dt == 1.0e-6
+        dae = SciMLBase.DAEProblem(
+            (r, du, u, p, t) -> (r .= du .+ u; nothing), [-1.0], [1.0], (0.0, 1.0),
+        )
+        @test SciMLBase.init(dae, PETScDiffEq.TSDAE("bdf")).dt == 1.0e-6
+    end
+
     @testset "Input validation" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
-        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"))
-        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRosW("ra34pw2"))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSImplicit("beuler"))
-        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX("3"))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSGeneric("alpha"))
+        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSIRK(2))
+        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); adaptive = false)
         @test_throws ArgumentError SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (1.0, 1.0)),
             PETScDiffEq.TSRK("5dp"); dt = 0.1,

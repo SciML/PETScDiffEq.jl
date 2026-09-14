@@ -1208,6 +1208,34 @@ function _tolvec(h::TSHandles, petsclib, tol, n, name)
     return v
 end
 
+# Hairer and Wanner's starting step, the estimate OrdinaryDiffEq makes, taken in the user's
+# time before the right-hand side is wrapped for PETSc.
+function _initial_dt(f1, f2, u0, p, t0, tdir, order, abstol, reltol, dtmax)
+    norm = DiffEqBase.ODE_DEFAULT_NORM
+    function rhs(u, t)
+        du = similar(u)
+        f1(du, u, p, t)
+        if f2 !== nothing
+            extra = similar(u)
+            f2(extra, u, p, t)
+            du .+= extra
+        end
+        return du
+    end
+    sk = abstol .+ abs.(u0) .* reltol
+    f0 = rhs(u0, t0)
+    all(isfinite, f0) || return 1.0e-6
+    d0 = norm(u0 ./ sk, t0)
+    d1 = norm(f0 ./ sk, t0)
+    dt0 = min(d0 < 1.0e-5 || d1 < 1.0e-5 ? 1.0e-6 : 0.01 * d0 / d1, dtmax)
+    f_next = rhs(u0 .+ (tdir * dt0) .* f0, t0 + tdir * dt0)
+    f0 == f_next && return min(100 * dt0, dtmax)
+    d2 = norm((f_next .- f0) ./ sk, t0) / dt0
+    m = max(d1, d2)
+    dt1 = m <= 1.0e-15 ? max(1.0e-6, dt0 * 1.0e-3) : 10.0^(-(2 + log10(m)) / order)
+    return min(100 * dt0, dt1, dtmax)
+end
+
 const SupportedProblem = Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}
 
 function _setup(
@@ -1235,7 +1263,14 @@ function _setup(
     end
     prob.u0 isa AbstractVector{<:Real} ||
         throw(ArgumentError("PETScDiffEq requires a real AbstractVector u0"))
-    dt === nothing && throw(ArgumentError("PETScDiffEq requires an initial dt"))
+    if dt === nothing && !(adaptive && _adapts(alg) === true)
+        throw(
+            ArgumentError(
+                "PETScDiffEq needs `dt` unless the solve adapts on an error estimate it " *
+                    "knows about, which `$(_ts_type(alg))` with `adaptive = $adaptive` does not",
+            ),
+        )
+    end
     is_split = prob.f isa SciMLBase.SplitFunction
     is_split && !(alg isa TSARKIMEX) &&
         throw(ArgumentError("PETScDiffEq only supports SplitODEProblem with TSARKIMEX"))
@@ -1364,6 +1399,20 @@ function _setup(
         )
     end
     jac_fn = has_jac ? (is_dae ? prob.f.jac : _as_inplace_jac(prob.f.jac, iip)) : nothing
+    if dt === nothing
+        # The tolerances as they will reach PETSc, whose own default is 1e-4 for both.
+        est_abstol = something(abstol, reltol === nothing ? 1.0e-4 : 1.0e-6)
+        est_reltol = something(reltol, abstol === nothing ? 1.0e-4 : 1.0e-3)
+        dt = if is_dae || has_mass
+            1.0e-6
+        else
+            est_dtmax = dtmax === nothing || isinf(dtmax) ? abs(tf - t0) : abs(Float64(dtmax))
+            _initial_dt(
+                f1, f2, u0, prob.p, Float64(prob.tspan[1]), tdir, SciMLBase.alg_order(alg),
+                est_abstol, est_reltol, est_dtmax,
+            )
+        end
+    end
     if tdir < 0
         f1 = is_dae ? _reverse_residual(f1) : _reverse_rhs(f1)
         f2 = f2 === nothing ? nothing : _reverse_rhs(f2)

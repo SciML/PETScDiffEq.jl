@@ -38,7 +38,8 @@ prob = SciMLBase.ODEProblem(lorenz, u0, tspan)
 sol = SciMLBase.solve(prob, TSRK("5dp"); dt = 0.01, abstol = 1e-8, reltol = 1e-8)
 ```
 
-`dt` is required and sets the first step.
+`dt` sets the first step. An adaptive solve can leave it out and starts from the same
+estimate OrdinaryDiffEq makes; a fixed-step solve needs it.
 
 ## Solvers
 
