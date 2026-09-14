@@ -347,6 +347,48 @@ _adapts(alg::TSImplicit) = alg.subtype == "bdf"
 _adapts(::TSMPRK) = false
 _adapts(::TSGeneric) = nothing
 
+# The orders PETSc registers each tableau with; GaussAdjoint sizes its quadrature from them.
+const _RK_ORDER = Dict(
+    "1fe" => 1, "2a" => 2, "2b" => 2, "3" => 3, "3bs" => 3, "4" => 4,
+    "5f" => 5, "5dp" => 5, "5bs" => 5, "6vr" => 6, "7vr" => 7, "8vr" => 8,
+)
+const _ROSW_ORDER = Dict(
+    "theta1" => 1, "theta2" => 2, "2p" => 2, "2m" => 2, "ra3pw" => 3, "ra34pw2" => 3,
+    "r34prw" => 3, "r3prl2" => 3, "rodas3" => 3, "rodaspr" => 4, "rodaspr2" => 4,
+    "sandu3" => 3, "assp3p3s1c" => 3, "lassp3p4s2c" => 3, "llssp3p4s2c" => 3, "ark3" => 3,
+    "grk4t" => 4, "shamp4" => 4, "veldd4" => 4, "4l" => 4,
+)
+# PETSc registers `1bee` at 2, but it is backward Euler and converges at first order.
+const _ARKIMEX_ORDER = Dict(
+    "1bee" => 1, "ars122" => 2, "a2" => 2, "l2" => 2, "2c" => 2, "2d" => 2, "2e" => 2,
+    "prssp2" => 2, "3" => 3, "ars443" => 3, "bpr3" => 3, "4" => 4, "5" => 5,
+)
+const _MPRK_ORDER = Dict(
+    "2a22" => 2, "2a23" => 2, "2a32" => 2, "2a33" => 2, "p2" => 2, "p3" => 3,
+)
+
+function _order(table, family, subtype)
+    haskey(table, subtype) ||
+        throw(ArgumentError("no order is known for $family subtype \"$subtype\""))
+    return table[subtype]
+end
+
+SciMLBase.alg_order(alg::TSRK) = _order(_RK_ORDER, "TSRK", alg.subtype)
+SciMLBase.alg_order(alg::TSRosW) = _order(_ROSW_ORDER, "TSRosW", alg.subtype)
+SciMLBase.alg_order(alg::TSARKIMEX) = _order(_ARKIMEX_ORDER, "TSARKIMEX", alg.subtype)
+SciMLBase.alg_order(alg::TSMPRK) = _order(_MPRK_ORDER, "TSMPRK", alg.subtype)
+SciMLBase.alg_order(alg::TSIRK) = 2 * alg.nstages
+SciMLBase.alg_order(alg::TSImplicit) = _implicit_order(alg.subtype, alg.theta, alg.order)
+SciMLBase.alg_order(alg::TSDAE) = _implicit_order(alg.subtype, nothing, alg.order)
+
+function _implicit_order(subtype, theta, order)
+    subtype == "beuler" && return 1
+    subtype == "cn" && return 2
+    subtype == "theta" && return theta === nothing || theta == 0.5 ? 2 : 1
+    subtype == "bdf" && return something(order, 2)
+    throw(ArgumentError("no order is known for implicit subtype \"$subtype\""))
+end
+
 mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     petsclib::T
     f!::F
@@ -415,8 +457,8 @@ end
 _saved(ctx, u) = ctx.save_idxs === nothing ? Vector{Float64}(u) :
     Float64[u[i] for i in ctx.save_idxs]
 
-_interp(ctx) = ctx.dense ? SciMLBase.HermiteInterpolation(ctx.ts, ctx.us, ctx.dus) :
-    SciMLBase.LinearInterpolation(ctx.ts, ctx.us)
+_interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, dus) :
+    SciMLBase.LinearInterpolation(ts, ctx.us)
 
 _mass(ctx, i, j) = ctx.M === nothing ? (i == j ? 1.0 : 0.0) : ctx.M[i, j]
 
@@ -500,6 +542,22 @@ _stored(A::SparseMatrixCSC, i, j) = any(==(i), @view A.rowval[A.colptr[j]:(A.col
 _as_inplace(f, iip::Bool) = iip ? f : (du, u, p, t) -> (du .= f(u, p, t); nothing)
 _as_inplace_jac(j, iip::Bool) = iip ? j :
     (J, u, p, t) -> (_copy_jac!(J, j(u, p, t)); nothing)
+
+# PETSc only steps forward in time, so a reversed span is stepped in s = -t, where
+# v(s) = u(-s) has dv/ds = -f(v, p, -s) and a residual G(t, u, u') becomes
+# G(-s, v, -dv/ds). The derivative buffer is negated in place and restored rather
+# than copied, since these run on every function and Jacobian evaluation.
+_reverse_rhs(f) = (du, u, p, s) -> (f(du, u, p, _user_t(-1.0, s)); du .*= -1; nothing)
+_reverse_jac(j) =
+    (J, u, p, s) -> (j(J, u, p, _user_t(-1.0, s)); LinearAlgebra.rmul!(J, -1); nothing)
+_reverse_residual(g) =
+    (r, dv, u, p, s) -> (dv .*= -1; g(r, dv, u, p, _user_t(-1.0, s)); dv .*= -1; nothing)
+_reverse_dae_jac(j) =
+    (J, dv, u, p, gamma, s) -> (dv .*= -1; j(J, dv, u, p, -gamma, _user_t(-1.0, s)); dv .*= -1; nothing)
+
+# The user's time for PETSc's s. Negating s = 0 gives -0.0, and `isless(-0.0, 0.0)`
+# holds, so a stop or a saved time at zero would be missed; adding zero gives +0.0.
+_user_t(tdir, s) = tdir * s + 0.0
 
 _copy_jac!(J::AbstractMatrix, A) = (copyto!(J, A); nothing)
 
@@ -1041,6 +1099,7 @@ mutable struct TSHandles{CTX, T}
     opts::Any
     t0::Float64
     tf::Float64
+    tdir::Float64
     u0::Vector{Float64}
     maxiters::Int
     save_start::Bool
@@ -1163,7 +1222,10 @@ function _setup(
     end
 
     t0, tf = Float64(prob.tspan[1]), Float64(prob.tspan[2])
-    t0 < tf || throw(ArgumentError("PETScDiffEq requires tspan[1] < tspan[2]"))
+    t0 == tf && throw(ArgumentError("PETScDiffEq requires tspan[1] != tspan[2]"))
+    # Everything handed to PETSc from here on is in its forward-running time s = tdir * t.
+    tdir = t0 < tf ? 1.0 : -1.0
+    t0, tf = tdir * t0, tdir * tf
 
     u0 = Vector{Float64}(vec(prob.u0))
     n = length(u0)
@@ -1215,6 +1277,12 @@ function _setup(
         )
     end
     jac_fn = has_jac ? (is_dae ? prob.f.jac : _as_inplace_jac(prob.f.jac, iip)) : nothing
+    if tdir < 0
+        f1 = is_dae ? _reverse_residual(f1) : _reverse_rhs(f1)
+        f2 = f2 === nothing ? nothing : _reverse_rhs(f2)
+        jac_fn = jac_fn === nothing ? nothing :
+            (is_dae ? _reverse_dae_jac(jac_fn) : _reverse_jac(jac_fn))
+    end
     jac_prototype = has_jac ? prob.f.jac_prototype : nothing
     uses_sparse_jac = jac_prototype isa SparseMatrixCSC
     J0 = if !has_jac
@@ -1225,7 +1293,8 @@ function _setup(
         zeros(n, n)
     end
     saveat_times = saveat isa Number ?
-        collect(Float64, t0:Float64(saveat):tf) : sort!(Vector{Float64}(collect(saveat)))
+        collect(Float64, t0:abs(Float64(saveat)):tf) :
+        sort!(tdir .* Vector{Float64}(collect(saveat)))
     filter!(t -> t0 - eps(tf) <= t <= tf + eps(tf), saveat_times)
     if !isempty(saveat_times) && save_start &&
             saveat_times[1] > t0 + 100 * eps(max(one(Float64), abs(tf)))
@@ -1288,7 +1357,7 @@ function _setup(
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing,
-        t0, tf, u0, Int(maxiters), save_start, save_end, Any[], Vector{Float64}[], false,
+        t0, tf, tdir, u0, Int(maxiters), save_start, save_end, Any[], Vector{Float64}[], false,
     )
     finalizer(_destroy!, h)
     LIVE_HANDLES[h] = nothing
@@ -1340,7 +1409,7 @@ function _setup(
             end
             LibPETSc.TSMonitorSet(petsclib, ts, MONITOR_PTR[], ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
-            LibPETSc.TSSetTimeStep(petsclib, ts, Float64(dt))
+            LibPETSc.TSSetTimeStep(petsclib, ts, abs(Float64(dt)))
             LibPETSc.TSSetMaxTime(petsclib, ts, tf)
             LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(maxiters))
             LibPETSc.TSSetExactFinalTime(
@@ -1368,9 +1437,9 @@ function _setup(
             append!(effective_options, _default_options(alg))
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
             (dtmin === nothing || dtmin == 0) ||
-                append!(effective_options, ["-ts_adapt_dt_min", string(Float64(dtmin))])
+                append!(effective_options, ["-ts_adapt_dt_min", string(abs(Float64(dtmin)))])
             (dtmax === nothing || isinf(dtmax)) ||
-                append!(effective_options, ["-ts_adapt_dt_max", string(Float64(dtmax))])
+                append!(effective_options, ["-ts_adapt_dt_max", string(abs(Float64(dtmax)))])
             append!(effective_options, alg.petsc_options)
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
@@ -1446,9 +1515,10 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
         ctx.nf, ctx.nf2, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
         st.nsteps, st.nreject, 0.0,
     )
+    ts, dus = _user_time(h)
     return SciMLBase.build_solution(
-        prob, alg, ctx.ts, ctx.us; retcode = retcode, stats = stats,
-        dense = ctx.dense, interp = _interp(ctx),
+        prob, alg, ts, ctx.us; retcode = retcode, stats = stats,
+        dense = ctx.dense, interp = _interp(ctx, ts, dus),
     )
 end
 
@@ -1579,11 +1649,11 @@ end
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
 function SciMLBase.get_proposed_dt(integ::PETScIntegrator)
-    integ.finished && return integ.dt
+    integ.finished && return abs(integ.dt)
     return Float64(LibPETSc.TSGetTimeStep(integ.h.petsclib, integ.h.ts))
 end
 function SciMLBase.set_proposed_dt!(integ::PETScIntegrator, dt)
-    integ.finished || LibPETSc.TSSetTimeStep(integ.h.petsclib, integ.h.ts, Float64(dt))
+    integ.finished || LibPETSc.TSSetTimeStep(integ.h.petsclib, integ.h.ts, abs(Float64(dt)))
     return nothing
 end
 _make_opts(h, kwargs) = PETScIntegratorOpts(
@@ -1605,9 +1675,9 @@ SciMLBase.isadaptive(integ::PETScIntegrator) =
 (integ::PETScIntegrator)(out::AbstractArray, t, ::Type{Val{0}}) =
     copyto!(out, _state_at(integ, Float64(t)))
 
-SciMLBase.get_du(integ::PETScIntegrator) = _derivative(integ.h.ctx, integ.t, integ.u)
+SciMLBase.get_du(integ::PETScIntegrator) = integ.tdir .* _derivative(integ.h.ctx, integ.tdir * integ.t, integ.u)
 function SciMLBase.get_du!(out, integ::PETScIntegrator)
-    copyto!(out, _derivative(integ.h.ctx, integ.t, integ.u))
+    copyto!(out, integ.tdir .* _derivative(integ.h.ctx, integ.tdir * integ.t, integ.u))
     return out
 end
 SciMLBase.get_tmp_cache(integ::PETScIntegrator) = (integ.tmp1, integ.tmp2)
@@ -1628,15 +1698,16 @@ end
 
 function SciMLBase.set_t!(integ::PETScIntegrator, t)
     integ.t = Float64(t)
-    integ.finished || LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, Float64(t))
+    integ.finished || LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * Float64(t))
     return nothing
 end
 
 function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
     t = Float64(t)
     ctx = integ.h.ctx
-    i = searchsortedfirst(ctx.saveat, t)
-    (i <= length(ctx.saveat) && ctx.saveat[i] == t) || insert!(ctx.saveat, i, t)
+    s = integ.tdir * t
+    i = searchsortedfirst(ctx.saveat, s)
+    (i <= length(ctx.saveat) && ctx.saveat[i] == s) || insert!(ctx.saveat, i, s)
     i < ctx.saveat_idx && (ctx.saveat_idx += 1)
     return nothing
 end
@@ -1652,14 +1723,14 @@ function SciMLBase.change_t_via_interpolation!(
     PETSc.withlocalarray!(
         ua -> copyto!(ua, integ.u), integ.h.u; read = false, write = true,
     )
-    LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, Float64(t))
+    LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * Float64(t))
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
     return nothing
 end
 
 function SciMLBase.savevalues!(integ::PETScIntegrator)
     integ.finished && return false
-    _record!(integ.h.ctx, integ.t, integ.u)
+    _record!(integ.h.ctx, integ.tdir * integ.t, integ.u)
     return true
 end
 
@@ -1668,14 +1739,14 @@ function _state_at(integ::PETScIntegrator, t::Float64)
     t == integ.tprev && return integ.uprev
     # PETSc interpolates within the step it just took and nowhere else, so a
     # request outside that window has no answer to give.
-    integ.tprev <= t <= integ.t || throw(
+    integ.tdir * integ.tprev <= integ.tdir * t <= integ.tdir * integ.t || throw(
         ArgumentError(
             "PETScDiffEq can only interpolate inside the step just taken, " *
                 "$(integ.tprev) to $(integ.t), but $t was asked for",
         ),
     )
     h = integ.h
-    LibPETSc.TSInterpolate(h.petsclib, h.ts, t, h.ctx.work)
+    LibPETSc.TSInterpolate(h.petsclib, h.ts, integ.tdir * t, h.ctx.work)
     _readvec!(integ.ucache, h.petsclib, h.ctx.work)
     return integ.ucache
 end
@@ -1708,7 +1779,10 @@ _is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev 
 function _bisect_root(integ::PETScIntegrator, cb, lo, hi, slo, i::Int, buf)
     while true
         mid = lo + (hi - lo) / 2
-        (mid <= lo || mid >= hi || hi - lo <= cb.abstol) && break
+        (
+            integ.tdir * (mid - lo) <= 0 || integ.tdir * (hi - mid) <= 0 ||
+                abs(hi - lo) <= cb.abstol
+        ) && break
         smid = _fill_conditions!(buf, integ, cb, mid)[i]
         smid == 0 && return mid
         if slo * smid <= 0
@@ -1734,13 +1808,13 @@ end
 
 function _find_event(integ::PETScIntegrator, cb, k::Int)
     t0, t1 = integ.tprev, integ.t
-    t1 > t0 || return nothing
+    integ.tdir * (t1 - t0) > 0 || return nothing
     # A component that fired at the start of this step would find the same root
     # again, so its own crossings are ignored for a nudge past it. The window is
     # per component: another condition may legitimately cross inside it.
     ev = integ.event_t[k]
-    nudge = Float64(cb.repeat_nudge) * (t1 - t0)
-    fresh(i, upto) = isnan(ev[i]) || upto > ev[i] + nudge
+    nudge = Float64(cb.repeat_nudge) * abs(t1 - t0)
+    fresh(i, upto) = isnan(ev[i]) || integ.tdir * upto > integ.tdir * ev[i] + nudge
     m = _ncond(cb)
     s0 = Vector{Float64}(undef, m)
     sk = Vector{Float64}(undef, m)
@@ -1760,8 +1834,11 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
             roots = [_bisect_root(integ, cb, lo, tk, s0[i], i, sk) for i in hit]
             live = [j for j in eachindex(hit) if fresh(hit[j], roots[j])]
             if !isempty(live)
-                first_root = minimum(roots[j] for j in live)
-                keep = [hit[j] for j in live if roots[j] <= first_root + cb.abstol]
+                first_root = roots[live[argmin([integ.tdir * roots[j] for j in live])]]
+                keep = [
+                    hit[j] for j in live
+                        if integ.tdir * roots[j] <= integ.tdir * first_root + cb.abstol
+                ]
                 return (first_root, _crossing(cb, s0, keep, m))
             end
         end
@@ -1801,15 +1878,15 @@ function _rollback!(integ::PETScIntegrator, t::Float64, dt::Float64, interpolate
     h = integ.h
     pl = h.petsclib
     if interpolate && t != integ.t
-        LibPETSc.TSInterpolate(pl, h.ts, t, h.ctx.work)
+        LibPETSc.TSInterpolate(pl, h.ts, integ.tdir * t, h.ctx.work)
         PETSc.withlocalarray!(
             a -> copyto!(integ.u, a), h.ctx.work; read = true, write = false,
         )
     end
     integ.t = t
     PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
-    LibPETSc.TSSetTime(pl, h.ts, t)
-    LibPETSc.TSSetTimeStep(pl, h.ts, dt)
+    LibPETSc.TSSetTime(pl, h.ts, integ.tdir * t)
+    LibPETSc.TSSetTimeStep(pl, h.ts, integ.tdir * dt)
     LibPETSc.TSRestartStep(pl, h.ts)
     integ.dt = dt
     return nothing
@@ -1823,7 +1900,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt::Float64)
     for (k, cb) in enumerate(integ.continuous)
         found = _find_event(integ, cb, k)
         found === nothing && continue
-        if best === nothing || found[1] < best
+        if best === nothing || integ.tdir * found[1] < integ.tdir * best
             best, best_cb, best_crossing, best_k = found[1], cb, found[2], k
         end
     end
@@ -1831,13 +1908,13 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt::Float64)
     ctx = integ.h.ctx
     _save_step!(integ, best, false)
     _rollback!(integ, best, dt, true)
-    best_cb.save_positions[1] && _record!(ctx, integ.t, integ.u)
+    best_cb.save_positions[1] && _record!(ctx, integ.tdir * integ.t, integ.u)
     integ.derivative_discontinuity = true
     _fire!(integ, best_cb, best_crossing)
     integ.finished && return true
     _rollback!(integ, integ.t, dt, false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
-    best_cb.save_positions[2] && _record!(ctx, integ.t, integ.u)
+    best_cb.save_positions[2] && _record!(ctx, integ.tdir * integ.t, integ.u)
     return true
 end
 
@@ -1858,8 +1935,27 @@ function _apply_callbacks!(integ::PETScIntegrator)
             PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
         end
-        cb.save_positions[2] && _record!(ctx, integ.t, integ.u)
+        cb.save_positions[2] && _record!(ctx, integ.tdir * integ.t, integ.u)
     end
+    return nothing
+end
+
+# An initialize may change the state, and PETSc steps from its own vector rather
+# than from `integ.u`.
+function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
+    h = integ.h
+    cbs = (integ.callbacks..., integ.continuous...)
+    before = copy(integ.u)
+    for cb in cbs
+        cb.initialize(cb, integ.u, integ.t, integ)
+    end
+    integ.derivative_discontinuity = false
+    integ.u == before && return nothing
+    copyto!(integ.uprev, integ.u)
+    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    initialize_save && any(cb -> cb.save_positions[2], cbs) &&
+        _record!(h.ctx, h.tdir * integ.t, integ.u)
     return nothing
 end
 
@@ -1871,44 +1967,44 @@ function SciMLBase.__init(
     h = _setup(prob, alg; kwargs...)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
     _initial_save!(h)
-    stops = _tstops(tstops, h.t0, h.tf)
-    dt0 = Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
+    stops = _tstops(tstops, h)
+    dt0 = h.tdir * Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
     integ = PETScIntegrator(
-        alg, copy(h.u0), copy(h.u0), h.t0, h.t0, dt0, 1.0,
+        alg, copy(h.u0), copy(h.u0), _user_t(h.tdir, h.t0), _user_t(h.tdir, h.t0),
+        dt0, h.tdir,
         prob.p, h, prob, callbacks, continuous, prob.f, _make_opts(h, kwargs),
         copy(h.u0), similar(h.u0), similar(h.u0),
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
-        stops, copy(stops), dt0, _initial_solution(prob, alg, h), false, false,
+        stops, _user_t.(h.tdir, stops), dt0, _initial_solution(prob, alg, h), false, false,
     )
-    for cb in (callbacks..., continuous...)
-        cb.initialize(cb, integ.u, integ.t, integ)
-    end
+    _initialize_callbacks!(integ, true)
     return integ
 end
 
-function _tstops(tstops, t0, tf)
-    stops = sort!(unique!(Vector{Float64}(collect(Float64, tstops))))
-    filter!(t -> t0 < t < tf, stops)
+function _tstops(tstops, h::TSHandles)
+    stops = sort!(unique!(h.tdir .* Vector{Float64}(collect(Float64, tstops))))
+    filter!(s -> h.t0 < s < h.tf, stops)
     return stops
 end
 
 function SciMLBase.add_tstop!(integ::PETScIntegrator, t)
     t = Float64(t)
-    t < integ.t &&
+    s = integ.tdir * t
+    s < integ.tdir * integ.t &&
         throw(ArgumentError("cannot add a tstop at $t, behind the current time $(integ.t)"))
-    t > integ.h.tf && throw(
+    s > integ.h.tf && throw(
         ArgumentError(
-            "cannot add a tstop at $t, beyond the final time $(integ.h.tf); " *
+            "cannot add a tstop at $t, beyond the final time $(integ.tdir * integ.h.tf); " *
                 "PETScDiffEq cannot integrate past the problem's tspan",
         ),
     )
-    i = searchsortedfirst(integ.tstops, t)
-    (i <= length(integ.tstops) && integ.tstops[i] == t) || insert!(integ.tstops, i, t)
+    i = searchsortedfirst(integ.tstops, s)
+    (i <= length(integ.tstops) && integ.tstops[i] == s) || insert!(integ.tstops, i, s)
     return nothing
 end
 SciMLBase.has_tstop(integ::PETScIntegrator) = !isempty(integ.tstops)
-SciMLBase.first_tstop(integ::PETScIntegrator) = integ.tstops[1]
-SciMLBase.pop_tstop!(integ::PETScIntegrator) = popfirst!(integ.tstops)
+SciMLBase.first_tstop(integ::PETScIntegrator) = _user_t(integ.tdir, integ.tstops[1])
+SciMLBase.pop_tstop!(integ::PETScIntegrator) = _user_t(integ.tdir, popfirst!(integ.tstops))
 
 function _initial_save!(h::TSHandles)
     ctx = h.ctx
@@ -1926,10 +2022,17 @@ function _initial_save!(h::TSHandles)
     return nothing
 end
 
-_initial_solution(prob, alg, h::TSHandles) = SciMLBase.build_solution(
-    prob, alg, h.ctx.ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
-    dense = h.ctx.dense, interp = _interp(h.ctx),
-)
+# Recorded times and derivatives are in PETSc's forward-running time.
+_user_time(h::TSHandles) = h.tdir > 0 ? (h.ctx.ts, h.ctx.dus) :
+    (_user_t.(h.tdir, h.ctx.ts), [-d for d in h.ctx.dus])
+
+function _initial_solution(prob, alg, h::TSHandles)
+    ts, dus = _user_time(h)
+    return SciMLBase.build_solution(
+        prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
+        dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus),
+    )
+end
 
 # A reinitialised integrator gets fresh PETSc objects built from the keywords
 # given to `init`, so its solve is identical to a fresh one and it works even
@@ -1970,23 +2073,20 @@ function SciMLBase.reinit!(
     integ.ucache = copy(h.u0)
     integ.tmp1 = similar(h.u0)
     integ.tmp2 = similar(h.u0)
-    integ.t = h.t0
-    integ.tprev = h.t0
-    integ.dt = Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
+    integ.tdir = h.tdir
+    integ.t = _user_t(h.tdir, h.t0)
+    integ.tprev = _user_t(h.tdir, h.t0)
+    integ.dt = h.tdir * Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
     integ.dtcache = integ.dt
-    integ.tstops = _tstops(tstops, h.t0, h.tf)
-    integ.tstops_cache = copy(integ.tstops)
+    integ.tstops = _tstops(tstops, h)
+    integ.tstops_cache = _user_t.(h.tdir, integ.tstops)
     integ.finished = false
     for ev in integ.event_t
         fill!(ev, NaN)
     end
     integ.derivative_discontinuity = false
     integ.sol = _initial_solution(integ.prob, integ.alg, h)
-    if reinit_callbacks
-        for cb in (integ.callbacks..., integ.continuous...)
-            cb.initialize(cb, integ.u, integ.t, integ)
-        end
-    end
+    reinit_callbacks && _initialize_callbacks!(integ, initialize_save)
     return nothing
 end
 
@@ -2001,7 +2101,7 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
         cb.finalize(cb, integ.u, integ.t, integ)
     end
     st = _read_stats(h)
-    sol = _assemble(integ.prob, integ.alg, h, integ.t, copy(integ.u), st)
+    sol = _assemble(integ.prob, integ.alg, h, integ.tdir * integ.t, copy(integ.u), st)
     integ.sol = retcode === nothing ? sol : SciMLBase.solution_new_retcode(sol, retcode)
     integ.finished = true
     _destroy!(h)
@@ -2020,11 +2120,12 @@ function _save_step!(integ::PETScIntegrator, upto::Float64, endpoint::Bool)
     ctx, pl = h.ctx, h.petsclib
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
     if isempty(ctx.saveat)
-        endpoint && ctx.save_everystep && _record!(ctx, upto, integ.u)
+        endpoint && ctx.save_everystep && _record!(ctx, integ.tdir * upto, integ.u)
     else
-        while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= upto + tol
+        while ctx.saveat_idx <= length(ctx.saveat) &&
+                ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + tol
             want = ctx.saveat[ctx.saveat_idx]
-            if abs(want - integ.t) <= tol
+            if abs(want - integ.tdir * integ.t) <= tol
                 _record!(ctx, want, integ.u)
             else
                 LibPETSc.TSInterpolate(pl, h.ts, want, ctx.work)
@@ -2051,7 +2152,7 @@ function SciMLBase.step!(integ::PETScIntegrator)
     copyto!(integ.uprev, integ.u)
     integ.tprev = integ.t
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
-    while !isempty(integ.tstops) && integ.tstops[1] <= integ.t + tol
+    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + tol
         popfirst!(integ.tstops)
     end
     # PETSc lands on its max time exactly but keeps the shortened step
@@ -2061,9 +2162,9 @@ function SciMLBase.step!(integ::PETScIntegrator)
     LibPETSc.TSSetMaxTime(pl, h.ts, target)
     # TSAdaptChoose rejects a step that reaches past the max time, so the step
     # onto the target is shortened here rather than by PETSc.
-    if integ.dt > target - integ.t
-        integ.dt = target - integ.t
-        LibPETSc.TSSetTimeStep(pl, h.ts, integ.dt)
+    if integ.tdir * integ.dt > target - integ.tdir * integ.t
+        LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
+        integ.dt = integ.tdir * (target - integ.tdir * integ.t)
     end
     GC.@preserve ctx begin
         try
@@ -2077,32 +2178,32 @@ function SciMLBase.step!(integ::PETScIntegrator)
         _finish!(integ)
         throw(err)
     end
-    integ.t = Float64(LibPETSc.TSGetTime(pl, h.ts))
-    integ.dt = Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
+    integ.t = _user_t(integ.tdir, Float64(LibPETSc.TSGetTime(pl, h.ts)))
+    integ.dt = integ.tdir * Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
     # A step PETSc could not take returns without advancing the clock, which
     # would otherwise spin a `while !done` loop forever.
-    if integ.t <= integ.tprev
+    if integ.tdir * integ.t <= integ.tdir * integ.tprev
         _finish!(integ, SciMLBase.ReturnCode.Failure)
         return nothing
     end
     if stop === nothing
         integ.dtcache = integ.dt
-    elseif integ.t >= stop - tol
-        integ.t = stop
+    elseif integ.tdir * integ.t >= stop - tol
+        integ.t = _user_t(integ.tdir, stop)
         LibPETSc.TSSetTime(pl, h.ts, stop)
-        LibPETSc.TSSetTimeStep(pl, h.ts, integ.dtcache)
+        LibPETSc.TSSetTimeStep(pl, h.ts, integ.tdir * integ.dtcache)
         integ.dt = integ.dtcache
     end
     _readvec!(integ.u, pl, h.u)
     fired = _apply_continuous_callbacks!(integ, dtprev)
-    while !isempty(integ.tstops) && integ.tstops[1] <= integ.t + tol
+    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + tol
         popfirst!(integ.tstops)
     end
     integ.finished && return nothing
     fired || _save_step!(integ, integ.t, true)
     _apply_callbacks!(integ)
     integ.finished && return nothing
-    if !all(isfinite, integ.u) || integ.t >= h.tf - tol ||
+    if !all(isfinite, integ.u) || integ.tdir * integ.t >= h.tf - tol ||
             Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
         _finish!(integ)
     end
