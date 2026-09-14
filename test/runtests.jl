@@ -1269,7 +1269,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         for st in ("3bs", "5dp", "5f", "5bs")
             @test runs(PETScDiffEq.TSRK(st))
         end
-        for st in ("2m", "ra34pw2", "ra3pw", "sandu3")
+        for st in ("2m", "ra34pw2", "ra3pw", "r34prw", "sandu3", "rodas3", "grk4t")
             @test runs(PETScDiffEq.TSRosW(st))
         end
         for st in ("2e", "3", "4", "5")
@@ -2771,6 +2771,30 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
             @test sol.t[end] ≈ 1.0
             @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-7
+        end
+    end
+
+    @testset "TSRosW on a right-hand side that depends on t" begin
+        forced!(du, u, p, t) = (du[1] = -u[1] + cos(t); nothing)
+        autonomous!(du, u, p, t) = (du[1] = -u[1] + cos(u[2]); du[2] = 1.0; nothing)
+        exact = (cos(2.0) + sin(2.0) + exp(-2.0)) / 2
+        function order(prob, st)
+            alg = PETScDiffEq.TSRosW(st, ["-ts_adapt_type", "none"])
+            errs = [
+                abs(SciMLBase.solve(prob, alg; dt = dt).u[end][1] - exact)
+                    for dt in (0.02, 0.01)
+            ]
+            return log2(errs[1] / errs[2])
+        end
+        forced = SciMLBase.ODEProblem(forced!, [1.0], (0.0, 2.0))
+        for st in ("ra34pw2", "ra3pw", "r34prw")
+            @test order(forced, st) > 2.8
+        end
+        @test order(forced, "2m") > 1.8
+        with_time = SciMLBase.ODEProblem(autonomous!, [1.0, 0.0], (0.0, 2.0))
+        for st in ("sandu3", "rodas3", "grk4t")
+            @test order(forced, st) < 1.2
+            @test order(with_time, st) > 2.8
         end
     end
 

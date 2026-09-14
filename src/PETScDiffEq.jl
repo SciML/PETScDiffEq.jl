@@ -45,11 +45,16 @@ TSRK(subtype::AbstractString = "5dp", petsc_options::AbstractVector{<:AbstractSt
     TSRosW(subtype = "ra34pw2", petsc_options = String[])
 
 Rosenbrock-W from PETSc's `TSROSW`. `subtype` is a PETSc `TSRosWType` without
-its prefix, such as `"2m"`, `"ra34pw2"`, `"ra3pw"` or `"sandu3"`.
+its prefix, such as `"2m"`, `"ra34pw2"`, `"ra3pw"` or `"r34prw"`.
 
 Adapts on its embedded error estimate. Linearly implicit, so it uses an
 `ODEFunction`'s `jac` when one is given and PETSc's finite-difference
 fallback otherwise, and it accepts a mass matrix.
+
+PETSc's implementation assumes a right-hand side that does not depend on `t`.
+The types above keep their order when it does, but others such as `"sandu3"`,
+`"rodas3"` and `"grk4t"` fall to first order, with or without a `jac`. For those,
+carry `t` as an extra state whose derivative is 1.
 """
 struct TSRosW <: PETScTSAlgorithm
     subtype::String
