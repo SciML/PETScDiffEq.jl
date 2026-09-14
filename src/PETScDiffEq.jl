@@ -965,23 +965,6 @@ end
 # PETSc built with 32-bit indices.
 _maxsteps(maxiters) = LibPETSc.PetscInt(min(maxiters, typemax(LibPETSc.PetscInt)))
 
-# `PETSc.VecSeq` types its length argument as the platform `Int` and hands it
-# straight to a `PetscInt` ccall, so where the two widths differ neither a
-# platform `Int` nor a `PetscInt` matches. These build the vector directly.
-function _vecseq(petsclib, n::Integer)
-    v = LibPETSc.VecCreateSeq(petsclib, MPI.COMM_SELF, LibPETSc.PetscInt(n))
-    finalizer(PETSc.destroy, v)
-    return v
-end
-
-function _vecseq(petsclib, x::Vector{Float64})
-    v = LibPETSc.VecCreateSeqWithArray(
-        petsclib, MPI.COMM_SELF, LibPETSc.PetscInt(1), LibPETSc.PetscInt(length(x)), x,
-    )
-    finalizer(PETSc.destroy, v)
-    return v
-end
-
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer)
     rows, cols, _ = findnz(jac_prototype)
     all_rows = vcat(rows, 1:n)
@@ -1119,7 +1102,7 @@ function _tolvec(h::TSHandles, petsclib, tol, n, name)
     # adaptive step, so it has to outlive the handle.
     buf = Vector{Float64}(collect(tol))
     push!(h.tolbufs, buf)
-    v = _vecseq(petsclib, buf)
+    v = PETSc.VecSeq(petsclib, buf)
     push!(h.tolvecs, v)
     return v
 end
@@ -1300,7 +1283,7 @@ function _setup(
         row_cols0, row_src, row_buf, J0,
         Float64[], Vector{Float64}[], Vector{Float64}[],
         saveat_times, 1, save_everystep, dense_out, kept,
-        _vecseq(petsclib, n), slow_idxs, medium_idxs, fast_idxs,
+        PETSc.VecSeq(petsclib, n), slow_idxs, medium_idxs, fast_idxs,
         NaN, similar(u0), false, 0, 0, 0, nothing,
     )
     h = TSHandles(
@@ -1317,7 +1300,7 @@ function _setup(
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
         _set_subtype!(petsclib, ts, alg)
 
-        h.u = _vecseq(petsclib, n)
+        h.u = PETSc.VecSeq(petsclib, n)
         u = h.u
         PETSc.withlocalarray!(u; read = false, write = true) do ua
             copyto!(ua, u0)
