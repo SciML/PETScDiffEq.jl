@@ -25,9 +25,11 @@ const AnyPETScTS = Union{PETScTSAlgorithm, PETScTSDAEAlgorithm}
 Explicit Runge-Kutta from PETSc's `TSRK`. `subtype` is a PETSc `TSRKType`
 without its prefix, such as `"3bs"`, `"5dp"`, `"5f"` or `"5bs"`.
 
-Adapts on its embedded error estimate, so `reltol` and `abstol` apply. Being
-explicit it never forms a Jacobian and ignores an `ODEFunction`'s `jac`, and
-it cannot carry a mass matrix.
+Adapts on its embedded error estimate, so `reltol` and `abstol` apply. PETSc
+gives `"1fe"`, `"2b"`, `"3"` and `"4"` no such estimate, so those step at the
+`dt` you give and warn if you pass a tolerance. Being explicit it never forms
+a Jacobian and ignores an `ODEFunction`'s `jac`, and it cannot carry a mass
+matrix.
 
 `petsc_options` are command-line style tokens passed to PETSc for this solve,
 for example `["-ts_adapt_type", "none"]`. They are parsed after the options
@@ -45,19 +47,30 @@ TSRK(subtype::AbstractString = "5dp", petsc_options::AbstractVector{<:AbstractSt
     TSRosW(subtype = "ra34pw2", petsc_options = String[])
 
 Rosenbrock-W from PETSc's `TSROSW`. `subtype` is a PETSc `TSRosWType` without
-its prefix, such as `"2m"`, `"ra34pw2"`, `"ra3pw"` or `"r34prw"`.
+its prefix, such as `"2m"`, `"ra34pw2"` or `"r34prw"`.
 
-Adapts on its embedded error estimate. Linearly implicit, so it uses an
-`ODEFunction`'s `jac` when one is given and PETSc's finite-difference
-fallback otherwise, and it accepts a mass matrix.
+Adapts on its embedded error estimate, except for `"theta1"` and `"theta2"`,
+which PETSc gives none, so they step at the `dt` you give and warn if you pass
+a tolerance. Linearly implicit, so it uses an `ODEFunction`'s `jac` when one is
+given and PETSc's finite-difference fallback otherwise, and it accepts a mass
+matrix.
 
 PETSc's implementation assumes a right-hand side that does not depend on `t`.
-The types above keep their order when it does, but others such as `"sandu3"`,
-`"rodas3"` and `"grk4t"` fall to first order, with or without a `jac`. For those,
-carry `t` as an extra state whose derivative is 1.
+When it does, `"2p"`, `"2m"`, `"ra3pw"`, `"ra34pw2"`, `"r34prw"` and `"assp3p3s1c"`
+keep their order, and every other type, including all the fourth-order ones,
+converges at first order with or without a `jac`. Carrying `t` as an extra state
+whose derivative is 1 restores their order.
 
-`"assp3p3s1c"` needs a `jac`. `"lassp3p4s2c"`, `"llssp3p4s2c"` and `"ark3"` are refused,
-since driven this way they fail on their first step with or without one.
+On a linear right-hand side that does not depend on `t`, `"ra3pw"`'s embedded error
+estimate is zero with a `jac` and far too small without one, so an adaptive solve
+reports success with an error well above the tolerance. Step it with a fixed `dt` on
+such problems.
+
+`"assp3p3s1c"` needs a `jac` and cannot take a mass matrix, which PETSc leaves out of
+its explicit first stage. `"lassp3p4s2c"`, `"llssp3p4s2c"` and `"ark3"` are refused.
+They end on an explicit stage: without a `jac` PETSc stops and asks for one, and with
+one it does not restore its Jacobian lag after that stage, so an adaptive solve fails
+within its first two steps and a fixed-step solve diverges.
 """
 struct TSRosW <: PETScTSAlgorithm
     subtype::String
@@ -192,10 +205,15 @@ Takes a `SplitODEProblem` whose `f1` is integrated implicitly and whose `f2`
 is integrated explicitly, and uses `f1`'s Jacobian when the problem carries
 one. A plain `ODEProblem` is treated as fully implicit with the explicit part
 left at zero, which is PETSc's own default. Adapts on its embedded error
-estimate.
+estimate, except for `"prssp2"`, `"ars443"` and `"bpr3"`, which PETSc gives
+none, so they step at the `dt` you give and warn if you pass a tolerance.
 
-`"ars122"` needs a `SplitODEProblem`: its first stage is explicit, and PETSc refuses to
-start it when the whole problem is implicit.
+`"ars122"` needs a `SplitODEProblem`: it has an explicit first stage and is not stiffly
+accurate, so PETSc cannot evaluate its first-stage slope when the whole problem is
+implicit.
+
+`"bpr3"` is refused on a `SplitODEProblem`, where it converges at first order. On a
+plain `ODEProblem` PETSc does not use its explicit tableau, and it keeps order 3.
 """
 struct TSARKIMEX <: PETScTSAlgorithm
     subtype::String
@@ -322,8 +340,9 @@ const _NEEDS_OTHER_SETUP = Dict(
 # through PETSc; `glee` returns the initial condition and reports success.
 const _EXPLICIT_ONLY = ("euler", "glee", "rk", "ssp")
 
-# Driven through an implicit residual alone these never complete a step, analytic
-# Jacobian or not, and report it only as a failed retcode.
+# These end on an explicit stage. Without a Jacobian PETSc stops and asks for one; with
+# one it does not restore its Jacobian lag after that stage, so an adaptive solve fails
+# within its first two steps and a fixed-step solve diverges.
 const _ROSW_NO_STEP = ("lassp3p4s2c", "llssp3p4s2c", "ark3")
 
 function TSGeneric(
@@ -350,14 +369,19 @@ _uses_ifunction(::TSARKIMEX) = true
 _uses_ifunction(::TSMPRK) = false
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
+# PETSc registers these without embedded weights and gives them the `none` adaptor.
+const _RK_NO_ESTIMATE = ("1fe", "2b", "3", "4")
+const _ROSW_NO_ESTIMATE = ("theta1", "theta2")
+const _ARKIMEX_NO_ESTIMATE = ("prssp2", "ars443", "bpr3")
+
 # Only these PETSc TS families carry an embedded error estimate. The rest step
 # at the requested dt and ignore any tolerance. `nothing` means the answer is
 # not known, which is the case for an arbitrary TSGeneric type.
-_adapts(::TSRK) = true
-_adapts(::TSRosW) = true
+_adapts(alg::TSRK) = !(alg.subtype in _RK_NO_ESTIMATE)
+_adapts(alg::TSRosW) = !(alg.subtype in _ROSW_NO_ESTIMATE)
 _adapts(::TSIRK) = false
 _adapts(alg::TSDAE) = alg.subtype == "bdf"
-_adapts(::TSARKIMEX) = true
+_adapts(alg::TSARKIMEX) = !(alg.subtype in _ARKIMEX_NO_ESTIMATE)
 _adapts(alg::TSImplicit) = alg.subtype == "bdf"
 _adapts(::TSMPRK) = false
 _adapts(::TSGeneric) = nothing
@@ -1059,6 +1083,9 @@ _ts_type(::TSARKIMEX) = "arkimex"
 _ts_type(::TSMPRK) = "mprk"
 _ts_type(alg::TSGeneric) = alg.ts_type
 
+_warn_name(alg::Union{TSRK, TSRosW, TSARKIMEX}) = "$(_ts_type(alg)) $(alg.subtype)"
+_warn_name(alg) = _ts_type(alg)
+
 _set_subtype!(petsclib, ts, alg::TSRK) =
     _cstr(p -> LibPETSc.TSRKSetType(petsclib, ts, p), alg.subtype)
 _set_subtype!(petsclib, ts, alg::TSRosW) =
@@ -1294,8 +1321,19 @@ function _setup(
     if alg isa TSRosW && alg.subtype in _ROSW_NO_STEP
         throw(
             ArgumentError(
-                "TSRosW(\"$(alg.subtype)\") fails on its first step when driven by " *
-                    "PETScDiffEq, with or without a `jac`; use another TSRosW type",
+                "TSRosW(\"$(alg.subtype)\") cannot be used: without a `jac` PETSc stops " *
+                    "and asks for one, and with one it does not restore its Jacobian lag " *
+                    "after the explicit last stage, so an adaptive solve fails within its " *
+                    "first two steps and a fixed-step solve diverges; use another TSRosW type",
+            ),
+        )
+    end
+    if alg isa TSRosW && alg.subtype == "assp3p3s1c" && has_mass
+        throw(
+            ArgumentError(
+                "TSRosW(\"assp3p3s1c\") cannot take a mass matrix; PETSc leaves the mass " *
+                    "matrix out of its explicit first stage, so the solve reports success " *
+                    "with an error that does not shrink with dt",
             ),
         )
     end
@@ -1311,8 +1349,17 @@ function _setup(
     if alg isa TSARKIMEX && alg.subtype == "ars122" && !is_split
         throw(
             ArgumentError(
-                "TSARKIMEX(\"ars122\") needs a SplitODEProblem; PETSc cannot start its " *
-                    "explicit first stage when the whole problem is implicit",
+                "TSARKIMEX(\"ars122\") needs a SplitODEProblem; it has an explicit first " *
+                    "stage and is not stiffly accurate, so PETSc cannot evaluate its " *
+                    "first-stage slope when the whole problem is implicit",
+            ),
+        )
+    end
+    if alg isa TSARKIMEX && alg.subtype == "bpr3" && is_split
+        throw(
+            ArgumentError(
+                "TSARKIMEX(\"bpr3\") converges at first order on a SplitODEProblem; solve " *
+                    "a plain ODEProblem with it, or use another TSARKIMEX type",
             ),
         )
     end
@@ -1456,7 +1503,7 @@ function _setup(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
             )
             if (reltol !== nothing || abstol !== nothing) && _adapts(alg) === false
-                @warn "`$(_ts_type(alg))` has no embedded error estimate in PETSc, so " *
+                @warn "`$(_warn_name(alg))` has no embedded error estimate in PETSc, so " *
                     "it steps at the requested dt and ignores reltol/abstol"
             end
             if reltol !== nothing || abstol !== nothing
