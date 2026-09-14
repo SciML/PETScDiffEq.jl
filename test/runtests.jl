@@ -2802,6 +2802,192 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         ) > 1.8
     end
 
+    @testset "Reversed time span" begin
+        grow!(du, u, p, t) = (du[1] = u[1]; nothing)
+        back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
+        tight = (dt = 0.1, reltol = 1.0e-10, abstol = 1.0e-12)
+
+        @testset "steps exactly as the forward mirror problem" begin
+            # PETSc steps u' = -u from t = 1 down to 0 as v' = v from s = -1 up to 0, so that
+            # forward problem runs the same clock and matches bit for bit, BDF history included.
+            fwd = SciMLBase.ODEProblem(grow!, [1.0], (-1.0, 0.0))
+            for (alg, kw) in (
+                    (PETScDiffEq.TSRK("5dp"), (reltol = 1.0e-8, abstol = 1.0e-10)),
+                    (PETScDiffEq.TSRosW("ra34pw2"), (reltol = 1.0e-8, abstol = 1.0e-10)),
+                    (PETScDiffEq.TSImplicit("bdf"), (reltol = 1.0e-8, abstol = 1.0e-10)),
+                    (PETScDiffEq.TSARKIMEX("3"), (reltol = 1.0e-8, abstol = 1.0e-10)),
+                    (PETScDiffEq.TSRK("3bs"), (adaptive = false,)),
+                )
+                b = SciMLBase.solve(back, alg; dt = 0.1, kw...)
+                f = SciMLBase.solve(fwd, alg; dt = 0.1, kw...)
+                @test b.retcode == SciMLBase.ReturnCode.Success
+                @test b.t[1] == 1.0
+                @test b.t[end] == 0.0
+                @test b.t == -f.t
+                @test b.u == f.u
+            end
+        end
+
+        @testset "time zero is +0.0 and a stop there fires" begin
+            for span in ((0.0, -1.0), (0.5, -0.5), (1.0, 0.0))
+                prob = SciMLBase.ODEProblem(decay!, [1.0], span)
+                hits = Float64[]
+                cb = PresetTimeCallback([0.0], integ -> push!(hits, integ.t))
+                sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = cb)
+                @test hits == [0.0]
+                @test !any(t -> t === -0.0, hits)
+                @test !any(t -> t === -0.0, sol.t)
+                sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, saveat = 0.25)
+                @test 0.0 in sol.t
+                @test !any(t -> t === -0.0, sol.t)
+            end
+        end
+
+        @testset "saveat, dense output and tstops" begin
+            alg = PETScDiffEq.TSRK("5dp")
+            sol = SciMLBase.solve(back, alg; saveat = 0.25, tight...)
+            @test sol.t == [1.0, 0.75, 0.5, 0.25, 0.0]
+            @test maximum(abs(sol.u[i][1] - exp(1 - sol.t[i])) for i in eachindex(sol.t)) < 1.0e-7
+            sol = SciMLBase.solve(back, alg; saveat = [0.2, 0.7], tight...)
+            @test sol.t == [1.0, 0.7, 0.2, 0.0]
+            sol = SciMLBase.solve(back, alg; tight...)
+            @test issorted(sol.t; rev = true)
+            @test abs(sol(0.5)[1] - exp(0.5)) < 1.0e-6
+            sol = SciMLBase.solve(back, alg; tstops = [0.3, 0.6], tight...)
+            @test 0.3 in sol.t
+            @test 0.6 in sol.t
+        end
+
+        @testset "the integrator's clock runs backward" begin
+            integ = SciMLBase.init(back, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            @test integ.tdir == -1
+            SciMLBase.step!(integ)
+            @test integ.t ≈ 0.9
+            @test integ.tprev == 1.0
+            @test integ.dt < 0
+            @test SciMLBase.get_proposed_dt(integ) > 0
+            @test SciMLBase.get_du(integ) ≈ -integ.u
+            @test_throws ArgumentError SciMLBase.add_tstop!(integ, 0.95)
+            t1 = integ.t
+            @test SciMLBase.savevalues!(integ)
+            SciMLBase.add_tstop!(integ, 0.45)
+            SciMLBase.solve!(integ)
+            @test issorted(integ.sol.t; rev = true)
+            @test count(==(t1), integ.sol.t) == 2
+            @test 0.45 in integ.sol.t
+            @test integ.t == 0.0
+            @test abs(integ.u[1] - exp(1.0)) < 1.0e-5
+        end
+
+        @testset "callbacks" begin
+            hits = Float64[]
+            preset = PresetTimeCallback([0.25, 0.75], integ -> push!(hits, integ.t))
+            sol = SciMLBase.solve(back, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = preset)
+            @test hits == [0.75, 0.25]
+            # save_positions defaults to (true, true), so each stop is saved twice
+            @test issorted(sol.t; rev = true)
+            @test count(==(0.75), sol.t) == 2
+            empty!(hits)
+            cross = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 2.0, integ -> push!(hits, integ.t),
+            )
+            sol = SciMLBase.solve(back, PETScDiffEq.TSRK("5dp"); callback = cross, tight...)
+            @test abs(only(hits) - (1 - log(2.0))) < 1.0e-6
+            @test issorted(sol.t; rev = true)
+            @test count(==(hits[1]), sol.t) == 2
+        end
+
+        @testset "a state changed by initialize is the one PETSc integrates" begin
+            setu = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> false, integ -> nothing;
+                initialize = (c, u, t, integ) -> (integ.u[1] = 2.0; nothing),
+            )
+            for (span, expected) in (((0.0, 1.0), 2 * exp(-1.0)), ((1.0, 0.0), 2 * exp(1.0)))
+                prob = SciMLBase.ODEProblem(decay!, [1.0], span)
+                sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); callback = setu, tight...)
+                @test abs(sol.u[end][1] - expected) < 1.0e-8
+                @test sol.t[1] == span[1]
+                @test sol.t[2] == span[1]
+                @test first.(sol.u[1:2]) == [1.0, 2.0]
+            end
+            integ = SciMLBase.init(
+                SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+                callback = setu, tight...,
+            )
+            SciMLBase.solve!(integ)
+            first_run = integ.u[1]
+            SciMLBase.reinit!(integ)
+            SciMLBase.solve!(integ)
+            @test integ.u[1] == first_run
+            @test abs(first_run - 2 * exp(-1.0)) < 1.0e-8
+        end
+
+        @testset "every problem form integrates backward" begin
+            kw = (dt = 0.01, reltol = 1.0e-8, abstol = 1.0e-10)
+            mass = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0], (1.0, 0.0),
+            )
+            sol = SciMLBase.solve(mass, PETScDiffEq.TSRosW("ra34pw2"); kw...)
+            @test abs(sol.u[end][1] - exp(0.5)) < 1.0e-5
+            split = SciMLBase.SplitODEProblem(decay!, decay!, [1.0], (1.0, 0.0))
+            sol = SciMLBase.solve(split, PETScDiffEq.TSARKIMEX("3"); kw...)
+            @test abs(sol.u[end][1] - exp(2.0)) < 1.0e-4
+            dae = SciMLBase.DAEProblem(
+                (r, du, u, p, t) -> (r .= du .+ u; nothing), [-1.0], [1.0], (1.0, 0.0),
+            )
+            sol = SciMLBase.solve(dae, PETScDiffEq.TSDAE("bdf"); kw...)
+            @test abs(sol.u[end][1] - exp(1.0)) < 1.0e-4
+            # sin is odd, so a right-hand side handed PETSc's own time would flip the answer.
+            sine!(du, u, p, t) = (du[1] = sin(t); nothing)
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(sine!, [0.0], (1.0, 0.0)), PETScDiffEq.TSRK("5dp"); kw...,
+            )
+            @test abs(sol.u[end][1] - (cos(1.0) - 1)) < 1.0e-6
+            sine_dae = SciMLBase.DAEProblem(
+                (r, du, u, p, t) -> (r[1] = du[1] - sin(t); nothing), [sin(1.0)], [0.0], (1.0, 0.0),
+            )
+            sol = SciMLBase.solve(sine_dae, PETScDiffEq.TSDAE("bdf"); kw...)
+            @test abs(sol.u[end][1] - (cos(1.0) - 1)) < 1.0e-4
+            two_rate!(du, u, p, t) = (du[1] = -u[1]; du[2] = -3 * u[2]; nothing)
+            mprk = SciMLBase.ODEProblem(two_rate!, [1.0, 1.0], (1.0, 0.0))
+            sol = SciMLBase.solve(mprk, PETScDiffEq.TSMPRK([1], "p2"); dt = 0.001)
+            @test isapprox(sol.u[end], [exp(1.0), exp(3.0)]; rtol = 1.0e-4)
+        end
+    end
+
+    @testset "alg_order is the order PETSc registers" begin
+        @test SciMLBase.alg_order(PETScDiffEq.TSRK("5dp")) == 5
+        @test SciMLBase.alg_order(PETScDiffEq.TSRK("3bs")) == 3
+        @test SciMLBase.alg_order(PETScDiffEq.TSRosW("ra34pw2")) == 3
+        @test SciMLBase.alg_order(PETScDiffEq.TSRosW("rodaspr")) == 4
+        @test SciMLBase.alg_order(PETScDiffEq.TSARKIMEX("1bee")) == 1
+        @test SciMLBase.alg_order(PETScDiffEq.TSARKIMEX("5")) == 5
+        @test SciMLBase.alg_order(PETScDiffEq.TSMPRK([1], "p3")) == 3
+        @test SciMLBase.alg_order(PETScDiffEq.TSIRK(2)) == 4
+        @test SciMLBase.alg_order(PETScDiffEq.TSImplicit("beuler")) == 1
+        @test SciMLBase.alg_order(PETScDiffEq.TSImplicit("theta", 1.0)) == 1
+        @test SciMLBase.alg_order(PETScDiffEq.TSImplicit("theta", 0.5)) == 2
+        @test SciMLBase.alg_order(PETScDiffEq.TSImplicit("bdf")) == 2
+        @test SciMLBase.alg_order(PETScDiffEq.TSImplicit("bdf"; order = 4)) == 4
+        @test SciMLBase.alg_order(PETScDiffEq.TSDAE("bdf"; order = 3)) == 3
+        @test_throws ArgumentError SciMLBase.alg_order(PETScDiffEq.TSRK("9zz"))
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for alg in (
+                PETScDiffEq.TSRK("2a", ["-ts_adapt_type", "none"]),
+                PETScDiffEq.TSRK("4", ["-ts_adapt_type", "none"]),
+                PETScDiffEq.TSRosW("2m", ["-ts_adapt_type", "none"]),
+                PETScDiffEq.TSRosW("ra34pw2", ["-ts_adapt_type", "none"]),
+                PETScDiffEq.TSARKIMEX("1bee", ["-ts_adapt_type", "none"]),
+                PETScDiffEq.TSARKIMEX("2e", ["-ts_adapt_type", "none"]),
+            )
+            errs = [
+                abs(SciMLBase.solve(prob, alg; dt = dt).u[end][1] - exp(-1.0))
+                    for dt in (0.04, 0.02)
+            ]
+            @test isapprox(log2(errs[1] / errs[2]), SciMLBase.alg_order(alg); atol = 0.2)
+        end
+    end
+
     @testset "Input validation" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"))
@@ -2810,7 +2996,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX("3"))
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSGeneric("alpha"))
         @test_throws ArgumentError SciMLBase.solve(
-            SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0)),
+            SciMLBase.ODEProblem(decay!, [1.0], (1.0, 1.0)),
             PETScDiffEq.TSRK("5dp"); dt = 0.1,
         )
     end
