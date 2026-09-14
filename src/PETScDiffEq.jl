@@ -55,6 +55,9 @@ PETSc's implementation assumes a right-hand side that does not depend on `t`.
 The types above keep their order when it does, but others such as `"sandu3"`,
 `"rodas3"` and `"grk4t"` fall to first order, with or without a `jac`. For those,
 carry `t` as an extra state whose derivative is 1.
+
+`"assp3p3s1c"` needs a `jac`. `"lassp3p4s2c"`, `"llssp3p4s2c"` and `"ark3"` are refused,
+since driven this way they fail on their first step with or without one.
 """
 struct TSRosW <: PETScTSAlgorithm
     subtype::String
@@ -190,6 +193,9 @@ is integrated explicitly, and uses `f1`'s Jacobian when the problem carries
 one. A plain `ODEProblem` is treated as fully implicit with the explicit part
 left at zero, which is PETSc's own default. Adapts on its embedded error
 estimate.
+
+`"ars122"` needs a `SplitODEProblem`: its first stage is explicit, and PETSc refuses to
+start it when the whole problem is implicit.
 """
 struct TSARKIMEX <: PETScTSAlgorithm
     subtype::String
@@ -315,6 +321,10 @@ const _NEEDS_OTHER_SETUP = Dict(
 # Handed an implicit residual these integrate nothing. `euler`, `ssp` and `rk` say so
 # through PETSc; `glee` returns the initial condition and reports success.
 const _EXPLICIT_ONLY = ("euler", "glee", "rk", "ssp")
+
+# Driven through an implicit residual alone these never complete a step, analytic
+# Jacobian or not, and report it only as a failed retcode.
+const _ROSW_NO_STEP = ("lassp3p4s2c", "llssp3p4s2c", "ark3")
 
 function TSGeneric(
         ts_type::AbstractString,
@@ -1278,6 +1288,31 @@ function _setup(
                 "TSIRK needs an analytic Jacobian; give the ODEFunction a `jac`, since " *
                     "PETSc builds its coupled-stage matrix from one and has no " *
                     "finite-difference fallback for it",
+            ),
+        )
+    end
+    if alg isa TSRosW && alg.subtype in _ROSW_NO_STEP
+        throw(
+            ArgumentError(
+                "TSRosW(\"$(alg.subtype)\") fails on its first step when driven by " *
+                    "PETScDiffEq, with or without a `jac`; use another TSRosW type",
+            ),
+        )
+    end
+    if alg isa TSRosW && alg.subtype == "assp3p3s1c" && !has_jac
+        throw(
+            ArgumentError(
+                "TSRosW(\"assp3p3s1c\") needs an analytic Jacobian; give the ODEFunction " *
+                    "a `jac`, since PETSc asks for one at the start of every step and has " *
+                    "no finite-difference fallback there",
+            ),
+        )
+    end
+    if alg isa TSARKIMEX && alg.subtype == "ars122" && !is_split
+        throw(
+            ArgumentError(
+                "TSARKIMEX(\"ars122\") needs a SplitODEProblem; PETSc cannot start its " *
+                    "explicit first stage when the whole problem is implicit",
             ),
         )
     end

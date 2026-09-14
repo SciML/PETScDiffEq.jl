@@ -2798,6 +2798,34 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "Subtypes that need more than a plain problem" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for st in ("lassp3p4s2c", "llssp3p4s2c", "ark3")
+            @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRosW(st); dt = 0.1)
+        end
+        @test_throws ArgumentError SciMLBase.solve(
+            prob, PETScDiffEq.TSRosW("assp3p3s1c"); dt = 0.1,
+        )
+        with_jac = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),
+        )
+        sol = SciMLBase.solve(
+            with_jac, PETScDiffEq.TSRosW("assp3p3s1c"); dt = 0.01, reltol = 1.0e-8,
+            abstol = 1.0e-10,
+        )
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-6
+        @test_throws ArgumentError SciMLBase.solve(
+            prob, PETScDiffEq.TSARKIMEX("ars122"); dt = 0.1,
+        )
+        split = SciMLBase.SplitODEProblem(decay!, decay!, [1.0], (0.0, 1.0))
+        sol = SciMLBase.solve(
+            split, PETScDiffEq.TSARKIMEX("ars122"); dt = 0.01, adaptive = false,
+        )
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        @test abs(sol.u[end][1] - exp(-2.0)) < 1.0e-4
+    end
+
     @testset "Requested subtypes actually take effect" begin
         # Each of these differs in order from its family's PETSc default.
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
