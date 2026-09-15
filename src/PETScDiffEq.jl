@@ -12,7 +12,7 @@ using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, ro
     sparse
 
 export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSDAE, TSMPRK, TSGeneric,
-    PETScIntegrator
+    PETScIntegrator, PETScAdjoint
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 abstract type PETScTSDAEAlgorithm <: SciMLBase.AbstractDAEAlgorithm end
@@ -564,7 +564,7 @@ function _row_structure(J::SparseMatrixCSC, n)
         cols[i] = cols[i][perm]
         src[i] = src[i][perm]
     end
-    cols0 = [LibPETSc.PetscInt[c - 1 for c in cols[i]] for i in 1:n]
+    cols0 = Vector{LibPETSc.PetscInt}[LibPETSc.PetscInt[c - 1 for c in cols[i]] for i in 1:n]
     buf = [zeros(length(cols[i])) for i in 1:n]
     return cols0, src, buf
 end
@@ -1017,6 +1017,7 @@ function __init__()
             Ptr{Cvoid},
         )
     )
+    _init_adjoint_pointers!()
     return nothing
 end
 
@@ -1268,6 +1269,7 @@ function _setup(
         dense = nothing,
         save_idxs = nothing,
         tstops = (),
+        extra_options = String[],
         kwargs...,
     )
     for key in UNSUPPORTED_KWARGS
@@ -1605,6 +1607,7 @@ function _setup(
             (dtmax === nothing || isinf(dtmax)) ||
                 append!(effective_options, ["-ts_adapt_dt_max", string(abs(Float64(dtmax)))])
             append!(effective_options, alg.petsc_options)
+            append!(effective_options, extra_options)
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
                 h.opts = PETSc.Options(petsclib; parsed...)
@@ -2392,5 +2395,7 @@ function SciMLBase.solve!(integ::PETScIntegrator)
 end
 
 SciMLBase.done(integ::PETScIntegrator) = integ.finished
+
+include("adjoint.jl")
 
 end

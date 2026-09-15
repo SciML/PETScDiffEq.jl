@@ -1,0 +1,40 @@
+name: "Adjoint"
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  adjoint:
+    name: "SciMLSensitivity"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.10', '1']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v3
+      - name: "Instantiate test/adjoint"
+        run: |
+          julia --project=test/adjoint -e '
+            using Pkg
+            Pkg.develop(path=".")
+            Pkg.instantiate()'
+      - name: "Run the SciMLSensitivity tests"
+        run: julia --project=test/adjoint test/adjoint/adjoint.jl
