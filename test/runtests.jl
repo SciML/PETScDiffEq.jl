@@ -499,6 +499,45 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test err("p3") < err("p2") / 100
         end
 
+        @testset "a dt that does not divide the span is shortened at the end" begin
+            for (st, dt, tol) in (
+                    ("p2", 0.3, 1.0e-2), ("p2", 0.03, 1.0e-4),
+                    ("p3", 0.3, 5.0e-4), ("p3", 0.1, 1.0e-5),
+                )
+                sol = SciMLBase.solve(
+                    mprob, PETScDiffEq.TSMPRK([1], st); dt = dt, adaptive = false,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.t[end] == 1.0
+                @test all(<=(1.0), sol.t)
+                @test abs(sol.u[end][1] - exp(-1.0)) < tol
+            end
+            ends = SciMLBase.solve(
+                mprob, PETScDiffEq.TSMPRK([1], "p3"); dt = 0.3, adaptive = false,
+                save_everystep = false,
+            )
+            @test ends.t == [0.0, 1.0]
+            @test abs(ends.u[end][1] - exp(-1.0)) < 5.0e-4
+            three_way!(du, u, p, t) = (
+                du[1] = -u[1]; du[2] = -10.0 * u[2]; du[3] = -100.0 * u[3]; nothing
+            )
+            split3 = SciMLBase.solve(
+                SciMLBase.ODEProblem(three_way!, [1.0, 1.0, 1.0], (0.0, 1.0)),
+                PETScDiffEq.TSMPRK([1], [2], "2a33"); dt = 0.3, adaptive = false,
+            )
+            @test split3.t[end] == 1.0
+            @test abs(split3.u[end][1] - exp(-1.0)) < 1.0e-2
+            # Backward in time the fast row has to decay as well, so its sign flips.
+            back!(du, u, p, t) = (du[1] = -u[1]; du[2] = 10.0 * u[2]; nothing)
+            rev = SciMLBase.solve(
+                SciMLBase.ODEProblem(back!, [1.0, 1.0], (1.0, 0.0)),
+                PETScDiffEq.TSMPRK([1], "p3"); dt = 0.3, adaptive = false,
+            )
+            @test rev.t[end] == 0.0
+            @test all(>=(0.0), rev.t)
+            @test abs(rev.u[end][1] - exp(1.0)) < 1.0e-3
+        end
+
         @testset "which half is slow is the caller's to say" begin
             # Naming component 2 slow puts the stiff row on the outer step, which
             # a two-component problem still integrates correctly.

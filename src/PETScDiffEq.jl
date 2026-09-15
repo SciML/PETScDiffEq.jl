@@ -1700,7 +1700,9 @@ function SciMLBase.__solve(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), kwargs...,
     )
-    if callback !== nothing || !isempty(tstops)
+    # PETSc's MPRK step never shortens itself onto the final time, so it runs
+    # through the integrator, which shortens the last step for it.
+    if callback !== nothing || !isempty(tstops) || alg isa TSMPRK
         return SciMLBase.solve!(
             SciMLBase.__init(prob, alg; callback = callback, tstops = tstops, kwargs...),
         )
@@ -2362,6 +2364,11 @@ function SciMLBase.step!(integ::PETScIntegrator)
     end
     if stop === nothing
         integ.dtcache = integ.dt
+        # Steps summed onto the final time can fall a rounding error short of it.
+        if integ.tdir * integ.t != h.tf && integ.tdir * integ.t >= h.tf - tol
+            integ.t = _user_t(integ.tdir, h.tf)
+            LibPETSc.TSSetTime(pl, h.ts, h.tf)
+        end
     elseif integ.tdir * integ.t >= stop - tol
         integ.t = _user_t(integ.tdir, stop)
         LibPETSc.TSSetTime(pl, h.ts, stop)
