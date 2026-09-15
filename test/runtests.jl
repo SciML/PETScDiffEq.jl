@@ -1293,9 +1293,13 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     @testset "the exported names carry a docstring" begin
         # `Base.doc` is not available on every supported version, and `@doc`
         # reports a docstring even for a name that has none.
-        lines = split(read(joinpath(@__DIR__, "..", "src", "PETScDiffEq.jl"), String), '\n')
+        lines = reduce(
+            vcat,
+            split(read(joinpath(@__DIR__, "..", "src", file), String), '\n')
+                for file in ("PETScDiffEq.jl", "adjoint.jl")
+        )
         exported = filter(!=(:PETScDiffEq), names(PETScDiffEq))
-        @test length(exported) == 9
+        @test length(exported) == 10
         for n in exported
             i = findfirst(l -> occursin(Regex("^(mutable )?struct \\Q$(n)\\E\\b"), l), lines)
             @test i !== nothing
@@ -3277,5 +3281,494 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.ODEProblem(decay!, [1.0], (1.0, 1.0)),
             PETScDiffEq.TSRK("5dp"); dt = 0.1,
         )
+    end
+
+    @testset "PETScAdjoint" begin
+        # Nonlinear and explicitly time dependent, so every term of an adjoint step counts.
+        function adj_f!(du, u, p, t)
+            du[1] = -p[1] * u[1] + p[2] * u[1] * u[2]
+            du[2] = p[3] * u[1] - p[4] * u[2]^2 + p[1] * sin(t)
+            return nothing
+        end
+        function adj_jac!(J, u, p, t)
+            J[1, 1] = -p[1] + p[2] * u[2]
+            J[1, 2] = p[2] * u[1]
+            J[2, 1] = p[3]
+            J[2, 2] = -2 * p[4] * u[2]
+            return nothing
+        end
+        function adj_paramjac!(pJ, u, p, t)
+            fill!(pJ, 0.0)
+            pJ[1, 1] = -u[1]
+            pJ[1, 2] = u[1] * u[2]
+            pJ[2, 1] = sin(t)
+            pJ[2, 3] = u[1]
+            pJ[2, 4] = -u[2]^2
+            return nothing
+        end
+        adj_f(u, p, t) = (du = similar(u); adj_f!(du, u, p, t); du)
+        adj_jac(u, p, t) = (J = zeros(2, 2); adj_jac!(J, u, p, t); J)
+        adj_paramjac(u, p, t) = (pJ = zeros(2, 4); adj_paramjac!(pJ, u, p, t); pJ)
+        function adj_prob(u0, p, tspan; oop = false, sparse_jac = false)
+            f = if oop
+                SciMLBase.ODEFunction{false}(adj_f; jac = adj_jac, paramjac = adj_paramjac)
+            else
+                SciMLBase.ODEFunction{true}(
+                    adj_f!; jac = adj_jac!, paramjac = adj_paramjac!,
+                    jac_prototype = sparse_jac ? sparse(ones(2, 2)) : nothing,
+                )
+            end
+            return SciMLBase.ODEProblem(f, u0, tspan, p)
+        end
+        u0, p0 = [1.0, 0.5], [0.7, 0.3, 0.4, 0.2]
+        forward_t, backward_t = collect(0.0:0.1:1.0), collect(1.0:-0.1:0.0)
+        # Tight Newton and direct linear solves keep solver tolerances out of the differences.
+        exact = [
+            "-snes_rtol", "1e-13", "-snes_atol", "1e-15", "-ksp_type", "preonly", "-pc_type", "lu",
+        ]
+        half_norm(u, p, t) = sum(abs2, u) / 2
+        half_norm_du!(out, u, p, t, i) = (out .= u; nothing)
+        coupled(u, p, t) = sum(abs2, u) / 2 + p[2] * u[1] * u[2] + p[1]^2 * t
+        function coupled_du!(out, u, p, t, i)
+            out[1] = u[1] + p[2] * u[2]
+            out[2] = u[2] + p[2] * u[1]
+            return nothing
+        end
+        function coupled_dp!(out, u, p, t, i)
+            fill!(out, 0.0)
+            out[1] = 2 * p[1] * t
+            out[2] = u[1] * u[2]
+            return nothing
+        end
+        grad(
+            prob, alg; sensealg = PETScAdjoint(), t = forward_t,
+            dgdu_discrete = half_norm_du!, kwargs...,
+        ) = PETScDiffEq._discrete_adjoint(
+            prob, alg, sensealg; t, dgdu_discrete, dt = 0.01, adaptive = false, kwargs...,
+        )
+        central_differences(loss, θ; h = 1.0e-6) = [
+            (loss(θ + h * (eachindex(θ) .== i)) - loss(θ - h * (eachindex(θ) .== i))) / (2h)
+                for i in eachindex(θ)
+        ]
+        relerr(a, b) = norm(a - b) / norm(b)
+
+        @testset "matches finite differences of the same fixed-step solve: $name" for (
+                name, alg, tspan, ts, opts,
+            ) in (
+                ("RK4", TSRK("4"), (0.0, 1.0), forward_t, (;)),
+                ("RK4 backward in time", TSRK("4"), (1.0, 0.0), backward_t, (;)),
+                ("5dp at a fixed step", TSRK("5dp"), (0.0, 1.0), forward_t, (;)),
+                ("backward Euler", TSImplicit("beuler", exact), (0.0, 1.0), forward_t, (;)),
+                (
+                    "backward Euler backward in time", TSImplicit("beuler", exact),
+                    (1.0, 0.0), backward_t, (;),
+                ),
+                ("Crank-Nicolson", TSImplicit("cn", exact), (0.0, 1.0), forward_t, (;)),
+                (
+                    "Crank-Nicolson backward in time", TSImplicit("cn", exact),
+                    (1.0, 0.0), backward_t, (;),
+                ),
+                (
+                    "a trajectory of states only", TSRK("4"), (0.0, 1.0), forward_t,
+                    (sensealg = ["-ts_trajectory_solution_only", "1"],),
+                ),
+                (
+                    "a trajectory on disk", TSRK("4"), (0.0, 1.0), forward_t,
+                    (sensealg = ["-ts_trajectory_type", "basic"],),
+                ),
+                (
+                    "a sparse jac_prototype, RK4 backward in time", TSRK("4"), (1.0, 0.0),
+                    backward_t, (sparse_jac = true,),
+                ),
+                (
+                    "a sparse jac_prototype, backward Euler", TSImplicit("beuler", exact),
+                    (0.0, 1.0), forward_t, (sparse_jac = true,),
+                ),
+                ("no_start", TSRK("4"), (0.0, 1.0), forward_t, (no_start = true,)),
+                ("a cost that depends on p", TSRK("4"), (0.0, 1.0), forward_t, (coupled = true,)),
+                (
+                    "a cost that depends on p, Crank-Nicolson backward in time",
+                    TSImplicit("cn", exact), (1.0, 0.0), backward_t, (coupled = true,),
+                ),
+                ("out of place", TSRK("4"), (0.0, 1.0), forward_t, (oop = true,)),
+                (
+                    "out of place, backward Euler backward in time", TSImplicit("beuler", exact),
+                    (1.0, 0.0), backward_t, (oop = true,),
+                ),
+            )
+            prob = adj_prob(
+                copy(u0), copy(p0), tspan;
+                oop = get(opts, :oop, false), sparse_jac = get(opts, :sparse_jac, false),
+            )
+            is_coupled = get(opts, :coupled, false)
+            no_start = get(opts, :no_start, false)
+            # A disk trajectory writes its files to the working directory.
+            du0, dp = cd(mktempdir()) do
+                grad(
+                    prob, alg; t = ts, no_start,
+                    sensealg = PETScAdjoint(petsc_options = get(opts, :sensealg, String[])),
+                    dgdu_discrete = is_coupled ? coupled_du! : half_norm_du!,
+                    dgdp_discrete = is_coupled ? coupled_dp! : nothing,
+                )
+            end
+            cost = is_coupled ? coupled : half_norm
+            function loss(θ)
+                sol = SciMLBase.solve(
+                    adj_prob(θ[1:2], θ[3:6], tspan), alg; dt = 0.01, adaptive = false, saveat = ts,
+                )
+                return sum(
+                    cost(sol.u[i], θ[3:6], sol.t[i]) for i in eachindex(sol.t)
+                        if !(no_start && i == 1)
+                )
+            end
+            # The worst case measured 6.9e-10, the floor of central differences at h = 1e-6.
+            @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-9
+        end
+
+        @testset "dp is nothing without parameters and empty with no entries" begin
+            function g!(du, u, p, t)
+                du[1] = -u[1] + 0.3 * u[1] * u[2]
+                du[2] = 0.4 * u[1] - 0.2 * u[2]^2 + sin(t)
+                return nothing
+            end
+            function g_jac!(J, u, p, t)
+                J[1, 1] = -1 + 0.3 * u[2]
+                J[1, 2] = 0.3 * u[1]
+                J[2, 1] = 0.4
+                J[2, 2] = -0.4 * u[2]
+                return nothing
+            end
+            for p in (nothing, SciMLBase.NullParameters(), Float64[])
+                prob = SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(g!; jac = g_jac!), copy(u0), (0.0, 1.0), p,
+                )
+                du0, dp = grad(prob, TSRK("4"))
+                function loss(u)
+                    sol = SciMLBase.solve(
+                        SciMLBase.remake(prob; u0 = u), TSRK("4");
+                        dt = 0.01, adaptive = false, saveat = forward_t,
+                    )
+                    return sum(half_norm(v, p, 0.0) for v in sol.u)
+                end
+                # Measured 1.9e-10.
+                @test relerr(du0, central_differences(loss, u0)) < 5.0e-9
+                if p isa Vector
+                    @test dp == zeros(0)'
+                else
+                    @test dp === nothing
+                end
+            end
+        end
+
+        @testset "an adaptive solve holds its accepted steps fixed" begin
+            prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+            tolerances = (abstol = 1.0e-8, reltol = 1.0e-8, dt = 0.01)
+            du0, dp = PETScDiffEq._discrete_adjoint(
+                prob, TSRK("5dp"), PETScAdjoint();
+                t = [0.0, 1.0], dgdu_discrete = half_norm_du!, tolerances...,
+            )
+            steps = SciMLBase.solve(prob, TSRK("5dp"); tolerances...).t
+            # Stopping on every accepted step keeps those steps for perturbed inputs too.
+            stepped(θ) = SciMLBase.solve(
+                adj_prob(θ[1:2], θ[3:6], (0.0, 1.0)), TSRK("5dp");
+                dt = 1.0, adaptive = false, tstops = steps[2:(end - 1)],
+            )
+            @test length(steps) > 3
+            @test stepped(vcat(u0, p0)).t == steps
+            function loss(θ)
+                sol = stepped(θ)
+                return half_norm(sol.u[1], nothing, 0.0) + half_norm(sol.u[end], nothing, 1.0)
+            end
+            # Measured 4.3e-11.
+            @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 4.0e-10
+        end
+
+        @testset "inputs are left alone and a repeated call gives the same numbers" begin
+            alg = TSImplicit("cn", copy(exact))
+            options = ["-ts_trajectory_solution_only", "1"]
+            sensealg = PETScAdjoint(petsc_options = copy(options))
+            prob = adj_prob(copy(u0), copy(p0), (1.0, 0.0))
+            ts = copy(backward_t)
+            first_call = grad(prob, alg; sensealg, t = ts)
+            @test prob.u0 == u0
+            @test prob.p == p0
+            @test ts == backward_t
+            @test alg.petsc_options == exact
+            @test sensealg.petsc_options == options
+            @test grad(prob, alg; sensealg, t = ts) == first_call
+        end
+
+        @testset "saving keywords from the call or the problem do not reach the adjoint" begin
+            prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+            reference = grad(prob, TSRK("4"))
+            saving = SciMLBase.remake(prob; saveat = 0.05, dense = true, sensealg = PETScAdjoint())
+            result = @test_logs min_level = Logging.Warn grad(
+                saving, TSRK("4");
+                save_everystep = true, save_start = false, save_end = false, saveat = [0.3],
+                extra_options = String[],
+            )
+            @test result == reference
+        end
+
+        @testset "cost times on the grid are found after many steps" begin
+            decay!(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
+            prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    decay!; jac = (J, u, p, t) -> (J[1, 1] = -p[1]; nothing),
+                    paramjac = (pJ, u, p, t) -> (pJ[1, 1] = -u[1]; nothing),
+                ),
+                [1.0], (0.0, 32.0), [0.05],
+            )
+            dt, ts = 0.001, collect(0.0:1.0:32.0)
+            du0, dp = PETScDiffEq._discrete_adjoint(
+                prob, TSRK("1fe"),
+                PETScAdjoint(petsc_options = ["-ts_trajectory_solution_only", "1"]);
+                t = ts, dgdu_discrete = half_norm_du!, dt, adaptive = false,
+            )
+            # Forward Euler multiplies the state by a = 1 - p dt on every step.
+            a, k = 1 - 0.05 * dt, round.(Int, ts ./ dt)
+            expected_du0 = sum(a .^ (2k))
+            expected_dp = -sum(k .* dt .* a .^ (2k .- 1))
+            # Measured 1.2e-13 and 1.9e-13.
+            @test abs(du0[1] - expected_du0) / expected_du0 < 2.0e-12
+            @test abs(dp[1] - expected_dp) / abs(expected_dp) < 2.0e-12
+        end
+
+        @testset "an empty state with a sparse jac_prototype" begin
+            prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    (du, u, p, t) -> nothing; jac = (J, u, p, t) -> nothing,
+                    jac_prototype = spzeros(0, 0),
+                ),
+                Float64[], (0.0, 1.0),
+            )
+            @test grad(prob, TSRK("4"); t = [0.0, 1.0]) == (Float64[], nothing)
+        end
+
+        @testset "a user exception reaches the caller and leaves nothing behind" begin
+            live() = count(h -> !h.destroyed, keys(PETScDiffEq.LIVE_HANDLES))
+            before = live()
+            prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+            reference = grad(prob, TSRK("4"))
+            thrower(key) = (args...) -> throw(KeyError(key))
+            @test_throws KeyError(:dgdu) grad(prob, TSRK("4"); dgdu_discrete = thrower(:dgdu))
+            with(; jac = adj_jac!, paramjac = adj_paramjac!) = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(adj_f!; jac, paramjac), copy(u0), (0.0, 1.0), copy(p0),
+            )
+            for alg in (TSRK("4"), TSImplicit("beuler", exact))
+                @test_throws KeyError(:paramjac) grad(with(paramjac = thrower(:paramjac)), alg)
+            end
+            @test_throws KeyError(:jac) grad(with(jac = thrower(:jac)), TSRK("4"))
+            @test grad(prob, TSRK("4")) == reference
+            @test live() <= before
+        end
+
+        @testset "what it refuses, and why" begin
+            prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            residual!(r, du, u, p, t) = (r .= du .+ u; nothing)
+            without(; jac = adj_jac!, paramjac = adj_paramjac!, mass_matrix = I, p = p0) =
+                SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(adj_f!; jac, paramjac, mass_matrix), copy(u0), (0.0, 1.0), p,
+            )
+            solely_states = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction((du, u, p, t) -> (du .= -u); jac = (J, u, p, t) -> (J .= -I)),
+                copy(u0), (0.0, 1.0),
+            )
+            runs(type) = "PETScAdjoint supports PETSc's rk, beuler and cn as this package " *
+                "drives them, but this solve runs `$type`"
+            trajectory(type) = "PETScAdjoint keeps its trajectory in memory, or on disk " *
+                "with `-ts_trajectory_type basic`, but this solve's is `$type`"
+            no_ksp = [
+                "-ksp_type", "gmres", "-ksp_max_it", "1", "-pc_type", "none",
+                "-snes_max_linear_solve_fail", "1000", "-ts_max_snes_failures", "-1",
+            ]
+            @testset "$message" for (message, call) in (
+                    ("PETSc has no adjoint for TSRosW", () -> grad(prob, TSRosW())),
+                    ("PETSc has no adjoint for TSIRK", () -> grad(prob, TSIRK(2))),
+                    ("PETSc has no adjoint for TSMPRK", () -> grad(prob, TSMPRK([1]))),
+                    ("PETSc has no adjoint for TSDAE", () -> grad(prob, TSDAE("beuler"))),
+                    (
+                        "PETSc has no adjoint for TSImplicit(\"bdf\")",
+                        () -> grad(prob, TSImplicit("bdf")),
+                    ),
+                    ("PETScAdjoint does not support TSARKIMEX", () -> grad(prob, TSARKIMEX())),
+                    (
+                        "PETScAdjoint has not been verified on TSImplicit(\"theta\")",
+                        () -> grad(prob, TSImplicit("theta", 0.7)),
+                    ),
+                    (runs("euler"), () -> grad(prob, TSGeneric("euler"; explicit = true))),
+                    (runs("bdf"), () -> grad(prob, TSImplicit("beuler", ["-ts_type", "bdf"]))),
+                    (
+                        "PETScAdjoint does not support multirate TSRK",
+                        () -> grad(prob, TSRK("4", ["-ts_rk_multirate", "1"])),
+                    ),
+                    (
+                        "PETScAdjoint needs the solve to end on a step at tspan's end",
+                        () -> grad(prob, TSRK("4", ["-ts_exact_final_time", "interpolate"])),
+                    ),
+                    (
+                        "`-ts_adjoint_solve` makes PETSc start the adjoint",
+                        () -> grad(prob, TSRK("4", ["-ts_adjoint_solve", "1"])),
+                    ),
+                    (
+                        "`-ts_adjoint_solve` makes PETSc start the adjoint",
+                        () -> grad(
+                            prob, TSRK("4");
+                            sensealg = PETScAdjoint(petsc_options = ["-ts_adjoint_solve", "1"]),
+                        ),
+                    ),
+                    (
+                        "`-ts_adjoint_solve` makes PETSc start the adjoint",
+                        () -> grad(prob, TSRK("4", ["-ts_adjoint_solve=1"])),
+                    ),
+                    (
+                        "`-ts_adjoint_solve` makes PETSc start the adjoint",
+                        () -> grad(
+                            prob, TSRK("4");
+                            sensealg = PETScAdjoint(petsc_options = ["-TS_ADJOINT_SOLVE", "1"]),
+                        ),
+                    ),
+                    (
+                        trajectory("singlefile"),
+                        () -> cd(mktempdir()) do
+                            grad(
+                                prob, TSRK("4"); sensealg = PETScAdjoint(
+                                    petsc_options = ["-ts_trajectory_type", "singlefile"],
+                                ),
+                            )
+                        end,
+                    ),
+                    (
+                        trajectory("none"),
+                        () -> grad(
+                            prob, TSRK("4");
+                            sensealg = PETScAdjoint(petsc_options = ["-ts_save_trajectory", "0"]),
+                        ),
+                    ),
+                    (
+                        "PETScAdjoint supports an ODEProblem, not a DAEProblem",
+                        () -> grad(
+                            SciMLBase.DAEProblem(residual!, zeros(2), ones(2), (0.0, 1.0), p0),
+                            TSDAE("beuler"),
+                        ),
+                    ),
+                    (
+                        "PETScAdjoint supports an ODEProblem, not a DAEProblem or SplitODEProblem",
+                        () -> grad(
+                            SciMLBase.SplitODEProblem(
+                                SciMLBase.ODEFunction(adj_f!; jac = adj_jac!),
+                                SciMLBase.ODEFunction(adj_f!), copy(u0), (0.0, 1.0), p0,
+                            ),
+                            TSARKIMEX(),
+                        ),
+                    ),
+                    (
+                        "PETScAdjoint does not support a mass matrix",
+                        () -> grad(without(mass_matrix = [2.0 0.0; 0.0 1.0]), TSImplicit("beuler")),
+                    ),
+                    (
+                        "PETScAdjoint needs the ODEFunction's `jac`",
+                        () -> grad(without(jac = nothing), TSRK("4")),
+                    ),
+                    (
+                        "PETScAdjoint needs the ODEFunction's `paramjac`",
+                        () -> grad(without(paramjac = nothing), TSRK("4")),
+                    ),
+                    (
+                        "PETScAdjoint needs `p` to be a vector of real numbers",
+                        () -> grad(without(p = (0.7, 0.3, 0.4, 0.2)), TSRK("4")),
+                    ),
+                    (
+                        "`dgdp_discrete` was given, but the problem has no parameters",
+                        () -> grad(
+                            solely_states, TSRK("4"); dgdp_discrete = (out, u, p, t, i) -> nothing,
+                        ),
+                    ),
+                    (
+                        "PETScAdjoint does not support callbacks",
+                        () -> grad(prob, TSRK("4"); callback = never),
+                    ),
+                    (
+                        "PETScAdjoint does not support callbacks",
+                        () -> grad(SciMLBase.remake(prob; callback = never), TSRK("4")),
+                    ),
+                    (
+                        "PETScAdjoint does not support `tstops`",
+                        () -> grad(prob, TSRK("4"); tstops = [0.5]),
+                    ),
+                    (
+                        "PETScAdjoint does not support `tstops`",
+                        () -> grad(SciMLBase.remake(prob; tstops = [0.5]), TSRK("4")),
+                    ),
+                    (
+                        "PETScAdjoint does not support `d_discontinuities`",
+                        () -> grad(prob, TSRK("4"); d_discontinuities = [0.5]),
+                    ),
+                    (
+                        "PETScAdjoint does not support `save_idxs`",
+                        () -> grad(prob, TSRK("4"); save_idxs = [1]),
+                    ),
+                    ("PETScAdjoint needs cost times", () -> grad(prob, TSRK("4"); t = nothing)),
+                    ("PETScAdjoint needs cost times", () -> grad(prob, TSRK("4"); t = Float64[])),
+                    (
+                        "PETScAdjoint needs cost times",
+                        () -> grad(prob, TSRK("4"); dgdu_discrete = nothing),
+                    ),
+                    (
+                        "PETScAdjoint needs the cost times `t` as a vector of real numbers",
+                        () -> grad(prob, TSRK("4"); t = 1.0),
+                    ),
+                    (
+                        "cost time 1.5 lies outside tspan = (0.0, 1.0)",
+                        () -> grad(prob, TSRK("4"); t = [1.5]),
+                    ),
+                    (
+                        "cost time -0.1 lies outside tspan = (1.0, 0.0)",
+                        () -> grad(adj_prob(copy(u0), copy(p0), (1.0, 0.0)), TSRK("4"); t = [-0.1]),
+                    ),
+                    (
+                        "cost time t[1] = 0.105 is not a time the solve stepped to",
+                        () -> grad(prob, TSRK("4"); t = [0.105]),
+                    ),
+                    (
+                        "an adaptive solve steps onto no time but tspan's ends",
+                        () -> grad(prob, TSRK("5dp"); t = [0.5], adaptive = true),
+                    ),
+                    (
+                        "the forward solve stopped with TS_CONVERGED_ITS",
+                        () -> grad(prob, TSRK("4"); maxiters = 5),
+                    ),
+                    (
+                        "the forward solve ended on a state that is not finite",
+                        () -> grad(
+                            SciMLBase.ODEProblem(
+                                SciMLBase.ODEFunction(
+                                    (du, u, p, t) -> (du .= u .^ 2; nothing);
+                                    jac = (J, u, p, t) -> (J .= Diagonal(2 .* u); nothing),
+                                ),
+                                [1.0, 0.5], (0.0, 2.0),
+                            ),
+                            TSRK("4"); t = [2.0],
+                        ),
+                    ),
+                    (
+                        "PETSc's adjoint solve stopped with TSADJOINT_DIVERGED_LINEAR_SOLVE",
+                        () -> grad(
+                            prob, TSImplicit("beuler");
+                            sensealg = PETScAdjoint(petsc_options = no_ksp),
+                        ),
+                    ),
+                    (
+                        "PETScAdjoint is reached through `adjoint_sensitivities",
+                        () -> SciMLBase._concrete_solve_adjoint(
+                            prob, TSRK("4"), PETScAdjoint(), u0, p0,
+                            SciMLBase.ChainRulesOriginator(),
+                        ),
+                    ),
+                )
+                @test_throws "ArgumentError: $message" call()
+            end
+        end
     end
 end

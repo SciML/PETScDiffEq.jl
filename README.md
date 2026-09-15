@@ -80,6 +80,13 @@ anything sparse: without one the Jacobian is dense and forces a dense factorizat
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`
 and `terminate!`.
 
+## Adjoint sensitivities
+
+With SciMLSensitivity loaded, `adjoint_sensitivities(sol, alg; sensealg = PETScAdjoint(), ...)`
+runs PETSc's own discrete adjoint for `TSRK`, `TSImplicit("beuler")` and `TSImplicit("cn")`.
+The keywords that set the steps have to be repeated from `solve`. `?PETScAdjoint` and the
+documentation cover what it needs, what it refuses and how to check `jac` and `paramjac`.
+
 ## Limitations
 
 Every solve runs on `MPI.COMM_SELF`, so this package is serial. PETSc TS is built for

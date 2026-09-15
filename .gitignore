@@ -6,3 +6,4 @@ Manifest.toml
 *.jl.mem
 .DS_Store
 test/qa/Manifest.toml
+test/adjoint/Manifest.toml
