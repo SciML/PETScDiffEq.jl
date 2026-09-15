@@ -38,7 +38,13 @@ prob = SciMLBase.ODEProblem(lorenz, u0, tspan)
 sol = SciMLBase.solve(prob, TSRK("5dp"); dt = 0.01, abstol = 1e-8, reltol = 1e-8)
 ```
 
-`dt` is required and sets the first step.
+`dt` sets the first step. An adaptive solve can leave it out, and the first step is then
+Hairer and Wanner's estimate as OrdinaryDiffEq uses it, taken with the `abstol` and `reltol`
+keywords (PETSc's default of 1e-4 for both when neither is given). DAE and mass-matrix
+problems start from a small step instead. A solve PETSc steps at a fixed size needs `dt`:
+`adaptive = false`, `-ts_adapt_type none`, the fixed-step families (`TSImplicit` and `TSDAE`
+other than `bdf`, `TSIRK`, `TSMPRK`), and subtypes registered without an embedded error
+estimate. `TSGeneric` needs it too, since which of its types adapt is not known here.
 
 ## Solvers
 

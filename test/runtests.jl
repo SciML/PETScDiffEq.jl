@@ -3119,13 +3119,121 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "The first step without dt" begin
+        sinf!(du, u, p, t) = (du[1] = -u[1] + sin(10t); nothing)
+        lv!(du, u, p, t) = (du[1] = 1.5u[1] - u[1] * u[2]; du[2] = -3u[2] + u[1] * u[2]; nothing)
+        rk, rosw = PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2")
+        tight = (abstol = 1.0e-8, reltol = 1.0e-6)
+        loose = (abstol = 1.0e-6, reltol = 1.0e-3)
+        forced = SciMLBase.ODEProblem(sinf!, [2.0], (2.0, 0.0))
+        lv = SciMLBase.ODEProblem(lv!, [2.0, 0.5], (0.0, 10.0))
+        split_prob = SciMLBase.SplitODEProblem(
+            (du, u, p, t) -> (du[1] = -u[1]; nothing),
+            (du, u, p, t) -> (du[1] = sin(10t); nothing), [2.0], (0.0, 1.0),
+        )
+        oop = SciMLBase.ODEProblem((u, p, t) -> [-u[1] + sin(10t)], [2.0], (2.0, 0.0))
+        # Expected values are OrdinaryDiffEq's init dt: Tsit5 for order 5, BS3 for order 3.
+        for (prob, alg, kw, expected) in (
+                (forced, rk, tight, -0.020195969921921846),
+                (forced, rosw, tight, -0.001497756427620111),
+                (
+                    SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), rk,
+                    (; loose..., dtmax = 1.0e-3), 0.001,
+                ),
+                (SciMLBase.ODEProblem(lv!, [1.0, 1.0], (0.0, 10.0)), rk, NamedTuple(), 0.056237800849029955),
+                (lv, rk, (abstol = 1.0e-9,), 0.08421578155635664),
+                (lv, rk, (reltol = 1.0e-7,), 0.021785462059001403),
+                (lv, rosw, loose, 0.016189521278835287),
+                (lv, rk, (abstol = [1.0e-8, 1.0e-4], reltol = [1.0e-6, 1.0e-3]), 0.024832977354891702),
+                (split_prob, PETScDiffEq.TSARKIMEX("3"), tight, 0.001188153919924332),
+                (oop, rk, tight, -0.020195969921921846),
+            )
+            @test isapprox(SciMLBase.init(prob, alg; kw...).dt, expected; rtol = 1.0e-12)
+        end
+        lin(k) = (du, u, p, t) -> (du .= k .* u; nothing)
+        for (prob, kw, expected) in (
+                (SciMLBase.ODEProblem(lin(-1.0e8), [1.0], (0.0, 1.0)), (; loose..., dtmin = 1.0e-3), 0.0010000000000000002),
+                (SciMLBase.ODEProblem(lin(-1.0e8), [1.0], (1.0e10, 1.0e10 + 1)), loose, 1.9073486328125004e-6),
+                (SciMLBase.ODEProblem(lin(-1.0e20), [1.0], (0.0, 1.0)), loose, 1.0e-6),
+                (SciMLBase.ODEProblem(lin(-1.0e-6), [1.0], (0.0, 1.0)), (; loose..., dtmax = 10.0), 1.0),
+            )
+            @test isapprox(SciMLBase.init(prob, rk; kw...).dt, expected; rtol = 1.0e-12)
+        end
+        # Infinite at u0: OrdinaryDiffEq returns its floor near 1e-323, this the small default.
+        blowup = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 1 / u[1]; nothing), [0.0], (0.0, 1.0))
+        @test SciMLBase.init(blowup, rk; loose...).dt == 1.0e-6
+        # NaN only after the trial step: OrdinaryDiffEq returns NaN, this the small default.
+        nan_after = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = u[1] < 1 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
+        )
+        @test SciMLBase.init(nan_after, rk; loose...).dt == 1.0e-6
+        # DFBDF's first step for a DAEProblem and Rodas5P's for a mass matrix.
+        res!(r, du, u, p, t) = (r .= du .+ u; nothing)
+        for (span, expected) in (((0.0, 100.0), 9.999999999999999e-5), ((100.0, 0.0), -9.999999999999999e-5))
+            dae = SciMLBase.DAEProblem(res!, [-1.0], [1.0], span)
+            @test isapprox(SciMLBase.init(dae, PETScDiffEq.TSDAE("bdf")).dt, expected; rtol = 1.0e-12)
+        end
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0], (0.0, 1.0),
+        )
+        @test SciMLBase.init(mass, rosw).dt == 1.0e-6
+        # On (0, 0.5) the constant case is held to the span, where OrdinaryDiffEq returns 1.0.
+        constant!(du, u, p, t) = (du .= 1.0; nothing)
+        tiny!(du, u, p, t) = (du[1] = 1.0e-20 * (1 + t); nothing)
+        for (prob, alg, kw, expected) in (
+                (SciMLBase.ODEProblem(constant!, [1.0], (0.0, 10.0)), rk, loose, 1.0),
+                (SciMLBase.ODEProblem(constant!, [1.0], (0.0, 0.5)), rk, loose, 0.5),
+                (SciMLBase.ODEProblem(tiny!, [1.0], (0.0, 1.0)), rk, loose, 1.0e-6),
+                (SciMLBase.ODEProblem(lv!, [-2.0, 0.5], (0.0, 10.0)), rk, loose, 0.0571251726271507),
+                (mass, rosw, (dtmin = 1.0e-3,), 0.0010000000000000002),
+                (
+                    SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), rk,
+                    (; loose..., tstops = [1.0e-3]), 0.001,
+                ),
+            )
+            @test isapprox(SciMLBase.init(prob, alg; kw...).dt, expected; rtol = 1.0e-12)
+        end
+    end
+
+    @testset "Adaptive solves run without dt" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for alg in (
+                PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
+                PETScDiffEq.TSARKIMEX("3"), PETScDiffEq.TSImplicit("bdf"),
+            )
+            sol = SciMLBase.solve(prob, alg; reltol = 1.0e-8, abstol = 1.0e-10)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-5
+        end
+        # abstol = 0 gives the zero component a scale of 0, so the estimate's norms are NaN.
+        zero_start = SciMLBase.ODEProblem(decay!, [0.0, 1.0], (0.0, 1.0))
+        sol = SciMLBase.solve(zero_start, PETScDiffEq.TSRK("5dp"); abstol = 0.0, reltol = 1.0e-6)
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+    end
+
     @testset "Input validation" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
-        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"))
-        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRosW("ra34pw2"))
-        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSImplicit("beuler"))
-        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX("3"))
-        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSGeneric("alpha"))
+        with_jac = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),
+        )
+        pair = SciMLBase.ODEProblem(decay!, [1.0, 1.0], (0.0, 1.0))
+        # Each of these is stepped at a fixed size, so it still needs dt.
+        for (p, alg) in (
+                (prob, PETScDiffEq.TSRK("4")), (prob, PETScDiffEq.TSRK("1fe")),
+                (prob, PETScDiffEq.TSRosW("theta1")), (prob, PETScDiffEq.TSARKIMEX("prssp2")),
+                (prob, PETScDiffEq.TSARKIMEX("ars443")),
+                (prob, PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])),
+                (prob, PETScDiffEq.TSImplicit("beuler")), (with_jac, PETScDiffEq.TSIRK(2)),
+                (pair, PETScDiffEq.TSMPRK([1], "p2")), (prob, PETScDiffEq.TSGeneric("alpha")),
+            )
+            @test_throws ArgumentError SciMLBase.solve(p, alg)
+        end
+        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); adaptive = false)
+        @test SciMLBase.solve(prob, PETScDiffEq.TSRK("4"); dt = 0.01).retcode ==
+            SciMLBase.ReturnCode.Success
+        @test_throws ArgumentError SciMLBase.solve(
+            pair, PETScDiffEq.TSRK("5dp"); abstol = [1.0e-6, 1.0e-6, 1.0e-6],
+        )
         @test_throws ArgumentError SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (1.0, 1.0)),
             PETScDiffEq.TSRK("5dp"); dt = 0.1,

@@ -1194,11 +1194,16 @@ end
 
 _tolscalar(tol, default) = tol === nothing || tol isa AbstractVector ? default : Float64(tol)
 
-function _tolvec(h::TSHandles, petsclib, tol, n, name)
+function _check_tol(tol, n, name)
     tol isa AbstractVector || return nothing
     length(tol) == n ||
         throw(ArgumentError("`$name` has length $(length(tol)), but the state has $n"))
     all(t -> t >= 0, tol) || throw(ArgumentError("`$name` has a negative entry"))
+    return nothing
+end
+
+function _tolvec(h::TSHandles, petsclib, tol, n, name)
+    tol isa AbstractVector || return nothing
     # PETSc borrows this array rather than copying it, and reads it on every
     # adaptive step, so it has to outlive the handle.
     buf = Vector{Float64}(collect(tol))
@@ -1206,6 +1211,42 @@ function _tolvec(h::TSHandles, petsclib, tol, n, name)
     v = PETSc.VecSeq(petsclib, buf)
     push!(h.tolvecs, v)
     return v
+end
+
+# Hairer and Wanner's starting step as OrdinaryDiffEq takes it for an in-place f, in the
+# user's time before the right-hand side is wrapped for PETSc. Where OrdinaryDiffEq falls
+# back to its floor nextfloat(max(dtmin, eps(t0))) or ends up with NaN, this returns the
+# small default instead.
+function _initial_dt(f1, f2, u0, p, t0, tdir, order, abstol, reltol, dtmin, dtmax)
+    dtmin_floor = nextfloat(max(dtmin, eps(t0)))
+    smalldt = max(dtmin_floor, 1.0e-6)
+    isempty(u0) && return smalldt
+    norm = DiffEqBase.ODE_DEFAULT_NORM
+    function rhs(u, t)
+        du = similar(u)
+        f1(du, u, p, t)
+        if f2 !== nothing
+            extra = similar(u)
+            f2(extra, u, p, t)
+            du .+= extra
+        end
+        return du
+    end
+    sk = abstol .+ abs.(u0) .* reltol
+    f0 = rhs(u0, t0)
+    all(isfinite, f0) || return smalldt
+    d0 = norm(u0 ./ sk, t0)
+    d1 = norm(f0 ./ sk, t0)
+    isnan(d1) && return smalldt
+    dt0 = min(d0 < 1.0e-5 || d1 < 1.0e-5 ? smalldt : (d0 / d1) / 100, dtmax)
+    dt0 < 10 * eps(Float64) && return smalldt
+    f_next = rhs(u0 .+ (tdir * dt0) .* f0, t0 + tdir * dt0)
+    f0 == f_next && return min(max(dtmin_floor, 100 * dt0), dtmax)
+    d2 = norm((f_next .- f0) ./ sk, t0) / dt0
+    m = max(d1, d2)
+    dt1 = m <= 1.0e-15 ? max(1.0e-6, dt0 * 1.0e-3) : 10.0^(-(2 + log10(m)) / order)
+    dt = max(dtmin_floor, min(100 * dt0, dt1, dtmax))
+    return isfinite(dt) && dt > 0 ? dt : smalldt
 end
 
 const SupportedProblem = Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}
@@ -1226,6 +1267,7 @@ function _setup(
         save_end = true,
         dense = nothing,
         save_idxs = nothing,
+        tstops = (),
         kwargs...,
     )
     for key in UNSUPPORTED_KWARGS
@@ -1235,7 +1277,15 @@ function _setup(
     end
     prob.u0 isa AbstractVector{<:Real} ||
         throw(ArgumentError("PETScDiffEq requires a real AbstractVector u0"))
-    dt === nothing && throw(ArgumentError("PETScDiffEq requires an initial dt"))
+    dt_given = dt !== nothing
+    if !dt_given && !(adaptive && _adapts(alg) === true)
+        throw(
+            ArgumentError(
+                "PETScDiffEq needs `dt` unless the solve adapts on an error estimate it " *
+                    "knows about, which `$(_ts_type(alg))` with `adaptive = $adaptive` does not",
+            ),
+        )
+    end
     is_split = prob.f isa SciMLBase.SplitFunction
     is_split && !(alg isa TSARKIMEX) &&
         throw(ArgumentError("PETScDiffEq only supports SplitODEProblem with TSARKIMEX"))
@@ -1364,6 +1414,33 @@ function _setup(
         )
     end
     jac_fn = has_jac ? (is_dae ? prob.f.jac : _as_inplace_jac(prob.f.jac, iip)) : nothing
+    _check_tol(abstol, n, "abstol")
+    _check_tol(reltol, n, "reltol")
+    if !dt_given
+        user_t0 = Float64(prob.tspan[1])
+        est_dtmin = dtmin === nothing ? 0.0 : abs(Float64(dtmin))
+        # With no explicit derivative to estimate from, start small as OrdinaryDiffEq does.
+        dt = if is_dae
+            1.0e-6 * abs(tf - t0)
+        elseif has_mass
+            max(nextfloat(max(est_dtmin, eps(user_t0))), 1.0e-6)
+        else
+            # The abstol/reltol keywords as this function hands them to PETSc below, which
+            # keeps its own 1e-4 for both when neither is given. Tolerances set through
+            # petsc_options are not seen here.
+            est_abstol = something(abstol, reltol === nothing ? 1.0e-4 : 1.0e-6)
+            est_reltol = something(reltol, abstol === nothing ? 1.0e-4 : 1.0e-3)
+            user_dtmax = dtmax === nothing || isinf(dtmax) ? Inf : abs(Float64(dtmax))
+            first_stop = minimum(
+                (abs(Float64(s) - user_t0) for s in tstops if tdir * (Float64(s) - user_t0) > 0);
+                init = Inf,
+            )
+            _initial_dt(
+                f1, f2, u0, prob.p, user_t0, tdir, SciMLBase.alg_order(alg),
+                est_abstol, est_reltol, est_dtmin, min(user_dtmax, first_stop, abs(tf - t0)),
+            )
+        end
+    end
     if tdir < 0
         f1 = is_dae ? _reverse_residual(f1) : _reverse_rhs(f1)
         f2 = f2 === nothing ? nothing : _reverse_rhs(f2)
@@ -1539,6 +1616,16 @@ function _setup(
                 end
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
+            end
+            if !dt_given &&
+                    LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
+                throw(
+                    ArgumentError(
+                        "PETScDiffEq needs `dt` here: PETSc will step this solve at a fixed " *
+                            "size, since the method has no embedded error estimate or " *
+                            "`-ts_adapt_type none` is set",
+                    ),
+                )
             end
         end
     catch
@@ -2051,7 +2138,7 @@ function SciMLBase.__init(
         callback = nothing, tstops = (), kwargs...,
     )
     callbacks, continuous = _split_callbacks(callback)
-    h = _setup(prob, alg; kwargs...)
+    h = _setup(prob, alg; tstops = tstops, kwargs...)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
     _initial_save!(h)
     stops = _tstops(tstops, h)
@@ -2133,7 +2220,7 @@ function SciMLBase.reinit!(
     old = integ.h
     prob = SciMLBase.remake(integ.prob; u0 = u0, tspan = (t0, tf))
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
-    h = _setup(prob, integ.alg; setup_kwargs...)
+    h = _setup(prob, integ.alg; tstops = tstops, setup_kwargs...)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
     if !erase_sol
         append!(h.ctx.ts, old.ctx.ts)
