@@ -1922,6 +1922,20 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.terminate!(integ)
         end
 
+        @testset "the queue is keyed on the direction of integration" begin
+            # Forward, the key and the time are the same number, so this only shows up
+            # when the span runs backward.
+            back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
+            integ = SciMLBase.init(back, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            @test integ.tdir == -1
+            SciMLBase.add_tstop!(integ, 0.5)
+            @test SciMLBase.first_tstop(integ) == -0.5
+            @test integ.tdir * SciMLBase.first_tstop(integ) == 0.5
+            @test SciMLBase.pop_tstop!(integ) == -0.5
+            @test !SciMLBase.has_tstop(integ)
+            SciMLBase.terminate!(integ)
+        end
+
         @testset "the queue reports the final time as a stop" begin
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
             @test PETScDiffEq.DiffEqBase.get_tstops_max(integ) == 1.0

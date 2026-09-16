@@ -2187,8 +2187,11 @@ function SciMLBase.add_tstop!(integ::PETScIntegrator, t)
     return nothing
 end
 SciMLBase.has_tstop(integ::PETScIntegrator) = !isempty(integ.tstops)
-SciMLBase.first_tstop(integ::PETScIntegrator) = _user_t(integ.tdir, integ.tstops[1])
-SciMLBase.pop_tstop!(integ::PETScIntegrator) = _user_t(integ.tdir, popfirst!(integ.tstops))
+# The queue is keyed on the direction of integration, and the key is what these two
+# report, which is what generic solver and callback code compares against. A caller
+# reads the time back as `integ.tdir * first_tstop(integ)`.
+SciMLBase.first_tstop(integ::PETScIntegrator) = integ.tstops[1]
+SciMLBase.pop_tstop!(integ::PETScIntegrator) = popfirst!(integ.tstops)
 
 function _initial_save!(h::TSHandles)
     ctx = h.ctx
