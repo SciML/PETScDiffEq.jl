@@ -1692,6 +1692,28 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
         end
 
+        @testset "the root does not move with the callback's abstol" begin
+            # `abstol` is the window for not finding the same event twice, so raising it,
+            # which is what the docs suggest for repeated events, must leave the located
+            # root where it is.
+            loose(hits, abstol) = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5,
+                integ -> (push!(hits, integ.t); integ.u[1] += 1.0);
+                abstol = abstol,
+            )
+            for abstol in (1.0e-6, 1.0e-4, 1.0e-2)
+                hits = Float64[]
+                sol = SciMLBase.solve(
+                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, reltol = 1.0e-10,
+                    abstol = 1.0e-12, callback = loose(hits, abstol),
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test length(hits) == 2
+                @test abs(hits[1] - log(2.0)) < 1.0e-9
+                @test abs(hits[2] - log(6.0)) < 1.0e-9
+            end
+        end
+
         @testset "a bouncing ball" begin
             function ball!(du, u, p, t)
                 du[1] = u[2]

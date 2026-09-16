@@ -1955,13 +1955,14 @@ function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
 end
 _is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev * next <= 0
 
+# The bracket is halved until it cannot be halved again, which puts the root at the
+# precision of the time type. `cb.abstol` is the window for not finding the same event
+# twice, which `_find_event` applies through `repeat_nudge`, so it is not a stopping
+# tolerance here: using it as one would move the event itself by whatever the user set.
 function _bisect_root(integ::PETScIntegrator, cb, lo, hi, slo, i::Int, buf)
     while true
         mid = lo + (hi - lo) / 2
-        (
-            integ.tdir * (mid - lo) <= 0 || integ.tdir * (hi - mid) <= 0 ||
-                abs(hi - lo) <= cb.abstol
-        ) && break
+        (integ.tdir * (mid - lo) <= 0 || integ.tdir * (hi - mid) <= 0) && break
         smid = _fill_conditions!(buf, integ, cb, mid)[i]
         smid == 0 && return mid
         if slo * smid <= 0
