@@ -181,6 +181,143 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.ReturnCode.Success
         @test SciMLBase.solve(halves(-1.0, -2000.0), bounded; dt = 0.01).retcode !=
             SciMLBase.ReturnCode.Success
+
+        @testset "a zero pivot fails the solve rather than raising" begin
+            printed(f) = mktemp() do path, io
+                result = redirect_stderr(f, io)
+                flush(io)
+                return result, read(path, String)
+            end
+            # With no cap on the line search's step, u grows until the finite-difference
+            # Jacobian is exactly zero, and its dense LU hits a zero pivot on the fifth step.
+            pivots = PETScDiffEq.TSARKIMEX(
+                "3", [bounded.petsc_options; "-snes_linesearch_maxstep"; "1e300"],
+            )
+            prob = halves(-1.0, -2000.0)
+            upto = SciMLBase.solve(
+                SciMLBase.remake(prob; tspan = (0.0, 0.04)), pivots; dt = 0.01,
+            )
+            @test upto.retcode == SciMLBase.ReturnCode.Success
+
+            sol, text = printed(() -> SciMLBase.solve(prob, pivots; dt = 0.01))
+            @test sol.retcode == SciMLBase.ReturnCode.Failure
+            @test !occursin("PETSC ERROR", text)
+            # The solve ends on the last step PETSc finished.
+            @test sol.t == upto.t
+            @test sol.u == upto.u
+            @test sol.stats.naccept == upto.stats.naccept
+            ends = SciMLBase.solve(prob, pivots; dt = 0.01, save_everystep = false)
+            @test ends.retcode == SciMLBase.ReturnCode.Failure
+            @test ends.t == [0.0, upto.t[end]]
+            @test ends.u[end] == upto.u[end]
+            # A step that failed this way leaves PETSc's rejection counters untouched, so
+            # the solve names the reason itself.
+            @test sol.stats.nreject == upto.stats.nreject
+            @test_logs (:warn, r"zero pivot") match_mode = :any SciMLBase.solve(
+                prob, pivots; dt = 0.01,
+            )
+
+            n_fin = Ref(0)
+            hooked = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> false, integ -> nothing;
+                finalize = (cb, u, t, integ) -> (n_fin[] += 1; nothing),
+            )
+            integ = SciMLBase.init(prob, pivots; dt = 0.01, callback = hooked)
+            isol, text = printed(() -> SciMLBase.solve!(integ))
+            @test isol.retcode == SciMLBase.ReturnCode.Failure
+            @test !occursin("PETSC ERROR", text)
+            @test isol.t == upto.t
+            @test isol.u == upto.u
+            # The integrator ends as it does on any other failed step, with the stats and
+            # the callback's finalize that go with an assembled solution.
+            @test isol.stats.naccept == upto.stats.naccept
+            @test n_fin[] == 1
+            @test_throws ArgumentError SciMLBase.step!(integ)
+            @test_logs (:warn, r"zero pivot") match_mode = :any SciMLBase.solve!(
+                SciMLBase.init(prob, pivots; dt = 0.01),
+            )
+
+            # A Newton matrix singular from the outset pivots before any step, and the
+            # solve ends where it started.
+            index1 = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (du[1] = -u[1]; du[2] = u[1] - u[2]; nothing);
+                    mass_matrix = [1.0 0.0; 0.0 0.0],
+                ), [1.0, 1.0], (0.0, 0.1),
+            )
+            unstepped = PETScDiffEq.TSARKIMEX("3", ["-ts_adapt_type", "none"])
+            start, text = printed(() -> SciMLBase.solve(index1, unstepped; dt = 0.01))
+            @test start.retcode == SciMLBase.ReturnCode.Failure
+            @test start.t == [0.0]
+            @test start.u == [[1.0, 1.0]]
+            @test !occursin("PETSC ERROR", text)
+            @test_logs (:warn, r"zero pivot") match_mode = :any SciMLBase.solve(
+                index1, unstepped; dt = 0.01,
+            )
+
+            # An error the options ask PETSc to raise still raises, with its traceback.
+            plain = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+            raising = PETScDiffEq.TSImplicit(
+                "beuler", ["-snes_max_it", "0", "-snes_error_if_not_converged"],
+            )
+            for run in (
+                    () -> SciMLBase.solve(plain, raising; dt = 0.1, adaptive = false),
+                    () -> SciMLBase.solve!(
+                        SciMLBase.init(plain, raising; dt = 0.1, adaptive = false),
+                    ),
+                )
+                err, text = printed() do
+                    try
+                        run()
+                    catch e
+                        e
+                    end
+                end
+                @test err isa PETScDiffEq.LibPETSc.PetscError
+                @test occursin("PETSC ERROR", text)
+            end
+
+            # A zero pivot the options ask the linear solve to raise is the error the user
+            # asked for, in the plain solve, the integrator and the adjoint's forward solve
+            # alike.
+            singular = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (du[1] = p[1] * u[1]; nothing);
+                    jac = (J, u, p, t) -> (J[1, 1] = p[1]; nothing),
+                    paramjac = (pJ, u, p, t) -> (pJ[1, 1] = u[1]; nothing),
+                ), [1.0], (0.0, 1.0), [10.0],
+            )
+            # Backward Euler at this step shifts by 10, so `shift - J` is exactly zero.
+            zrpvt = PETScDiffEq.TSImplicit(
+                "beuler",
+                ["-ksp_type", "preonly", "-pc_type", "lu", "-ksp_error_if_not_converged"],
+            )
+            for run in (
+                    () -> SciMLBase.solve(singular, zrpvt; dt = 0.1, adaptive = false),
+                    () -> SciMLBase.solve!(
+                        SciMLBase.init(singular, zrpvt; dt = 0.1, adaptive = false),
+                    ),
+                    () -> PETScDiffEq._discrete_adjoint(
+                        singular, zrpvt, PETScDiffEq.PETScAdjoint();
+                        t = collect(0.0:0.1:1.0),
+                        dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing),
+                        dt = 0.1, adaptive = false,
+                    ),
+                )
+                err, text = printed() do
+                    try
+                        run()
+                    catch e
+                        e
+                    end
+                end
+                @test err isa PETScDiffEq.LibPETSc.PetscError
+                @test occursin("Zero pivot", text)
+            end
+
+            @test SciMLBase.solve(halves(-2000.0, -1.0), bounded; dt = 0.01).retcode ==
+                SciMLBase.ReturnCode.Success
+        end
     end
 
     @testset "an integrator dropped part-way still exits cleanly" begin

@@ -575,8 +575,88 @@ _no_interpolant(ctx) = ArgumentError(
         "as BDF, or keep saveat times on step ends and pass `rootfind = NoRootFind`",
 )
 
-# PETSc.jl does not carry PETSc's error codes; this is PETSC_ERR_SUP.
+# PETSc.jl does not carry PETSc's error codes; these are PETSC_ERR_SUP and
+# PETSC_ERR_MAT_LU_ZRPVT.
 const PETSC_ERR_SUP = 56
+const PETSC_ERR_MAT_LU_ZRPVT = 71
+
+# A dense LU factorization raises on a zero pivot whatever PETSc was told about failed
+# steps, so a Newton matrix gone singular ends TSSolve or TSStep with this error rather
+# than with a step that failed. Where the options ask the linear solve to raise, this
+# error is the one that was asked for and is left to raise.
+_failed_step(e, h) =
+    e isa LibPETSc.PetscError && e.code == PETSC_ERR_MAT_LU_ZRPVT && !h.pivot_raises
+
+# A step reported through the retcode carries no traceback, and one PETSc raised part way
+# through leaves the rejection counters it would otherwise have raised at zero, so this is
+# the only account of why the solve stopped where it did.
+_warn_zero_pivot(alg) = @warn "`$(_warn_name(alg))` ends here because the LU " *
+    "factorization of its Newton matrix hit a zero pivot"
+
+# Whether the options leave the linear solve raising on a factorization it cannot use.
+function _pivot_raises(pl, ts)
+    lib = Libdl.dlopen(pl.petsc_library)
+    snes, ksp = Ref{LibPETSc.CSNES}(C_NULL), Ref{LibPETSc.CKSP}(C_NULL)
+    raises = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE)
+    ccall(
+        Libdl.dlsym(lib, :TSGetSNES), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
+    )
+    ccall(
+        Libdl.dlsym(lib, :SNESGetKSP), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}), snes[], ksp,
+    )
+    ccall(
+        Libdl.dlsym(lib, :KSPGetErrorIfNotConverged), LibPETSc.PetscErrorCode,
+        (LibPETSc.CKSP, Ptr{LibPETSc.PetscBool}), ksp[], raises,
+    )
+    return raises[] == LibPETSc.PETSC_TRUE
+end
+
+# A zero pivot is reported through the retcode, so its traceback is not printed, and PETSc
+# does not then open the next error's traceback as one that followed it. Every other
+# error goes on to PETSc's own traceback handler, passed in as `traceback`.
+function _zero_pivot_handler(
+        comm::MPI.API.MPI_Comm, line::Cint, fun::Ptr{Cchar}, file::Ptr{Cchar},
+        n::LibPETSc.PetscErrorCode, p::Cint, mess::Ptr{Cchar}, traceback::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    n == PETSC_ERR_MAT_LU_ZRPVT && return n
+    return ccall(
+        traceback, LibPETSc.PetscErrorCode,
+        (
+            MPI.API.MPI_Comm, Cint, Ptr{Cchar}, Ptr{Cchar}, LibPETSc.PetscErrorCode, Cint,
+            Ptr{Cchar}, Ptr{Cvoid},
+        ),
+        comm, line, fun, file, n, p, mess, C_NULL,
+    )
+end
+
+const ZERO_PIVOT_HANDLER_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+const ERROR_HANDLER_FNS = Ref((C_NULL, C_NULL, C_NULL))
+
+# Runs `f` with the handler above in front of PETSc's, except where a zero pivot goes on
+# to raise and keeps its traceback. It wraps every step, and opening the library by path
+# costs far more than the step, so the functions are looked up once.
+function _quiet_zero_pivot(f, h)
+    h.pivot_raises && return f()
+    if ERROR_HANDLER_FNS[][1] == C_NULL
+        lib = Libdl.dlopen(h.petsclib.petsc_library)
+        ERROR_HANDLER_FNS[] = (
+            Libdl.dlsym(lib, :PetscPushErrorHandler), Libdl.dlsym(lib, :PetscPopErrorHandler),
+            Libdl.dlsym(lib, :PetscTraceBackErrorHandler),
+        )
+    end
+    push, pop, traceback = ERROR_HANDLER_FNS[]
+    ccall(
+        push, LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
+        ZERO_PIVOT_HANDLER_PTR[], traceback,
+    )
+    try
+        return f()
+    finally
+        ccall(pop, LibPETSc.PetscErrorCode, ())
+    end
+end
 
 # PETSc's interpolant at s, left in `ctx.work`, or `nothing` where PETSc has none.
 function _petsc_interpolate!(ctx, ts, s)
@@ -1143,6 +1223,14 @@ function __init__()
             Ptr{Cvoid},
         )
     )
+    ZERO_PIVOT_HANDLER_PTR[] = @cfunction(
+        _zero_pivot_handler,
+        LibPETSc.PetscErrorCode,
+        (
+            MPI.API.MPI_Comm, Cint, Ptr{Cchar}, Ptr{Cchar}, LibPETSc.PetscErrorCode, Cint,
+            Ptr{Cchar}, Ptr{Cvoid},
+        )
+    )
     _init_adjoint_pointers!()
     return nothing
 end
@@ -1282,6 +1370,7 @@ mutable struct TSHandles{CTX, T}
     maxiters::Int
     save_start::Bool
     save_end::Bool
+    pivot_raises::Bool
     tolvecs::Vector{Any}
     tolbufs::Vector{Vector{Float64}}
     destroyed::Bool
@@ -1661,7 +1750,8 @@ function _setup(
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing,
-        t0, tf, tdir, u0, Int(maxiters), save_start, save_end, Any[], Vector{Float64}[], false,
+        t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false,
+        Any[], Vector{Float64}[], false,
     )
     finalizer(_destroy!, h)
     LIVE_HANDLES[h] = nothing
@@ -1758,6 +1848,9 @@ function _setup(
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
             end
+            # The options have reached the linear solve by here, and reading what they
+            # left it doing keeps that read off the per-step path.
+            h.pivot_raises = _pivot_raises(petsclib, ts)
             if !dt_given &&
                     LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
                 throw(
@@ -1860,17 +1953,26 @@ function SciMLBase.__solve(
     ctx, pl = h.ctx, h.petsclib
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
+        pivot = false
         GC.@preserve ctx begin
             try
-                LibPETSc.TSSolve(pl, h.ts, h.u)
-            catch
+                _quiet_zero_pivot(h) do
+                    LibPETSc.TSSolve(pl, h.ts, h.u)
+                end
+            catch e
                 # A callback that threw reports failure to PETSc, which raises a
                 # PetscError here. The user's own exception is the useful one.
-                ctx.err === nothing && rethrow()
+                ctx.err === nothing && !_failed_step(e, h) && rethrow()
+                pivot = true
             end
         end
         ctx.err === nothing || throw(ctx.err)
-        tend = Float64(LibPETSc.TSGetSolveTime(pl, h.ts))
+        pivot && _warn_zero_pivot(alg)
+        # PETSc records the solve time only as TSSolve returns, and a step it raised on
+        # leaves the time and state where the last finished step put them.
+        tend = Float64(
+            pivot ? LibPETSc.TSGetTime(pl, h.ts) : LibPETSc.TSGetSolveTime(pl, h.ts),
+        )
         st = _read_stats(h)
         uend = _readvec!(similar(h.u0), pl, h.u)
     finally
@@ -2520,11 +2622,15 @@ function SciMLBase.step!(integ::PETScIntegrator)
         LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
         integ.dt = integ.tdir * (target - integ.tdir * integ.t)
     end
+    pivot = false
     GC.@preserve ctx begin
         try
-            LibPETSc.TSStep(pl, h.ts)
-        catch
-            ctx.err === nothing && rethrow()
+            _quiet_zero_pivot(h) do
+                LibPETSc.TSStep(pl, h.ts)
+            end
+        catch e
+            ctx.err === nothing && !_failed_step(e, h) && rethrow()
+            pivot = true
         end
     end
     if ctx.err !== nothing
@@ -2532,10 +2638,11 @@ function SciMLBase.step!(integ::PETScIntegrator)
         _finish!(integ)
         throw(err)
     end
+    pivot && _warn_zero_pivot(integ.alg)
     integ.t = _user_t(integ.tdir, Float64(LibPETSc.TSGetTime(pl, h.ts)))
     integ.dt = integ.tdir * Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
-    # A step PETSc could not take returns without advancing the clock, which
-    # would otherwise spin a `while !done` loop forever.
+    # A step PETSc could not take, or raised part-way through, returns without advancing
+    # the clock, which would otherwise spin a `while !done` loop forever.
     if integ.tdir * integ.t <= integ.tdir * integ.tprev
         _finish!(integ, SciMLBase.ReturnCode.Failure)
         return nothing
