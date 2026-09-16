@@ -1860,10 +1860,15 @@ function SciMLBase.get_du!(out, integ::PETScIntegrator)
     return out
 end
 SciMLBase.get_tmp_cache(integ::PETScIntegrator) = (integ.tmp1, integ.tmp2)
-DiffEqBase.get_tstops(integ::PETScIntegrator) = integ.tstops
-DiffEqBase.get_tstops_array(integ::PETScIntegrator) = integ.tstops
-DiffEqBase.get_tstops_max(integ::PETScIntegrator) =
-    isempty(integ.tstops) ? integ.h.tf : maximum(integ.tstops)
+# The queue carries the stops still to be stepped onto, and leaves out the final time
+# because the solve ends there whether or not it is queued. A callback that schedules its
+# own next tick compares that tick against these accessors and reads anything past the
+# last one as past the end of the solve, so the final time belongs in what they report.
+_queued_tstops(integ::PETScIntegrator) = push!(copy(integ.tstops), integ.h.tf)
+
+DiffEqBase.get_tstops(integ::PETScIntegrator) = _queued_tstops(integ)
+DiffEqBase.get_tstops_array(integ::PETScIntegrator) = _queued_tstops(integ)
+DiffEqBase.get_tstops_max(integ::PETScIntegrator) = integ.h.tf
 
 function SciMLBase.set_u!(integ::PETScIntegrator, u)
     copyto!(integ.u, u)

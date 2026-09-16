@@ -1922,6 +1922,50 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.terminate!(integ)
         end
 
+        @testset "the queue reports the final time as a stop" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            @test PETScDiffEq.DiffEqBase.get_tstops_max(integ) == 1.0
+            @test PETScDiffEq.DiffEqBase.get_tstops_array(integ) == [1.0]
+            @test length(PETScDiffEq.DiffEqBase.get_tstops(integ)) == 1
+            SciMLBase.add_tstop!(integ, 0.35)
+            @test PETScDiffEq.DiffEqBase.get_tstops_max(integ) == 1.0
+            @test PETScDiffEq.DiffEqBase.get_tstops_array(integ) == [0.35, 1.0]
+            # Reading the queue leaves it as it was.
+            @test integ.tstops == [0.35]
+            SciMLBase.terminate!(integ)
+        end
+
+        @testset "a callback that schedules its own ticks reaches the end" begin
+            for (name, make, stops) in (
+                    (
+                        "IterativeCallback",
+                        fires -> DiffEqCallbacks.IterativeCallback(
+                            integ -> integ.t + 0.3,
+                            integ -> (push!(fires, integ.t); nothing),
+                        ),
+                        Float64[],
+                    ),
+                    (
+                        "PeriodicCallback",
+                        fires -> DiffEqCallbacks.PeriodicCallback(
+                            integ -> (push!(fires, integ.t); nothing), 0.3,
+                        ),
+                        [0.35],
+                    ),
+                )
+                @testset "$name" begin
+                    fires = Float64[]
+                    sol = SciMLBase.solve(
+                        prob, PETScDiffEq.TSRK("5dp"); dt = 0.1,
+                        callback = make(fires), tstops = stops,
+                    )
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test length(fires) == 3
+                    @test isapprox(fires, [0.3, 0.6, 0.9]; atol = 1.0e-9)
+                end
+            end
+        end
+
         @testset "PresetTimeCallback" begin
             expected(t) = t < 0.5 ? exp(-t) : (exp(-0.5) + 1) * exp(-(t - 0.5))
             hits = Float64[]
