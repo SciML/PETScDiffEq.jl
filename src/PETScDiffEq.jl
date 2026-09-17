@@ -386,9 +386,8 @@ _adapts(alg::TSImplicit) = alg.subtype == "bdf"
 _adapts(::TSMPRK) = false
 _adapts(::TSGeneric) = nothing
 
-# PETSc's interpolant between step ends is at least cubic for these. Every other one it
-# has is linear or quadratic, so where the problem gives a derivative the state between
-# step ends comes from the cubic Hermite interpolant on the step's two ends instead.
+# PETSc's interpolant is at least cubic for these. For the rest, where the problem gives a
+# derivative, the state between step ends comes from a cubic Hermite interpolant.
 const _RK_CUBIC_INTERP = ("5dp",)
 const _ROSW_CUBIC_INTERP = ("ra34pw2", "lassp3p4s2c", "llssp3p4s2c", "ark3")
 const _ARKIMEX_CUBIC_INTERP = ("4", "5")
@@ -406,9 +405,9 @@ _petsc_interpolant(alg::TSARKIMEX) = alg.subtype in _ARKIMEX_CUBIC_INTERP
 _petsc_interpolant(alg::Union{TSImplicit, TSDAE}) = alg.subtype == "bdf"
 _petsc_interpolant(::Union{TSIRK, TSMPRK, TSGeneric}) = false
 
-# Whether PETSc can interpolate at all, which is all a mass matrix or a DAEProblem leaves
-# to go on. TSIRK's Gauss tableaus register no formula, and PETSc then hands back its
-# output vector untouched rather than failing. `nothing` means the answer is not known.
+# Whether PETSc can interpolate at all, which is all a mass matrix or a DAEProblem has.
+# TSIRK hands back its output vector untouched rather than failing. `nothing` means the
+# answer is not known yet.
 _interpolates(::TSRK) = true
 _interpolates(alg::TSRosW) = !(alg.subtype in _ROSW_NO_INTERP)
 _interpolates(alg::TSARKIMEX) = !(alg.subtype in _ARKIMEX_NO_INTERP)
@@ -492,8 +491,7 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     # The start of the step a TSSolve monitor call ends.
     step_t::Float64
     step_u::Vector{Float64}
-    # The end of the integrator's step as the step reached it, which a callback changing
-    # the state there leaves as it was.
+    # The end of the integrator's step as the step reached it, before any callback there.
     end_s::Float64
     end_u::Vector{Float64}
     # The derivatives at the two ends of the step being interpolated, each `nothing`
@@ -554,9 +552,8 @@ _saved(ctx, u) = ctx.save_idxs === nothing ? Vector{Float64}(u) :
 _interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, dus) :
     SciMLBase.LinearInterpolation(ts, ctx.us)
 
-# The cubic Hermite interpolant at s on the step from (s0, u0) to (s1, u1), written as
-# SciMLBase writes the one dense output uses. Root finding asks for many points in one
-# step, so each end's derivative is kept until the state or time at that end changes.
+# The cubic Hermite interpolant at s on the step from (s0, u0) to (s1, u1), as SciMLBase
+# writes the one dense output uses. Each end's derivative is kept until that end moves.
 function _hermite!(out, ctx, s, s0, u0, s1, u1)
     ctx.fstart === nothing && (ctx.fstart = _derivative(ctx, s0, u0))
     ctx.fend === nothing && (ctx.fend = _derivative(ctx, s1, u1))
@@ -1022,8 +1019,7 @@ function _monitor!(
 end
 
 function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
-    # A solve ended for a state PETSc could not give is only finishing its last step, and
-    # the time that failed now lies before the step PETSc can interpolate in.
+    # The time that failed lies before the step PETSc can interpolate in.
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     try
@@ -1053,8 +1049,8 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
                     )
                 elseif _petsc_interpolate!(ctx, ts, want) === nothing
                     ctx.err = _no_interpolant(ctx)
-                    # PETSc prints a traceback for a monitor that fails, which would bury
-                    # the reason, so the solve is instead ended after its next step.
+                    # A monitor that fails makes PETSc print a traceback, so the solve
+                    # ends after its next step instead.
                     LibPETSc.TSSetMaxSteps(ctx.petsclib, ts, step + 1)
                     return LibPETSc.PetscErrorCode(0)
                 else
@@ -2042,8 +2038,7 @@ function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
     return nothing
 end
 
-# The state at an earlier time inside the step just taken, the only one either
-# interpolant covers.
+# The state at an earlier time inside the step just taken.
 function SciMLBase.change_t_via_interpolation!(
         integ::PETScIntegrator, t, modify_save_endpoint::Type{Val{T}} = Val{false},
     ) where {T}
@@ -2068,8 +2063,7 @@ end
 function _state_at(integ::PETScIntegrator, t::Float64)
     t == integ.t && return integ.u
     t == integ.tprev && return integ.uprev
-    # Only the step just taken has both its ends at hand, so a request outside
-    # that window has no answer to give.
+    # Only the step just taken has both ends at hand.
     integ.tdir * integ.tprev <= integ.tdir * t <= integ.tdir * integ.t || throw(
         ArgumentError(
             "PETScDiffEq can only interpolate inside the step just taken, " *
