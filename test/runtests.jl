@@ -1923,8 +1923,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "the queue is keyed on the direction of integration" begin
-            # Forward, the key and the time are the same number, so this only shows up
-            # when the span runs backward.
+            # Forward the key and the time are the same number, so this needs a
+            # reversed span.
             back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
             integ = SciMLBase.init(back, PETScDiffEq.TSRK("5dp"); dt = 0.1)
             @test integ.tdir == -1

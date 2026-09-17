@@ -1860,10 +1860,8 @@ function SciMLBase.get_du!(out, integ::PETScIntegrator)
     return out
 end
 SciMLBase.get_tmp_cache(integ::PETScIntegrator) = (integ.tmp1, integ.tmp2)
-# The queue carries the stops still to be stepped onto, and leaves out the final time
-# because the solve ends there whether or not it is queued. A callback that schedules its
-# own next tick compares that tick against these accessors and reads anything past the
-# last one as past the end of the solve, so the final time belongs in what they report.
+# The queue holds the stops still to be stepped onto. Callbacks compare their next tick
+# against these accessors, so the final time is reported alongside them.
 _queued_tstops(integ::PETScIntegrator) = push!(copy(integ.tstops), integ.h.tf)
 
 DiffEqBase.get_tstops(integ::PETScIntegrator) = _queued_tstops(integ)
@@ -2187,9 +2185,8 @@ function SciMLBase.add_tstop!(integ::PETScIntegrator, t)
     return nothing
 end
 SciMLBase.has_tstop(integ::PETScIntegrator) = !isempty(integ.tstops)
-# The queue is keyed on the direction of integration, and the key is what these two
-# report, which is what generic solver and callback code compares against. A caller
-# reads the time back as `integ.tdir * first_tstop(integ)`.
+# Both report the queue key, `integ.tdir * t`, which is what generic callback code
+# compares against.
 SciMLBase.first_tstop(integ::PETScIntegrator) = integ.tstops[1]
 SciMLBase.pop_tstop!(integ::PETScIntegrator) = popfirst!(integ.tstops)
 
