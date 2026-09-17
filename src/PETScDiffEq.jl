@@ -1955,10 +1955,8 @@ function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
 end
 _is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev * next <= 0
 
-# The bracket is halved until it cannot be halved again, which puts the root at the
-# precision of the time type. `cb.abstol` is the window for not finding the same event
-# twice, which `_find_event` applies through `repeat_nudge`, so it is not a stopping
-# tolerance here: using it as one would move the event itself by whatever the user set.
+# Halved until it cannot be halved again, so the root lands at the precision of the time
+# type. `cb.abstol` is the repeat-event window, applied in `_find_event`.
 function _bisect_root(integ::PETScIntegrator, cb, lo, hi, slo, i::Int, buf)
     while true
         mid = lo + (hi - lo) / 2

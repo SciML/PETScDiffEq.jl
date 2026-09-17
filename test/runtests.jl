@@ -1693,9 +1693,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "the root does not move with the callback's abstol" begin
-            # `abstol` is the window for not finding the same event twice, so raising it,
-            # which is what the docs suggest for repeated events, must leave the located
-            # root where it is.
+            # `abstol` is the repeat-event window, so raising it must not move the root.
             loose(hits, abstol) = SciMLBase.ContinuousCallback(
                 (u, t, integ) -> u[1] - 0.5,
                 integ -> (push!(hits, integ.t); integ.u[1] += 1.0);
