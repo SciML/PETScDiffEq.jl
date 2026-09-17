@@ -210,8 +210,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test ends.retcode == SciMLBase.ReturnCode.Failure
             @test ends.t == [0.0, upto.t[end]]
             @test ends.u[end] == upto.u[end]
-            # A step that failed this way leaves PETSc's rejection counters untouched, so
-            # the solve names the reason itself.
+            # A step that failed this way leaves the rejection counters untouched.
             @test sol.stats.nreject == upto.stats.nreject
             @test_logs (:warn, r"zero pivot") match_mode = :any SciMLBase.solve(
                 prob, pivots; dt = 0.01,
@@ -228,8 +227,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test !occursin("PETSC ERROR", text)
             @test isol.t == upto.t
             @test isol.u == upto.u
-            # The integrator ends as it does on any other failed step, with the stats and
-            # the callback's finalize that go with an assembled solution.
+            # The integrator ends as on any other failed step, with stats and finalize.
             @test isol.stats.naccept == upto.stats.naccept
             @test n_fin[] == 1
             @test_throws ArgumentError SciMLBase.step!(integ)
@@ -237,8 +235,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 SciMLBase.init(prob, pivots; dt = 0.01),
             )
 
-            # A Newton matrix singular from the outset pivots before any step, and the
-            # solve ends where it started.
+            # A Newton matrix singular from the outset pivots before any step.
             index1 = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(
                     (du, u, p, t) -> (du[1] = -u[1]; du[2] = u[1] - u[2]; nothing);
@@ -277,9 +274,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test occursin("PETSC ERROR", text)
             end
 
-            # A zero pivot the options ask the linear solve to raise is the error the user
-            # asked for, in the plain solve, the integrator and the adjoint's forward solve
-            # alike.
+            # A zero pivot the options ask to raise is the error the user asked for.
             singular = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(
                     (du, u, p, t) -> (du[1] = p[1] * u[1]; nothing);

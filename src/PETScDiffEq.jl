@@ -581,15 +581,13 @@ const PETSC_ERR_SUP = 56
 const PETSC_ERR_MAT_LU_ZRPVT = 71
 
 # A dense LU factorization raises on a zero pivot whatever PETSc was told about failed
-# steps, so a Newton matrix gone singular ends TSSolve or TSStep with this error rather
-# than with a step that failed. Where the options ask the linear solve to raise, this
-# error is the one that was asked for and is left to raise.
+# steps, so a singular Newton matrix ends the solve with this error instead of a failed
+# step. Where the options ask the linear solve to raise, it is left to raise.
 _failed_step(e, h) =
     e isa LibPETSc.PetscError && e.code == PETSC_ERR_MAT_LU_ZRPVT && !h.pivot_raises
 
-# A step reported through the retcode carries no traceback, and one PETSc raised part way
-# through leaves the rejection counters it would otherwise have raised at zero, so this is
-# the only account of why the solve stopped where it did.
+# A pivot raised part way through a step leaves PETSc's rejection counters at zero, so
+# the warning is the only account of why the solve stopped where it did.
 _warn_zero_pivot(alg) = @warn "`$(_warn_name(alg))` ends here because the LU " *
     "factorization of its Newton matrix hit a zero pivot"
 
@@ -613,9 +611,8 @@ function _pivot_raises(pl, ts)
     return raises[] == LibPETSc.PETSC_TRUE
 end
 
-# A zero pivot is reported through the retcode, so its traceback is not printed, and PETSc
-# does not then open the next error's traceback as one that followed it. Every other
-# error goes on to PETSc's own traceback handler, passed in as `traceback`.
+# A zero pivot carries no traceback, which also keeps PETSc from opening the next error's
+# as one that followed it. Every other code goes on to `traceback`.
 function _zero_pivot_handler(
         comm::MPI.API.MPI_Comm, line::Cint, fun::Ptr{Cchar}, file::Ptr{Cchar},
         n::LibPETSc.PetscErrorCode, p::Cint, mess::Ptr{Cchar}, traceback::Ptr{Cvoid},
@@ -634,9 +631,8 @@ end
 const ZERO_PIVOT_HANDLER_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 const ERROR_HANDLER_FNS = Ref((C_NULL, C_NULL, C_NULL))
 
-# Runs `f` with the handler above in front of PETSc's, except where a zero pivot goes on
-# to raise and keeps its traceback. It wraps every step, and opening the library by path
-# costs far more than the step, so the functions are looked up once.
+# Runs `f` with the handler above in front of PETSc's, except where a zero pivot keeps its
+# traceback. This wraps every step, so the symbols are looked up once.
 function _quiet_zero_pivot(f, h)
     h.pivot_raises && return f()
     if ERROR_HANDLER_FNS[][1] == C_NULL
@@ -1848,8 +1844,7 @@ function _setup(
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
             end
-            # The options have reached the linear solve by here, and reading what they
-            # left it doing keeps that read off the per-step path.
+            # The options have reached the linear solve by here.
             h.pivot_raises = _pivot_raises(petsclib, ts)
             if !dt_given &&
                     LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
@@ -1968,8 +1963,8 @@ function SciMLBase.__solve(
         end
         ctx.err === nothing || throw(ctx.err)
         pivot && _warn_zero_pivot(alg)
-        # PETSc records the solve time only as TSSolve returns, and a step it raised on
-        # leaves the time and state where the last finished step put them.
+        # PETSc records the solve time only as TSSolve returns, so a raised step leaves
+        # the time and state at the last finished one.
         tend = Float64(
             pivot ? LibPETSc.TSGetTime(pl, h.ts) : LibPETSc.TSGetSolveTime(pl, h.ts),
         )
