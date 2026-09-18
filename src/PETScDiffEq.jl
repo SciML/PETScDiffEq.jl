@@ -1620,6 +1620,20 @@ function _setup(
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
             end
+            # An option can change the type, so the constructor's refusals are applied again
+            # to the type PETSc will run.
+            chosen = LibPETSc.TSGetType(petsclib, ts)
+            !(alg isa TSMPRK) && haskey(_NEEDS_OTHER_SETUP, chosen) && throw(
+                ArgumentError(
+                    "PETScDiffEq cannot drive `$chosen`, which $(_NEEDS_OTHER_SETUP[chosen])",
+                ),
+            )
+            _uses_ifunction(alg) && chosen in _EXPLICIT_ONLY && throw(
+                ArgumentError(
+                    "`$chosen` is an explicit PETSc type, so it needs " *
+                        "`TSGeneric(\"$chosen\"; explicit = true)` rather than an option",
+                ),
+            )
             if !dt_given &&
                     LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
                 throw(
