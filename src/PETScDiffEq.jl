@@ -12,7 +12,7 @@ using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, ro
     sparse
 
 export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSDAE, TSMPRK, TSGeneric,
-    PETScIntegrator
+    PETScIntegrator, PETScAdjoint
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 abstract type PETScTSDAEAlgorithm <: SciMLBase.AbstractDAEAlgorithm end
@@ -564,7 +564,7 @@ function _row_structure(J::SparseMatrixCSC, n)
         cols[i] = cols[i][perm]
         src[i] = src[i][perm]
     end
-    cols0 = [LibPETSc.PetscInt[c - 1 for c in cols[i]] for i in 1:n]
+    cols0 = Vector{LibPETSc.PetscInt}[LibPETSc.PetscInt[c - 1 for c in cols[i]] for i in 1:n]
     buf = [zeros(length(cols[i])) for i in 1:n]
     return cols0, src, buf
 end
@@ -1017,6 +1017,7 @@ function __init__()
             Ptr{Cvoid},
         )
     )
+    _init_adjoint_pointers!()
     return nothing
 end
 
@@ -1268,6 +1269,7 @@ function _setup(
         dense = nothing,
         save_idxs = nothing,
         tstops = (),
+        extra_options = String[],
         kwargs...,
     )
     for key in UNSUPPORTED_KWARGS
@@ -1605,6 +1607,7 @@ function _setup(
             (dtmax === nothing || isinf(dtmax)) ||
                 append!(effective_options, ["-ts_adapt_dt_max", string(abs(Float64(dtmax)))])
             append!(effective_options, alg.petsc_options)
+            append!(effective_options, extra_options)
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
                 h.opts = PETSc.Options(petsclib; parsed...)
@@ -1700,7 +1703,9 @@ function SciMLBase.__solve(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), kwargs...,
     )
-    if callback !== nothing || !isempty(tstops)
+    # PETSc's MPRK step never shortens itself onto the final time, so it runs
+    # through the integrator, which shortens the last step for it.
+    if !_no_callback(callback) || !isempty(tstops) || alg isa TSMPRK
         return SciMLBase.solve!(
             SciMLBase.__init(prob, alg; callback = callback, tstops = tstops, kwargs...),
         )
@@ -1796,6 +1801,12 @@ mutable struct PETScIntegrator{Alg, P, H, Pr, CB, CC} <:
     finished::Bool
     derivative_discontinuity::Bool
 end
+
+# `solve` can pass an empty `CallbackSet` where no callback was given.
+_no_callback(cb) = cb === nothing || (
+    cb isa SciMLBase.CallbackSet &&
+        isempty(cb.discrete_callbacks) && isempty(cb.continuous_callbacks)
+)
 
 _split_callbacks(::Nothing) = ((), ())
 _split_callbacks(cb::SciMLBase.DiscreteCallback) = ((cb,), ())
@@ -2362,6 +2373,11 @@ function SciMLBase.step!(integ::PETScIntegrator)
     end
     if stop === nothing
         integ.dtcache = integ.dt
+        # Steps summed onto the final time can fall a rounding error short of it.
+        if integ.tdir * integ.t != h.tf && integ.tdir * integ.t >= h.tf - tol
+            integ.t = _user_t(integ.tdir, h.tf)
+            LibPETSc.TSSetTime(pl, h.ts, h.tf)
+        end
     elseif integ.tdir * integ.t >= stop - tol
         integ.t = _user_t(integ.tdir, stop)
         LibPETSc.TSSetTime(pl, h.ts, stop)
@@ -2392,5 +2408,7 @@ function SciMLBase.solve!(integ::PETScIntegrator)
 end
 
 SciMLBase.done(integ::PETScIntegrator) = integ.finished
+
+include("adjoint.jl")
 
 end
