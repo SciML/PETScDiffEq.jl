@@ -308,8 +308,8 @@ TSMPRK(
 Any other PETSc `TSType` by name. An implicit one such as `"alpha"` works with
 the default; an explicit one such as `"euler"` or `"ssp"` needs
 `explicit = true`, since PETSc then wants the right-hand side rather than the
-implicit residual. Getting that wrong is a PETSc error, not a silent wrong
-answer. An explicit type also ignores a `jac` and rejects a mass matrix.
+implicit residual. The constructor refuses a type given the wrong `explicit`.
+An explicit type also ignores a `jac` and rejects a mass matrix.
 
 Whether the named type adapts is not known here, so no tolerance warning is
 issued for it. Only `"euler"` and `"alpha"` have been run through this

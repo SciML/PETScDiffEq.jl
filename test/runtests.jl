@@ -645,8 +645,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t; explicit = true)
         end
 
-        # Handed an implicit residual these integrate nothing at all. glee used to
-        # return the initial condition and report success.
+        # Handed an implicit residual these integrate nothing, and glee still reports success.
         for t in ("euler", "glee", "rk", "ssp")
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
             @test PETScDiffEq.TSGeneric(t; explicit = true).ts_type == t
@@ -975,8 +974,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.step!(integ)
             n += 1
         end
-        # A step PETSc cannot take returns without advancing, which used to spin
-        # this loop forever.
+        # A step PETSc cannot take returns without advancing, and step! ends the integrator there.
         @test SciMLBase.done(integ)
         @test integ.sol.retcode == SciMLBase.ReturnCode.Failure
 
