@@ -672,6 +672,16 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test abs(sol.u[end][1] - exp(-1)) < 1.0e-3
         end
 
+        @testset "an empty callback set leaves the solve to TSSolve" begin
+            # GLLE has no step of its own, so it runs only through TSSolve.
+            sol = SciMLBase.solve(
+                prob, PETScDiffEq.TSGeneric("glle"); dt = 0.1, adaptive = false,
+                callback = SciMLBase.CallbackSet(),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test abs(sol.u[end][1] - exp(-1)) < 1.0e-3
+        end
+
         @testset "no implicit method that works trips it" begin
             for alg in (
                     PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSImplicit("cn"),
@@ -3508,6 +3518,14 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 extra_options = String[],
             )
             @test result == reference
+        end
+
+        @testset "an empty callback set is no callback" begin
+            prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+            reference = grad(prob, TSRK("4"))
+            none = SciMLBase.CallbackSet()
+            @test grad(prob, TSRK("4"); callback = none) == reference
+            @test grad(SciMLBase.remake(prob; callback = none), TSRK("4")) == reference
         end
 
         @testset "cost times on the grid are found after many steps" begin

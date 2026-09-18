@@ -390,7 +390,7 @@ const _ADJOINT_OWNED_KWARGS =
 _names_option(opt, name) =
     startswith(opt, "-") && lowercase(first(split(opt[2:end], "="))) == name
 
-_unset(v) = v === nothing || ((v isa Tuple || v isa AbstractArray) && isempty(v))
+_unset(v) = _no_callback(v) || ((v isa Tuple || v isa AbstractArray) && isempty(v))
 
 function _adjoint_solve_kwargs(prob, kwargs)
     given = hasproperty(prob, :kwargs) ? values(prob.kwargs) : NamedTuple()
