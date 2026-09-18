@@ -1793,6 +1793,7 @@ mutable struct PETScIntegrator{Alg, P, H, Pr, CB, CC} <:
     tmp1::Vector{Float64}
     tmp2::Vector{Float64}
     event_t::Vector{Vector{Float64}}
+    event_residual::Vector{Vector{Float64}}
     kwargs::Any
     tstops::Vector{Float64}
     tstops_cache::Vector{Float64}
@@ -1955,21 +1956,11 @@ function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
 end
 _is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev * next <= 0
 
-# Halved until it cannot be halved again, so the root lands at the precision of the time
-# type. `cb.abstol` is the repeat-event window, applied in `_find_event`.
-function _bisect_root(integ::PETScIntegrator, cb, lo, hi, slo, i::Int, buf)
-    while true
-        mid = lo + (hi - lo) / 2
-        (integ.tdir * (mid - lo) <= 0 || integ.tdir * (hi - mid) <= 0) && break
-        smid = _fill_conditions!(buf, integ, cb, mid)[i]
-        smid == 0 && return mid
-        if slo * smid <= 0
-            hi = mid
-        else
-            lo, slo = mid, smid
-        end
-    end
-    return cb.rootfind === SciMLBase.RightRootFind ? hi : lo
+# DiffEqBase's root finder, the one OrdinaryDiffEq uses, run to the precision of the time
+# type. `buf` is this search's own; the caller's condition values are never written.
+function _event_root(integ::PETScIntegrator, cb, lo, hi, i::Int, buf)
+    condition(t, _) = _fill_conditions!(buf, integ, cb, t)[i]
+    return DiffEqBase.find_root(condition, (lo, hi), cb.rootfind)
 end
 
 # What gets handed to the user: the crossing direction for a scalar callback,
@@ -1987,19 +1978,28 @@ end
 function _find_event(integ::PETScIntegrator, cb, k::Int)
     t0, t1 = integ.tprev, integ.t
     integ.tdir * (t1 - t0) > 0 || return nothing
-    # A component that fired at the start of this step would find the same root
-    # again, so its own crossings are ignored for a nudge past it. The window is
-    # per component: another condition may legitimately cross inside it.
-    ev = integ.event_t[k]
-    nudge = Float64(cb.repeat_nudge) * abs(t1 - t0)
-    fresh(i, upto) = isnan(ev[i]) || integ.tdir * upto > integ.tdir * ev[i] + nudge
     m = _ncond(cb)
     s0 = Vector{Float64}(undef, m)
     sk = Vector{Float64}(undef, m)
+    buf = Vector{Float64}(undef, m)
     _fill_conditions!(s0, integ, cb, t0)
+    # A component that fired at t0, and whose condition the affect! left within
+    # `cb.abstol` of its value at the root, still sits on that root. Its sign is read
+    # and its search starts a nudge past t0, so the root it fired on stays behind it.
+    ev, residual = integ.event_t[k], integ.event_residual[k]
+    nudged = [ev[i] == t0 && abs(s0[i] - residual[i]) <= cb.abstol for i in 1:m]
+    start = fill(t0, m)
+    if any(nudged)
+        tn = t0 + (t1 - t0) * Float64(cb.repeat_nudge)
+        _fill_conditions!(buf, integ, cb, tn)
+        for i in 1:m
+            nudged[i] && (s0[i] = buf[i]; start[i] = tn)
+        end
+    end
+    past(i, t) = integ.tdir * t > integ.tdir * start[i]
     if cb.rootfind === SciMLBase.NoRootFind
         _fill_conditions!(sk, integ, cb, t1)
-        hit = [i for i in 1:m if _is_event(s0[i], sk[i], cb) && fresh(i, t1)]
+        hit = [i for i in 1:m if _is_event(s0[i], sk[i], cb)]
         return isempty(hit) ? nothing : (t1, _crossing(cb, s0, hit, m))
     end
     lo = t0
@@ -2007,20 +2007,25 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
     for k in 1:n
         tk = k == n ? t1 : t0 + (t1 - t0) * (k / n)
         _fill_conditions!(sk, integ, cb, tk)
-        hit = [i for i in 1:m if _is_event(s0[i], sk[i], cb) && fresh(i, tk)]
+        hit = [i for i in 1:m if past(i, tk) && _is_event(s0[i], sk[i], cb)]
         if !isempty(hit)
-            roots = [_bisect_root(integ, cb, lo, tk, s0[i], i, sk) for i in hit]
-            live = [j for j in eachindex(hit) if fresh(hit[j], roots[j])]
-            if !isempty(live)
-                first_root = roots[live[argmin([integ.tdir * roots[j] for j in live])]]
-                keep = [
-                    hit[j] for j in live
-                        if integ.tdir * roots[j] <= integ.tdir * first_root + cb.abstol
-                ]
-                return (first_root, _crossing(cb, s0, keep, m))
-            end
+            roots = [
+                sk[i] == 0 ? tk :
+                    _event_root(integ, cb, past(i, lo) ? lo : start[i], tk, i, buf)
+                    for i in hit
+            ]
+            first_root = roots[argmin(integ.tdir .* roots)]
+            # Roots this close to the first are one crossing seen through rounding.
+            together = 10 * eps(first_root)
+            keep = [
+                hit[j] for j in eachindex(hit)
+                    if integ.tdir * roots[j] <= integ.tdir * first_root + together
+            ]
+            return (first_root, _crossing(cb, s0, keep, m))
         end
-        copyto!(s0, sk)
+        for i in 1:m
+            past(i, tk) && (s0[i] = sk[i])
+        end
         lo = tk
     end
     return nothing
@@ -2086,6 +2091,11 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt::Float64)
     ctx = integ.h.ctx
     _save_step!(integ, best, false)
     _rollback!(integ, best, dt, true)
+    # A repeat is judged against the condition at the root before the affect! runs. An
+    # event found without root finding is at no root, and is judged against zero.
+    residual = integ.event_residual[best_k]
+    best_cb.rootfind === SciMLBase.NoRootFind ? fill!(residual, 0.0) :
+        _fill_conditions!(residual, integ, best_cb, integ.t)
     best_cb.save_positions[1] && _record!(ctx, integ.tdir * integ.t, integ.u)
     integ.derivative_discontinuity = true
     _fire!(integ, best_cb, best_crossing)
@@ -2152,6 +2162,7 @@ function SciMLBase.__init(
         dt0, h.tdir,
         prob.p, h, prob, callbacks, continuous, prob.f, _make_opts(h, kwargs),
         copy(h.u0), similar(h.u0), similar(h.u0),
+        Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous],
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
         stops, _user_t.(h.tdir, stops), dt0, _initial_solution(prob, alg, h), false, false,
     )
