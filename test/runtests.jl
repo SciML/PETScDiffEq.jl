@@ -310,8 +310,30 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test occursin("Zero pivot", text)
             end
 
-            @test SciMLBase.solve(halves(-2000.0, -1.0), bounded; dt = 0.01).retcode ==
-                SciMLBase.ReturnCode.Success
+            # The dense path raises too, whichever switch asks for it.
+            dense_singular = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = 8.0 * u[1]; nothing), [1.0], (0.0, 1.0),
+            )
+            # Backward Euler at 0.125 shifts by 8, so `shift - J` is exactly zero.
+            @test SciMLBase.solve(
+                dense_singular, PETScDiffEq.TSImplicit("beuler"); dt = 0.125, adaptive = false,
+            ).retcode == SciMLBase.ReturnCode.Failure
+            for opts in (
+                    ["-snes_error_if_not_converged"],
+                    ["-ts_error_if_step_fails"],
+                    ["-ts_error_if_step_fails", "true"],
+                    ["-TS_ERROR_IF_STEP_FAILS=1"],
+                )
+                err = try
+                    SciMLBase.solve(
+                        dense_singular, PETScDiffEq.TSImplicit("beuler", opts);
+                        dt = 0.125, adaptive = false,
+                    )
+                catch e
+                    e
+                end
+                @test err isa PETScDiffEq.LibPETSc.PetscError
+            end
         end
     end
 

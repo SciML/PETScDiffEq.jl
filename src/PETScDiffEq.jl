@@ -586,16 +586,17 @@ const PETSC_ERR_MAT_LU_ZRPVT = 71
 _failed_step(e, h) =
     e isa LibPETSc.PetscError && e.code == PETSC_ERR_MAT_LU_ZRPVT && !h.pivot_raises
 
-# A pivot raised part way through a step leaves PETSc's rejection counters at zero, so
+# A pivot raised part way through a step adds nothing to PETSc's rejection counters, so
 # the warning is the only account of why the solve stopped where it did.
 _warn_zero_pivot(alg) = @warn "`$(_warn_name(alg))` ends here because the LU " *
     "factorization of its Newton matrix hit a zero pivot"
 
-# Whether the options leave the linear solve raising on a factorization it cannot use.
+# Whether the options leave the linear or the nonlinear solve raising on a failure.
 function _pivot_raises(pl, ts)
     lib = Libdl.dlopen(pl.petsc_library)
     snes, ksp = Ref{LibPETSc.CSNES}(C_NULL), Ref{LibPETSc.CKSP}(C_NULL)
     raises = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE)
+    snes_raises = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE)
     ccall(
         Libdl.dlsym(lib, :TSGetSNES), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
@@ -608,11 +609,28 @@ function _pivot_raises(pl, ts)
         Libdl.dlsym(lib, :KSPGetErrorIfNotConverged), LibPETSc.PetscErrorCode,
         (LibPETSc.CKSP, Ptr{LibPETSc.PetscBool}), ksp[], raises,
     )
-    return raises[] == LibPETSc.PETSC_TRUE
+    ccall(
+        Libdl.dlsym(lib, :SNESGetErrorIfNotConverged), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{LibPETSc.PetscBool}), snes[], snes_raises,
+    )
+    return raises[] == LibPETSc.PETSC_TRUE || snes_raises[] == LibPETSc.PETSC_TRUE
 end
 
-# A zero pivot carries no traceback, which also keeps PETSc from opening the next error's
-# as one that followed it. Every other code goes on to `traceback`.
+# PETSc applies the last setting of an option, matches its name without regard to case, and
+# reads a bare flag as true. PETSc 3.22 has no getter for this one, so it is read here.
+function _option_flag(opts, name)
+    value = false
+    for (i, opt) in enumerate(opts)
+        _names_option(opt, name) || continue
+        setting = occursin("=", opt) ? last(split(opt, "="; limit = 2)) :
+            i < length(opts) && !startswith(opts[i + 1], "-") ? opts[i + 1] : "true"
+        value = lowercase(setting) in ("1", "true", "yes", "on")
+    end
+    return value
+end
+
+# A zero pivot is not printed, so PETSc does not open the next error's traceback as one
+# that followed it. Every other code goes on to `traceback`.
 function _zero_pivot_handler(
         comm::MPI.API.MPI_Comm, line::Cint, fun::Ptr{Cchar}, file::Ptr{Cchar},
         n::LibPETSc.PetscErrorCode, p::Cint, mess::Ptr{Cchar}, traceback::Ptr{Cvoid},
@@ -1854,7 +1872,8 @@ function _setup(
                 LibPETSc.TSSetFromOptions(petsclib, ts)
             end
             # The options have reached the linear solve by here.
-            h.pivot_raises = _pivot_raises(petsclib, ts)
+            h.pivot_raises = _pivot_raises(petsclib, ts) ||
+                _option_flag(effective_options, "ts_error_if_step_fails")
             if !dt_given &&
                     LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
                 throw(
