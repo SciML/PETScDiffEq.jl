@@ -1383,6 +1383,44 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test events[1][2] == Int8[-1, -1]
         end
 
+        @testset "components crossing together share one event far from t = 0" begin
+            # y = 3x, so both levels are reached at 50 log 2, where rounding leaves the two
+            # roots a few ulps apart.
+            slow!(du, u, p, t) = (du[1] = -u[1] / 50; du[2] = -u[2] / 50; nothing)
+            events = Tuple{Float64, Vector{Int8}}[]
+            cb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out[1] = u[1] - 0.5; out[2] = u[2] - 1.5; nothing),
+                (integ, mask) -> push!(events, (integ.t, Vector{Int8}(mask))), 2,
+            )
+            SciMLBase.solve(
+                SciMLBase.ODEProblem(slow!, [1.0, 3.0], (0.0, 100.0)), alg;
+                dt = 2.5, reltol = 1.0e-10, abstol = 1.0e-12, callback = cb,
+            )
+            @test length(events) == 1
+            @test abs(events[1][1] - 50 * log(2.0)) < 1.0e-7
+            @test events[1][2] == Int8[-1, -1]
+        end
+
+        @testset "components crossing apart fire apart whatever abstol is" begin
+            # The levels are reached at log 2 and 1e-3 later, well inside an `abstol` of
+            # 1e-2, which bounds a condition value and not a time.
+            events = Tuple{Float64, Vector{Int8}}[]
+            cb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out[1] = u[1] - 0.5; out[2] = u[1] - 0.4995; nothing),
+                (integ, mask) -> push!(events, (integ.t, Vector{Int8}(mask))), 2;
+                abstol = 1.0e-2,
+            )
+            SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), alg;
+                dt = 0.1, adaptive = false, callback = cb,
+            )
+            @test length(events) == 2
+            @test abs(events[1][1] - log(2.0)) < 1.0e-8
+            @test events[1][2] == Int8[-1, 0]
+            @test abs(events[2][1] + log(0.4995)) < 1.0e-8
+            @test events[2][2] == Int8[0, -1]
+        end
+
         @testset "the mask carries the crossing direction" begin
             function osc!(du, u, p, t)
                 du[1] = u[2]
@@ -1680,6 +1718,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             (u, t, integ) -> u[1] - 0.5, integ -> (push!(hits, integ.t); integ.u[1] += 1.0),
         )
         after(t) = 1.5 * exp(-(t - log(6.0)))
+        ramp!(du, u, p, t) = (du[1] = 1.0; nothing)
 
         @testset "roots are located on the interpolant" begin
             for (alg, tol) in (
@@ -1698,6 +1737,174 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test abs(hits[2] - log(6.0)) < tol
                 @test abs(sol.u[end][1] - after(2.0)) < tol
             end
+        end
+
+        @testset "the root does not move with the callback's abstol" begin
+            # `abstol` gates repeated events and plays no part in where the root lands.
+            loose(hits, abstol) = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5,
+                integ -> (push!(hits, integ.t); integ.u[1] += 1.0);
+                abstol = abstol,
+            )
+            for abstol in (1.0e-6, 1.0e-4, 1.0e-2)
+                hits = Float64[]
+                sol = SciMLBase.solve(
+                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, reltol = 1.0e-10,
+                    abstol = 1.0e-12, callback = loose(hits, abstol),
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test length(hits) == 2
+                @test abs(hits[1] - log(2.0)) < 1.0e-9
+                @test abs(hits[2] - log(6.0)) < 1.0e-9
+            end
+            # A falling ball's height is a quadratic the integrator reproduces to rounding,
+            # so its impact is located to within a few ulps.
+            fall!(du, u, p, t) = (du[1] = u[2]; du[2] = -9.81; nothing)
+            drop = SciMLBase.ODEProblem(fall!, [1.0, 0.0], (0.0, 1.0))
+            impact = sqrt(2 / 9.81)
+            for rootfind in (SciMLBase.LeftRootFind, SciMLBase.RightRootFind),
+                    kw in ((;), (abstol = 1.0e-6,), (abstol = 1.0e-4,), (abstol = 1.0e-2,))
+                cb = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> u[1], SciMLBase.terminate!; rootfind = rootfind, kw...,
+                )
+                sol = SciMLBase.solve(
+                    drop, PETScDiffEq.TSRK("5dp"); dt = 0.05, reltol = 1.0e-10,
+                    abstol = 1.0e-12, callback = cb,
+                )
+                @test abs(sol.t[end] - impact) <= 16 * eps(impact)
+            end
+        end
+
+        @testset "a crossing skipped as a repeat hides nothing after it" begin
+            # u[1] is a mode the affect! switches at 0.2345. From there the condition stays
+            # within `abstol` of its value at the root, reaches zero inside the nudge of the
+            # 0.1 step, and falls through zero for real at 0.2495 in the same step.
+            hold!(du, u, p, t) = (du[1] = 0.0; nothing)
+            function level(u, t, integ)
+                u[1] == 0 && return 0.2345 - t
+                t < 0.235 && return -1.0e-16
+                t <= 0.2353 && return 0.0
+                t < 0.2495 && return 1.0e-16
+                return -1.0e-16
+            end
+            hits = Float64[]
+            cb = SciMLBase.ContinuousCallback(
+                level, integ -> (push!(hits, integ.t); integ.u[1] = 1.0),
+            )
+            SciMLBase.solve(
+                SciMLBase.ODEProblem(hold!, [0.0], (0.0, 0.5)), PETScDiffEq.TSRK("5dp");
+                dt = 0.1, adaptive = false, callback = cb,
+            )
+            @test length(hits) == 2
+            @test abs(hits[1] - 0.2345) < 1.0e-12
+            @test abs(hits[2] - 0.2495) < 1.0e-12
+        end
+
+        @testset "a condition the affect! moves off its root can fire again at once" begin
+            # Each reset leaves the condition 1e-3 below zero, far outside the default
+            # `abstol`, and it rises through zero again 1e-3 later, inside the nudge of a
+            # 0.25 step.
+            function fires(; kw...)
+                hits = Float64[]
+                cb = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> u[1] - 1.0,
+                    integ -> (push!(hits, integ.t); length(hits) < 3 && (integ.u[1] -= 1.0e-3));
+                    kw...,
+                )
+                SciMLBase.solve(
+                    SciMLBase.ODEProblem(ramp!, [0.99], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+                    dt = 0.25, adaptive = false, callback = cb,
+                )
+                return hits
+            end
+            hits = fires()
+            @test length(hits) == 3
+            @test all(abs.(hits .- [0.01, 0.011, 0.012]) .< 1.0e-12)
+            # An `abstol` wider than the reset makes the next crossing the same event.
+            @test length(fires(abstol = 1.0e-2)) == 1
+        end
+
+        @testset "a crossing just after an event is found" begin
+            fall!(du, u, p, t) = (du[1] = u[2]; du[2] = -9.81; nothing)
+            toss = SciMLBase.ODEProblem(fall!, [0.0, 5.0], (0.0, 1.0))
+            # A sensor just below the apex is passed going up and again 0.0314 later coming
+            # down, inside the first tenth of the step after the first pass.
+            h = 1.273
+            apex, half = 5.0 / 9.81, sqrt(5.0^2 - 2 * 9.81 * h) / 9.81
+            # Checked at its ends only, the step after the up crossing at 0.25 starts on
+            # that root and ends past the down crossing at 0.32.
+            band = SciMLBase.ODEProblem(ramp!, [0.0], (0.0, 1.0))
+            for rootfind in (SciMLBase.LeftRootFind, SciMLBase.RightRootFind)
+                ups, downs = Float64[], Float64[]
+                cb = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> u[1] - h, integ -> push!(ups, integ.t),
+                    integ -> push!(downs, integ.t); rootfind = rootfind,
+                )
+                SciMLBase.solve(toss, PETScDiffEq.TSRK("5dp"); callback = cb)
+                @test length(ups) == 1 && abs(ups[1] - (apex - half)) < 1.0e-9
+                @test length(downs) == 1 && abs(downs[1] - (apex + half)) < 1.0e-9
+
+                ups, downs = Float64[], Float64[]
+                cb = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> (u[1] - 0.25) * (0.32 - u[1]),
+                    integ -> push!(ups, integ.t), integ -> push!(downs, integ.t);
+                    rootfind = rootfind, interp_points = 0,
+                )
+                SciMLBase.solve(
+                    band, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = cb,
+                )
+                @test length(ups) == 1 && abs(ups[1] - 0.25) < 1.0e-12
+                @test length(downs) == 1 && abs(downs[1] - 0.32) < 1.0e-12
+            end
+        end
+
+        @testset "a crossing inside the nudge is not seen" begin
+            # A nudge of half the step puts the down crossing at 0.29 behind 0.3045, where
+            # the step after the up crossing at 0.2545 is first read.
+            ups, downs = Float64[], Float64[]
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> (u[1] - 0.2545) * (0.29 - u[1]),
+                integ -> push!(ups, integ.t), integ -> push!(downs, integ.t);
+                repeat_nudge = 1 // 2,
+            )
+            SciMLBase.solve(
+                SciMLBase.ODEProblem(ramp!, [0.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+                dt = 0.1, adaptive = false, callback = cb,
+            )
+            @test length(ups) == 1 && abs(ups[1] - 0.2545) < 1.0e-12
+            @test isempty(downs)
+        end
+
+        @testset "only the step right after an event starts past it" begin
+            # A tstop 1e-5 past the up crossing ends the step after it. The down crossing,
+            # 5e-4 later, is in the step after that, which starts with the condition still
+            # within `abstol` of its value at the up root.
+            ups, downs = Float64[], Float64[]
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> (u[1] - 0.2545) * (0.255 - u[1]),
+                integ -> push!(ups, integ.t), integ -> push!(downs, integ.t);
+                abstol = 1.0e-6,
+            )
+            SciMLBase.solve(
+                SciMLBase.ODEProblem(ramp!, [0.0], (0.0, 0.5)), PETScDiffEq.TSRK("5dp");
+                dt = 0.1, adaptive = false, tstops = [0.25451], callback = cb,
+            )
+            @test length(ups) == 1 && abs(ups[1] - 0.2545) < 1.0e-12
+            @test length(downs) == 1 && abs(downs[1] - 0.255) < 1.0e-12
+        end
+
+        @testset "locating a root takes few condition evaluations" begin
+            # One fixed step reaches the root and one more ends the solve, so all but a
+            # handful of the evaluations go to the root.
+            n = Ref(0)
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> (n[] += 1; u[1] - 0.5), integ -> nothing; interp_points = 0,
+            )
+            SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+                dt = 1.0, adaptive = false, callback = cb,
+            )
+            @test n[] <= 30
         end
 
         @testset "a bouncing ball" begin
@@ -1721,6 +1928,30 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             gaps = diff(bounces)
             @test all(isapprox(0.9; atol = 1.0e-6), gaps[2:end] ./ gaps[1:(end - 1)])
             @test minimum(u[1] for u in sol.u) > -1.0e-10
+        end
+
+        @testset "RightRootFind lands each bounce just past the floor" begin
+            fall!(du, u, p, t) = (du[1] = u[2]; du[2] = -9.81; nothing)
+            ups, downs, heights = Float64[], Float64[], Float64[]
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1], integ -> push!(ups, integ.t),
+                integ -> (
+                    push!(downs, integ.t); push!(heights, integ.u[1]);
+                    integ.u[2] = -0.9 * integ.u[2]
+                );
+                rootfind = SciMLBase.RightRootFind,
+            )
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(fall!, [1.0, 0.0], (0.0, 3.0)), PETScDiffEq.TSRK("5dp");
+                dt = 0.05, reltol = 1.0e-10, abstol = 1.0e-12, callback = cb,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            # Rising back through the floor just after a landing is that landing's crossing.
+            @test isempty(ups)
+            @test length(downs) == 4
+            @test all(h -> -1.0e-14 < h <= 0, heights)
+            gaps = diff(downs)
+            @test all(isapprox(0.9; atol = 1.0e-6), gaps[2:end] ./ gaps[1:(end - 1)])
         end
 
         @testset "crossing direction picks the handler" begin
@@ -1838,6 +2069,26 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             # exp(-t) is first below 1/2 at the step ending at 0.7.
             @test hits[1] > log(2.0)
             @test abs(hits[1] - 0.7) < 1.0e-8
+        end
+
+        @testset "without root finding a repeat is judged against zero" begin
+            # The condition is 2.5e-5 when the up crossing fires at 0.3, and falls back
+            # through zero at 0.3005, inside the nudge of the next 0.1 step.
+            function downs(; kw...)
+                found = Float64[]
+                cb = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> (u[1] - 0.25) * (0.3005 - u[1]), integ -> nothing,
+                    integ -> push!(found, integ.t); rootfind = SciMLBase.NoRootFind, kw...,
+                )
+                SciMLBase.solve(
+                    SciMLBase.ODEProblem(ramp!, [0.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+                    dt = 0.1, adaptive = false, callback = cb,
+                )
+                return found
+            end
+            found = downs()
+            @test length(found) == 1 && abs(found[1] - 0.4) < 1.0e-12
+            @test isempty(downs(abstol = 1.0e-2))
         end
 
         @testset "an unsupported callback kind is rejected" begin
