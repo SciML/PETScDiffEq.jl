@@ -1860,7 +1860,7 @@ function SciMLBase.__solve(
     )
     # PETSc's MPRK step never shortens itself onto the final time, so it runs
     # through the integrator, which shortens the last step for it.
-    if callback !== nothing || !isempty(tstops) || alg isa TSMPRK
+    if !_no_callback(callback) || !isempty(tstops) || alg isa TSMPRK
         return SciMLBase.solve!(
             SciMLBase.__init(prob, alg; callback = callback, tstops = tstops, kwargs...),
         )
@@ -1956,6 +1956,12 @@ mutable struct PETScIntegrator{Alg, P, H, Pr, CB, CC} <:
     finished::Bool
     derivative_discontinuity::Bool
 end
+
+# `solve` can pass an empty `CallbackSet` where no callback was given.
+_no_callback(cb) = cb === nothing || (
+    cb isa SciMLBase.CallbackSet &&
+        isempty(cb.discrete_callbacks) && isempty(cb.continuous_callbacks)
+)
 
 _split_callbacks(::Nothing) = ((), ())
 _split_callbacks(cb::SciMLBase.DiscreteCallback) = ((cb,), ())
