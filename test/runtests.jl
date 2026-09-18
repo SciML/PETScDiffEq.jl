@@ -2493,8 +2493,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             for (family, table, skip) in families, st in sort(collect(keys(table)))
                 st in skip || push!(algs, family(st))
             end
-            # The interpolant dense output uses, at the same points of the same steps, so
-            # saved values, the event state and the root agree with it to rounding.
+            # The interpolant dense output uses, so saved values, the event state and
+            # the root agree with it to rounding.
             for alg in algs, (prob, want, level) in spans
                 dense = SciMLBase.solve(prob, alg; fixed...)
                 expected = [dense(t) for t in want]
@@ -2576,12 +2576,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test nf(save_everystep = false, callback = idle) == plain
             @test nf(saveat = [0.2, 0.5]) == plain
             @test nf_init(saveat = [0.2, 0.5]) == plain
-            # 0.25 takes both ends of its step and 0.28 reuses them; 0.35's step starts
-            # where that one ended, so only its far end is new.
+            # 0.28 reuses 0.25's ends. 0.35 starts where that step ended, so only its
+            # far end is new.
             @test nf(saveat = [0.25, 0.28, 0.35]) == plain + 3
             @test nf_init(saveat = [0.25, 0.28, 0.35]) == plain + 3
-            # Dense output at a saved time on a step's end takes the derivative the point
-            # before it already needed there, and the next step starts from the one it took.
+            # A saved time on a step's end reuses the derivative already taken there.
             for count in (nf, nf_init)
                 @test count(saveat = [0.25, 0.3], dense = true) ==
                     count(saveat = [0.25], dense = true)
@@ -2589,8 +2588,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test count(saveat = [0.3, 0.35], dense = true) ==
                     count(saveat = [0.3], dense = true) + 2
             end
-            # A root finder asks for many points in every step, and dense output needs the
-            # derivative at every end it looks at anyway.
+            # A root finder asks for many points per step, all inside the same two ends.
             never = SciMLBase.ContinuousCallback((u, t, integ) -> u[1] + 1.0, integ -> nothing)
             @test nf(callback = never) == nf()
         end
@@ -2604,8 +2602,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 return @. (1 - Θ) * u0 + Θ * u1 +
                     Θ * (Θ - 1) * ((1 - 2Θ) * (u1 - u0) + (Θ - 1) * dt * f0 + Θ * dt * f1)
             end
-            # What the integrator should give inside its current step, from the
-            # derivative `rhs` has at each end as things stand.
+            # What the integrator should give inside its current step.
             expected(integ, t, rhs) = hermite(
                 t, integ.tprev, integ.uprev, rhs(integ.uprev, integ.tprev),
                 integ.t, integ.u, rhs(integ.u, integ.t),
@@ -2647,8 +2644,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test integ(0.55) == expected(integ, 0.55, (u, t) -> -3.0 .* u)
             SciMLBase.terminate!(integ)
 
-            # Values saved after an affect! changed the state match dense output of the
-            # same run, which takes each derivative afresh.
+            # Values saved after an affect! match dense output of the same run.
             lift = SciMLBase.ContinuousCallback(
                 (u, t, integ) -> u[1] - 0.5, integ -> (integ.u[1] += 1.0),
             )
@@ -2666,8 +2662,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
 
             midstep(integ) = integ((integ.tprev + integ.t) / 2)
-            # The same after an affect! that looked inside the step and then changed a
-            # parameter, which the derivative at the step's end depends on.
+            # The same with an affect! that reads inside the step, then changes a
+            # parameter the end derivative depends on.
             retuned = Ref(false)
             retune! = integ -> (midstep(integ); integ.p[1] = 3.0; retuned[] = true)
             retunes = (
@@ -2690,6 +2686,41 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 dense = SciMLBase.solve(tunable, alg; fixed..., callback = cb)
                 @test [at.u[findfirst(==(t), at.t)] for t in want] == [dense(t) for t in want]
             end
+
+            # A parameter changed at a step's end leaves that step's interpolant alone. The
+            # step was taken with the old value, and only the next one answers to the new.
+            tuned = Vector{Float64}[]
+            tuned_yet = Ref(false)
+            looked_after = Ref(false)
+            retune_peeking! = integ -> begin
+                push!(tuned, midstep(integ))
+                integ.p[1] = 3.0
+                push!(tuned, midstep(integ))
+                tuned_yet[] = true
+            end
+            watcher = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> (
+                    tuned_yet[] && !looked_after[] &&
+                        (push!(tuned, midstep(integ)); looked_after[] = true); false
+                ),
+                integ -> nothing,
+            )
+            for cb in (
+                    SciMLBase.DiscreteCallback(
+                        (u, t, integ) -> t >= 0.5 && !tuned_yet[], retune_peeking!,
+                    ),
+                    SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.7, retune_peeking!),
+                )
+                empty!(tuned)
+                tuned_yet[] = false
+                looked_after[] = false
+                tunable.p[1] = 1.0
+                SciMLBase.solve(
+                    tunable, alg; fixed..., callback = SciMLBase.CallbackSet(cb, watcher),
+                )
+                @test tuned == fill(tuned[1], 3)
+            end
+            tunable.p[1] = 1.0
 
             # A change to the state at a step's end leaves the step before it as it was.
             driven = SciMLBase.ODEProblem(forced!, [1.0], (0.0, 1.0))
@@ -2834,6 +2865,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
             # Whether a type given by name interpolates is only found out by asking PETSc.
             refuses_between_steps(PETScDiffEq.TSGeneric("rosw", ["-ts_rosw_type", "rodas3"]))
+            # A type whose interpolant is registered but writes nothing is refused as well,
+            # rather than passing the untouched vector back as an answer.
+            refuses_between_steps(PETScDiffEq.TSGeneric("irk", ["-pc_type", "pbjacobi"]))
             @test matches_petsc(mass, PETScDiffEq.TSGeneric("rosw"))
             # So is a subtype an option changes.
             refuses_between_steps(PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "rodas3"]))
