@@ -2555,6 +2555,41 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test [at.u[findfirst(==(t), at.t)] for t in want] == [dense(t) for t in want]
             end
 
+            # A parameter changed at a step's end leaves that step's interpolant alone. The
+            # step was taken with the old value, and only the next one answers to the new.
+            tuned = Vector{Float64}[]
+            tuned_yet = Ref(false)
+            looked_after = Ref(false)
+            retune_peeking! = integ -> begin
+                push!(tuned, midstep(integ))
+                integ.p[1] = 3.0
+                push!(tuned, midstep(integ))
+                tuned_yet[] = true
+            end
+            watcher = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> (
+                    tuned_yet[] && !looked_after[] &&
+                        (push!(tuned, midstep(integ)); looked_after[] = true); false
+                ),
+                integ -> nothing,
+            )
+            for cb in (
+                    SciMLBase.DiscreteCallback(
+                        (u, t, integ) -> t >= 0.5 && !tuned_yet[], retune_peeking!,
+                    ),
+                    SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.7, retune_peeking!),
+                )
+                empty!(tuned)
+                tuned_yet[] = false
+                looked_after[] = false
+                tunable.p[1] = 1.0
+                SciMLBase.solve(
+                    tunable, alg; fixed..., callback = SciMLBase.CallbackSet(cb, watcher),
+                )
+                @test tuned == fill(tuned[1], 3)
+            end
+            tunable.p[1] = 1.0
+
             # A change to the state at a step's end leaves the step before it as it was.
             driven = SciMLBase.ODEProblem(forced!, [1.0], (0.0, 1.0))
             for a in (alg, PETScDiffEq.TSRosW("2m"))
@@ -2698,6 +2733,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
             # Whether a type given by name interpolates is only found out by asking PETSc.
             refuses_between_steps(PETScDiffEq.TSGeneric("rosw", ["-ts_rosw_type", "rodas3"]))
+            # A type whose interpolant is registered but writes nothing is refused as well,
+            # rather than passing the untouched vector back as an answer.
+            refuses_between_steps(PETScDiffEq.TSGeneric("irk", ["-pc_type", "pbjacobi"]))
             @test matches_petsc(mass, PETScDiffEq.TSGeneric("rosw"))
             # So is a subtype an option changes.
             refuses_between_steps(PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "rodas3"]))
