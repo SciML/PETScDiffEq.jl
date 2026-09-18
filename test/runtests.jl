@@ -3196,20 +3196,40 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 ),
                 integ -> nothing,
             )
-            for cb in (
-                    SciMLBase.DiscreteCallback(
-                        (u, t, integ) -> t >= 0.5 && !tuned_yet[], retune_peeking!,
-                    ),
-                    SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.7, retune_peeking!),
-                )
+            retunes_at = (
+                affect! -> SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t >= 0.5 && !tuned_yet[], affect!,
+                ),
+                affect! -> SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.7, affect!),
+            )
+            peeked = Vector{Float64}[]
+            for at in retunes_at
                 empty!(tuned)
                 tuned_yet[] = false
                 looked_after[] = false
                 tunable.p[1] = 1.0
                 SciMLBase.solve(
-                    tunable, alg; fixed..., callback = SciMLBase.CallbackSet(cb, watcher),
+                    tunable, alg; fixed...,
+                    callback = SciMLBase.CallbackSet(at(retune_peeking!), watcher),
                 )
                 @test tuned == fill(tuned[1], 3)
+                push!(peeked, tuned[1])
+            end
+
+            # The same holds when nothing looked inside the step before the change, whatever
+            # the solve saves.
+            retune_blind! = integ -> begin
+                integ.p[1] = 3.0
+                push!(tuned, midstep(integ))
+                tuned_yet[] = true
+            end
+            for (at, want) in zip(retunes_at, peeked),
+                    kw in ((;), (save_everystep = false,), (dense = false,))
+                empty!(tuned)
+                tuned_yet[] = false
+                tunable.p[1] = 1.0
+                SciMLBase.solve(tunable, alg; fixed..., kw..., callback = at(retune_blind!))
+                @test tuned == [want]
             end
             tunable.p[1] = 1.0
 
