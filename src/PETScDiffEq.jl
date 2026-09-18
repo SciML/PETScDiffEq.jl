@@ -2105,6 +2105,17 @@ function _interpolate!(integ::PETScIntegrator, s::Float64)
     )
 end
 
+# An affect! may change the parameters, so the derivatives of the step just taken are
+# fixed before one runs, while the parameters are still those the step was taken with.
+function _pin_step!(integ::PETScIntegrator)
+    ctx = integ.h.ctx
+    ctx.hermite || return nothing
+    ctx.fstart === nothing &&
+        (ctx.fstart = _derivative(ctx, integ.tdir * integ.tprev, integ.uprev))
+    ctx.fend === nothing && (ctx.fend = _derivative(ctx, ctx.end_s, ctx.end_u))
+    return nothing
+end
+
 # The integrator's step now ends at its current time and state.
 function _end_step_here!(integ::PETScIntegrator)
     ctx = integ.h.ctx
@@ -2276,6 +2287,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt::Float64)
     _rollback!(integ, best, dt, true)
     best_cb.save_positions[1] && _record!(ctx, integ.tdir * integ.t, integ.u)
     integ.derivative_discontinuity = true
+    _pin_step!(integ)
     _fire!(integ, best_cb, best_crossing)
     integ.finished && return true
     _rollback!(integ, integ.t, dt, false)
@@ -2293,6 +2305,7 @@ function _apply_callbacks!(integ::PETScIntegrator)
         # An affect! is assumed to change the state unless it says otherwise
         # through derivative_discontinuity!(integ, false).
         integ.derivative_discontinuity = true
+        _pin_step!(integ)
         cb.affect!(integ)
         integ.finished && return nothing
         if integ.derivative_discontinuity
