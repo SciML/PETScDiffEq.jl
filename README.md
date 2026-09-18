@@ -71,6 +71,13 @@ may be a vector of per-component tolerances), `saveat`, `save_everystep`, `save_
 `save_end`, `save_idxs`, `dense`, `callback` and `tstops`. Keywords it cannot honour emit
 a warning rather than being silently dropped.
 
+A state between step ends, for `saveat`, `integrator(t)` or a `ContinuousCallback`, comes
+from PETSc's own interpolant for `TSRK("5dp")`, `TSRosW("ra34pw2")`, `TSARKIMEX("4")` and
+`"5"`, `TSImplicit("bdf")` and `TSDAE("bdf")`, and from the cubic Hermite interpolant dense
+output uses for everything else, `TSGeneric` and a type `petsc_options` changes included.
+With a mass matrix or a `DAEProblem` only PETSc's is available, and a type that has none
+raises an `ArgumentError` when such a state is needed.
+
 `ODEProblem`, `SplitODEProblem` and `DAEProblem` are supported, in place or out of
 place, along with
 `ODEFunction`'s `jac`, `jac_prototype` and `mass_matrix`. Supply a `jac_prototype` for
