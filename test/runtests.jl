@@ -283,7 +283,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
             dt = 0.1, tstops = [0.0, 0.5, 1.0],
         )
-        @test integ.tstops == [0.5]
+        @test integ.tstops == [0.5, 1.0]
     end
 
     @testset "dense output" begin
@@ -1904,19 +1904,19 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
         @testset "integrator queue" begin
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
-            @test !SciMLBase.has_tstop(integ)
+            @test SciMLBase.has_tstop(integ) && SciMLBase.first_tstop(integ) == 1.0
             SciMLBase.add_tstop!(integ, 0.33)
             SciMLBase.add_tstop!(integ, 0.33)
             SciMLBase.add_tstop!(integ, 0.15)
             @test SciMLBase.has_tstop(integ)
             @test SciMLBase.first_tstop(integ) == 0.15
-            @test integ.tstops == [0.15, 0.33]
+            @test integ.tstops == [0.15, 0.33, 1.0]
             @test SciMLBase.pop_tstop!(integ) == 0.15
             while integ.t < 0.33
                 SciMLBase.step!(integ)
             end
             @test integ.t == 0.33
-            @test !SciMLBase.has_tstop(integ)
+            @test integ.tstops == [1.0]
             @test_throws ArgumentError SciMLBase.add_tstop!(integ, 0.1)
             @test_throws ArgumentError SciMLBase.add_tstop!(integ, 1.5)
             SciMLBase.terminate!(integ)
@@ -1932,21 +1932,142 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test SciMLBase.first_tstop(integ) == -0.5
             @test integ.tdir * SciMLBase.first_tstop(integ) == 0.5
             @test SciMLBase.pop_tstop!(integ) == -0.5
-            @test !SciMLBase.has_tstop(integ)
+            @test SciMLBase.has_tstop(integ) && SciMLBase.first_tstop(integ) == -0.0
             SciMLBase.terminate!(integ)
         end
 
-        @testset "the queue reports the final time as a stop" begin
-            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
-            @test PETScDiffEq.DiffEqBase.get_tstops_max(integ) == 1.0
-            @test PETScDiffEq.DiffEqBase.get_tstops_array(integ) == [1.0]
-            @test length(PETScDiffEq.DiffEqBase.get_tstops(integ)) == 1
-            SciMLBase.add_tstop!(integ, 0.35)
-            @test PETScDiffEq.DiffEqBase.get_tstops_max(integ) == 1.0
-            @test PETScDiffEq.DiffEqBase.get_tstops_array(integ) == [0.35, 1.0]
-            # Reading the queue leaves it as it was.
-            @test integ.tstops == [0.35]
-            SciMLBase.terminate!(integ)
+        @testset "every tstop accessor reads the one queue" begin
+            DEB = PETScDiffEq.DiffEqBase
+            # `queued` is the queue OrdinaryDiffEq's Tsit5 holds in the same state, as keys
+            # `tdir * t`, with each stop once.
+            function check_queue(integ, queued)
+                @test DEB.get_tstops(integ) === integ.tstops
+                @test DEB.get_tstops_array(integ) === integ.tstops
+                @test DEB.get_tstops(integ) == queued
+                @test SciMLBase.has_tstop(integ) == !isempty(queued)
+                if isempty(queued)
+                    @test_throws BoundsError SciMLBase.first_tstop(integ)
+                    @test_throws BoundsError DEB.get_tstops_max(integ)
+                else
+                    @test SciMLBase.has_tstop(integ) && SciMLBase.first_tstop(integ) == queued[1]
+                    @test SciMLBase.has_tstop(integ) && DEB.get_tstops_max(integ) == queued[end]
+                end
+                return nothing
+            end
+
+            @testset "forward" begin
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+                check_queue(integ, [1.0])
+                SciMLBase.add_tstop!(integ, 0.35)
+                check_queue(integ, [0.35, 1.0])
+                SciMLBase.add_tstop!(integ, 1.0)
+                check_queue(integ, [0.35, 1.0])
+                SciMLBase.add_tstop!(integ, 0.7)
+                while integ.t < 0.35
+                    SciMLBase.step!(integ)
+                end
+                @test integ.t == 0.35
+                check_queue(integ, [0.7, 1.0])
+                SciMLBase.step!(integ)
+                @test 0.35 < integ.t < 0.7
+                check_queue(integ, [0.7, 1.0])
+                SciMLBase.solve!(integ)
+                @test integ.t == 1.0
+                check_queue(integ, Float64[])
+            end
+
+            @testset "reversed span" begin
+                back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
+                integ = SciMLBase.init(back, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+                check_queue(integ, [-0.0])
+                SciMLBase.add_tstop!(integ, 0.5)
+                check_queue(integ, [-0.5, -0.0])
+                SciMLBase.add_tstop!(integ, 0.0)
+                check_queue(integ, [-0.5, -0.0])
+                while integ.t > 0.5
+                    SciMLBase.step!(integ)
+                end
+                @test integ.t == 0.5
+                check_queue(integ, [-0.0])
+                SciMLBase.solve!(integ)
+                @test integ.t == 0.0
+                check_queue(integ, Float64[])
+            end
+
+            @testset "pop_tstop! takes the final time last" begin
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, tstops = [0.35])
+                @test SciMLBase.pop_tstop!(integ) == 0.35
+                @test SciMLBase.has_tstop(integ) && SciMLBase.pop_tstop!(integ) == 1.0
+                check_queue(integ, Float64[])
+                SciMLBase.terminate!(integ)
+            end
+
+            @testset "terminate! leaves no stop queued" begin
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, tstops = [0.35])
+                SciMLBase.step!(integ)
+                SciMLBase.terminate!(integ)
+                check_queue(integ, Float64[])
+            end
+
+            @testset "reinit! queues the final time of the new span once" begin
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, tstops = [0.25])
+                check_queue(integ, [0.25, 1.0])
+                SciMLBase.solve!(integ)
+                SciMLBase.reinit!(integ)
+                check_queue(integ, [0.25, 1.0])
+                SciMLBase.reinit!(integ; tf = 2.0)
+                check_queue(integ, [0.25, 2.0])
+                SciMLBase.terminate!(integ)
+            end
+
+            @testset "reinit! queues the stops given to init that lie in the new span" begin
+                integ = SciMLBase.init(
+                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, tstops = [0.25, 0.75, 1.5],
+                )
+                check_queue(integ, [0.25, 0.75, 1.0])
+                SciMLBase.reinit!(integ; tf = 0.5)
+                check_queue(integ, [0.25, 0.5])
+                SciMLBase.reinit!(integ)
+                check_queue(integ, [0.25, 0.75, 1.0])
+                SciMLBase.reinit!(integ; tf = 2.0)
+                check_queue(integ, [0.25, 0.75, 1.5, 2.0])
+                SciMLBase.reinit!(integ; tstops = [0.6])
+                check_queue(integ, [0.6, 1.0])
+                SciMLBase.reinit!(integ)
+                check_queue(integ, [0.25, 0.75, 1.0])
+                SciMLBase.terminate!(integ)
+
+                back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
+                integ = SciMLBase.init(back, PETScDiffEq.TSRK("5dp"); dt = 0.1, tstops = [0.25, 0.75])
+                SciMLBase.reinit!(integ; tf = 0.5)
+                check_queue(integ, [-0.75, -0.5])
+                SciMLBase.reinit!(integ)
+                check_queue(integ, [-0.75, -0.25, -0.0])
+                SciMLBase.terminate!(integ)
+            end
+        end
+
+        @testset "a discrete callback at a stop sees it at the head of the queue" begin
+            head(integ) = SciMLBase.has_tstop(integ) ?
+                (SciMLBase.first_tstop(integ), PETScDiffEq.DiffEqBase.get_tstops_max(integ)) :
+                (NaN, NaN)
+            for (span, stops) in (((0.0, 1.0), [0.35, 0.5]), ((1.0, 0.0), [0.5, 0.35]))
+                seen = Tuple{Float64, Float64, Float64}[]
+                cb = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t in (stops..., span[2]),
+                    integ -> (
+                        push!(seen, (integ.t, head(integ)...));
+                        SciMLBase.derivative_discontinuity!(integ, false)
+                    ),
+                )
+                sol = SciMLBase.solve(
+                    SciMLBase.ODEProblem(decay!, [1.0], span), PETScDiffEq.TSRK("5dp");
+                    dt = 0.1, tstops = stops, callback = cb,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                tdir = sign(span[2] - span[1])
+                @test seen == [(t, tdir * t, tdir * span[2]) for t in (stops..., span[2])]
+            end
         end
 
         @testset "a callback that schedules its own ticks reaches the end" begin
@@ -1974,8 +2095,39 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                         callback = make(fires), tstops = stops,
                     )
                     @test sol.retcode == SciMLBase.ReturnCode.Success
-                    @test length(fires) == 3
-                    @test isapprox(fires, [0.3, 0.6, 0.9]; atol = 1.0e-9)
+                    @test length(fires) == 3 && isapprox(fires, [0.3, 0.6, 0.9]; atol = 1.0e-9)
+                end
+            end
+        end
+
+        @testset "a tick that lands on the final time fires there" begin
+            for (span, tick, want) in (
+                    ((0.0, 1.0), 0.25, [0.25, 0.5, 0.75, 1.0]),
+                    ((1.0, 0.0), -0.25, [0.75, 0.5, 0.25, 0.0]),
+                )
+                @testset "IterativeCallback on $span" begin
+                    fires = Float64[]
+                    cb = DiffEqCallbacks.IterativeCallback(
+                        integ -> integ.t + tick, integ -> (push!(fires, integ.t); nothing),
+                    )
+                    sol = SciMLBase.solve(
+                        SciMLBase.ODEProblem(decay!, [1.0], span), PETScDiffEq.TSRK("5dp");
+                        dt = 0.1, callback = cb,
+                    )
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test fires == want
+                end
+                @testset "PeriodicCallback with final_affect on $span" begin
+                    fires = Float64[]
+                    cb = DiffEqCallbacks.PeriodicCallback(
+                        integ -> push!(fires, integ.t), tick; final_affect = true,
+                    )
+                    sol = SciMLBase.solve(
+                        SciMLBase.ODEProblem(decay!, [1.0], span), PETScDiffEq.TSRK("5dp");
+                        dt = 0.1, callback = cb,
+                    )
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test fires == want
                 end
             end
         end
