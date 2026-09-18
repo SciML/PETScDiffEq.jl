@@ -2024,8 +2024,7 @@ end
 SciMLBase.get_tmp_cache(integ::PETScIntegrator) = (integ.tmp1, integ.tmp2)
 DiffEqBase.get_tstops(integ::PETScIntegrator) = integ.tstops
 DiffEqBase.get_tstops_array(integ::PETScIntegrator) = integ.tstops
-DiffEqBase.get_tstops_max(integ::PETScIntegrator) =
-    isempty(integ.tstops) ? integ.h.tf : maximum(integ.tstops)
+DiffEqBase.get_tstops_max(integ::PETScIntegrator) = last(integ.tstops)
 
 function SciMLBase.set_u!(integ::PETScIntegrator, u)
     copyto!(integ.u, u)
@@ -2343,16 +2342,18 @@ function SciMLBase.__init(
         prob.p, h, prob, callbacks, continuous, prob.f, _make_opts(h, kwargs),
         copy(h.u0), similar(h.u0), similar(h.u0),
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
-        stops, _user_t.(h.tdir, stops), dt0, _initial_solution(prob, alg, h), false, false,
+        stops, collect(Float64, tstops), dt0, _initial_solution(prob, alg, h), false, false,
     )
     _initialize_callbacks!(integ, true)
     return integ
 end
 
+# The queue holds `tdir * t` for each stop, the final time included, in increasing order and
+# without repeats. step! drops each stop the integrator reaches, and terminate! empties it.
 function _tstops(tstops, h::TSHandles)
     stops = sort!(unique!(h.tdir .* Vector{Float64}(collect(Float64, tstops))))
     filter!(s -> h.t0 < s < h.tf, stops)
-    return stops
+    return push!(stops, h.tf)
 end
 
 function SciMLBase.add_tstop!(integ::PETScIntegrator, t)
@@ -2371,8 +2372,10 @@ function SciMLBase.add_tstop!(integ::PETScIntegrator, t)
     return nothing
 end
 SciMLBase.has_tstop(integ::PETScIntegrator) = !isempty(integ.tstops)
-SciMLBase.first_tstop(integ::PETScIntegrator) = _user_t(integ.tdir, integ.tstops[1])
-SciMLBase.pop_tstop!(integ::PETScIntegrator) = _user_t(integ.tdir, popfirst!(integ.tstops))
+# Both report the queue key, `integ.tdir * t`, which is what generic callback code
+# compares against.
+SciMLBase.first_tstop(integ::PETScIntegrator) = integ.tstops[1]
+SciMLBase.pop_tstop!(integ::PETScIntegrator) = popfirst!(integ.tstops)
 
 function _initial_save!(h::TSHandles)
     ctx = h.ctx
@@ -2447,7 +2450,6 @@ function SciMLBase.reinit!(
     integ.dt = h.tdir * Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
     integ.dtcache = integ.dt
     integ.tstops = _tstops(tstops, h)
-    integ.tstops_cache = _user_t.(h.tdir, integ.tstops)
     integ.finished = false
     for ev in integ.event_t
         fill!(ev, NaN)
@@ -2479,6 +2481,7 @@ end
 function SciMLBase.terminate!(
         integ::PETScIntegrator, retcode = SciMLBase.ReturnCode.Terminated,
     )
+    empty!(integ.tstops)
     _finish!(integ, retcode)
     return nothing
 end
@@ -2571,12 +2574,13 @@ function SciMLBase.step!(integ::PETScIntegrator)
     _readvec!(integ.u, pl, h.u)
     _end_step_here!(integ)
     fired = _apply_continuous_callbacks!(integ, dtprev)
+    integ.finished && return nothing
+    fired || _save_step!(integ, integ.t, true)
+    # Discrete callbacks run with the stop they landed on still at the head of the queue.
+    _apply_callbacks!(integ)
     while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + tol
         popfirst!(integ.tstops)
     end
-    integ.finished && return nothing
-    fired || _save_step!(integ, integ.t, true)
-    _apply_callbacks!(integ)
     integ.finished && return nothing
     if !all(isfinite, integ.u) || integ.tdir * integ.t >= h.tf - tol ||
             Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
