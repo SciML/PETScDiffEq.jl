@@ -811,6 +811,32 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "the same types are refused when an option selects them" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        solve_at(alg; kw...) = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, kw...)
+        for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk"), alg in (
+                    PETScDiffEq.TSImplicit("beuler", ["-ts_type", t]),
+                    PETScDiffEq.TSRK("4", ["-ts_type=$t"]),
+                    PETScDiffEq.TSGeneric("glee", ["-TS_TYPE", t]; explicit = true),
+                )
+            @test_throws "PETScDiffEq cannot drive `$t`" solve_at(alg)
+        end
+        for t in ("euler", "glee", "rk", "ssp"), alg in (
+                    PETScDiffEq.TSImplicit("beuler", ["-ts_type", t]),
+                    PETScDiffEq.TSRosW("ra34pw2", ["-ts_type=$t"]),
+                    PETScDiffEq.TSGeneric("beuler", ["-TS_TYPE", t]),
+                )
+            @test_throws "`$t` is an explicit PETSc type" solve_at(alg)
+            @test_throws "`$t` is an explicit PETSc type" SciMLBase.init(
+                prob, alg; dt = 0.1, adaptive = false,
+            )
+        end
+        # Given the right-hand side, an explicit type chosen by an option runs.
+        sol = solve_at(PETScDiffEq.TSRK("4", ["-ts_type", "glee"]))
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        @test abs(sol.u[end][1] - exp(-1)) < 1.0e-3
+    end
+
     @testset "a solve that never uses the Jacobian is called out" begin
         prob = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),

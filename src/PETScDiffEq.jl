@@ -1871,6 +1871,20 @@ function _setup(
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
             end
+            # An option can change the type, so the constructor's refusals are applied again
+            # to the type PETSc will run.
+            chosen = LibPETSc.TSGetType(petsclib, ts)
+            !(alg isa TSMPRK) && haskey(_NEEDS_OTHER_SETUP, chosen) && throw(
+                ArgumentError(
+                    "PETScDiffEq cannot drive `$chosen`, which $(_NEEDS_OTHER_SETUP[chosen])",
+                ),
+            )
+            _uses_ifunction(alg) && chosen in _EXPLICIT_ONLY && throw(
+                ArgumentError(
+                    "`$chosen` is an explicit PETSc type, so it needs " *
+                        "`TSGeneric(\"$chosen\"; explicit = true)` rather than an option",
+                ),
+            )
             # The options have reached the linear solve by here.
             h.pivot_raises = _pivot_raises(petsclib, ts) ||
                 _option_flag(effective_options, "ts_error_if_step_fails")
