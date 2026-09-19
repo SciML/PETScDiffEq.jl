@@ -3656,6 +3656,39 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     @testset "Integrator interface" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
 
+        @testset "the last step after the integrator has finished" begin
+            # The solution's dense output answers it, whichever interpolant ran before.
+            for alg in (
+                    PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
+                    PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSARKIMEX("4"),
+                    PETScDiffEq.TSRK("4"),
+                )
+                integ = SciMLBase.init(prob, alg; dt = 0.1, adaptive = false)
+                SciMLBase.solve!(integ)
+                t = (integ.tprev + integ.t) / 2
+                @test integ(t) == integ.sol(t)
+                @test abs(integ(t)[1] - exp(-t)) < 1.0e-3
+            end
+
+            # An affect! that ends the solve finishes the integrator too.
+            stop = SciMLBase.DiscreteCallback((u, t, integ) -> t >= 0.5, SciMLBase.terminate!)
+            integ = SciMLBase.init(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = stop,
+            )
+            SciMLBase.solve!(integ)
+            @test integ.finished
+            t = (integ.tprev + integ.t) / 2
+            @test integ(t) == integ.sol(t)
+
+            # With a mass matrix there is no derivative to interpolate with instead.
+            massive = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0], (0.0, 1.0),
+            )
+            integ = SciMLBase.init(massive, PETScDiffEq.TSImplicit("bdf"); dt = 0.1)
+            SciMLBase.solve!(integ)
+            @test_throws "freed PETSc's interpolant" integ((integ.tprev + integ.t) / 2)
+        end
+
         @testset "init, step! and solve! reproduce solve exactly" begin
             for alg in (
                     PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"),

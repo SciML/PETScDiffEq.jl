@@ -2213,12 +2213,30 @@ function _interpolate!(integ::PETScIntegrator, s::Float64)
     h = integ.h
     ctx = h.ctx
     if !ctx.hermite
+        integ.finished && return _interpolate_finished!(integ, s)
         v = _petsc_interpolate!(ctx, h.ts, s)
         v === nothing && throw(_no_interpolant(ctx))
         return _readvec!(integ.ucache, h.petsclib, v)
     end
     return _hermite!(
         integ.ucache, ctx, s, integ.tdir * integ.tprev, integ.uprev, ctx.end_s, ctx.end_u,
+    )
+end
+
+# PETSc's interpolant goes with the TS, which a finished integrator has freed. The last
+# step is then answered by the cubic Hermite interpolant the solution's dense output uses.
+function _interpolate_finished!(integ::PETScIntegrator, s::Float64)
+    ctx = integ.h.ctx
+    (ctx.M === nothing && !ctx.dae) || throw(
+        ArgumentError(
+            "the integrator has finished and freed PETSc's interpolant, and a mass matrix " *
+                "or a DAEProblem gives no derivative to build another from; interpolate " *
+                "before the last step completes, or use the solution's saveat times",
+        ),
+    )
+    return _hermite!(
+        integ.ucache, ctx, s, integ.tdir * integ.tprev, integ.uprev,
+        integ.tdir * integ.t, integ.u,
     )
 end
 
