@@ -482,6 +482,7 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     saveat::Vector{Float64}
     saveat_idx::Int
     save_everystep::Bool
+    save_start::Bool
     dense::Bool
     save_idxs::Union{Nothing, Vector{Int}}
     work::V
@@ -1155,51 +1156,53 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     try
-        if isempty(ctx.saveat)
-            # A step PETSc cannot take brings the monitor back to the time it last
-            # reported, and one time is worth one point.
-            if (ctx.save_everystep || step == 0) && !_last_recorded(ctx, Float64(t))
-                _record!(ctx, t, _readvec!(ctx.u, ctx.petsclib, x))
+        ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
+        tol = 100 * eps(max(one(Float64), abs(Float64(t))))
+        # Whether a saveat point sits on this step's end, which then needs no second point.
+        landed = false
+        while ctx.saveat_idx <= length(ctx.saveat) &&
+                ctx.saveat[ctx.saveat_idx] <= Float64(t) + tol
+            want = ctx.saveat[ctx.saveat_idx]
+            # Before any step has been taken there is nothing to interpolate
+            # from, and the incoming vector is already the initial state.
+            if step == 0 || abs(want - Float64(t)) <= tol
+                _record_end!(ctx, want, _readvec!(ctx.u, ctx.petsclib, x))
+                landed = true
+            elseif ctx.hermite
+                # `-ts_exact_final_time interpolate` steps past tf, then reports its own
+                # state at tf, which is the one the solve ends on, in a call of its own.
+                tmax = Float64(LibPETSc.TSGetMaxTime(ctx.petsclib, ts))
+                want >= tmax - tol && Float64(t) > tmax + tol && break
+                u1 = _readvec!(ctx.u, ctx.petsclib, x)
+                _record!(
+                    ctx, want,
+                    _hermite!(similar(u1), ctx, want, ctx.step_t, ctx.step_u, Float64(t), u1),
+                )
+            elseif _petsc_interpolate!(ctx, ts, want) === nothing
+                ctx.err = _no_interpolant(ctx)
+                # A monitor that fails makes PETSc print a traceback, so the solve
+                # ends after its next step instead.
+                LibPETSc.TSSetMaxSteps(ctx.petsclib, ts, step + 1)
+                return LibPETSc.PetscErrorCode(0)
+            else
+                _record!(ctx, want, _readvec!(ctx.u, ctx.petsclib, ctx.work))
             end
-        else
-            ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
-            tol = 100 * eps(max(one(Float64), abs(Float64(t))))
-            while ctx.saveat_idx <= length(ctx.saveat) &&
-                    ctx.saveat[ctx.saveat_idx] <= Float64(t) + tol
-                want = ctx.saveat[ctx.saveat_idx]
-                # Before any step has been taken there is nothing to interpolate
-                # from, and the incoming vector is already the initial state.
-                if step == 0 || abs(want - Float64(t)) <= tol
-                    _record_end!(ctx, want, _readvec!(ctx.u, ctx.petsclib, x))
-                elseif ctx.hermite
-                    # `-ts_exact_final_time interpolate` steps past tf, then reports its own
-                    # state at tf, which is the one the solve ends on, in a call of its own.
-                    tmax = Float64(LibPETSc.TSGetMaxTime(ctx.petsclib, ts))
-                    want >= tmax - tol && Float64(t) > tmax + tol && break
-                    u1 = _readvec!(ctx.u, ctx.petsclib, x)
-                    _record!(
-                        ctx, want,
-                        _hermite!(similar(u1), ctx, want, ctx.step_t, ctx.step_u, Float64(t), u1),
-                    )
-                elseif _petsc_interpolate!(ctx, ts, want) === nothing
-                    ctx.err = _no_interpolant(ctx)
-                    # A monitor that fails makes PETSc print a traceback, so the solve
-                    # ends after its next step instead.
-                    LibPETSc.TSSetMaxSteps(ctx.petsclib, ts, step + 1)
-                    return LibPETSc.PetscErrorCode(0)
-                else
-                    _record!(ctx, want, _readvec!(ctx.u, ctx.petsclib, ctx.work))
-                end
-                ctx.saveat_idx += 1
-            end
-            # The step that ends here is where the next one starts.
-            if ctx.hermite && ctx.saveat_idx <= length(ctx.saveat)
-                ctx.step_t = Float64(t)
-                _readvec!(ctx.step_u, ctx.petsclib, x)
-                ctx.fstart = ctx.pdirty ? nothing : ctx.fend
-                ctx.fend = nothing
-                ctx.pdirty = false
-            end
+            ctx.saveat_idx += 1
+        end
+        # The start, and every step's end when every step is saved. A step PETSc cannot
+        # take brings the monitor back to the time it last reported, and one time is worth
+        # one point.
+        if (step == 0 ? ctx.save_start : ctx.save_everystep) && !landed &&
+                !_last_recorded(ctx, Float64(t))
+            _record!(ctx, t, _readvec!(ctx.u, ctx.petsclib, x))
+        end
+        # The step that ends here is where the next one starts.
+        if ctx.hermite && ctx.saveat_idx <= length(ctx.saveat)
+            ctx.step_t = Float64(t)
+            _readvec!(ctx.step_u, ctx.petsclib, x)
+            ctx.fstart = ctx.pdirty ? nothing : ctx.fend
+            ctx.fend = nothing
+            ctx.pdirty = false
         end
         _stop_below_dtmin!(ctx, ts_ptr, step)
     catch e
@@ -1542,9 +1545,10 @@ function _setup(
         dtmin = nothing,
         dtmax = nothing,
         saveat = Float64[],
-        save_everystep = true,
-        save_start = true,
-        save_end = true,
+        save_everystep = nothing,
+        save_start = nothing,
+        save_end = nothing,
+        save_on = true,
         dense = nothing,
         save_idxs = nothing,
         tstops = (),
@@ -1741,10 +1745,22 @@ function _setup(
         collect(Float64, t0:abs(Float64(saveat)):tf) :
         sort!(tdir .* Vector{Float64}(collect(saveat)))
     filter!(t -> t0 - eps(tf) <= t <= tf + eps(tf), saveat_times)
-    if !isempty(saveat_times) && save_start &&
-            saveat_times[1] > t0 + 100 * eps(max(one(Float64), abs(tf)))
-        pushfirst!(saveat_times, t0)
-    end
+    # OrdinaryDiffEq's defaults: a saveat keeps only its own points, and an end is kept
+    # when saveat names it. A save flag given explicitly wins over saveat.
+    endtol = 100 * eps(max(one(Float64), abs(tf)))
+    no_saveat = !(saveat isa Number) && isempty(saveat)
+    save_everystep = save_on && something(save_everystep, no_saveat)
+    save_start = something(
+        save_start, save_everystep || no_saveat || saveat isa Number ||
+            any(t -> abs(t - t0) <= endtol, saveat_times),
+    )
+    save_end = something(
+        save_end, save_everystep || no_saveat || saveat isa Number ||
+            any(t -> abs(t - tf) <= endtol, saveat_times),
+    )
+    save_on || empty!(saveat_times)
+    save_start || filter!(t -> abs(t - t0) > endtol, saveat_times)
+    save_end || filter!(t -> abs(t - tf) > endtol, saveat_times)
     M = has_mass ? Matrix{Float64}(mass_matrix) : nothing
     if M !== nothing && uses_sparse_jac &&
             any(M[i, j] != 0 for i in 1:n, j in 1:n if i != j)
@@ -1773,7 +1789,7 @@ function _setup(
         v
     end
     dense_out = dense === nothing ?
-        (save_everystep && isempty(saveat_times) && !has_mass && !is_dae) : Bool(dense)
+        (save_everystep && no_saveat && !has_mass && !is_dae) : Bool(dense)
     if dense_out && has_mass
         throw(
             ArgumentError(
@@ -1796,7 +1812,7 @@ function _setup(
         idx0,
         row_cols0, row_src, row_buf, J0,
         Float64[], Vector{Float64}[], Vector{Float64}[],
-        saveat_times, 1, save_everystep, dense_out, kept,
+        saveat_times, 1, save_everystep, save_start, dense_out, kept,
         PETSc.VecSeq(petsclib, n),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
         NaN, similar(u0), t0, copy(u0), nothing, nothing, false,
@@ -1980,6 +1996,11 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
             ctx.dense && pop!(ctx.dus)
         end
         _record!(ctx, tend, uend)
+    end
+    if !h.save_end && !isempty(ctx.ts) && abs(ctx.ts[end] - tf) <= tol
+        pop!(ctx.ts)
+        pop!(ctx.us)
+        ctx.dense && pop!(ctx.dus)
     end
     if !h.save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= tol
         popfirst!(ctx.ts)
@@ -2595,16 +2616,13 @@ SciMLBase.pop_tstop!(integ::PETScIntegrator) = popfirst!(integ.tstops)
 function _initial_save!(h::TSHandles)
     ctx = h.ctx
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
-    if isempty(ctx.saveat)
-        if h.save_start
-            _record_end!(ctx, h.t0, h.u0)
-        end
-    else
-        while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= h.t0 + tol
-            _record_end!(ctx, ctx.saveat[ctx.saveat_idx], h.u0)
-            ctx.saveat_idx += 1
-        end
+    landed = false
+    while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= h.t0 + tol
+        _record_end!(ctx, ctx.saveat[ctx.saveat_idx], h.u0)
+        ctx.saveat_idx += 1
+        landed = true
     end
+    h.save_start && !landed && _record_end!(ctx, h.t0, h.u0)
     return nothing
 end
 
@@ -2705,20 +2723,20 @@ function _save_step!(integ::PETScIntegrator, upto::Float64, endpoint::Bool)
     h = integ.h
     ctx = h.ctx
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
-    if isempty(ctx.saveat)
-        endpoint && ctx.save_everystep && _record_end!(ctx, integ.tdir * upto, integ.u)
-    else
-        while ctx.saveat_idx <= length(ctx.saveat) &&
-                ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + tol
-            want = ctx.saveat[ctx.saveat_idx]
-            if abs(want - integ.tdir * integ.t) <= tol
-                _record_end!(ctx, want, integ.u)
-            else
-                _record!(ctx, want, _interpolate!(integ, want))
-            end
-            ctx.saveat_idx += 1
+    landed = false
+    while ctx.saveat_idx <= length(ctx.saveat) &&
+            ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + tol
+        want = ctx.saveat[ctx.saveat_idx]
+        if abs(want - integ.tdir * integ.t) <= tol
+            _record_end!(ctx, want, integ.u)
+            landed = true
+        else
+            _record!(ctx, want, _interpolate!(integ, want))
         end
+        ctx.saveat_idx += 1
     end
+    endpoint && ctx.save_everystep && !landed &&
+        _record_end!(ctx, integ.tdir * upto, integ.u)
     return nothing
 end
 

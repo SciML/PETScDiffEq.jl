@@ -2932,8 +2932,13 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @testset "saveat hits the requested times" begin
             scalar = SciMLBase.solve(prob, alg; dt = 0.1, saveat = 0.25)
             @test scalar.t ≈ [0.0, 0.25, 0.5, 0.75, 1.0]
+            # As in OrdinaryDiffEq, a saveat keeps only its own points unless told otherwise.
             vec = SciMLBase.solve(prob, alg; dt = 0.1, saveat = [0.3, 0.7])
-            @test vec.t ≈ [0.0, 0.3, 0.7, 1.0]
+            @test vec.t ≈ [0.3, 0.7]
+            ends = SciMLBase.solve(
+                prob, alg; dt = 0.1, saveat = [0.3, 0.7], save_start = true, save_end = true,
+            )
+            @test ends.t ≈ [0.0, 0.3, 0.7, 1.0]
             # interpolated points must carry the solver's accuracy, not a
             # linear fallback between stored steps
             for sol in (scalar, vec), i in eachindex(sol.t)
@@ -2941,11 +2946,36 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
         end
 
+        @testset "the saving flags combine as in OrdinaryDiffEq" begin
+            # Every step and the saveat points together, with one point per time.
+            both = SciMLBase.solve(
+                prob, alg; dt = 0.25, saveat = [0.3], save_everystep = true, tstops = [0.5],
+            )
+            @test both.t ≈ [0.0, 0.25, 0.3, 0.5, 0.75, 1.0]
+            @test allunique(both.t)
+            # A saveat that names no time in the span saves nothing.
+            @test isempty(SciMLBase.solve(prob, alg; dt = 0.1, saveat = [5.0]).t)
+            # save_on = false keeps only the ends saveat does not rule out.
+            @test SciMLBase.solve(prob, alg; dt = 0.1, save_on = false).t == [0.0, 1.0]
+            @test isempty(SciMLBase.solve(prob, alg; dt = 0.1, saveat = [0.5], save_on = false).t)
+            # A saveat added to an integrator leaves every-step saving on.
+            integ = SciMLBase.init(prob, alg; dt = 0.25, adaptive = false)
+            SciMLBase.step!(integ)
+            SciMLBase.add_saveat!(integ, 0.6)
+            @test SciMLBase.solve!(integ).t ≈ [0.0, 0.25, 0.5, 0.6, 0.75, 1.0]
+        end
+
         @testset "save_start and save_end" begin
             nostart = SciMLBase.solve(
-                prob, alg; dt = 0.1, saveat = [0.3, 0.7], save_start = false,
+                prob, alg; dt = 0.1, saveat = [0.0, 0.3, 1.0], save_start = false,
             )
-            @test nostart.t ≈ [0.3, 0.7, 1.0]
+            @test nostart.t ≈ [0.3, 1.0]
+            noend = SciMLBase.solve(
+                prob, alg; dt = 0.1, saveat = [0.0, 0.3, 1.0], save_end = false,
+            )
+            @test noend.t ≈ [0.0, 0.3]
+            @test SciMLBase.solve(prob, alg; dt = 0.25, save_end = false).t ≈
+                [0.0, 0.25, 0.5, 0.75]
             # Without saveat the first saved point is t0 itself, which is the
             # only case where it has to be dropped.
             everystep = SciMLBase.solve(prob, alg; dt = 0.25, save_start = false)
@@ -3369,7 +3399,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             long = (dt = 0.3, adaptive = false)
             for alg in algs, (pr, want) in cases
                 sol = SciMLBase.solve(pr, alg; long..., saveat = want)
-                @test sol.t == [pr.tspan[1]; want]
+                @test sol.t == want
                 @test sol.u[end] ==
                     SciMLBase.solve(pr, alg; long..., save_everystep = false).u[end]
             end
@@ -3419,7 +3449,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 end
                 # Nothing between step ends is asked for here.
                 @test SciMLBase.solve(mass, alg; fixed..., saveat = [0.2, 0.5]).t ==
-                    [0.0, 0.2, 0.5, 1.0]
+                    [0.2, 0.5]
                 @test SciMLBase.solve(
                     mass, alg; fixed..., callback = crossing(rootfind = SciMLBase.NoRootFind),
                 ).retcode == SciMLBase.ReturnCode.Success
@@ -4264,7 +4294,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test sol.t == [1.0, 0.75, 0.5, 0.25, 0.0]
             @test maximum(abs(sol.u[i][1] - exp(1 - sol.t[i])) for i in eachindex(sol.t)) < 1.0e-7
             sol = SciMLBase.solve(back, alg; saveat = [0.2, 0.7], tight...)
-            @test sol.t == [1.0, 0.7, 0.2, 0.0]
+            @test sol.t == [0.7, 0.2]
             sol = SciMLBase.solve(back, alg; tight...)
             @test issorted(sol.t; rev = true)
             @test abs(sol(0.5)[1] - exp(0.5)) < 1.0e-6
