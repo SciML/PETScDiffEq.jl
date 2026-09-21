@@ -507,6 +507,9 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     part_t::Float64
     part_u::Vector{Float64}
     part_valid::Bool
+    # The smallest step the caller allows, 0.0 when none, and whether one was asked for.
+    dtmin::Float64
+    dt_too_small::Bool
     nf::Int
     nf2::Int
     njacs::Int
@@ -533,6 +536,22 @@ function _record_end!(ctx, t, x)
     ctx.hermite && (ctx.fend = du)
     return nothing
 end
+
+# PETSc's own `dt_min` clamps the step and takes it anyway, error estimate or not, so the
+# caller's floor ends the solve here instead, as OrdinaryDiffEq's does. A reason set here
+# would not survive, since the next step resets it, so the step count is what stops PETSc.
+function _stop_below_dtmin!(ctx, ts_ptr, step)
+    (ctx.dtmin > 0 && step > 0 && !ctx.dt_too_small) || return nothing
+    ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
+    abs(Float64(LibPETSc.TSGetTimeStep(ctx.petsclib, ts))) < ctx.dtmin || return nothing
+    ctx.dt_too_small = true
+    LibPETSc.TSSetMaxSteps(ctx.petsclib, ts, step)
+    return nothing
+end
+
+# Exactly the same time: accepted steps near a singularity can be far closer than any
+# tolerance and are still points of the solution.
+_last_recorded(ctx, t) = !isempty(ctx.ts) && ctx.ts[end] == t
 
 _select(u, ::Nothing) = u
 _select(u, idxs::Vector{Int}) = u[idxs]
@@ -579,17 +598,25 @@ _no_interpolant(ctx) = ArgumentError(
 # PETSC_ERR_MAT_LU_ZRPVT.
 const PETSC_ERR_SUP = 56
 const PETSC_ERR_MAT_LU_ZRPVT = 71
+const PETSC_ERR_FP = 72
 
 # A dense LU factorization raises on a zero pivot whatever PETSc was told about failed
 # steps, so a singular Newton matrix ends the solve with this error instead of a failed
 # step. Where the options ask the linear solve to raise, it is left to raise.
 _failed_step(e, h) =
-    e isa LibPETSc.PetscError && e.code == PETSC_ERR_MAT_LU_ZRPVT && !h.pivot_raises
+    e isa LibPETSc.PetscError && !h.pivot_raises &&
+    (e.code == PETSC_ERR_MAT_LU_ZRPVT || e.code == PETSC_ERR_FP)
 
-# A pivot raised part way through a step adds nothing to PETSc's rejection counters, so
-# the warning is the only account of why the solve stopped where it did.
-_warn_zero_pivot(alg) = @warn "`$(_warn_name(alg))` ends here because the LU " *
-    "factorization of its Newton matrix hit a zero pivot"
+# A step that stopped part way through adds nothing to PETSc's rejection counters, so the
+# warning is the only account of why the solve stopped where it did.
+function _warn_failed_step(alg, code)
+    why = code == PETSC_ERR_FP ?
+        "PETSc hit a floating point exception, an overflow or a NaN in the step or in " *
+        "its error estimate" :
+        "the LU factorization of its Newton matrix hit a zero pivot"
+    @warn "`$(_warn_name(alg))` ends here because $why"
+    return nothing
+end
 
 # Whether the options leave the linear or the nonlinear solve raising on a failure.
 function _pivot_raises(pl, ts)
@@ -635,7 +662,7 @@ function _zero_pivot_handler(
         comm::MPI.API.MPI_Comm, line::Cint, fun::Ptr{Cchar}, file::Ptr{Cchar},
         n::LibPETSc.PetscErrorCode, p::Cint, mess::Ptr{Cchar}, traceback::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
-    n == PETSC_ERR_MAT_LU_ZRPVT && return n
+    (n == PETSC_ERR_MAT_LU_ZRPVT || n == PETSC_ERR_FP) && return n
     return ccall(
         traceback, LibPETSc.PetscErrorCode,
         (
@@ -1129,7 +1156,9 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     try
         if isempty(ctx.saveat)
-            if ctx.save_everystep || step == 0
+            # A step PETSc cannot take brings the monitor back to the time it last
+            # reported, and one time is worth one point.
+            if (ctx.save_everystep || step == 0) && !_last_recorded(ctx, Float64(t))
                 _record!(ctx, t, _readvec!(ctx.u, ctx.petsclib, x))
             end
         else
@@ -1172,6 +1201,7 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
                 ctx.pdirty = false
             end
         end
+        _stop_below_dtmin!(ctx, ts_ptr, step)
     catch e
         ctx.err = e
         return LibPETSc.PetscErrorCode(1)
@@ -1394,6 +1424,8 @@ mutable struct TSHandles{CTX, T}
     save_start::Bool
     save_end::Bool
     pivot_raises::Bool
+    # The PETSc error code a step stopped on, or 0 where none did.
+    stopped::Int
     tolvecs::Vector{Any}
     tolbufs::Vector{Vector{Float64}}
     destroyed::Bool
@@ -1769,11 +1801,13 @@ function _setup(
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
         NaN, similar(u0), t0, copy(u0), nothing, nothing, false,
         slow_idxs, medium_idxs, fast_idxs,
-        NaN, similar(u0), false, 0, 0, 0, nothing,
+        NaN, similar(u0), false,
+        dtmin === nothing ? 0.0 : abs(Float64(dtmin)), false,
+        0, 0, 0, nothing,
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing,
-        t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false,
+        t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0,
         Any[], Vector{Float64}[], false,
     )
     finalizer(_destroy!, h)
@@ -1853,8 +1887,6 @@ function _setup(
             effective_options = ["-ts_error_if_step_fails", "false"]
             append!(effective_options, _default_options(alg))
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
-            (dtmin === nothing || dtmin == 0) ||
-                append!(effective_options, ["-ts_adapt_dt_min", string(abs(Float64(dtmin)))])
             (dtmax === nothing || isinf(dtmax)) ||
                 append!(effective_options, ["-ts_adapt_dt_max", string(abs(Float64(dtmax)))])
             append!(effective_options, alg.petsc_options)
@@ -1917,6 +1949,7 @@ end
 function _read_stats(h::TSHandles)
     pl, ts = h.petsclib, h.ts
     return (
+        reason = LibPETSc.TSGetConvergedReason(pl, ts),
         nsteps = Int(LibPETSc.TSGetStepNumber(pl, ts)),
         nreject = Int(LibPETSc.TSGetStepRejections(pl, ts)),
         nnonliniter = Int(LibPETSc.TSGetSNESIterations(pl, ts)),
@@ -1939,6 +1972,13 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
             isempty(ctx.ts) || ctx.ts[end] < tend - tol ||
                 (ctx.ts[end] <= tend + tol && ctx.us[end] != _saved(ctx, uend))
         )
+        # A step that stopped part way through leaves the time already recorded, with the
+        # state it had then, so the end replaces that point rather than repeating its time.
+        if !isempty(ctx.ts) && abs(ctx.ts[end] - tend) <= tol
+            pop!(ctx.ts)
+            pop!(ctx.us)
+            ctx.dense && pop!(ctx.dus)
+        end
         _record!(ctx, tend, uend)
     end
     if !h.save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= tol
@@ -1948,12 +1988,17 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     end
 
     finite = all(isfinite, uend)
-    retcode = if !finite
+    # PETSc's own reason says what stopped a solve short of the final time.
+    retcode = if !finite || h.stopped == PETSC_ERR_FP
         SciMLBase.ReturnCode.Unstable
     elseif tend >= tf - tol
         SciMLBase.ReturnCode.Success
     elseif st.nsteps >= h.maxiters
         SciMLBase.ReturnCode.MaxIters
+    elseif st.reason == LibPETSc.TS_DIVERGED_NONLINEAR_SOLVE
+        SciMLBase.ReturnCode.ConvergenceFailure
+    elseif ctx.dt_too_small || st.reason == LibPETSc.TS_DIVERGED_STEP_REJECTED
+        SciMLBase.ReturnCode.DtLessThanMin
     else
         SciMLBase.ReturnCode.Failure
     end
@@ -1990,7 +2035,6 @@ function SciMLBase.__solve(
     ctx, pl = h.ctx, h.petsclib
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
-        pivot = false
         GC.@preserve ctx begin
             try
                 _quiet_zero_pivot(h) do
@@ -2000,15 +2044,15 @@ function SciMLBase.__solve(
                 # A callback that threw reports failure to PETSc, which raises a
                 # PetscError here. The user's own exception is the useful one.
                 ctx.err === nothing && !_failed_step(e, h) && rethrow()
-                pivot = true
+                h.stopped = e.code
             end
         end
         ctx.err === nothing || throw(ctx.err)
-        pivot && _warn_zero_pivot(alg)
+        h.stopped == 0 || _warn_failed_step(alg, h.stopped)
         # PETSc records the solve time only as TSSolve returns, so a raised step leaves
         # the time and state at the last finished one.
         tend = Float64(
-            pivot ? LibPETSc.TSGetTime(pl, h.ts) : LibPETSc.TSGetSolveTime(pl, h.ts),
+            h.stopped == 0 ? LibPETSc.TSGetSolveTime(pl, h.ts) : LibPETSc.TSGetTime(pl, h.ts),
         )
         st = _read_stats(h)
         uend = _readvec!(similar(h.u0), pl, h.u)
@@ -2709,7 +2753,7 @@ function SciMLBase.step!(integ::PETScIntegrator)
         LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
         integ.dt = integ.tdir * (target - integ.tdir * integ.t)
     end
-    pivot = false
+    h.stopped = 0
     GC.@preserve ctx begin
         try
             _quiet_zero_pivot(h) do
@@ -2717,7 +2761,7 @@ function SciMLBase.step!(integ::PETScIntegrator)
             end
         catch e
             ctx.err === nothing && !_failed_step(e, h) && rethrow()
-            pivot = true
+            h.stopped = e.code
         end
     end
     if ctx.err !== nothing
@@ -2725,13 +2769,13 @@ function SciMLBase.step!(integ::PETScIntegrator)
         _finish!(integ)
         throw(err)
     end
-    pivot && _warn_zero_pivot(integ.alg)
+    h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped)
     integ.t = _user_t(integ.tdir, Float64(LibPETSc.TSGetTime(pl, h.ts)))
     integ.dt = integ.tdir * Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
     # A step PETSc could not take, or raised part-way through, returns without advancing
     # the clock, which would otherwise spin a `while !done` loop forever.
     if integ.tdir * integ.t <= integ.tdir * integ.tprev
-        _finish!(integ, SciMLBase.ReturnCode.Failure)
+        _finish!(integ)
         return nothing
     end
     if stop === nothing
@@ -2758,8 +2802,10 @@ function SciMLBase.step!(integ::PETScIntegrator)
         popfirst!(integ.tstops)
     end
     integ.finished && return nothing
+    # The step PETSc proposes next is smaller than the caller's floor.
+    ctx.dtmin > 0 && abs(integ.dt) < ctx.dtmin && (ctx.dt_too_small = true)
     if !all(isfinite, integ.u) || integ.tdir * integ.t >= h.tf - tol ||
-            Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
+            ctx.dt_too_small || Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
         _finish!(integ)
     end
     return nothing

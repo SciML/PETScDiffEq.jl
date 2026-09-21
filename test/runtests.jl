@@ -1143,8 +1143,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         sol = SciMLBase.solve(
             stiff, PETScDiffEq.TSImplicit("beuler"); dt = 1.0, adaptive = false,
         )
-        @test sol.retcode == SciMLBase.ReturnCode.Failure
+        # PETSc stops this one in its nonlinear solve.
+        @test sol.retcode == SciMLBase.ReturnCode.ConvergenceFailure
         @test sol.t[end] > 0.0
+        @test allunique(sol.t)
 
         integ = SciMLBase.init(
             stiff, PETScDiffEq.TSImplicit("beuler"); dt = 1.0, adaptive = false,
@@ -1156,7 +1158,47 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
         # A step PETSc cannot take returns without advancing, and step! ends the integrator there.
         @test SciMLBase.done(integ)
-        @test integ.sol.retcode == SciMLBase.ReturnCode.Failure
+        @test integ.sol.retcode == SciMLBase.ReturnCode.ConvergenceFailure
+        @test allunique(integ.sol.t)
+
+        @testset "an overflow is Unstable, not a raised error" begin
+            square!(du, u, p, t) = (du[1] = u[1]^2; nothing)
+            runaway = SciMLBase.ODEProblem(square!, [1.0], (0.0, 2.0))
+            over = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                runaway, PETScDiffEq.TSRK("5dp");
+                dt = 0.01, abstol = 1.0e-10, reltol = 1.0e-10,
+            )
+            @test over.retcode == SciMLBase.ReturnCode.Unstable
+            @test over.t[end] < 2.0
+            @test allunique(over.t)
+        end
+
+        @testset "a step below dtmin ends the solve where it still holds" begin
+            fast!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
+            quick = SciMLBase.ODEProblem(fast!, [1.0], (0.0, 1.0))
+            kw = (; dt = 0.01, dtmin = 0.1, abstol = 1.0e-10, reltol = 1.0e-10)
+            floored = SciMLBase.solve(quick, PETScDiffEq.TSRK("5dp"); kw...)
+            @test floored.retcode == SciMLBase.ReturnCode.DtLessThanMin
+            @test 0.0 < floored.t[end] < 1.0
+            @test abs(floored.u[end][1] - exp(-50 * floored.t[end])) < 1.0e-6
+
+            stepped = SciMLBase.init(quick, PETScDiffEq.TSRK("5dp"); kw...)
+            n = 0
+            while !SciMLBase.done(stepped) && n < 100
+                SciMLBase.step!(stepped)
+                n += 1
+            end
+            @test SciMLBase.done(stepped)
+            @test stepped.sol.retcode == SciMLBase.ReturnCode.DtLessThanMin
+            @test stepped.sol.t[end] < 1.0
+
+            # Without a floor the same solve runs to the end.
+            free = SciMLBase.solve(
+                quick, PETScDiffEq.TSRK("5dp"); dt = 0.01, abstol = 1.0e-10, reltol = 1.0e-10,
+            )
+            @test free.retcode == SciMLBase.ReturnCode.Success
+            @test free.t[end] == 1.0
+        end
 
         # Choosing an explicit type through the implicit path is a misuse, and
         # stays an exception rather than a quiet failure code.
