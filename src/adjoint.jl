@@ -540,7 +540,7 @@ end
 
 const _ADJOINT_TRAJECTORY = ["-ts_save_trajectory", "1", "-ts_trajectory_type", "memory"]
 
-function _discrete_adjoint(
+function _discrete_adjoint_unlocked(
         prob, alg::AnyPETScTS, sensealg::PETScAdjoint;
         t = nothing, dgdu_discrete = nothing, dgdp_discrete = nothing, no_start = false,
         kwargs...,
@@ -698,6 +698,9 @@ function _discrete_adjoint(
     end
     return du0, has_p ? dp' : nothing
 end
+
+_discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...) =
+    _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; kwargs...))
 
 function SciMLBase._concrete_solve_adjoint(
         ::SupportedProblem, ::AnyPETScTS, ::PETScAdjoint, u0, p,

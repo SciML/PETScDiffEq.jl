@@ -1457,6 +1457,25 @@ function _destroy_live_handles!()
     return nothing
 end
 
+# PETSc and MPI, which runs at THREAD_SERIALIZED, are shared by the whole process, and PETSc's
+# options stack is global, so every entry point that reaches them runs one task at a time.
+const PETSC_LOCK = ReentrantLock()
+_locked(f) = lock(f, PETSC_LOCK)
+
+# A finalizer must not wait on a lock, so one that finds it taken tries again later.
+function _finalize!(h::TSHandles)
+    if islocked(PETSC_LOCK) || !trylock(PETSC_LOCK)
+        finalizer(_finalize!, h)
+        return nothing
+    end
+    try
+        _destroy!(h)
+    finally
+        unlock(PETSC_LOCK)
+    end
+    return nothing
+end
+
 function _destroy!(h::TSHandles)
     h.destroyed && return nothing
     h.destroyed = true
@@ -1840,7 +1859,7 @@ function _setup(
         t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0,
         Any[], Vector{Float64}[], false,
     )
-    finalizer(_destroy!, h)
+    finalizer(_finalize!, h)
     LIVE_HANDLES[h] = nothing
 
     try
@@ -2046,7 +2065,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     )
 end
 
-function SciMLBase.__solve(
+function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), kwargs...,
     )
@@ -2088,6 +2107,9 @@ function SciMLBase.__solve(
     return _assemble(prob, alg, h, tend, uend, st)
 end
 
+SciMLBase.__solve(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
+    _locked(() -> _solve_unlocked(prob, alg; kwargs...))
+
 # Callbacks written against OrdinaryDiffEq reach for `integrator.opts` and set
 # tolerances or a step cap mid-solve, so writes here reach PETSc.
 mutable struct PETScIntegratorOpts{H}
@@ -2100,7 +2122,7 @@ mutable struct PETScIntegratorOpts{H}
     verbose::Bool
 end
 
-function Base.setproperty!(o::PETScIntegratorOpts, name::Symbol, v)
+function _setopt_unlocked(o::PETScIntegratorOpts, name::Symbol, v)
     setfield!(o, name, name in (:dtmin, :dtmax) ? Float64(v) : v)
     h = getfield(o, :h)
     (h === nothing || h.destroyed) && return v
@@ -2118,6 +2140,9 @@ function Base.setproperty!(o::PETScIntegratorOpts, name::Symbol, v)
     end
     return v
 end
+
+Base.setproperty!(o::PETScIntegratorOpts, name::Symbol, v) =
+    _locked(() -> _setopt_unlocked(o, name, v))
 
 """
     PETScIntegrator
@@ -2182,21 +2207,29 @@ _check_continuous(cb) = throw(
     ),
 )
 
-function SciMLBase.derivative_discontinuity!(integ::PETScIntegrator, bool::Bool)
+function _discontinuity_unlocked(integ::PETScIntegrator, bool::Bool)
     integ.derivative_discontinuity = bool
     bool && (integ.h.ctx.pdirty = true)
     return nothing
 end
 
+SciMLBase.derivative_discontinuity!(integ::PETScIntegrator, bool::Bool) =
+    _locked(() -> _discontinuity_unlocked(integ, bool))
+
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
-function SciMLBase.get_proposed_dt(integ::PETScIntegrator)
+function _proposed_dt_unlocked(integ::PETScIntegrator)
     integ.finished && return abs(integ.dt)
     return Float64(LibPETSc.TSGetTimeStep(integ.h.petsclib, integ.h.ts))
 end
-function SciMLBase.set_proposed_dt!(integ::PETScIntegrator, dt)
+
+SciMLBase.get_proposed_dt(integ::PETScIntegrator) = _locked(() -> _proposed_dt_unlocked(integ))
+function _set_proposed_dt_unlocked(integ::PETScIntegrator, dt)
     integ.finished || LibPETSc.TSSetTimeStep(integ.h.petsclib, integ.h.ts, abs(Float64(dt)))
     return nothing
 end
+
+SciMLBase.set_proposed_dt!(integ::PETScIntegrator, dt) =
+    _locked(() -> _set_proposed_dt_unlocked(integ, dt))
 _make_opts(h, kwargs) = PETScIntegratorOpts(
     h, get(kwargs, :adaptive, true) === true,
     get(kwargs, :abstol, 1.0e-6), get(kwargs, :reltol, 1.0e-3),
@@ -2226,7 +2259,7 @@ DiffEqBase.get_tstops(integ::PETScIntegrator) = integ.tstops
 DiffEqBase.get_tstops_array(integ::PETScIntegrator) = integ.tstops
 DiffEqBase.get_tstops_max(integ::PETScIntegrator) = last(integ.tstops)
 
-function SciMLBase.set_u!(integ::PETScIntegrator, u)
+function _set_u_unlocked(integ::PETScIntegrator, u)
     copyto!(integ.u, u)
     integ.finished && return nothing
     PETSc.withlocalarray!(
@@ -2236,12 +2269,16 @@ function SciMLBase.set_u!(integ::PETScIntegrator, u)
     return nothing
 end
 
-function SciMLBase.set_t!(integ::PETScIntegrator, t)
+SciMLBase.set_u!(integ::PETScIntegrator, u) = _locked(() -> _set_u_unlocked(integ, u))
+
+function _set_t_unlocked(integ::PETScIntegrator, t)
     integ.t = Float64(t)
     _end_step_here!(integ)
     integ.finished || LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * Float64(t))
     return nothing
 end
+
+SciMLBase.set_t!(integ::PETScIntegrator, t) = _locked(() -> _set_t_unlocked(integ, t))
 
 function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
     t = Float64(t)
@@ -2257,7 +2294,7 @@ function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
 end
 
 # The state at an earlier time inside the step just taken.
-function SciMLBase.change_t_via_interpolation!(
+function _change_t_unlocked(
         integ::PETScIntegrator, t, modify_save_endpoint::Type{Val{T}} = Val{false},
     ) where {T}
     integ.finished && return nothing
@@ -2272,9 +2309,13 @@ function SciMLBase.change_t_via_interpolation!(
     return nothing
 end
 
+SciMLBase.change_t_via_interpolation!(
+    integ::PETScIntegrator, t, modify_save_endpoint::Type{Val{T}} = Val{false},
+) where {T} = _locked(() -> _change_t_unlocked(integ, t, modify_save_endpoint))
+
 # Returns `(saved, savedexactly)`: whether any point was saved, and whether one was saved at
 # the current time. The current time is saved only when every step is, and not twice.
-function SciMLBase.savevalues!(integ::PETScIntegrator, force_save = false)
+function _savevalues_unlocked(integ::PETScIntegrator, force_save = false)
     integ.finished && return (false, false)
     ctx = integ.h.ctx
     n = length(ctx.ts)
@@ -2286,6 +2327,9 @@ function SciMLBase.savevalues!(integ::PETScIntegrator, force_save = false)
     saved = length(ctx.ts) > n
     return (saved, saved && ctx.ts[end] == s)
 end
+
+SciMLBase.savevalues!(integ::PETScIntegrator, force_save = false) =
+    _locked(() -> _savevalues_unlocked(integ, force_save))
 
 # SciMLBase's version steps again once the span is done, which a finished integrator refuses.
 function SciMLBase.step!(integ::PETScIntegrator, dt, stop_at_tdt = false)
@@ -2299,7 +2343,7 @@ function SciMLBase.step!(integ::PETScIntegrator, dt, stop_at_tdt = false)
     return nothing
 end
 
-function _state_at(integ::PETScIntegrator, t::Float64)
+function _state_at_unlocked(integ::PETScIntegrator, t::Float64)
     # A rounding error from an end of the step is that end, so `integ(integ.t - integ.dt)`
     # is the step's start.
     tol = 100 * eps(max(one(Float64), abs(integ.t)))
@@ -2314,6 +2358,8 @@ function _state_at(integ::PETScIntegrator, t::Float64)
     )
     return _interpolate!(integ, integ.tdir * t)
 end
+
+_state_at(integ::PETScIntegrator, t::Float64) = _locked(() -> _state_at_unlocked(integ, t))
 
 # The state at PETSc's time s inside the step just taken, in `integ.ucache`.
 function _interpolate!(integ::PETScIntegrator, s::Float64)
@@ -2589,7 +2635,7 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     return nothing
 end
 
-function SciMLBase.__init(
+function _init_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), kwargs...,
     )
@@ -2612,6 +2658,9 @@ function SciMLBase.__init(
     return integ
 end
 
+SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
+    _locked(() -> _init_unlocked(prob, alg; kwargs...))
+
 # The queue holds `tdir * t` for each stop, the final time included, in increasing order and
 # without repeats. step! drops each stop the integrator reaches, and terminate! empties it.
 function _tstops(tstops, h::TSHandles)
@@ -2620,7 +2669,7 @@ function _tstops(tstops, h::TSHandles)
     return push!(stops, h.tf)
 end
 
-function SciMLBase.add_tstop!(integ::PETScIntegrator, t)
+function _add_tstop_unlocked(integ::PETScIntegrator, t)
     t = Float64(t)
     s = integ.tdir * t
     s < integ.tdir * integ.t &&
@@ -2635,6 +2684,8 @@ function SciMLBase.add_tstop!(integ::PETScIntegrator, t)
     (i <= length(integ.tstops) && integ.tstops[i] == s) || insert!(integ.tstops, i, s)
     return nothing
 end
+
+SciMLBase.add_tstop!(integ::PETScIntegrator, t) = _locked(() -> _add_tstop_unlocked(integ, t))
 SciMLBase.has_tstop(integ::PETScIntegrator) = !isempty(integ.tstops)
 # Both report the queue key, `integ.tdir * t`, which is what generic callback code
 # compares against.
@@ -2680,7 +2731,7 @@ end
 # A reinitialised integrator gets fresh PETSc objects built from the keywords
 # given to `init`, so its solve is identical to a fresh one and it works even
 # after the previous solve released them.
-function SciMLBase.reinit!(
+function _reinit_unlocked(
         integ::PETScIntegrator, u0 = integ.prob.u0;
         t0 = integ.prob.tspan[1], tf = integ.prob.tspan[2],
         erase_sol = true, saveat = nothing, tstops = integ.tstops_cache,
@@ -2732,6 +2783,9 @@ function SciMLBase.reinit!(
     return nothing
 end
 
+SciMLBase.reinit!(integ::PETScIntegrator, u0 = integ.prob.u0; kwargs...) =
+    _locked(() -> _reinit_unlocked(integ, u0; kwargs...))
+
 @static if isdefined(SciMLBase, :has_reinit)
     SciMLBase.has_reinit(::PETScIntegrator) = true
 end
@@ -2750,13 +2804,16 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
     return nothing
 end
 
-function SciMLBase.terminate!(
+function _terminate_unlocked(
         integ::PETScIntegrator, retcode = SciMLBase.ReturnCode.Terminated,
     )
     empty!(integ.tstops)
     _finish!(integ, retcode)
     return nothing
 end
+
+SciMLBase.terminate!(integ::PETScIntegrator, retcode = SciMLBase.ReturnCode.Terminated) =
+    _locked(() -> _terminate_unlocked(integ, retcode))
 
 function _save_step!(integ::PETScIntegrator, upto::Float64, endpoint::Bool)
     h = integ.h
@@ -2779,7 +2836,7 @@ function _save_step!(integ::PETScIntegrator, upto::Float64, endpoint::Bool)
     return nothing
 end
 
-function SciMLBase.step!(integ::PETScIntegrator)
+function _step_unlocked(integ::PETScIntegrator)
     integ.finished && throw(
         ArgumentError(
             "this integrator has finished at t = $(integ.t) and cannot step further; " *
@@ -2875,12 +2932,16 @@ function SciMLBase.step!(integ::PETScIntegrator)
     return nothing
 end
 
-function SciMLBase.solve!(integ::PETScIntegrator)
+SciMLBase.step!(integ::PETScIntegrator) = _locked(() -> _step_unlocked(integ))
+
+function _solve_integrator_unlocked(integ::PETScIntegrator)
     while !integ.finished
         SciMLBase.step!(integ)
     end
     return integ.sol
 end
+
+SciMLBase.solve!(integ::PETScIntegrator) = _locked(() -> _solve_integrator_unlocked(integ))
 
 SciMLBase.done(integ::PETScIntegrator) = integ.finished
 
