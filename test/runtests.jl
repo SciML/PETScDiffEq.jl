@@ -576,7 +576,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
         @testset "erase_sol = false across a change of saving" begin
             alg = PETScDiffEq.TSRK("5dp")
-            integ = SciMLBase.init(prob, alg; dt = 0.1, saveat = 0.5)
+            integ = SciMLBase.init(
+                prob, alg; dt = 0.1, saveat = 0.5, abstol = 1.0e-8, reltol = 1.0e-8,
+            )
             kept = SciMLBase.solve!(integ)
             @test !kept.dense
             SciMLBase.reinit!(
@@ -1926,7 +1928,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test length(hits) == 2
             @test abs(hits[1] - log(2.0)) < 1.0e-9
 
-            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            integ = SciMLBase.init(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, abstol = 1.0e-8, reltol = 1.0e-8,
+            )
             SciMLBase.step!(integ)
             SciMLBase.reinit!(integ)
             @test abs(SciMLBase.solve!(integ).u[end][1] - exp(-1)) < 1.0e-5
@@ -3754,6 +3758,50 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     @testset "Integrator interface" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
 
+        @testset "the integrator reports what OrdinaryDiffEq's does" begin
+            held(integ) = (
+                t = PETScDiffEq.LibPETSc.TSGetTolerances(integ.h.petsclib, integ.h.ts);
+                (t[1], t[3])
+            )
+            # SciML's default tolerances reach PETSc, and opts reports them.
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            @test (integ.opts.abstol, integ.opts.reltol) == (1.0e-6, 1.0e-3)
+            @test held(integ) == (1.0e-6, 1.0e-3)
+            # Writing one tolerance leaves the other where it was.
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, reltol = 1.0e-5)
+            integ.opts.abstol = 1.0e-9
+            @test held(integ) == (1.0e-9, 1.0e-5)
+
+            # integ.dt is the step just taken; the next one is get_proposed_dt.
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            @test integ.dt == integ.t - integ.tprev
+            @test integ(integ.t - integ.dt) == integ.uprev
+            # The counters are live during the solve.
+            @test integ.sol.stats.naccept == 2
+            @test integ.sol.stats.nf > 0
+            saved, exactly = SciMLBase.savevalues!(integ)
+            @test (saved, exactly) == (false, false)
+
+            # A cap of no steps takes none, callback or not.
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            capped = SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, maxiters = 0,
+                callback = never,
+            )
+            @test capped.retcode == SciMLBase.ReturnCode.MaxIters
+            @test capped.t == [0.0]
+
+            # A floor written through opts is the one the solve keeps.
+            fast!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
+            quick = SciMLBase.ODEProblem(fast!, [1.0], (0.0, 1.0))
+            integ = SciMLBase.init(
+                quick, PETScDiffEq.TSRK("5dp"); dt = 0.01, abstol = 1.0e-10, reltol = 1.0e-10,
+            )
+            integ.opts.dtmin = 0.1
+            @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.DtLessThanMin
+        end
+
         @testset "the last step after the integrator has finished" begin
             # The solution's dense output answers it, whichever interpolant ran before.
             for alg in (
@@ -3852,9 +3900,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 SciMLBase.step!(integ, 0.3)
             end
             @test integ.t == 1.0
-            # A silent no-op here spins SciMLBase's generic loop forever, since
-            # it advances only on `integ.t` and breaks only on a bad retcode.
-            @test_throws ArgumentError SciMLBase.step!(integ, 0.3)
+            # Past the end of the span it returns, rather than stepping a finished integrator.
+            SciMLBase.step!(integ, 0.3)
+            @test integ.t == 1.0
+            @test SciMLBase.done(integ)
         end
 
         @testset "save_everystep = false keeps only the endpoints" begin
@@ -4003,7 +4052,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test integ.t ≈ 0.05
                 @test SciMLBase.get_dt(integ) ≈ 0.05
                 n = length(integ.sol.t)
-                SciMLBase.savevalues!(integ)
+                # Every step is saved already, so only a forced save adds a point.
+                @test SciMLBase.savevalues!(integ) == (false, false)
+                @test length(integ.sol.t) == n
+                @test SciMLBase.savevalues!(integ, true) == (true, true)
                 @test length(integ.sol.t) == n + 1
                 @test integ.sol.t[end] ≈ 0.05
                 SciMLBase.solve!(integ)
@@ -4314,7 +4366,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test SciMLBase.get_du(integ) ≈ -integ.u
             @test_throws ArgumentError SciMLBase.add_tstop!(integ, 0.95)
             t1 = integ.t
-            @test SciMLBase.savevalues!(integ)
+            @test SciMLBase.savevalues!(integ, true) == (true, true)
             SciMLBase.add_tstop!(integ, 0.45)
             SciMLBase.solve!(integ)
             @test issorted(integ.sol.t; rev = true)

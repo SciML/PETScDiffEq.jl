@@ -1485,6 +1485,20 @@ function _check_tol(tol, n, name)
     return nothing
 end
 
+# PETSc prefers the per-component vector when one is attached, so the scalar beside it is
+# only the fallback.
+function _set_tolerances!(h::TSHandles, abstol, reltol)
+    pl, n = h.petsclib, length(h.u0)
+    novec = LibPETSc.PetscVec{typeof(pl)}()
+    avec = _tolvec(h, pl, abstol, n, "abstol")
+    rvec = _tolvec(h, pl, reltol, n, "reltol")
+    LibPETSc.TSSetTolerances(
+        pl, h.ts, _tolscalar(abstol, 1.0e-6), avec === nothing ? novec : avec,
+        _tolscalar(reltol, 1.0e-3), rvec === nothing ? novec : rvec,
+    )
+    return nothing
+end
+
 function _tolvec(h::TSHandles, petsclib, tol, n, name)
     tol isa AbstractVector || return nothing
     # PETSc borrows this array rather than copying it, and reads it on every
@@ -1886,18 +1900,9 @@ function _setup(
                 @warn "`$(_warn_name(alg))` has no embedded error estimate in PETSc, so " *
                     "it steps at the requested dt and ignores reltol/abstol"
             end
-            if reltol !== nothing || abstol !== nothing
-                novec = LibPETSc.PetscVec{typeof(petsclib)}()
-                # PETSc prefers the per-component vector when one is attached,
-                # so the scalar beside it is only the fallback.
-                avec = _tolvec(h, petsclib, abstol, n, "abstol")
-                rvec = _tolvec(h, petsclib, reltol, n, "reltol")
-                LibPETSc.TSSetTolerances(
-                    petsclib, ts,
-                    _tolscalar(abstol, 1.0e-6), avec === nothing ? novec : avec,
-                    _tolscalar(reltol, 1.0e-3), rvec === nothing ? novec : rvec,
-                )
-            end
+            # SciML's defaults, as its other wrappers use, rather than PETSc's own 1e-4 for
+            # both, so an unset tolerance is the one `integrator.opts` reports.
+            _set_tolerances!(h, something(abstol, 1.0e-6), something(reltol, 1.0e-3))
             # A step PETSc cannot take is reported through the retcode rather
             # than raised, which leaves argument errors still raising.
             effective_options = ["-ts_error_if_step_fails", "false"]
@@ -2101,16 +2106,15 @@ function Base.setproperty!(o::PETScIntegratorOpts, name::Symbol, v)
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib
     if name === :abstol || name === :reltol
-        novec = LibPETSc.PetscVec{typeof(pl)}()
-        LibPETSc.TSSetTolerances(
-            pl, h.ts, _tolscalar(getfield(o, :abstol), 1.0e-6), novec,
-            _tolscalar(getfield(o, :reltol), 1.0e-3), novec,
-        )
-    elseif name === :dtmin || name === :dtmax
-        lo, hi = getfield(o, :dtmin), getfield(o, :dtmax)
-        LibPETSc.TSAdaptSetStepLimits(
-            pl, LibPETSc.TSGetAdapt(pl, h.ts), lo, isfinite(hi) ? hi : 1.0e308,
-        )
+        _set_tolerances!(h, getfield(o, :abstol), getfield(o, :reltol))
+    elseif name === :dtmin
+        # The floor is kept here rather than by PETSc, whose own floor takes the step anyway.
+        h.ctx.dtmin = getfield(o, :dtmin)
+    elseif name === :dtmax
+        adapt = LibPETSc.TSGetAdapt(pl, h.ts)
+        lo, _ = LibPETSc.TSAdaptGetStepLimits(pl, adapt)
+        hi = getfield(o, :dtmax)
+        LibPETSc.TSAdaptSetStepLimits(pl, adapt, lo, isfinite(hi) ? hi : 1.0e308)
     end
     return v
 end
@@ -2268,15 +2272,39 @@ function SciMLBase.change_t_via_interpolation!(
     return nothing
 end
 
-function SciMLBase.savevalues!(integ::PETScIntegrator)
-    integ.finished && return false
-    _record!(integ.h.ctx, integ.tdir * integ.t, integ.u)
-    return true
+# Returns `(saved, savedexactly)`: whether any point was saved, and whether one was saved at
+# the current time. The current time is saved only when every step is, and not twice.
+function SciMLBase.savevalues!(integ::PETScIntegrator, force_save = false)
+    integ.finished && return (false, false)
+    ctx = integ.h.ctx
+    n = length(ctx.ts)
+    _save_step!(integ, integ.t, false)
+    s = integ.tdir * integ.t
+    if force_save || (ctx.save_everystep && !_last_recorded(ctx, s))
+        _record!(ctx, s, integ.u)
+    end
+    saved = length(ctx.ts) > n
+    return (saved, saved && ctx.ts[end] == s)
+end
+
+# SciMLBase's version steps again once the span is done, which a finished integrator refuses.
+function SciMLBase.step!(integ::PETScIntegrator, dt, stop_at_tdt = false)
+    integ.tdir * dt < 0 && throw(ArgumentError("cannot step backward in time"))
+    next_t = integ.t + dt
+    tf = _user_t(integ.tdir, integ.h.tf)
+    stop_at_tdt && integ.tdir * next_t < integ.tdir * tf && SciMLBase.add_tstop!(integ, next_t)
+    while !integ.finished && integ.tdir * integ.t < integ.tdir * next_t
+        SciMLBase.step!(integ)
+    end
+    return nothing
 end
 
 function _state_at(integ::PETScIntegrator, t::Float64)
-    t == integ.t && return integ.u
-    t == integ.tprev && return integ.uprev
+    # A rounding error from an end of the step is that end, so `integ(integ.t - integ.dt)`
+    # is the step's start.
+    tol = 100 * eps(max(one(Float64), abs(integ.t)))
+    abs(t - integ.t) <= tol && return integ.u
+    abs(t - integ.tprev) <= tol && return integ.uprev
     # Only the step just taken has both ends at hand.
     integ.tdir * integ.tprev <= integ.tdir * t <= integ.tdir * integ.t || throw(
         ArgumentError(
@@ -2482,7 +2510,7 @@ function _rollback!(integ::PETScIntegrator, t::Float64, dt::Float64, interpolate
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * t)
     LibPETSc.TSSetTimeStep(pl, h.ts, integ.tdir * dt)
     LibPETSc.TSRestartStep(pl, h.ts)
-    integ.dt = dt
+    integ.dt = integ.t - integ.tprev
     return nothing
 end
 
@@ -2634,8 +2662,19 @@ function _initial_solution(prob, alg, h::TSHandles)
     ts, dus = _user_time(h)
     return SciMLBase.build_solution(
         prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
-        dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus),
+        dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = SciMLBase.DEStats(0),
     )
+end
+
+# The counters a callback can read part way through the solve, as in OrdinaryDiffEq.
+function _live_stats!(integ::PETScIntegrator)
+    stats = integ.sol.stats
+    stats === nothing && return nothing
+    ctx, st = integ.h.ctx, _read_stats(integ.h)
+    stats.nf, stats.nf2, stats.njacs = ctx.nf, ctx.nf2, ctx.njacs
+    stats.nnonliniter, stats.nnonlinconvfail = st.nnonliniter, st.nnonlinfail
+    stats.naccept, stats.nreject = st.nsteps, st.nreject
+    return nothing
 end
 
 # A reinitialised integrator gets fresh PETSc objects built from the keywords
@@ -2749,7 +2788,13 @@ function SciMLBase.step!(integ::PETScIntegrator)
     )
     h = integ.h
     ctx, pl = h.ctx, h.petsclib
-    dtprev = integ.dt
+    # The cap is on steps taken, so a cap already reached takes none.
+    if Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
+        _finish!(integ)
+        return nothing
+    end
+    # PETSc's proposal for the next step; `integ.dt` is the step last taken.
+    dtprev = integ.tdir * Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
     copyto!(integ.uprev, integ.u)
     integ.tprev = integ.t
     # The last end's derivative starts this step only if nothing has moved that end since.
@@ -2767,9 +2812,8 @@ function SciMLBase.step!(integ::PETScIntegrator)
     LibPETSc.TSSetMaxTime(pl, h.ts, target)
     # TSAdaptChoose rejects a step that reaches past the max time, so the step
     # onto the target is shortened here rather than by PETSc.
-    if integ.tdir * integ.dt > target - integ.tdir * integ.t
+    if Float64(LibPETSc.TSGetTimeStep(pl, h.ts)) > target - integ.tdir * integ.t
         LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
-        integ.dt = integ.tdir * (target - integ.tdir * integ.t)
     end
     h.stopped = 0
     GC.@preserve ctx begin
@@ -2789,7 +2833,6 @@ function SciMLBase.step!(integ::PETScIntegrator)
     end
     h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped)
     integ.t = _user_t(integ.tdir, Float64(LibPETSc.TSGetTime(pl, h.ts)))
-    integ.dt = integ.tdir * Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
     # A step PETSc could not take, or raised part-way through, returns without advancing
     # the clock, which would otherwise spin a `while !done` loop forever.
     if integ.tdir * integ.t <= integ.tdir * integ.tprev
@@ -2797,7 +2840,7 @@ function SciMLBase.step!(integ::PETScIntegrator)
         return nothing
     end
     if stop === nothing
-        integ.dtcache = integ.dt
+        integ.dtcache = integ.tdir * Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
         # Steps summed onto the final time can fall a rounding error short of it.
         if integ.tdir * integ.t != h.tf && integ.tdir * integ.t >= h.tf - tol
             integ.t = _user_t(integ.tdir, h.tf)
@@ -2807,8 +2850,8 @@ function SciMLBase.step!(integ::PETScIntegrator)
         integ.t = _user_t(integ.tdir, stop)
         LibPETSc.TSSetTime(pl, h.ts, stop)
         LibPETSc.TSSetTimeStep(pl, h.ts, integ.tdir * integ.dtcache)
-        integ.dt = integ.dtcache
     end
+    integ.dt = integ.t - integ.tprev
     _readvec!(integ.u, pl, h.u)
     _end_step_here!(integ)
     fired = _apply_continuous_callbacks!(integ, dtprev)
@@ -2821,10 +2864,13 @@ function SciMLBase.step!(integ::PETScIntegrator)
     end
     integ.finished && return nothing
     # The step PETSc proposes next is smaller than the caller's floor.
-    ctx.dtmin > 0 && abs(integ.dt) < ctx.dtmin && (ctx.dt_too_small = true)
+    ctx.dtmin > 0 && Float64(LibPETSc.TSGetTimeStep(pl, h.ts)) < ctx.dtmin &&
+        (ctx.dt_too_small = true)
     if !all(isfinite, integ.u) || integ.tdir * integ.t >= h.tf - tol ||
             ctx.dt_too_small || Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
         _finish!(integ)
+    else
+        _live_stats!(integ)
     end
     return nothing
 end
