@@ -352,6 +352,30 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
     end
 
+    @testset "a threaded ensemble runs its solves one at a time" begin
+        # PETSc's options stack and MPI are shared by the process, so concurrent solves
+        # crashed it; the exit code of a process with four threads is the assertion.
+        script = """
+        using PETScDiffEq, SciMLBase
+        f!(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
+        prob = SciMLBase.ODEProblem(f!, [1.0], (0.0, 1.0), [1.0])
+        id(c) = c isa Integer ? c : c.sim_id
+        ens = SciMLBase.EnsembleProblem(
+            prob; prob_func = (p, c...) -> SciMLBase.remake(p; p = [1.0 + id(c[1]) / 10]),
+        )
+        never = SciMLBase.DiscreteCallback((u, t, i) -> false, i -> nothing)
+        for kw in ((;), (; callback = never))
+            sim = SciMLBase.solve(
+                ens, PETScDiffEq.TSRK("5dp"), SciMLBase.EnsembleThreads();
+                trajectories = 32, dt = 0.1, kw...,
+            )
+            all(s -> s.retcode == SciMLBase.ReturnCode.Success, sim.u) || exit(2)
+        end
+        """
+        cmd = `$(Base.julia_cmd()) -t 4 --project=$(Base.active_project()) -e $script`
+        @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
+    end
+
     @testset "running out of steps is MaxIters" begin
         sol = SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
