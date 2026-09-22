@@ -1289,6 +1289,18 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test stepped.sol.retcode == SciMLBase.ReturnCode.DtLessThanMin
             @test stepped.sol.t[end] < 1.0
 
+            # force_dtmin keeps the solve going at the floor, as in OrdinaryDiffEq.
+            forced = SciMLBase.solve(
+                quick, PETScDiffEq.TSRK("5dp"); kw..., force_dtmin = true,
+            )
+            @test forced.retcode == SciMLBase.ReturnCode.Success
+            @test forced.t[end] == 1.0
+            # The given dt starts the solve, and the floor holds every step after it.
+            @test minimum(diff(forced.t)[2:end]) > 0.9 * 0.1
+            @test_logs min_level = Logging.Warn SciMLBase.solve(
+                quick, PETScDiffEq.TSRK("5dp"); kw..., force_dtmin = true,
+            )
+
             # Without a floor the same solve runs to the end.
             free = SciMLBase.solve(
                 quick, PETScDiffEq.TSRK("5dp"); dt = 0.01, abstol = 1.0e-10, reltol = 1.0e-10,
