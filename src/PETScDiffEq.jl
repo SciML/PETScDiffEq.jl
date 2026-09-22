@@ -334,6 +334,7 @@ const _NEEDS_OTHER_SETUP = Dict(
     "eimex" => "needs its own right-hand-side split, and integrates to zero without one",
     "mimex" => "needs TSRHSSplit to declare its slow and fast parts",
     "mprk" => "needs TSRHSSplit to declare its slow and fast parts",
+    "pseudo" => "is pseudo-transient continuation toward a steady state and runs past the final time",
 )
 
 # Handed an implicit residual these integrate nothing. `euler`, `ssp` and `rk` say so
@@ -552,6 +553,10 @@ end
 
 # Exactly the same time: accepted steps near a singularity can be far closer than any
 # tolerance and are still points of the solution.
+# A rounding error at `t` itself. A stop just after the start of a long span is still ahead,
+# where a tolerance scaled to the final time would count it as passed.
+_near(t) = 100 * eps(max(one(Float64), abs(t)))
+
 _last_recorded(ctx, t) = !isempty(ctx.ts) && ctx.ts[end] == t
 
 _select(u, ::Nothing) = u
@@ -600,6 +605,9 @@ _no_interpolant(ctx) = ArgumentError(
 const PETSC_ERR_SUP = 56
 const PETSC_ERR_MAT_LU_ZRPVT = 71
 const PETSC_ERR_FP = 72
+# What a callback returns to PETSc when the user's code threw; the exception itself is what
+# reaches the caller.
+const CALLBACK_THREW = 1
 
 # A dense LU factorization raises on a zero pivot whatever PETSc was told about failed
 # steps, so a singular Newton matrix ends the solve with this error instead of a failed
@@ -657,13 +665,20 @@ function _option_flag(opts, name)
     return value
 end
 
-# A zero pivot is not printed, so PETSc does not open the next error's traceback as one
-# that followed it. Every other code goes on to `traceback`.
+# Whether a zero pivot or an overflow is being turned into a retcode, set on each push.
+# PETSc runs one task at a time, so one flag serves.
+const QUIET_FAILED_STEPS = Ref(true)
+
+# An exception the user's own code threw is not printed, since the exception reaches the
+# caller, and a zero pivot or overflow that becomes a retcode is not printed either. Nothing
+# printed also keeps PETSc from opening the next error's traceback as one that followed it.
+# Every other code goes on to `traceback`.
 function _zero_pivot_handler(
         comm::MPI.API.MPI_Comm, line::Cint, fun::Ptr{Cchar}, file::Ptr{Cchar},
         n::LibPETSc.PetscErrorCode, p::Cint, mess::Ptr{Cchar}, traceback::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
-    (n == PETSC_ERR_MAT_LU_ZRPVT || n == PETSC_ERR_FP) && return n
+    n == CALLBACK_THREW && return n
+    QUIET_FAILED_STEPS[] && (n == PETSC_ERR_MAT_LU_ZRPVT || n == PETSC_ERR_FP) && return n
     return ccall(
         traceback, LibPETSc.PetscErrorCode,
         (
@@ -677,10 +692,10 @@ end
 const ZERO_PIVOT_HANDLER_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 const ERROR_HANDLER_FNS = Ref((C_NULL, C_NULL, C_NULL))
 
-# Runs `f` with the handler above in front of PETSc's, except where a zero pivot keeps its
-# traceback. This wraps every step, so the symbols are looked up once.
-function _quiet_zero_pivot(f, h)
-    h.pivot_raises && return f()
+# Runs `f` with the handler above in front of PETSc's. This wraps every step, so the
+# symbols are looked up once.
+function _quiet_errors(f, h)
+    QUIET_FAILED_STEPS[] = !h.pivot_raises
     if ERROR_HANDLER_FNS[][1] == C_NULL
         lib = Libdl.dlopen(h.petsclib.petsc_library)
         ERROR_HANDLER_FNS[] = (
@@ -908,7 +923,7 @@ function _rhs_body!(ctx, t, x_ptr, f_ptr)
         ctx.nf += 1
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -935,7 +950,7 @@ function _split_rhs_body!(ctx, t, x_ptr, f_ptr)
         ctx.nf2 += 1
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -974,7 +989,7 @@ function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
         ctx.nf += 1
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -1006,7 +1021,7 @@ function _mprk_part!(ctx, t, x_ptr, f_ptr, idxs)
         end
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -1091,7 +1106,7 @@ function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         end
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -1133,7 +1148,7 @@ function _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         end
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -1207,7 +1222,7 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
         _stop_below_dtmin!(ctx, ts_ptr, step)
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -2082,7 +2097,7 @@ function _solve_unlocked(
     try
         GC.@preserve ctx begin
             try
-                _quiet_zero_pivot(h) do
+                _quiet_errors(h) do
                     LibPETSc.TSSolve(pl, h.ts, h.u)
                 end
             catch e
@@ -2574,7 +2589,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt::Float64)
     end
     best === nothing && return false
     ctx = integ.h.ctx
-    _save_step!(integ, best, false)
+    _save_step!(integ, best, false; slack = 0.0)
     _rollback!(integ, best, dt, true)
     # A repeat is judged against the condition at the root before the affect! runs. An
     # event found without root finding is at no root, and is judged against zero.
@@ -2815,13 +2830,18 @@ end
 SciMLBase.terminate!(integ::PETScIntegrator, retcode = SciMLBase.ReturnCode.Terminated) =
     _locked(() -> _terminate_unlocked(integ, retcode))
 
-function _save_step!(integ::PETScIntegrator, upto::Float64, endpoint::Bool)
+# `slack` lets a point a rounding error past `upto` count as reached. Before an event it is
+# 0, so a point just after the root waits for the state the event leaves.
+function _save_step!(
+        integ::PETScIntegrator, upto::Float64, endpoint::Bool;
+        slack = 100 * eps(max(one(Float64), abs(integ.h.tf))),
+    )
     h = integ.h
     ctx = h.ctx
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
     landed = false
     while ctx.saveat_idx <= length(ctx.saveat) &&
-            ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + tol
+            ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + slack
         want = ctx.saveat[ctx.saveat_idx]
         if abs(want - integ.tdir * integ.t) <= tol
             _record_end!(ctx, want, integ.u)
@@ -2859,7 +2879,7 @@ function _step_unlocked(integ::PETScIntegrator)
     ctx.fstart = unmoved && !ctx.pdirty ? ctx.fend : nothing
     ctx.pdirty = false
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
-    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + tol
+    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t)
         popfirst!(integ.tstops)
     end
     # PETSc lands on its max time exactly but keeps the shortened step
@@ -2875,7 +2895,7 @@ function _step_unlocked(integ::PETScIntegrator)
     h.stopped = 0
     GC.@preserve ctx begin
         try
-            _quiet_zero_pivot(h) do
+            _quiet_errors(h) do
                 LibPETSc.TSStep(pl, h.ts)
             end
         catch e
@@ -2916,7 +2936,7 @@ function _step_unlocked(integ::PETScIntegrator)
     fired || _save_step!(integ, integ.t, true)
     # Discrete callbacks run with the stop they landed on still at the head of the queue.
     _apply_callbacks!(integ)
-    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + tol
+    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t)
         popfirst!(integ.tstops)
     end
     integ.finished && return nothing

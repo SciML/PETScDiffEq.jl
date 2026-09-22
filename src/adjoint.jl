@@ -136,7 +136,7 @@ function _adjoint_rhsjacobian_body!(adj, s, x_ptr, A_ptr)
         PETSc.assemble!(A)
     catch e
         adj.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -178,7 +178,7 @@ function _adjoint_paramjac_body!(adj, s, x_ptr, A_ptr)
         PETSc.assemble!(LibPETSc.PetscMat(A_ptr, pl))
     catch e
         adj.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -224,7 +224,7 @@ function _adjoint_record_body!(adj, step, s, x_ptr)
         end
     catch e
         adj.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -264,7 +264,7 @@ function _adjoint_jump_body!(adj, step)
         _writevec!(pl, adj.lam, adj.work)
     catch e
         adj.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -619,7 +619,9 @@ function _discrete_adjoint_unlocked(
             _check_code(code, "TSAdjointMonitorSet")
 
             try
-                LibPETSc.TSSolve(pl, ts, h.u)
+                _quiet_errors(h) do
+                    LibPETSc.TSSolve(pl, ts, h.u)
+                end
             catch
                 ctx.err === nothing && adj.err === nothing && rethrow()
             end
@@ -666,7 +668,9 @@ function _discrete_adjoint_unlocked(
             )
             _check_code(code, "TSSetCostGradients")
             try
-                LibPETSc.TSAdjointSolve(pl, ts)
+                _quiet_errors(h) do
+                    LibPETSc.TSAdjointSolve(pl, ts)
+                end
             catch
                 ctx.err === nothing && adj.err === nothing && rethrow()
             end
