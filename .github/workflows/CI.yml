@@ -27,8 +27,10 @@ jobs:
         version: ['1.10', '1']
         os: [ubuntu-latest]
         arch: [x64]
+        # PETSc_jll 3.25 has no 32-bit builds, and Julia 1.10 cannot resolve 3.25, so the
+        # 32-bit lane runs where it gets 3.22.
         include:
-          - version: '1'
+          - version: '1.10'
             os: ubuntu-latest
             arch: x86
     steps:
