@@ -35,7 +35,7 @@ sol = SciMLBase.solve(prob, TSRK("5dp"); dt = 0.01, abstol = 1e-8, reltol = 1e-8
 
 `dt` sets the first step. An adaptive solve can leave it out, and the first step is then
 Hairer and Wanner's estimate as OrdinaryDiffEq uses it, taken with the `abstol` and `reltol`
-keywords (PETSc's default of 1e-4 for both when neither is given). DAE and mass-matrix
+keywords (SciML's defaults, `abstol = 1e-6` and `reltol = 1e-3`, when not given). DAE and mass-matrix
 problems start from a small step instead. A solve PETSc steps at a fixed size needs `dt`:
 `adaptive = false`, `-ts_adapt_type none`, the fixed-step families (`TSImplicit` and `TSDAE`
 other than `bdf`, `TSIRK`, `TSMPRK`), and subtypes registered without an embedded error
@@ -47,8 +47,20 @@ The options available in `solve` are documented
 [at the common solver options page](https://docs.sciml.ai/DiffEqDocs/stable/basics/common_solver_opts/).
 This package supports `dt`, `adaptive`, `dtmin`, `dtmax`, `reltol` and `abstol` (either
 may be a vector of per-component tolerances), `saveat`, `save_everystep`, `save_start`,
-`save_end`, `save_idxs`, `dense`, `callback` and `tstops`. Keywords it cannot honour emit
-a warning rather than being silently dropped.
+`save_end`, `save_on`, `save_idxs`, `dense`, `callback` and `tstops`. Keywords it cannot
+honour emit a warning rather than being silently dropped.
+
+Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
+only when it names them or `save_start` or `save_end` asks, and `save_everystep = true`
+saves every step alongside it. `dtmin` is a floor the solve keeps: once PETSc proposes a
+smaller step, the solve ends there with `ReturnCode.DtLessThanMin`.
+
+A solve that stops short of the final time says why in its retcode: `Unstable` when the
+state stops being finite or PETSc hits an overflow, `ConvergenceFailure` when a nonlinear
+solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are taken, and
+`Failure` for a zero pivot, with a warning, or another step PETSc cannot take. Where
+`petsc_options` asks PETSc to raise, with `-ksp_error_if_not_converged`,
+`-snes_error_if_not_converged` or `-ts_error_if_step_fails`, it raises instead.
 
 A state between step ends, for `saveat`, `integrator(t)` or a `ContinuousCallback`, comes
 from PETSc's own interpolant for `TSRK("5dp")`, `TSRosW("ra34pw2")`, `TSARKIMEX("4")` and
@@ -176,6 +188,12 @@ size.
 Every solve runs on `MPI.COMM_SELF`, so this package is serial. PETSc TS is built for
 large distributed problems, and reaching it from the SciML interface is what this package
 is for; use OrdinaryDiffEq.jl for serial problems where it applies.
+
+On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
+3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.
+
+Solves from several threads, such as an `EnsembleThreads` ensemble, are safe but run one
+at a time: PETSc's options and MPI are shared by the whole process.
 
 Finish or terminate every integrator you start. One dropped part way is released by a
 finalizer, and if that finalizer runs at process exit, after MPI has shut down, PETSc's
