@@ -605,6 +605,9 @@ _no_interpolant(ctx) = ArgumentError(
 const PETSC_ERR_SUP = 56
 const PETSC_ERR_MAT_LU_ZRPVT = 71
 const PETSC_ERR_FP = 72
+# What a callback returns to PETSc when the user's code threw; the exception itself is what
+# reaches the caller.
+const CALLBACK_THREW = 1
 
 # A dense LU factorization raises on a zero pivot whatever PETSc was told about failed
 # steps, so a singular Newton matrix ends the solve with this error instead of a failed
@@ -662,13 +665,20 @@ function _option_flag(opts, name)
     return value
 end
 
-# A zero pivot is not printed, so PETSc does not open the next error's traceback as one
-# that followed it. Every other code goes on to `traceback`.
+# Whether a zero pivot or an overflow is being turned into a retcode, set on each push.
+# PETSc runs one task at a time, so one flag serves.
+const QUIET_FAILED_STEPS = Ref(true)
+
+# An exception the user's own code threw is not printed, since the exception reaches the
+# caller, and a zero pivot or overflow that becomes a retcode is not printed either. Nothing
+# printed also keeps PETSc from opening the next error's traceback as one that followed it.
+# Every other code goes on to `traceback`.
 function _zero_pivot_handler(
         comm::MPI.API.MPI_Comm, line::Cint, fun::Ptr{Cchar}, file::Ptr{Cchar},
         n::LibPETSc.PetscErrorCode, p::Cint, mess::Ptr{Cchar}, traceback::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
-    (n == PETSC_ERR_MAT_LU_ZRPVT || n == PETSC_ERR_FP) && return n
+    n == CALLBACK_THREW && return n
+    QUIET_FAILED_STEPS[] && (n == PETSC_ERR_MAT_LU_ZRPVT || n == PETSC_ERR_FP) && return n
     return ccall(
         traceback, LibPETSc.PetscErrorCode,
         (
@@ -682,10 +692,10 @@ end
 const ZERO_PIVOT_HANDLER_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 const ERROR_HANDLER_FNS = Ref((C_NULL, C_NULL, C_NULL))
 
-# Runs `f` with the handler above in front of PETSc's, except where a zero pivot keeps its
-# traceback. This wraps every step, so the symbols are looked up once.
-function _quiet_zero_pivot(f, h)
-    h.pivot_raises && return f()
+# Runs `f` with the handler above in front of PETSc's. This wraps every step, so the
+# symbols are looked up once.
+function _quiet_errors(f, h)
+    QUIET_FAILED_STEPS[] = !h.pivot_raises
     if ERROR_HANDLER_FNS[][1] == C_NULL
         lib = Libdl.dlopen(h.petsclib.petsc_library)
         ERROR_HANDLER_FNS[] = (
@@ -913,7 +923,7 @@ function _rhs_body!(ctx, t, x_ptr, f_ptr)
         ctx.nf += 1
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -940,7 +950,7 @@ function _split_rhs_body!(ctx, t, x_ptr, f_ptr)
         ctx.nf2 += 1
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -979,7 +989,7 @@ function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
         ctx.nf += 1
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -1011,7 +1021,7 @@ function _mprk_part!(ctx, t, x_ptr, f_ptr, idxs)
         end
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -1096,7 +1106,7 @@ function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         end
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -1138,7 +1148,7 @@ function _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         end
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -1212,7 +1222,7 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
         _stop_below_dtmin!(ctx, ts_ptr, step)
     catch e
         ctx.err = e
-        return LibPETSc.PetscErrorCode(1)
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
 end
@@ -2087,7 +2097,7 @@ function _solve_unlocked(
     try
         GC.@preserve ctx begin
             try
-                _quiet_zero_pivot(h) do
+                _quiet_errors(h) do
                     LibPETSc.TSSolve(pl, h.ts, h.u)
                 end
             catch e
@@ -2885,7 +2895,7 @@ function _step_unlocked(integ::PETScIntegrator)
     h.stopped = 0
     GC.@preserve ctx begin
         try
-            _quiet_zero_pivot(h) do
+            _quiet_errors(h) do
                 LibPETSc.TSStep(pl, h.ts)
             end
         catch e

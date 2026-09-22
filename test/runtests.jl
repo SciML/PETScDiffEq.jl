@@ -398,6 +398,34 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test after.u[k][1] ≈ 10.5
     end
 
+    @testset "an exception from the user's code leaves no PETSc traceback" begin
+        throws!(du, u, p, t) = (t > 0.3 && error("boom"); du[1] = -u[1]; nothing)
+        bad = SciMLBase.ODEProblem(throws!, [1.0], (0.0, 1.0))
+        runs = (
+            () -> SciMLBase.solve(bad, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false),
+            () -> SciMLBase.solve(
+                bad, PETScDiffEq.TSRK("5dp", ["-ksp_error_if_not_converged"]);
+                dt = 0.1, adaptive = false,
+            ),
+            () -> SciMLBase.solve!(
+                SciMLBase.init(bad, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false),
+            ),
+        )
+        for run in runs, _ in 1:2
+            path, io = mktemp()
+            err = redirect_stderr(io) do
+                try
+                    run()
+                catch e
+                    e
+                end
+            end
+            close(io)
+            @test err isa ErrorException && err.msg == "boom"
+            @test !occursin("PETSC ERROR", read(path, String))
+        end
+    end
+
     @testset "running out of steps is MaxIters" begin
         sol = SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
