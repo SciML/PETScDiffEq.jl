@@ -1435,7 +1435,7 @@ function _check_state_type(u, name)
 end
 
 const UNSUPPORTED_KWARGS = (
-    :d_discontinuities, :isoutofdomain,
+    :isoutofdomain,
     :unstable_check, :internalnorm, :calck, :alias_u0, :sensealg,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
 )
@@ -2102,8 +2102,9 @@ end
 
 function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
-        callback = nothing, tstops = (), kwargs...,
+        callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
+    tstops = _with_discontinuities(tstops, d_discontinuities)
     # PETSc's MPRK step never shortens itself onto the final time, so it runs
     # through the integrator, which shortens the last step for it.
     if !_no_callback(callback) || !isempty(tstops) || alg isa TSMPRK
@@ -2672,8 +2673,9 @@ end
 
 function _init_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
-        callback = nothing, tstops = (), kwargs...,
+        callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
+    tstops = _with_discontinuities(tstops, d_discontinuities)
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = tstops, kwargs...)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
@@ -2698,6 +2700,10 @@ SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
 
 # The queue holds `tdir * t` for each stop, the final time included, in increasing order and
 # without repeats. step! drops each stop the integrator reaches, and terminate! empties it.
+# A time the solution is not smooth at is a time to step onto, as in OrdinaryDiffEq.
+_with_discontinuities(tstops, d_discontinuities) = isempty(d_discontinuities) ? tstops :
+    vcat(collect(Float64, tstops), collect(Float64, d_discontinuities))
+
 function _tstops(tstops, h::TSHandles)
     stops = sort!(unique!(h.tdir .* Vector{Float64}(collect(Float64, tstops))))
     filter!(s -> h.t0 < s < h.tf, stops)
