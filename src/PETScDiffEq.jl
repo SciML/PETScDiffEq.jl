@@ -1421,6 +1421,19 @@ _default_options(::TSIRK) = ["-pc_type", "pbjacobi"]
 _default_options(alg::TSMPRK) =
     ["-ts_mprk_type", alg.subtype, "-ts_use_splitrhsfunction", "true"]
 
+# PETSc ships single precision and complex builds, but this package drives the double one,
+# so a state it would have to convert is refused rather than converted out of sight. Whole
+# numbers are exact in Float64, as they are in OrdinaryDiffEq.
+function _check_state_type(u, name)
+    eltype(u) <: Union{Float64, Integer} && return nothing
+    throw(
+        ArgumentError(
+            "PETScDiffEq solves in Float64, and `$name` has eltype $(eltype(u)); convert " *
+                "the problem first, as in `remake(prob; u0 = Float64.(prob.u0))`",
+        ),
+    )
+end
+
 const UNSUPPORTED_KWARGS = (
     :d_discontinuities, :isoutofdomain,
     :unstable_check, :internalnorm, :calck, :force_dtmin, :alias_u0, :sensealg,
@@ -1610,6 +1623,8 @@ function _setup(
     end
     prob.u0 isa AbstractVector{<:Real} ||
         throw(ArgumentError("PETScDiffEq requires a real AbstractVector u0"))
+    _check_state_type(prob.u0, "u0")
+    prob isa SciMLBase.AbstractDAEProblem && _check_state_type(prob.du0, "du0")
     dt_given = dt !== nothing
     if !dt_given && !(adaptive && _adapts(alg) === true)
         throw(

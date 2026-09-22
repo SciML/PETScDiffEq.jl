@@ -426,6 +426,27 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "a state PETSc's double build cannot hold is refused" begin
+        thirty2 = SciMLBase.ODEProblem(decay!, Float32[1.0], (0.0, 1.0))
+        @test_throws "PETScDiffEq solves in Float64" SciMLBase.solve(
+            thirty2, PETScDiffEq.TSRK("5dp"); dt = 0.1,
+        )
+        @test_throws "PETScDiffEq solves in Float64" SciMLBase.init(
+            thirty2, PETScDiffEq.TSRK("5dp"); dt = 0.1,
+        )
+        residual!(r, du, u, p, t) = (r[1] = du[1] + u[1]; nothing)
+        @test_throws "`du0` has eltype Float32" SciMLBase.solve(
+            SciMLBase.DAEProblem(residual!, Float32[-1.0], [1.0], (0.0, 1.0)),
+            PETScDiffEq.TSDAE("beuler"); dt = 0.1,
+        )
+        # Whole numbers are exact in Float64, as in OrdinaryDiffEq.
+        whole = SciMLBase.solve(
+            SciMLBase.ODEProblem(decay!, [1], (0.0, 1.0)), PETScDiffEq.TSRK("5dp"); dt = 0.1,
+        )
+        @test whole.retcode == SciMLBase.ReturnCode.Success
+        @test abs(whole.u[end][1] - exp(-1)) < 1.0e-4
+    end
+
     @testset "running out of steps is MaxIters" begin
         sol = SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
