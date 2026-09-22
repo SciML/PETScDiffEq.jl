@@ -334,6 +334,7 @@ const _NEEDS_OTHER_SETUP = Dict(
     "eimex" => "needs its own right-hand-side split, and integrates to zero without one",
     "mimex" => "needs TSRHSSplit to declare its slow and fast parts",
     "mprk" => "needs TSRHSSplit to declare its slow and fast parts",
+    "pseudo" => "is pseudo-transient continuation toward a steady state and runs past the final time",
 )
 
 # Handed an implicit residual these integrate nothing. `euler`, `ssp` and `rk` say so
@@ -552,6 +553,10 @@ end
 
 # Exactly the same time: accepted steps near a singularity can be far closer than any
 # tolerance and are still points of the solution.
+# A rounding error at `t` itself. A stop just after the start of a long span is still ahead,
+# where a tolerance scaled to the final time would count it as passed.
+_near(t) = 100 * eps(max(one(Float64), abs(t)))
+
 _last_recorded(ctx, t) = !isempty(ctx.ts) && ctx.ts[end] == t
 
 _select(u, ::Nothing) = u
@@ -2574,7 +2579,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt::Float64)
     end
     best === nothing && return false
     ctx = integ.h.ctx
-    _save_step!(integ, best, false)
+    _save_step!(integ, best, false; slack = 0.0)
     _rollback!(integ, best, dt, true)
     # A repeat is judged against the condition at the root before the affect! runs. An
     # event found without root finding is at no root, and is judged against zero.
@@ -2815,13 +2820,18 @@ end
 SciMLBase.terminate!(integ::PETScIntegrator, retcode = SciMLBase.ReturnCode.Terminated) =
     _locked(() -> _terminate_unlocked(integ, retcode))
 
-function _save_step!(integ::PETScIntegrator, upto::Float64, endpoint::Bool)
+# `slack` lets a point a rounding error past `upto` count as reached. Before an event it is
+# 0, so a point just after the root waits for the state the event leaves.
+function _save_step!(
+        integ::PETScIntegrator, upto::Float64, endpoint::Bool;
+        slack = 100 * eps(max(one(Float64), abs(integ.h.tf))),
+    )
     h = integ.h
     ctx = h.ctx
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
     landed = false
     while ctx.saveat_idx <= length(ctx.saveat) &&
-            ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + tol
+            ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + slack
         want = ctx.saveat[ctx.saveat_idx]
         if abs(want - integ.tdir * integ.t) <= tol
             _record_end!(ctx, want, integ.u)
@@ -2859,7 +2869,7 @@ function _step_unlocked(integ::PETScIntegrator)
     ctx.fstart = unmoved && !ctx.pdirty ? ctx.fend : nothing
     ctx.pdirty = false
     tol = 100 * eps(max(one(Float64), abs(h.tf)))
-    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + tol
+    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t)
         popfirst!(integ.tstops)
     end
     # PETSc lands on its max time exactly but keeps the shortened step
@@ -2916,7 +2926,7 @@ function _step_unlocked(integ::PETScIntegrator)
     fired || _save_step!(integ, integ.t, true)
     # Discrete callbacks run with the stop they landed on still at the head of the queue.
     _apply_callbacks!(integ)
-    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + tol
+    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t)
         popfirst!(integ.tstops)
     end
     integ.finished && return nothing

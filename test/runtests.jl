@@ -376,6 +376,28 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
     end
 
+    @testset "stops and saved points near an event or the start" begin
+        # A stop just after the start of a long span is still ahead of the solve.
+        decay_long = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0e6))
+        hits = Float64[]
+        early = SciMLBase.solve(
+            decay_long, PETScDiffEq.TSRK("5dp"); dt = 1.0e-10,
+            callback = DiffEqCallbacks.PresetTimeCallback([1.0e-9], integ -> push!(hits, integ.t)),
+        )
+        @test hits == [1.0e-9]
+        @test 1.0e-9 in early.t
+
+        # A saved point a hair after an event root takes the state the event leaves.
+        ramp = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 1.0; nothing), [0.0], (0.0, 1.0))
+        jump = SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.5, integ -> (integ.u[1] += 10.0))
+        after = SciMLBase.solve(
+            ramp, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = jump, saveat = [0.5 + 1.0e-14, 0.6],
+        )
+        @test issorted(after.t)
+        k = findfirst(==(0.5 + 1.0e-14), after.t)
+        @test after.u[k][1] ≈ 10.5
+    end
+
     @testset "running out of steps is MaxIters" begin
         sol = SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
@@ -820,7 +842,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         # Given only a residual, PETSc reaches its solve with half a problem:
         # alpha2, discgrad and mimex abort the process, eimex integrates to zero
         # and reports success.
-        for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk")
+        for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk", "pseudo")
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t; explicit = true)
         end
@@ -840,7 +862,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     @testset "the same types are refused when an option selects them" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         solve_at(alg; kw...) = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, kw...)
-        for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk"), alg in (
+        for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk", "pseudo"), alg in (
                     PETScDiffEq.TSImplicit("beuler", ["-ts_type", t]),
                     PETScDiffEq.TSRK("4", ["-ts_type=$t"]),
                     PETScDiffEq.TSGeneric("glee", ["-TS_TYPE", t]; explicit = true),
