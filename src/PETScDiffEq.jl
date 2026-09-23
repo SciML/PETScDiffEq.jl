@@ -1436,7 +1436,7 @@ end
 
 const UNSUPPORTED_KWARGS = (
     :d_discontinuities, :isoutofdomain,
-    :unstable_check, :internalnorm, :calck, :force_dtmin, :alias_u0, :sensealg,
+    :unstable_check, :internalnorm, :calck, :alias_u0, :sensealg,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
 )
 
@@ -1605,6 +1605,7 @@ function _setup(
         adaptive = true,
         dtmin = nothing,
         dtmax = nothing,
+        force_dtmin = false,
         saveat = Float64[],
         save_everystep = nothing,
         save_start = nothing,
@@ -1881,7 +1882,7 @@ function _setup(
         NaN, similar(u0), t0, copy(u0), nothing, nothing, false,
         slow_idxs, medium_idxs, fast_idxs,
         NaN, similar(u0), false,
-        dtmin === nothing ? 0.0 : abs(Float64(dtmin)), false,
+        force_dtmin || dtmin === nothing ? 0.0 : abs(Float64(dtmin)), false,
         0, 0, 0, nothing,
     )
     h = TSHandles(
@@ -1957,6 +1958,10 @@ function _setup(
             effective_options = ["-ts_error_if_step_fails", "false"]
             append!(effective_options, _default_options(alg))
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
+            # Told to keep going below the floor, the floor is PETSc's to clamp with,
+            # since it takes the clamped step whatever its error.
+            force_dtmin && dtmin !== nothing && dtmin != 0 &&
+                append!(effective_options, ["-ts_adapt_dt_min", string(abs(Float64(dtmin)))])
             (dtmax === nothing || isinf(dtmax)) ||
                 append!(effective_options, ["-ts_adapt_dt_max", string(abs(Float64(dtmax)))])
             append!(effective_options, alg.petsc_options)
