@@ -633,7 +633,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         events = map((false, true)) do reject
             hits = Float64[]
             undone = Ref(false)
-            setp = SciMLBase.DiscreteCallback(
+            change_p = SciMLBase.DiscreteCallback(
                 (u, t, integ) -> t == 0.5, integ -> (integ.p[1] = 20.0; nothing),
             )
             cross = SciMLBase.ContinuousCallback(
@@ -643,7 +643,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.solve(
                 SciMLBase.ODEProblem(rate!, [1.0], (0.0, 1.0), [0.0]), PETScDiffEq.TSRK("3bs");
                 dt = 0.1, abstol = 1.0e-8, reltol = 1.0e-8, tstops = [0.5],
-                callback = SciMLBase.CallbackSet(setp, cross), isoutofdomain = first_after,
+                callback = SciMLBase.CallbackSet(change_p, cross), isoutofdomain = first_after,
             )
             (hits, undone[])
         end
