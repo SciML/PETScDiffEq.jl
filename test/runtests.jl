@@ -497,26 +497,64 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
     end
 
-    @testset "unstable_check ends the solve where it fires" begin
+    @testset "unstable_check sees what OrdinaryDiffEq's does" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        grow = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = u[1]; nothing), [1.0], (1.0, 0.0),
+        )
         alg = PETScDiffEq.TSRK("5dp")
         below(cut) = (dt, u, p, t) -> any(<(cut), u)
-        sol = SciMLBase.solve(prob, alg; dt = 0.1, unstable_check = below(0.7))
-        @test sol.retcode == SciMLBase.ReturnCode.Unstable
-        @test 0.0 < sol.t[end] < 1.0
-        @test sol.u[end][1] < 0.7
-        # The step it is given is the one just taken.
-        seen = Float64[]
-        SciMLBase.solve(
-            prob, alg; dt = 0.1, adaptive = false,
-            unstable_check = (dt, u, p, t) -> (push!(seen, dt); false),
+        on_solve(pr; kw...) = SciMLBase.solve(pr, alg; kw...)
+        on_integ(pr; kw...) = SciMLBase.solve!(SciMLBase.init(pr, alg; kw...))
+        for run in (on_solve, on_integ)
+            sol = run(prob; dt = 0.1, unstable_check = below(0.7))
+            @test sol.retcode == SciMLBase.ReturnCode.Unstable
+            @test 0.0 < sol.t[end] < 1.0
+            @test sol.u[end][1] < 0.7
+            # It is given the time just reached and the step about to be taken, and is not
+            # asked about the final state.
+            seen = Tuple{Float64, Float64}[]
+            full = run(
+                prob; dt = 0.01, abstol = 1.0e-8, reltol = 1.0e-8,
+                unstable_check = (dt, u, p, t) -> (push!(seen, (dt, t)); false),
+            )
+            @test full.stats.nreject == 0
+            @test last.(seen) == full.t[2:(end - 1)]
+            @test first.(seen)[1:(end - 1)] ≈ diff(full.t)[2:(end - 1)]
+            @test !(first.(seen) ≈ diff(full.t)[1:(end - 1)])
+            @test run(prob; dt = 0.1, unstable_check = (dt, u, p, t) -> t >= 1.0).retcode ==
+                SciMLBase.ReturnCode.Success
+            # In the caller's time on a reversed span, so a check on t stops where Tsit5 does.
+            empty!(seen)
+            back = run(
+                grow; dt = 0.1, adaptive = false,
+                unstable_check = (dt, u, p, t) -> (push!(seen, (dt, t)); t < 0.45),
+            )
+            @test back.retcode == SciMLBase.ReturnCode.Unstable
+            @test back.t[end] ≈ 0.4
+            @test last.(seen) ≈ back.t[2:end]
+            @test all(<(0), first.(seen))
+            # An exception from the check is the caller's.
+            @test_throws "check threw" run(
+                prob; dt = 0.1, unstable_check = (dt, u, p, t) -> t > 0.5 && error("check threw"),
+            )
+        end
+        # Callbacks run first, so the check sees the state an event leaves, and a terminate!
+        # on the same step wins.
+        halve = SciMLBase.ContinuousCallback(
+            (u, t, integ) -> u[1] - 0.8, integ -> (integ.u[1] /= 2),
         )
-        @test all(≈(0.1), seen)
-        # The integrator path stops in the same place.
-        integ = SciMLBase.init(prob, alg; dt = 0.1, unstable_check = below(0.7))
-        stepped = SciMLBase.solve!(integ)
-        @test stepped.retcode == SciMLBase.ReturnCode.Unstable
-        @test stepped.t[end] ≈ sol.t[end]
+        after = SciMLBase.solve(
+            prob, alg; dt = 0.1, adaptive = false, callback = halve, unstable_check = below(0.5),
+        )
+        @test after.retcode == SciMLBase.ReturnCode.Unstable
+        @test after.t[end] ≈ log(1 / 0.8)
+        @test after.u[end][1] ≈ 0.4
+        ends = SciMLBase.DiscreteCallback((u, t, integ) -> t > 0.42, SciMLBase.terminate!)
+        @test SciMLBase.solve(
+            prob, alg; dt = 0.1, adaptive = false, callback = ends,
+            unstable_check = (dt, u, p, t) -> t > 0.42,
+        ).retcode == SciMLBase.ReturnCode.Terminated
         # A check that never fires leaves the solve alone, and neither warns.
         quiet = @test_logs min_level = Logging.Warn SciMLBase.solve(
             prob, alg; dt = 0.1, unstable_check = below(-1.0),
@@ -1368,6 +1406,32 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test stepped.sol.t[end] < 1.0
             # Both paths stop on the step whose successor would fall below the floor.
             @test stepped.sol.t[end] == floored.t[end]
+
+            # A step shortened to land on the final time or a stop does not count, and a
+            # fixed-step solve has no floor, as in OrdinaryDiffEq.
+            line = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 1.0; nothing), [0.0], (0.0, 1.0))
+            for kw in ((; dt = 0.95), (; dt = 0.45, tstops = [0.5]))
+                landed = SciMLBase.solve(line, PETScDiffEq.TSRK("5dp"); kw..., dtmin = 0.1)
+                @test landed.retcode == SciMLBase.ReturnCode.Success
+                @test landed.t[end] == 1.0
+                integ = SciMLBase.init(line, PETScDiffEq.TSRK("5dp"); kw..., dtmin = 0.1)
+                @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
+            end
+            fixed = SciMLBase.solve(
+                quick, PETScDiffEq.TSRK("5dp"); dt = 0.3, adaptive = false, dtmin = 0.25,
+            )
+            @test fixed.retcode == SciMLBase.ReturnCode.Success
+            @test fixed.t[end] == 1.0
+
+            # A nonlinear failure is still ConvergenceFailure with a floor set.
+            breaks = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = t > 0.7 ? NaN : -1.0; nothing), [1.0], (0.0, 1.0),
+            )
+            bdf = PETScDiffEq.TSImplicit("bdf", ["-ts_max_snes_failures", "2"])
+            @test SciMLBase.solve(breaks, bdf; dt = 0.1, dtmin = 0.1).retcode ==
+                SciMLBase.ReturnCode.ConvergenceFailure
+            @test SciMLBase.solve!(SciMLBase.init(breaks, bdf; dt = 0.1, dtmin = 0.1)).retcode ==
+                SciMLBase.ReturnCode.ConvergenceFailure
 
             # force_dtmin keeps the solve going at the floor, as in OrdinaryDiffEq.
             forced = SciMLBase.solve(
@@ -5214,6 +5278,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     (
                         "PETScAdjoint does not support `tstops`",
                         () -> grad(prob, TSRK("4"); tstops = [0.5]),
+                    ),
+                    (
+                        "the forward solve's `unstable_check` fired at t = 0.5",
+                        () -> grad(prob, TSRK("4"); unstable_check = (dt, u, p, t) -> t >= 0.5),
                     ),
                     (
                         "PETScAdjoint does not support `tstops`",
