@@ -6215,10 +6215,16 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     "a trajectory of states only", TSRK("4"), (0.0, 1.0), forward_t,
                     (sensealg = ["-ts_trajectory_solution_only", "1"],),
                 ),
+                # PETSc's 32-bit build fails its trajectory's file writes and reads now and then,
+                # in different ways from run to run.
                 (
-                    "a trajectory on disk", TSRK("4"), (0.0, 1.0), forward_t,
-                    (sensealg = ["-ts_trajectory_type", "basic"],),
-                ),
+                    Sys.WORD_SIZE == 64 ? (
+                            (
+                                "a trajectory on disk", TSRK("4"), (0.0, 1.0), forward_t,
+                                (sensealg = ["-ts_trajectory_type", "basic"],),
+                            ),
+                        ) : ()
+                )...,
                 (
                     "a sparse jac_prototype, RK4 backward in time", TSRK("4"), (1.0, 0.0),
                     backward_t, (sparse_jac = true,),
