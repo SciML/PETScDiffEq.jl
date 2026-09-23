@@ -977,6 +977,56 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
         end
 
+        @testset "a sparse backend's pattern, and a prototype that leaves an entry out" begin
+            # The real map has two rows for each of the state's, so a pattern the backend was
+            # given is stacked on itself as a prototype's is, and matches dense AD exactly.
+            pattern = sparse(Matrix(H) .!= 0) * 1.0
+            known = PETScDiffEq.ADTypes.AutoSparse(
+                PETScDiffEq.AutoForwardDiff();
+                sparsity_detector = PETScDiffEq.ADTypes.KnownJacobianSparsityDetector(pattern),
+                coloring_algorithm = PETScDiffEq.SparseMatrixColorings.GreedyColoringAlgorithm(),
+            )
+            cn(ad = PETScDiffEq.AutoForwardDiff()) = PETScDiffEq.TSImplicit("cn", lu; autodiff = ad)
+            schr = SciMLBase.ODEProblem(schr!, u0, (0.0, 1.0))
+            @test SciMLBase.solve(schr, cn(known); dt = 0.05).u ==
+                SciMLBase.solve(schr, cn(); dt = 0.05).u
+            residual!(r, du, u, p, t) = (mul!(r, H, u); r .= du .+ im .* r; nothing)
+            dae = SciMLBase.DAEProblem(residual!, -im .* (H * u0), u0, (0.0, 1.0))
+            bdf(ad = PETScDiffEq.AutoForwardDiff()) =
+                PETScDiffEq.TSDAE("bdf", [none; lu]; autodiff = ad)
+            @test SciMLBase.solve(dae, bdf(known); dt = 0.01).u ==
+                SciMLBase.solve(dae, bdf(); dt = 0.01).u
+            # A holomorphic f whose prototype leaves out the subdiagonal is not refused: the
+            # missing entries cost Newton iterations, as they do for a real state. Measured
+            # 3.0e-9 from dense AD for the real state and 2.2e-9 for the complex one.
+            chainc!(du, u, p, t) = (
+                for i in 1:n
+                    du[i] = -2u[i] + (i > 1 ? u[i - 1] : 0) + (i < n ? u[i + 1] : 0) + p * u[i]^2
+                end; nothing
+            )
+            upper = sparse(Bidiagonal(ones(n), ones(n - 1), :U))
+            for v0 in ([0.5 + 0.2 * k / n for k in 1:n], [0.5 + 0.2im * k / n for k in 1:n])
+                full = SciMLBase.solve(
+                    SciMLBase.ODEProblem(chainc!, v0, (0.0, 1.0), 0.3),
+                    PETScDiffEq.TSImplicit("bdf", none); dt = 0.01,
+                )
+                partial = SciMLBase.solve(
+                    SciMLBase.ODEProblem(
+                        SciMLBase.ODEFunction(chainc!; jac_prototype = upper), v0, (0.0, 1.0), 0.3,
+                    ),
+                    PETScDiffEq.TSImplicit("bdf", none); dt = 0.01,
+                )
+                @test partial.retcode == SciMLBase.ReturnCode.Success
+                @test maximum(abs, partial.u[end] - full.u[end]) < 1.0e-7
+            end
+            # The check still refuses a function that is not holomorphic, with either prototype.
+            conj!(du, u, p, t) = (du .= -im .* conj.(u); nothing)
+            @test_throws "not holomorphic" SciMLBase.solve(
+                SciMLBase.ODEProblem(SciMLBase.ODEFunction(conj!; jac_prototype = upper), u0, (0.0, 1.0)),
+                PETScDiffEq.TSImplicit("cn"); dt = 0.1,
+            )
+        end
+
         @testset "a DAE, a mass matrix and a reversed span" begin
             residual!(r, du, u, p, t) = (mul!(r, H, u); r .= du .+ im .* r; nothing)
             residual_jac!(J, du, u, p, gamma, t) = (J .= gamma .* I(n) .+ im .* H; nothing)

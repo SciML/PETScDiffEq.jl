@@ -161,10 +161,11 @@ to return a real number, such as `real(u[1]) - 0.5`, since a root is a sign chan
 implicit methods' Newton iteration needs a holomorphic `f`, one that does not go through
 `conj`, `abs`, `real` or `imag` of the state. ForwardDiff takes no complex numbers, so
 without a `jac` the Jacobian is differentiated along the real parts of the state, which for
-a holomorphic `f` is its complex Jacobian, and a sparse `jac_prototype` is coloured as for a
-real state. A check at the start compares that derivative with the one along the imaginary
-parts and refuses an `f` that is not holomorphic; it is best effort, and can miss a term too
-small to show near the initial state. `AutoFiniteDiff()` and a hand-written `jac` are not
+a holomorphic `f` is its complex Jacobian, and a sparse `jac_prototype`, or the pattern a
+sparse backend is given, is coloured as for a real state. A check at the start compares the
+derivatives along the real and the imaginary parts and refuses an `f` that is not
+holomorphic; it is best effort, and can miss a term too small to show near the initial
+state. `AutoFiniteDiff()` and a hand-written `jac` are not
 checked. The explicit methods take any `f`.
 
 ## Adjoint sensitivities

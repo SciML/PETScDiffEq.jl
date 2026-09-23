@@ -160,6 +160,21 @@ function _stacked_pattern(R, proto)
     return vcat(P, P)
 end
 
+# The backend for the real map, whose Jacobian has two rows for each of the state's. A
+# pattern for the state, from the prototype or from a backend that knows one, is stacked
+# on itself. Any other detector would have to find the real map's pattern itself, so its
+# backend is used dense.
+function _complex_backend(R, backend, jac_prototype)
+    jac_prototype isa SparseArrays.AbstractSparseMatrix &&
+        return _with_pattern(backend, _stacked_pattern(R, jac_prototype))
+    backend isa ADTypes.AutoSparse || return backend
+    detector = ADTypes.sparsity_detector(backend)
+    detector isa ADTypes.KnownJacobianSparsityDetector || return ADTypes.dense_ad(backend)
+    return _with_pattern(
+        backend, _stacked_pattern(R, SparseArrays.sparse(detector.jacobian_sparsity)),
+    )
+end
+
 # The real Jacobian of a sparse prototype is stored column by column as the prototype's
 # rows and then the same rows shifted by n, so each column of `J` reads two runs of it.
 function _assemble_complex!(J::SparseMatrixCSC, Jr::SparseMatrixCSC)
@@ -220,22 +235,18 @@ function _ad_jacobian(
         backend, f!, jac_prototype, u0::AbstractVector{<:Complex}, p, t, calls, advice,
     )
     R, n = real(eltype(u0)), length(u0)
-    pattern = jac_prototype isa SparseArrays.AbstractSparseMatrix ?
-        _stacked_pattern(R, jac_prototype) : nothing
-    b = _with_pattern(backend, pattern)
+    b = _complex_backend(R, backend, jac_prototype)
     g! = Counted(f!, calls)
     x, y = real.(u0), imag.(u0)
-    Jr = jac_prototype isa SparseMatrixCSC ? copy(pattern) : zeros(R, 2n, n)
+    Jr = jac_prototype isa SparseMatrixCSC ? _stacked_pattern(R, jac_prototype) :
+        zeros(R, 2n, n)
     out = zeros(R, 2n)
     prep = DI.prepare_jacobian(
         _complex_rhs!, out, b, copy(x), DI.Constant(g!), DI.Constant(y), DI.Constant(p),
         DI.Constant(t),
     )
-    j = ADComplexJacobian(g!, b, prep, x, y, out, Jr, similar(u0), advice)
-    v = _off(u0)
-    _real_jacobian!(j, v, p, t)
-    _check_holomorphic(z -> (dz = similar(z); g!(dz, z, p, t); dz), j.Jr, v, b, advice)
-    return j
+    _check_holomorphic(z -> (dz = similar(z); g!(dz, z, p, t); dz), _off(u0), b, advice)
+    return ADComplexJacobian(g!, b, prep, x, y, out, Jr, similar(u0), advice)
 end
 
 struct ADComplexDAEJacobian{G, B, P, R, JR, S}
@@ -280,25 +291,22 @@ function _ad_dae_jacobian(
         backend, g!, jac_prototype, u0::AbstractVector{<:Complex}, p, t, calls, advice,
     )
     R, n = real(eltype(u0)), length(u0)
-    pattern = jac_prototype isa SparseArrays.AbstractSparseMatrix ?
-        _stacked_pattern(R, jac_prototype) : nothing
-    b = _with_pattern(backend, pattern)
+    b = _complex_backend(R, backend, jac_prototype)
     h! = Counted(g!, calls)
     x, y = real.(u0), imag.(u0)
-    Jr = jac_prototype isa SparseMatrixCSC ? copy(pattern) : zeros(R, 2n, n)
+    Jr = jac_prototype isa SparseMatrixCSC ? _stacked_pattern(R, jac_prototype) :
+        zeros(R, 2n, n)
     out = zeros(R, 2n)
     prep = DI.prepare_jacobian(
         _complex_residual!, out, b, copy(x), DI.Constant(h!), DI.Constant(y),
         DI.Constant(zero(u0)), DI.Constant(copy(u0)), DI.Constant(one(t)), DI.Constant(p),
         DI.Constant(t),
     )
-    j = ADComplexDAEJacobian(h!, b, prep, x, y, out, Jr, similar(u0), advice)
     # With no derivative given and a unit shift, the residual's Jacobian in its state is
     # the derivative of `z -> G(z - v, z)` at `z = v`.
     v = _off(u0)
-    _real_jacobian!(j, zero(v), v, p, one(t), t)
-    _check_holomorphic(z -> (r = similar(z); h!(r, z .- v, z, p, t); r), j.Jr, v, b, advice)
-    return j
+    _check_holomorphic(z -> (r = similar(z); h!(r, z .- v, z, p, t); r), v, b, advice)
+    return ADComplexDAEJacobian(h!, b, prep, x, y, out, Jr, similar(u0), advice)
 end
 
 # A point near `u0` and a direction from it that no simple symmetry of the problem lines up
@@ -309,20 +317,22 @@ _off(u0) = (R = real(eltype(u0)); u0 .+ complex(R(0.01), R(0.02)) .* (1 .+ abs.(
 
 # PETSc's complex Newton iteration needs a holomorphic function, whose derivative along the
 # imaginary part is `i` times the one along the real part that the Jacobian is built from.
-# One such pair is compared at a point near the start. A function that is not finite there
-# is not judged.
-function _check_holomorphic(h, Jr, v, backend, advice)
+# One such pair is compared at a point near the start, each taken dense, since a prototype
+# that leaves out an entry the function has changes a coloured Jacobian but not whether the
+# function is holomorphic. A function that is not finite there is not judged.
+function _check_holomorphic(h, v, backend, advice)
     n = length(v)
     n == 0 && return nothing
     R = real(eltype(v))
     w = _direction(R, n)
-    a = Jr * w
-    along_real = complex.(a[1:n], a[(n + 1):(2n)])
-    b = DI.derivative(ADTypes.dense_ad(backend), zero(R)) do e
-        z = h(complex.(real.(v), imag.(v) .+ e .* w))
-        return vcat(real.(z), imag.(z))
+    function along(d)
+        g = DI.derivative(ADTypes.dense_ad(backend), zero(R)) do e
+            z = h(v .+ e .* d)
+            return vcat(real.(z), imag.(z))
+        end
+        return complex.(g[1:n], g[(n + 1):(2n)])
     end
-    along_imag = complex.(b[1:n], b[(n + 1):(2n)])
+    along_real, along_imag = along(w), along(im .* w)
     gap = LinearAlgebra.norm(along_imag .- im .* along_real)
     scale = LinearAlgebra.norm(along_real) + LinearAlgebra.norm(along_imag)
     (isfinite(gap) && isfinite(scale)) || return nothing
