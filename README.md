@@ -136,8 +136,10 @@ accepted but buy nothing past its rounding.
 
 With SciMLSensitivity loaded, `adjoint_sensitivities(sol, alg; sensealg = PETScAdjoint(), ...)`
 runs PETSc's own discrete adjoint for `TSRK`, `TSImplicit("beuler")` and `TSImplicit("cn")`.
-The keywords that set the steps have to be repeated from `solve`. `?PETScAdjoint` and the
-documentation cover what it needs, what it refuses and how to check `jac` and `paramjac`.
+The keywords that set the steps have to be repeated from `solve`. It runs in PETSc's double
+real build, so a `Float32` problem is differentiated in `Float64` and its gradients come
+back as `Float32`, and a complex one is refused. `?PETScAdjoint` and the documentation cover
+what it needs, what it refuses and how to check `jac` and `paramjac`.
 
 ## Limitations
 

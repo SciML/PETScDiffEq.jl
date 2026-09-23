@@ -155,6 +155,10 @@ It works with `TSRK` of any subtype, `TSImplicit("beuler")` and `TSImplicit("cn"
 has no adjoint for `TSRosW`, `TSIRK`, `TSMPRK` or BDF, and `TSARKIMEX` and the general
 theta method are refused as well.
 
+It runs in PETSc's double real build. A `Float32` problem is differentiated there in
+`Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and the
+gradients come back as `Float32` where `u0` and `p` are. A complex state is refused.
+
 The gradient is that of the solution PETSc computes at these steps. It agrees with finite
 differences of the same fixed-step `solve`, and it differs from a continuous adjoint such as
 `GaussAdjoint` by the discretization error, which shrinks at the method's order. Because

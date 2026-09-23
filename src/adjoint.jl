@@ -34,6 +34,10 @@ which therefore has to be a vector of real numbers. A hand-written `jac` or `par
 goes into the gradient unchecked, so a wrong one gives a wrong gradient without an error;
 compare it against a gradient computed without it.
 
+The adjoint runs in PETSc's double real build. A `Float32` problem is solved there in
+`Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
+`du0` and `dp` come back as `Float32` where `u0` and `p` are. A complex state is refused.
+
 Costs are discrete: at each `t[i]`, `dgdu_discrete(out, u, p, t, i)` writes the cost's
 derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`, if given, its
 direct derivative with respect to `p`; `no_start = true` leaves out `t[1]`. PETSc's
@@ -414,6 +418,12 @@ function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_disc
             "PETScAdjoint supports an ODEProblem, not a DAEProblem or SplitODEProblem",
         ),
     )
+    eltype(prob.u0) <: Real || throw(
+        ArgumentError(
+            "PETScAdjoint supports a real state only; it runs in PETSc's double real " *
+                "build, which cannot hold a $(eltype(prob.u0)) one",
+        ),
+    )
     why = _adjoint_unsupported(alg)
     why === nothing || throw(ArgumentError(why))
     any(
@@ -560,7 +570,7 @@ function _discrete_adjoint_unlocked(
         prob, alg; solve_kwargs...,
         saveat = Float64[], save_everystep = false, save_start = true, save_end = true,
         dense = false, extra_options = vcat(_ADJOINT_TRAJECTORY, sensealg.petsc_options),
-        jac_advice = _ADJOINT_JAC_ADVICE,
+        jac_advice = _ADJOINT_JAC_ADVICE, eltypes = (Float64, Float64, Float64),
     )
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
     n = length(h.u0)
@@ -732,8 +742,11 @@ function _discrete_adjoint_unlocked(
             dp .+= gp
         end
     end
-    return du0, has_p ? dp' : nothing
+    return _like(prob.u0, du0), has_p ? _like(p, dp)' : nothing
 end
+
+# A gradient comes back in the precision of what it is the gradient of.
+_like(x, g) = eltype(x) === Float32 ? Float32.(g) : g
 
 _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...) =
     _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; kwargs...))

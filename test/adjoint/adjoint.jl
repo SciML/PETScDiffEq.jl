@@ -46,6 +46,19 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
         )
         @test via == direct
         @test via[2] isa LinearAlgebra.Adjoint
+        # A Float32 solution is differentiated in Float64 and its gradients come back Float32.
+        single = remake(prob; u0 = Float32.(U0), tspan = (0.0f0, 1.0f0), p = Float32.(P0))
+        sol32 = solve(single, TSRK("4"); dt = 0.01f0, adaptive = false)
+        via32 = adjoint_sensitivities(
+            sol32, TSRK("4"); sensealg = PETScAdjoint(),
+            t = TS, dgdu_discrete = dg!, dt = 0.01, adaptive = false,
+        )
+        @test via32 == PETScDiffEq._discrete_adjoint(
+            single, TSRK("4"), PETScAdjoint();
+            t = TS, dgdu_discrete = dg!, dt = 0.01, adaptive = false,
+        )
+        @test via32[1] isa Vector{Float32}
+        @test eltype(via32[2]) === Float32
     end
 
     @testset "agrees with GaussAdjoint, closer at the method's order" begin

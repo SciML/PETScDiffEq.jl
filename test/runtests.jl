@@ -5978,6 +5978,24 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test live() <= before
         end
 
+        @testset "a Float32 problem is differentiated in the double build" begin
+            # Its values are exact in Float64, so its gradients are the Float64 problem's
+            # rounded once to Float32, and a Float64 part keeps its own precision.
+            plain(u, p, tspan) = SciMLBase.ODEProblem(adj_f!, u, tspan, p)
+            u32, p32 = Float32.(u0), Float32.(p0)
+            for make in (adj_prob, plain), alg in (TSRK("4"), TSImplicit("cn", exact))
+                single = grad(make(u32, p32, (0.0f0, 1.0f0)), alg)
+                double = grad(make(Float64.(u32), Float64.(p32), (0.0, 1.0)), alg)
+                @test single[1] isa Vector{Float32}
+                @test eltype(single[2]) === Float32
+                @test single[1] == Float32.(double[1])
+                @test single[2] == Float32.(double[2])
+                mixed = grad(make(u32, Float64.(p32), (0.0, 1.0)), alg)
+                @test mixed[1] isa Vector{Float32}
+                @test mixed[2] == double[2]
+            end
+        end
+
         @testset "what it refuses, and why" begin
             prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
             never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
@@ -6077,6 +6095,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                             ),
                             TSARKIMEX(),
                         ),
+                    ),
+                    (
+                        "PETScAdjoint supports a real state only",
+                        () -> grad(adj_prob(ComplexF64.(u0), copy(p0), (0.0, 1.0)), TSRK("4")),
                     ),
                     (
                         "PETScAdjoint does not support a mass matrix",

@@ -1767,6 +1767,7 @@ function _setup(
         tstops = (),
         extra_options = String[],
         jac_advice = nothing,
+        eltypes = _eltypes(prob),
         kwargs...,
     )
     for key in UNSUPPORTED_KWARGS
@@ -1812,7 +1813,7 @@ function _setup(
         throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
     end
 
-    R, S, U = _eltypes(prob)
+    R, S, U = eltypes
     t0, tf = R(prob.tspan[1]), R(prob.tspan[2])
     t0 == tf && throw(ArgumentError("PETScDiffEq requires tspan[1] != tspan[2]"))
     # Everything handed to PETSc from here on is in its forward-running time s = tdir * t.
