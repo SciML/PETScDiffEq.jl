@@ -1750,10 +1750,17 @@ end
 
 const SupportedProblem = Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}
 
+# On 32-bit x86, PETSc_jll's single-precision builds end BDF and ARKIMEX solves in
+# ConvergenceFailure at stops that its double build and RosW take, so they are left out there
+# and a single-precision state runs in the double build.
+const _SINGLE_BUILDS = Sys.ARCH !== :i686
+
 # The scalar types of the PETSc builds PETSc.jl has loaded with the index width this package
 # uses. PETSc_jll brings all four; a library set with `PETSc.set_library!` is the only one.
 _loaded_builds() = Type[
-    PETSc.scalartype(pl) for pl in PETSc.petsclibs if PETSc.inttype(pl) === LibPETSc.PetscInt
+    PETSc.scalartype(pl) for pl in PETSc.petsclibs if
+        PETSc.inttype(pl) === LibPETSc.PetscInt &&
+        (_SINGLE_BUILDS || real(PETSc.scalartype(pl)) !== Float32)
 ]
 
 # The PETSc build's real and scalar types and the eltype the saved states come back in.

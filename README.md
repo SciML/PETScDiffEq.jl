@@ -132,7 +132,10 @@ rather than `dt = 0.01`, and it makes a whole-number span `Float64`. Any other r
 whole numbers included, is solved in `Float64` and comes back in it. Where PETSc.jl has not
 loaded the single-precision build, as with a library set with `PETSc.set_library!`, a
 single-precision state runs in the double-precision one, and a problem whose build is not
-loaded at all is refused with an `ArgumentError` that names it.
+loaded at all is refused with an `ArgumentError` that names it. On 32-bit x86 a
+single-precision state always runs in the double-precision build: there PETSc_jll's
+single-precision builds end BDF and ARKIMEX solves in failure at stops that its
+double-precision build takes.
 
 Times are in the type of the clock PETSc steps on: `Float32` for a single-precision state
 with a `Float32` span and `Float64` otherwise. That covers `sol.t` and the integrator's `t`

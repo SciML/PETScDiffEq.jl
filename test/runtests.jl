@@ -515,18 +515,22 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     @testset "Float32" begin
         build(integ) = PETScDiffEq.PETSc.scalartype(integ.h.petsclib)
         none = ["-ts_adapt_type", "none"]
+        # On 32-bit x86 PETSc's single build is left out, and a Float32 state with a Float32
+        # span runs on the double build's clock instead.
+        single_build = Float32 in PETScDiffEq._loaded_builds()
+        clock32 = single_build ? Float32 : Float64
 
         @testset "the span picks the PETSc build, and the solution keeps the problem's types" begin
-            # A Float32 state runs in PETSc's single build with a Float32 span and in the double
-            # one with a Float64 span, where only its saved states stay Float32. Any other state
-            # runs in Float64, and the times are in the clock's type whatever the span's. `f`
-            # sees exactly the build's types, which the wrapper SciMLBase made for the problem
-            # depends on.
+            # A Float32 state runs in PETSc's single build with a Float32 span, where that build
+            # is used, and in the double one with a Float64 span, where only its saved states
+            # stay Float32. Any other state runs in Float64, and the times are in the clock's
+            # type whatever the span's. `f` sees exactly the build's types, which the wrapper
+            # SciMLBase made for the problem depends on.
             seen = Set{Any}()
             typed!(du, u, p, t) = (push!(seen, (typeof(u), typeof(t))); du .= -u; nothing)
             typed(u, p, t) = (push!(seen, (typeof(u), typeof(t))); -u)
             cases = (
-                (Float32[1], (0.0f0, 1.0f0), Float32, Float32),
+                (Float32[1], (0.0f0, 1.0f0), clock32, Float32),
                 (Float32[1], (0.0, 1.0), Float64, Float32),
                 ([1.0], (0.0f0, 1.0f0), Float64, Float64),
                 ([1.0], (0.0, 1.0), Float64, Float64),
@@ -686,7 +690,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             start!(du, u, p, t) = (du[1] = t > 0 ? -1.0f0 : 1.0f0; nothing)
             begins = SciMLBase.ODEProblem(start!, Float32[0], (0.0f0, 1.0f0))
             integ = SciMLBase.init(begins, alg; dt = 0.1f0, d_discontinuities = [0.0f0])
-            @test integ.t === nextfloat(0.0f0)
+            @test integ.t === nextfloat(zero(clock32))
             # The limits reach PETSc's options as numbers its single build can read.
             slow = SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0))
             forced = SciMLBase.solve(
@@ -710,7 +714,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 b = SciMLBase.solve(back, alg; dt = 0.1f0, kw...)
                 f = SciMLBase.solve(fwd, alg; dt = 0.1f0, kw...)
                 @test b.retcode == SciMLBase.ReturnCode.Success
-                @test b.t[end] === 0.0f0
+                @test b.t[end] === zero(clock32)
                 @test b.t == -f.t
                 @test b.u == f.u
             end
@@ -816,7 +820,14 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             # single build, and a solve that starts there returns the state it was given.
             tiny = SciMLBase.ODEProblem(decay!, Float32[1.0f-22], (0.0f0, 1.0f0))
             beuler = PETScDiffEq.TSImplicit("beuler")
-            @test_logs (:warn, r"norms underflow") SciMLBase.solve(tiny, beuler; dt = 0.01f0)
+            if single_build
+                @test_logs (:warn, r"norms underflow") SciMLBase.solve(tiny, beuler; dt = 0.01f0)
+            else
+                # The double build's norms do not underflow there, and the state decays by
+                # backward Euler's 0.99^100.
+                sol = @test_logs min_level = Logging.Warn SciMLBase.solve(tiny, beuler; dt = 0.01f0)
+                @test sol.u[end][1] ≈ 1.0f-22 / 1.01f0^100 rtol = 1.0e-5
+            end
             # A state that decays there from above is within any tolerance coarser than that.
             @test_logs min_level = Logging.Warn SciMLBase.solve(
                 SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f5)),
@@ -883,13 +894,15 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         none = ["-ts_adapt_type", "none"]
         build(integ) = PETScDiffEq.PETSc.scalartype(integ.h.petsclib)
         order(errs, dts) = [log(errs[i] / errs[i + 1]) / log(dts[i] / dts[i + 1]) for i in 1:2]
+        # On 32-bit x86 PETSc's single complex build is left out, as the real one is.
+        clock32 = ComplexF32 in PETScDiffEq._loaded_builds() ? Float32 : Float64
 
         @testset "the state picks a complex build and keeps its type" begin
             seen = Set{Any}()
             typed!(du, u, p, t) = (push!(seen, (typeof(u), typeof(t))); schr!(du, u, p, t))
             cases = (
                 (u0, (0.0, 1.0), ComplexF64, ComplexF64),
-                (ComplexF32.(u0), (0.0f0, 1.0f0), ComplexF32, ComplexF32),
+                (ComplexF32.(u0), (0.0f0, 1.0f0), Complex{clock32}, ComplexF32),
                 (ComplexF32.(u0), (0.0, 1.0), ComplexF64, ComplexF32),
             )
             for (v0, tspan, S, U) in cases
@@ -901,7 +914,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test integ.u isa Vector{S} && integ.t isa R
                 sol = SciMLBase.solve!(integ)
                 @test sol.retcode == SciMLBase.ReturnCode.Success
-                @test eltype(sol.u[end]) === U && eltype(sol.t) === T
+                @test eltype(sol.u[end]) === U && eltype(sol.t) === R
                 @test seen == Set([(Vector{S}, R)])
             end
         end
