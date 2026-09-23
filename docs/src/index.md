@@ -101,15 +101,28 @@ and `terminate!`.
 
 ## Number types
 
-A `Float64` state runs in PETSc's double-precision build. A `Float32` state runs in its
+A `Float64` state runs in PETSc's double-precision build and a `ComplexF64` state in its
+double-precision complex build. A `Float32` or `ComplexF32` state runs in the matching
 single-precision build when the span is `Float32` as well, following OrdinaryDiffEq's advice
-to give a `Float32` problem a `Float32` span, and in the double build when the span is
-`Float64`, with the saved states given back as `Float32`. DiffEqBase promotes the span to
-the type of `dt`, so a single-precision solve takes `dt = 0.01f0` rather than `dt = 0.01`.
-Any other real state, whole numbers included, is solved in `Float64` and comes back in it.
-The saved times keep the span's type. The integrator's `u`, `t` and `dt` are in the types
-PETSc steps in. Tolerances finer than single precision can resolve, about `1e-7`, are
-accepted but buy nothing past its rounding.
+to give a single-precision problem a `Float32` span, and in the double-precision build when
+the span is `Float64`, with the saved states given back in single precision. DiffEqBase
+promotes the span to the type of `dt`, so a single-precision solve takes `dt = 0.01f0`
+rather than `dt = 0.01`. Any other real state, whole numbers included, is solved in
+`Float64` and comes back in it. The saved times keep the span's type. The integrator's `u`,
+`t` and `dt` are in the types PETSc steps in. Tolerances finer than single precision can
+resolve, about `1e-7`, are accepted but buy nothing past its rounding.
+
+With a complex state, times, `dt`, `saveat`, `tstops` and the tolerances stay real, and
+PETSc's error norms take each component's modulus. A `ContinuousCallback`'s condition has
+to return a real number, such as `real(u[1]) - 0.5`, since a root is a sign change. The
+implicit methods' Newton iteration needs a holomorphic `f`, one that does not go through
+`conj`, `abs`, `real` or `imag` of the state. ForwardDiff takes no complex numbers, so
+without a `jac` the Jacobian is differentiated along the real parts of the state, which for
+a holomorphic `f` is its complex Jacobian, and a sparse `jac_prototype` is coloured as for a
+real state. A check at the start compares that derivative with the one along the imaginary
+parts and refuses an `f` that is not holomorphic; it is best effort, and can miss a term too
+small to show near the initial state. `AutoFiniteDiff()` and a hand-written `jac` are not
+checked. The explicit methods take any `f`.
 
 ## Adjoint sensitivities
 

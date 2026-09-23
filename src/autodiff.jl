@@ -126,6 +126,218 @@ function _ad_dae_jacobian(backend, g!, jac_prototype, u0, p, t, calls, advice)
     return ADDAEJacobian(h!, b, prep, r, w, advice)
 end
 
+# ForwardDiff takes no complex input, so for a complex state the function is differentiated
+# as a real map: from the state's real part, its imaginary part held fixed, to the real and
+# imaginary parts of its value. For a holomorphic function that derivative, `[A; C]`, is
+# the complex Jacobian `A + iC`, and a sparse prototype's pattern stacked on itself is the
+# pattern to colour.
+function _split_parts!(out, z)
+    n = length(z)
+    @views out[1:n] .= real.(z)
+    @views out[(n + 1):(2n)] .= imag.(z)
+    return nothing
+end
+
+function _complex_rhs!(out, x, f!, y, p, t)
+    u = complex.(x, y)
+    du = similar(u)
+    f!(du, u, p, t)
+    _split_parts!(out, du)
+    return nothing
+end
+
+function _complex_residual!(out, x, g!, y, du, u, gamma, p, t)
+    v = complex.(x, y)
+    r = similar(v)
+    g!(r, @.(du + gamma * (v - u)), v, p, t)
+    _split_parts!(out, r)
+    return nothing
+end
+
+function _stacked_pattern(R, proto)
+    P = _structure(R, SparseMatrixCSC(proto))
+    fill!(P.nzval, one(R))
+    return vcat(P, P)
+end
+
+# The real Jacobian of a sparse prototype is stored column by column as the prototype's
+# rows and then the same rows shifted by n, so each column of `J` reads two runs of it.
+function _assemble_complex!(J::SparseMatrixCSC, Jr::SparseMatrixCSC)
+    for j in axes(J, 2)
+        r, k = nzrange(J, j), first(nzrange(Jr, j))
+        m = length(r)
+        for (i, q) in enumerate(r)
+            J.nzval[q] = complex(Jr.nzval[k + i - 1], Jr.nzval[k + m + i - 1])
+        end
+    end
+    return nothing
+end
+
+function _assemble_complex!(J, Jr)
+    n = size(J, 1)
+    @views J .= complex.(Jr[1:n, :], Jr[(n + 1):(2n), :])
+    return nothing
+end
+
+struct ADComplexJacobian{F, B, P, R, JR, S}
+    f!::F
+    backend::B
+    prep::P
+    x::Vector{R}
+    y::Vector{R}
+    out::Vector{R}
+    Jr::JR
+    du::Vector{S}
+    advice::String
+end
+
+function _real_jacobian!(j::ADComplexJacobian, u, p, t)
+    j.x .= real.(u)
+    j.y .= imag.(u)
+    try
+        DI.jacobian!(
+            _complex_rhs!, j.out, j.Jr, j.prep, j.backend, j.x, DI.Constant(j.f!),
+            DI.Constant(j.y), DI.Constant(p), DI.Constant(t),
+        )
+    catch e
+        _dual_failure(e) && throw(_dual_error(e, j.backend, j.advice))
+        rethrow()
+    end
+    return nothing
+end
+
+function (j::ADComplexJacobian)(J, u, p, t)
+    _real_jacobian!(j, u, p, t)
+    _assemble_complex!(J, j.Jr)
+    _check_finite(J, t, j.advice) do
+        j.f!(j.du, u, p, t)
+        return j.du
+    end
+    return nothing
+end
+
+function _ad_jacobian(
+        backend, f!, jac_prototype, u0::AbstractVector{<:Complex}, p, t, calls, advice,
+    )
+    R, n = real(eltype(u0)), length(u0)
+    pattern = jac_prototype isa SparseArrays.AbstractSparseMatrix ?
+        _stacked_pattern(R, jac_prototype) : nothing
+    b = _with_pattern(backend, pattern)
+    g! = Counted(f!, calls)
+    x, y = real.(u0), imag.(u0)
+    Jr = jac_prototype isa SparseMatrixCSC ? copy(pattern) : zeros(R, 2n, n)
+    out = zeros(R, 2n)
+    prep = DI.prepare_jacobian(
+        _complex_rhs!, out, b, copy(x), DI.Constant(g!), DI.Constant(y), DI.Constant(p),
+        DI.Constant(t),
+    )
+    j = ADComplexJacobian(g!, b, prep, x, y, out, Jr, similar(u0), advice)
+    v = _off(u0)
+    _real_jacobian!(j, v, p, t)
+    _check_holomorphic(z -> (dz = similar(z); g!(dz, z, p, t); dz), j.Jr, v, b, advice)
+    return j
+end
+
+struct ADComplexDAEJacobian{G, B, P, R, JR, S}
+    g!::G
+    backend::B
+    prep::P
+    x::Vector{R}
+    y::Vector{R}
+    out::Vector{R}
+    Jr::JR
+    r::Vector{S}
+    advice::String
+end
+
+function _real_jacobian!(j::ADComplexDAEJacobian, du, u, p, gamma, t)
+    j.x .= real.(u)
+    j.y .= imag.(u)
+    try
+        DI.jacobian!(
+            _complex_residual!, j.out, j.Jr, j.prep, j.backend, j.x, DI.Constant(j.g!),
+            DI.Constant(j.y), DI.Constant(du), DI.Constant(u), DI.Constant(gamma),
+            DI.Constant(p), DI.Constant(t),
+        )
+    catch e
+        _dual_failure(e) && throw(_dual_error(e, j.backend, j.advice))
+        rethrow()
+    end
+    return nothing
+end
+
+function (j::ADComplexDAEJacobian)(J, du, u, p, gamma, t)
+    _real_jacobian!(j, du, u, p, gamma, t)
+    _assemble_complex!(J, j.Jr)
+    _check_finite(J, t, j.advice) do
+        j.g!(j.r, du, u, p, t)
+        return j.r
+    end
+    return nothing
+end
+
+function _ad_dae_jacobian(
+        backend, g!, jac_prototype, u0::AbstractVector{<:Complex}, p, t, calls, advice,
+    )
+    R, n = real(eltype(u0)), length(u0)
+    pattern = jac_prototype isa SparseArrays.AbstractSparseMatrix ?
+        _stacked_pattern(R, jac_prototype) : nothing
+    b = _with_pattern(backend, pattern)
+    h! = Counted(g!, calls)
+    x, y = real.(u0), imag.(u0)
+    Jr = jac_prototype isa SparseMatrixCSC ? copy(pattern) : zeros(R, 2n, n)
+    out = zeros(R, 2n)
+    prep = DI.prepare_jacobian(
+        _complex_residual!, out, b, copy(x), DI.Constant(h!), DI.Constant(y),
+        DI.Constant(zero(u0)), DI.Constant(copy(u0)), DI.Constant(one(t)), DI.Constant(p),
+        DI.Constant(t),
+    )
+    j = ADComplexDAEJacobian(h!, b, prep, x, y, out, Jr, similar(u0), advice)
+    # With no derivative given and a unit shift, the residual's Jacobian in its state is
+    # the derivative of `z -> G(z - v, z)` at `z = v`.
+    v = _off(u0)
+    _real_jacobian!(j, zero(v), v, p, one(t), t)
+    _check_holomorphic(z -> (r = similar(z); h!(r, z .- v, z, p, t); r), j.Jr, v, b, advice)
+    return j
+end
+
+# A point near `u0` and a direction from it that no simple symmetry of the problem lines up
+# with, so that a state such as zero, where a non-holomorphic term's derivative can vanish,
+# does not hide it.
+_direction(R, n) = [one(R) + R(k) / n for k in 1:n]
+_off(u0) = (R = real(eltype(u0)); u0 .+ complex(R(0.01), R(0.02)) .* (1 .+ abs.(u0)) .* _direction(R, length(u0)))
+
+# PETSc's complex Newton iteration needs a holomorphic function, whose derivative along the
+# imaginary part is `i` times the one along the real part that the Jacobian is built from.
+# One such pair is compared at a point near the start. A function that is not finite there
+# is not judged.
+function _check_holomorphic(h, Jr, v, backend, advice)
+    n = length(v)
+    n == 0 && return nothing
+    R = real(eltype(v))
+    w = _direction(R, n)
+    a = Jr * w
+    along_real = complex.(a[1:n], a[(n + 1):(2n)])
+    b = DI.derivative(ADTypes.dense_ad(backend), zero(R)) do e
+        z = h(complex.(real.(v), imag.(v) .+ e .* w))
+        return vcat(real.(z), imag.(z))
+    end
+    along_imag = complex.(b[1:n], b[(n + 1):(2n)])
+    gap = LinearAlgebra.norm(along_imag .- im .* along_real)
+    scale = LinearAlgebra.norm(along_real) + LinearAlgebra.norm(along_imag)
+    (isfinite(gap) && isfinite(scale)) || return nothing
+    gap <= sqrt(eps(R)) * scale && return nothing
+    throw(
+        ArgumentError(
+            "the problem's function is not holomorphic in the complex state: its " *
+                "derivative along the imaginary part is not `im` times its derivative along " *
+                "the real part, as happens with `conj`, `abs`, `real` or `imag`, so it has " *
+                "no complex Jacobian for PETSc's Newton iteration. Write the state as a real " *
+                "vector of its real and imaginary parts, or use an explicit method",
+        ),
+    )
+end
+
 # The adjoint's parameter Jacobian, `df/dp`, in the form a user's `paramjac` takes.
 struct ADParamJacobian{F, B, P}
     f!::F
@@ -170,8 +382,10 @@ end
 
 # A function written for Float64 alone fails on the first dual number it is handed, as an
 # argument it has no method for, a type assertion, or a conversion.
-_has_dual(x) = x isa ForwardDiff.Dual || (x isa Type && x <: ForwardDiff.Dual) ||
-    (x isa AbstractArray && eltype(x) <: ForwardDiff.Dual)
+_has_dual(x) = _is_dual(x) || (x isa Type && _is_dual_type(x)) ||
+    (x isa AbstractArray && _is_dual_type(eltype(x)))
+_is_dual(x) = x isa Union{ForwardDiff.Dual, Complex{<:ForwardDiff.Dual}}
+_is_dual_type(T) = T <: Union{ForwardDiff.Dual, Complex{<:ForwardDiff.Dual}}
 
 function _dual_failure(e)
     e isa MethodError && any(_has_dual, e.args) && return true

@@ -380,37 +380,38 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8)
         SciMLBase.solve!(SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
         @test isempty(PETScDiffEq.POST_STEP_CTX)
-        # Solves in the single and double builds interleave, each through its own build's
-        # post-step hook, split functions and error handler, and each gives what it gives
-        # alone. A zero pivot is a retcode in either build, with nothing printed.
-        span(F) = (zero(F), one(F))
+        # Solves in all four builds interleave, each through its own build's post-step hook,
+        # split functions and error handler, and each gives what it gives alone. A zero pivot
+        # is a retcode in every build, with nothing printed.
+        span(S) = (zero(real(S)), one(real(S)))
         never = (dt, u, p, t) -> false
         runs = (
-            F -> SciMLBase.solve(
-                SciMLBase.ODEProblem(decay!, F[1, 2], span(F)), PETScDiffEq.TSRK("5dp");
-                dtmin = F(1.0e-6), unstable_check = never,
+            S -> SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, S[1, 2], span(S)), PETScDiffEq.TSRK("5dp");
+                dtmin = real(S)(1.0e-6), unstable_check = never,
             ),
-            F -> SciMLBase.solve(
-                SciMLBase.ODEProblem(decay!, F[1, 2], span(F)), PETScDiffEq.TSMPRK([1], "p2");
-                dt = F(0.01),
+            S -> SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, S[1, 2], span(S)), PETScDiffEq.TSMPRK([1], "p2");
+                dt = real(S)(0.01),
             ),
-            F -> SciMLBase.solve(
-                SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 8 * u[1]; nothing), F[1], span(F)),
-                PETScDiffEq.TSImplicit("beuler"); dt = F(0.125), adaptive = false,
+            S -> SciMLBase.solve(
+                SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 8 * u[1]; nothing), S[1], span(S)),
+                PETScDiffEq.TSImplicit("beuler"); dt = real(S)(0.125), adaptive = false,
             ),
         )
+        scalars = (Float32, Float64, ComplexF32, ComplexF64)
         quietly(f) = Logging.with_logger(f, Logging.NullLogger())
-        alone = Dict(F => quietly(() -> [run(F) for run in runs]) for F in (Float32, Float64))
-        for _ in 1:2, (k, run) in enumerate(runs), F in (Float32, Float64)
+        alone = Dict(S => quietly(() -> [run(S) for run in runs]) for S in scalars)
+        for _ in 1:2, (k, run) in enumerate(runs), S in scalars
             path, io = mktemp()
-            sol = redirect_stderr(() -> quietly(() -> run(F)), io)
+            sol = redirect_stderr(() -> quietly(() -> run(S)), io)
             close(io)
             @test !occursin("PETSC ERROR", read(path, String))
-            @test sol.retcode == alone[F][k].retcode
-            @test eltype(sol.u[end]) === F
-            @test sol.u == alone[F][k].u
+            @test sol.retcode == alone[S][k].retcode
+            @test eltype(sol.u[end]) === S
+            @test sol.u == alone[S][k].u
         end
-        @test last(alone[Float32]).retcode == SciMLBase.ReturnCode.Failure
+        @test all(S -> last(alone[S]).retcode == SciMLBase.ReturnCode.Failure, scalars)
         # Builds initialized after this package's first solve are torn down before its
         # cleanup of the double build runs, and each build's integrators are freed before
         # its own teardown; the exit code is the assertion.
@@ -420,15 +421,16 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         f!(du, u, p, t) = (du[1] = -u[1]; nothing)
         prob = SciMLBase.ODEProblem(f!, [1.0], (0.0, 1.0))
         single = SciMLBase.ODEProblem(f!, Float32[1], (0.0f0, 1.0f0))
+        complex = SciMLBase.ODEProblem(f!, ComplexF64[1], (0.0, 1.0))
         ok(sol) = sol.retcode == SciMLBase.ReturnCode.Success || exit(2)
         ok(SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
-        for S in (ComplexF64, ComplexF32)
-            PETSc.initialize(PETSc.getlib(; PetscScalar = S))
-        end
+        PETSc.initialize(PETSc.getlib(; PetscScalar = ComplexF32))
         ok(SciMLBase.solve(single, PETScDiffEq.TSRK("5dp"); dtmin = 1.0f-6))
+        ok(SciMLBase.solve(complex, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
         ok(SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
         SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
         SciMLBase.init(single, PETScDiffEq.TSRK("5dp"); dt = 0.1f0)
+        SciMLBase.init(complex, PETScDiffEq.TSRK("5dp"); dt = 0.1)
         """
         cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $script`
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
@@ -721,6 +723,248 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test length(single.t) == length(double.t)
                 @test maximum(abs, single.u[end] .- double.u[end]) < 1.0e-5
             end
+        end
+    end
+
+    @testset "complex states" begin
+        # The Schrodinger equation u' = -iHu for a real, symmetric, tridiagonal H, whose
+        # solution exp(-iHt) u0 keeps its norm.
+        n = 8
+        H = SymTridiagonal(collect(range(0.5, 2.0; length = n)), fill(-1.0, n - 1))
+        schr!(du, u, p, t) = (mul!(du, H, u); du .*= -im; nothing)
+        # Entry by entry, since broadcasting into a sparse buffer can change its structure.
+        function schr_jac!(J, u, p, t)
+            for i in 1:n
+                J[i, i] = -im * H[i, i]
+                i < n && (J[i, i + 1] = J[i + 1, i] = -im * H[i, i + 1])
+            end
+            return nothing
+        end
+        u0 = ComplexF64[exp(-(k - 4.5)^2 / 2) * cis(0.3k) for k in 1:n]
+        exact(t) = exp(-im * Matrix(H) * t) * u0
+        lu = ["-ksp_type", "preonly", "-pc_type", "lu"]
+        none = ["-ts_adapt_type", "none"]
+        build(integ) = PETScDiffEq.PETSc.scalartype(integ.h.petsclib)
+        order(errs, dts) = [log(errs[i] / errs[i + 1]) / log(dts[i] / dts[i + 1]) for i in 1:2]
+
+        @testset "the state picks a complex build and keeps its type" begin
+            seen = Set{Any}()
+            typed!(du, u, p, t) = (push!(seen, (typeof(u), typeof(t))); schr!(du, u, p, t))
+            cases = (
+                (u0, (0.0, 1.0), ComplexF64, ComplexF64),
+                (ComplexF32.(u0), (0.0f0, 1.0f0), ComplexF32, ComplexF32),
+                (ComplexF32.(u0), (0.0, 1.0), ComplexF64, ComplexF32),
+            )
+            for (v0, tspan, S, U) in cases
+                T, R = eltype(tspan), real(S)
+                prob = SciMLBase.ODEProblem(typed!, v0, tspan)
+                empty!(seen)
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("4"); dt = T(0.05))
+                @test build(integ) === S
+                @test integ.u isa Vector{S} && integ.t isa R
+                sol = SciMLBase.solve!(integ)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test eltype(sol.u[end]) === U && eltype(sol.t) === T
+                @test seen == Set([(Vector{S}, R)])
+            end
+        end
+
+        @testset "RK4 converges at order 4" begin
+            prob = SciMLBase.ODEProblem(schr!, u0, (0.0, 2.0))
+            dts = [2.0 / k for k in (10, 20, 40)]
+            errs = [
+                maximum(abs, SciMLBase.solve(prob, PETScDiffEq.TSRK("4"); dt).u[end] - exact(2.0))
+                    for dt in dts
+            ]
+            # Measured 3.97 and 3.99.
+            @test all(o -> isapprox(o, 4; atol = 0.1), order(errs, dts))
+        end
+
+        @testset "Crank-Nicolson keeps the norm and converges at order 2" begin
+            prob = SciMLBase.ODEProblem(schr!, u0, (0.0, 2.0))
+            dts = [2.0 / k for k in (20, 40, 80)]
+            sols = [SciMLBase.solve(prob, PETScDiffEq.TSImplicit("cn", lu); dt) for dt in dts]
+            # Every step is unitary, so the norm drifts only by rounding, measured at 2 ulps;
+            # backward Euler loses 2 percent over the same span.
+            for sol in sols
+                @test maximum(u -> abs(norm(u) - norm(u0)), sol.u) < 1.0e-13
+            end
+            @test all(o -> isapprox(o, 2; atol = 0.1), order([maximum(abs, s.u[end] - exact(2.0)) for s in sols], dts))
+            damped = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("beuler", lu); dt = dts[1])
+            @test norm(u0) - norm(damped.u[end]) > 1.0e-2
+        end
+
+        @testset "every source of the Jacobian gives the same solve" begin
+            # A holomorphic f's Jacobian from AD, coloured AD, PETSc's differences or a
+            # hand-written jac. The AD ones match the hand-written one to rounding, measured
+            # below 1e-16, and PETSc's differences to 2e-10.
+            pattern = sparse(Matrix(H) .!= 0) * 1.0
+            fd = PETScDiffEq.AutoFiniteDiff()
+            solve_with(f, alg) = SciMLBase.solve(SciMLBase.ODEProblem(f, u0, (0.0, 1.0)), alg; dt = 0.05)
+            ref = solve_with(SciMLBase.ODEFunction(schr!; jac = schr_jac!), PETScDiffEq.TSImplicit("cn", lu))
+            @test ref.stats.njacs > 0
+            for (f, alg, tol) in (
+                    (SciMLBase.ODEFunction(schr!), PETScDiffEq.TSImplicit("cn", lu), 1.0e-14),
+                    (
+                        SciMLBase.ODEFunction(schr!; jac_prototype = pattern),
+                        PETScDiffEq.TSImplicit("cn", lu), 1.0e-14,
+                    ),
+                    (
+                        SciMLBase.ODEFunction((u, p, t) -> -im .* (H * u)),
+                        PETScDiffEq.TSImplicit("cn", lu), 1.0e-14,
+                    ),
+                    (
+                        SciMLBase.ODEFunction(schr!; jac = schr_jac!, jac_prototype = complex.(pattern)),
+                        PETScDiffEq.TSImplicit("cn", lu), 1.0e-14,
+                    ),
+                    (SciMLBase.ODEFunction(schr!), PETScDiffEq.TSImplicit("cn", lu; autodiff = fd), 1.0e-8),
+                    (
+                        SciMLBase.ODEFunction(schr!; jac_prototype = pattern),
+                        PETScDiffEq.TSImplicit("cn", lu; autodiff = fd), 1.0e-8,
+                    ),
+                )
+                sol = solve_with(f, alg)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test maximum(abs, sol.u[end] - ref.u[end]) < tol
+            end
+            # The other implicit families take the same Jacobian; the worst error at 0.05, BDF2's,
+            # was measured at 1.1e-3.
+            for alg in (
+                    PETScDiffEq.TSRosW("ra34pw2", none), PETScDiffEq.TSIRK(2),
+                    PETScDiffEq.TSImplicit("bdf", none), PETScDiffEq.TSARKIMEX("3", none),
+                )
+                sol = solve_with(SciMLBase.ODEFunction(schr!; jac_prototype = pattern), alg)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.stats.njacs > 0
+                @test maximum(abs, sol.u[end] - exact(1.0)) < 5.0e-3
+            end
+        end
+
+        @testset "a DAE, a mass matrix and a reversed span" begin
+            residual!(r, du, u, p, t) = (mul!(r, H, u); r .= du .+ im .* r; nothing)
+            residual_jac!(J, du, u, p, gamma, t) = (J .= gamma .* I(n) .+ im .* H; nothing)
+            du0 = -im .* (H * u0)
+            bdf = PETScDiffEq.TSDAE("bdf", [none; lu])
+            solve_dae(f, alg) =
+                SciMLBase.solve(SciMLBase.DAEProblem(f, du0, u0, (0.0, 1.0)), alg; dt = 0.01)
+            ref = solve_dae(SciMLBase.DAEFunction(residual!; jac = residual_jac!), bdf)
+            # BDF2 at 0.01, measured 4.6e-5 from the exact solution, and differenced to 2e-12.
+            @test maximum(abs, ref.u[end] - exact(1.0)) < 2.0e-4
+            fd = PETScDiffEq.TSDAE("bdf", [none; lu]; autodiff = PETScDiffEq.AutoFiniteDiff())
+            for (f, alg, tol) in (
+                    (SciMLBase.DAEFunction(residual!), bdf, 1.0e-14),
+                    (
+                        SciMLBase.DAEFunction(residual!; jac_prototype = sparse(Matrix(H) .!= 0) * 1.0),
+                        bdf, 1.0e-14,
+                    ),
+                    (SciMLBase.DAEFunction(residual!), fd, 1.0e-10),
+                )
+                @test maximum(abs, solve_dae(f, alg).u[end] - ref.u[end]) < tol
+            end
+            # 2u' = -2iHu is the same equation, and a complex mass matrix is taken too.
+            twice!(du, u, p, t) = (mul!(du, H, u); du .*= -2im; nothing)
+            for (M, expected) in ((Matrix(2.0I, n, n), exact(1.0)), (Matrix(2.0im * I, n, n), exp(-Matrix(H)) * u0))
+                sol = SciMLBase.solve(
+                    SciMLBase.ODEProblem(SciMLBase.ODEFunction(twice!; mass_matrix = M), u0, (0.0, 1.0)),
+                    PETScDiffEq.TSImplicit("cn", lu); dt = 0.01,
+                )
+                # Crank-Nicolson at 0.01, measured 1.1e-5 and 6.4e-6.
+                @test maximum(abs, sol.u[end] - expected) < 5.0e-5
+            end
+            back = SciMLBase.solve(
+                SciMLBase.ODEProblem(schr!, exact(1.0), (1.0, 0.0)), PETScDiffEq.TSRK("4"); dt = -0.01,
+            )
+            @test back.t[end] === 0.0
+            # Measured 8.7e-10.
+            @test maximum(abs, back.u[end] - u0) < 1.0e-8
+        end
+
+        @testset "ComplexF32 in the single complex build" begin
+            prob = SciMLBase.ODEProblem(schr!, ComplexF32.(u0), (0.0f0, 2.0f0))
+            dts = [2.0f0 / k for k in (6, 9, 12)]
+            sols = [SciMLBase.solve(prob, PETScDiffEq.TSRK("4"); dt) for dt in dts]
+            @test all(s -> eltype(s.u[end]) === ComplexF32, sols)
+            errs = [maximum(abs, s.u[end] - exact(2.0)) for s in sols]
+            # Every error is above 1.5e-4, far from single precision's rounding, and the
+            # orders were measured at 3.89 and 3.95.
+            @test minimum(errs) > 1.0e-4
+            @test all(o -> isapprox(o, 4; atol = 0.2), order(errs, dts))
+            cn = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("cn", lu); dt = 0.05f0)
+            # One ulp of the norm, measured.
+            @test maximum(u -> abs(norm(u) - norm(ComplexF32.(u0))), cn.u) < 1.0e-6
+        end
+
+        @testset "a callback's condition is real" begin
+            # A root is a sign change, so the condition is a real function of the state.
+            for (F, tol) in ((ComplexF64, 1.0e-9), (ComplexF32, 1.0e-6))
+                R = real(F)
+                roots = R[]
+                cb = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> real(u[4]) - R(0.1), integ -> push!(roots, integ.t),
+                )
+                SciMLBase.solve(
+                    SciMLBase.ODEProblem(schr!, F.(u0), (zero(R), R(2))), PETScDiffEq.TSRK("5dp");
+                    abstol = R(1.0e-10), reltol = R(1.0e-10), callback = cb,
+                )
+                # Measured 2.7e-11 and 3.2e-8 from the exact root's condition.
+                @test length(roots) == 1
+                @test abs(real(exact(roots[1])[4]) - 0.1) < tol
+            end
+        end
+
+        @testset "what it refuses" begin
+            prob = SciMLBase.ODEProblem(schr!, u0, (0.0, 1.0))
+            rk = PETScDiffEq.TSRK("5dp")
+            conj!(du, u, p, t) = (du .= -im .* conj.(u); nothing)
+            nonlinear!(du, u, p, t) = (mul!(du, H, u); du .= -im .* (du .+ abs2.(u) .* u); nothing)
+            conj_residual!(r, du, u, p, t) = (r .= du .+ im .* conj.(u); nothing)
+            holomorphic = "the problem's function is not holomorphic in the complex state"
+            @testset "$message" for (message, call) in (
+                    ("`abstol` must be real", () -> SciMLBase.solve(prob, rk; abstol = 1.0e-6 + 0im)),
+                    (
+                        "`reltol` must be real",
+                        () -> SciMLBase.solve(prob, rk; reltol = fill(1.0e-3 + 0im, n)),
+                    ),
+                    ("`dt` must be real", () -> SciMLBase.__solve(prob, rk; dt = 0.1 + 0im)),
+                    ("`saveat` must be real", () -> SciMLBase.solve(prob, rk; saveat = [0.5 + 0im])),
+                    ("`saveat` must be real", () -> SciMLBase.solve(prob, rk; saveat = 0.1im)),
+                    ("`tstops` must be real", () -> SciMLBase.solve(prob, rk; tstops = [0.5im])),
+                    (
+                        "`d_discontinuities` must be real",
+                        () -> SciMLBase.solve(prob, rk; d_discontinuities = [0.5 + 0im]),
+                    ),
+                    (
+                        "`abstol` must be real",
+                        () -> (SciMLBase.init(prob, rk; dt = 0.1).opts.abstol = 1.0e-6im),
+                    ),
+                    (
+                        holomorphic,
+                        () -> SciMLBase.solve(
+                            SciMLBase.ODEProblem(conj!, u0, (0.0, 1.0)), PETScDiffEq.TSImplicit("cn");
+                            dt = 0.1,
+                        ),
+                    ),
+                    (
+                        holomorphic,
+                        () -> SciMLBase.solve(
+                            SciMLBase.ODEProblem(nonlinear!, 1.0e-3 .* u0, (0.0, 1.0)),
+                            PETScDiffEq.TSRosW(); dt = 0.1,
+                        ),
+                    ),
+                    (
+                        holomorphic,
+                        () -> SciMLBase.solve(
+                            SciMLBase.DAEProblem(conj_residual!, zero(u0), u0, (0.0, 1.0)),
+                            PETScDiffEq.TSDAE("beuler"); dt = 0.1,
+                        ),
+                    ),
+                )
+                @test_throws "ArgumentError: $message" call()
+            end
+            # An explicit method needs no Jacobian, so a function that is not holomorphic runs.
+            @test SciMLBase.solve(
+                SciMLBase.ODEProblem(nonlinear!, u0, (0.0, 1.0)), PETScDiffEq.TSRK("4"); dt = 0.01,
+            ).retcode == SciMLBase.ReturnCode.Success
         end
     end
 

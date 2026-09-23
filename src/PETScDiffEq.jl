@@ -60,7 +60,8 @@ accepts a mass matrix.
 
 Without a `jac` the Jacobian comes from `autodiff`: ForwardDiff by default, colouring a
 sparse `jac_prototype`, or `AutoFiniteDiff()` to have PETSc difference the step's own
-equations, colouring a sparse prototype too.
+equations, colouring a sparse prototype too. For a complex state `f` has to be holomorphic,
+and one that is not is refused under ForwardDiff.
 
 PETSc's implementation assumes a right-hand side that does not depend on `t`.
 When it does, `"2p"`, `"2m"`, `"ra3pw"`, `"ra34pw2"`, `"r34prw"` and `"assp3p3s1c"`
@@ -111,7 +112,9 @@ matrix an index-1 differential-algebraic problem.
 
 Without a `jac` the Jacobian comes from `autodiff`: ForwardDiff by default, colouring a
 sparse `jac_prototype`, or `AutoFiniteDiff()` to have PETSc difference the step's own
-equations, colouring a sparse prototype too.
+equations, colouring a sparse prototype too. For a complex state `f` has to be holomorphic,
+since PETSc's Newton iteration takes a complex Jacobian, and one that is not is refused
+under ForwardDiff.
 """
 struct TSImplicit <: PETScTSAlgorithm
     subtype::String
@@ -490,6 +493,9 @@ SciMLBase.alg_order(alg::TSMPRK) = _order(_MPRK_ORDER, "TSMPRK", alg.subtype)
 SciMLBase.alg_order(alg::TSIRK) = 2 * alg.nstages
 SciMLBase.alg_order(alg::TSImplicit) = _implicit_order(alg.subtype, alg.theta, alg.order)
 SciMLBase.alg_order(alg::TSDAE) = _implicit_order(alg.subtype, nothing, alg.order)
+
+# A complex state runs in PETSc's complex builds.
+SciMLBase.allowscomplex(::AnyPETScTS) = true
 
 function _implicit_order(subtype, theta, order)
     subtype == "beuler" && return 1
@@ -1641,7 +1647,17 @@ end
 _tolscalar(R, tol, default) =
     R(tol === nothing || tol isa AbstractVector ? default : tol)
 
+# PETSc's clock and its weighted norms are real, so a time or a tolerance with an imaginary
+# part is refused rather than having it dropped.
+function _check_real(x, name)
+    x === nothing || all(v -> v isa Real, x) || throw(
+        ArgumentError("`$name` must be real, even for a complex state; got $(repr(x))"),
+    )
+    return nothing
+end
+
 function _check_tol(tol, n, name)
+    _check_real(tol, name)
     tol isa AbstractVector || return nothing
     length(tol) == n ||
         throw(ArgumentError("`$name` has length $(length(tol)), but the state has $n"))
@@ -1715,15 +1731,18 @@ end
 const SupportedProblem = Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}
 
 # The PETSc build's real and scalar types and the eltype the saved states come back in.
-# Float32 runs in PETSc's single build only with a Float32 or whole-number span, as
-# OrdinaryDiffEq advises a Float32 span for Float32 work; with a Float64 span it runs in the
-# double build and only the saved states are Float32. Every other real state runs in
-# Float64 and comes back in it, as a whole-number state does in OrdinaryDiffEq.
+# Single precision, real or complex, runs in PETSc's single builds only with a Float32 or
+# whole-number span, as OrdinaryDiffEq advises a Float32 span for Float32 work; with a
+# Float64 span it runs in the double builds and only the saved states keep single
+# precision. Every other state runs in double precision and comes back in it, as a
+# whole-number state does in OrdinaryDiffEq.
 function _eltypes(prob)
     E, tE = eltype(prob.u0), eltype(prob.tspan)
-    R = E === Float32 && (tE === Float32 || tE <: Integer) ? Float32 : Float64
-    U = E === Float32 ? Float32 : Float64
-    return R, R, U
+    single = E === Float32 || E === ComplexF32
+    R = single && (tE === Float32 || tE <: Integer) ? Float32 : Float64
+    S = E <: Complex ? Complex{R} : R
+    U = single ? E : E <: Complex ? ComplexF64 : Float64
+    return R, S, U
 end
 
 # The saved times come back in the span's own type, as OrdinaryDiffEq gives them, or in the
@@ -1775,8 +1794,14 @@ function _setup(
             @warn "PETScDiffEq does not support `$key` and is ignoring it"
         end
     end
-    prob.u0 isa AbstractVector{<:Real} ||
-        throw(ArgumentError("PETScDiffEq requires a real AbstractVector u0"))
+    prob.u0 isa AbstractVector{<:Union{Real, Complex}} || throw(
+        ArgumentError("PETScDiffEq requires an AbstractVector u0 of real or complex numbers"),
+    )
+    for (name, value) in (
+            (:dt, dt), (:dtmin, dtmin), (:dtmax, dtmax), (:saveat, saveat), (:tstops, tstops),
+        )
+        _check_real(value, name)
+    end
     dt_given = dt !== nothing
     if !dt_given && !(adaptive && _adapts(alg) === true)
         throw(
@@ -2371,8 +2396,9 @@ mutable struct PETScIntegratorOpts{H, R}
 end
 
 function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {H, R}
-    setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : v)
     h = getfield(o, :h)
+    name in (:abstol, :reltol) && _check_real(v, name)
+    setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : v)
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib
     if name === :abstol || name === :reltol
@@ -2407,8 +2433,9 @@ restart it with `reinit!`. Between steps `u`, `uprev`, `t`, `tprev` and `dt`
 are readable, and `add_tstop!` schedules a time to land on exactly.
 
 These are in the types PETSc steps in, which are the problem's own except for a
-`Float32` state with a `Float64` span: that runs in PETSc's double build, so the
-integrator's state is `Float64` while the solution it saves is `Float32`.
+`Float32` or `ComplexF32` state with a `Float64` span: that runs in PETSc's
+double-precision build, so the integrator's state is in double precision while the
+solution it saves is in single.
 """
 mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, Vector{S}, R}
@@ -2904,6 +2931,8 @@ function _init_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
+    _check_real(tstops, :tstops)
+    _check_real(d_discontinuities, :d_discontinuities)
     R = first(_eltypes(prob))
     tstops, d_discontinuities = _times(R, tstops), _times(R, d_discontinuities)
     stops_given = vcat(tstops, d_discontinuities)
@@ -3089,6 +3118,8 @@ function _reinit_unlocked(
         d_discontinuities = integ.d_discontinuities_cache,
         reinit_callbacks = true, initialize_save = true,
     )
+    _check_real(tstops, :tstops)
+    _check_real(d_discontinuities, :d_discontinuities)
     R = typeof(integ.t)
     tstops, d_discontinuities = _times(R, tstops), _times(R, d_discontinuities)
     old = integ.h
@@ -3143,7 +3174,7 @@ function _reinit_unlocked(
     return nothing
 end
 
-_retype(old, new) = eltype(old) <: AbstractFloat ? eltype(old).(new) : new
+_retype(old, new) = eltype(old) <: Union{AbstractFloat, Complex} ? eltype(old).(new) : new
 
 SciMLBase.reinit!(integ::PETScIntegrator, u0 = integ.prob.u0; kwargs...) =
     _locked(() -> _reinit_unlocked(integ, u0; kwargs...))
