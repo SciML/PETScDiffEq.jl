@@ -494,6 +494,41 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test quiet.t[end] == 1.0
     end
 
+    @testset "isoutofdomain takes a step again smaller" begin
+        below(c) = (u, p, t) -> any(<(c), u)
+        # A step explicit Euler overshoots below zero with is halved until it does not.
+        fast = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = -10.0 * u[1]; nothing), [1.0], (0.0, 1.0),
+        )
+        euler = PETScDiffEq.TSRK("1fe")
+        loose = SciMLBase.solve(fast, euler; dt = 0.25, adaptive = false)
+        @test minimum(u[1] for u in loose.u) < 0
+        kept = @test_logs min_level = Logging.Warn SciMLBase.solve(
+            fast, euler; dt = 0.25, adaptive = false, isoutofdomain = below(0.0),
+        )
+        @test kept.retcode == SciMLBase.ReturnCode.Success
+        @test kept.t[end] == 1.0
+        @test all(u -> u[1] >= 0, kept.u)
+        # A domain no step can stay in ends the solve Unstable where it last held, as in
+        # OrdinaryDiffEq, which stops `u' = -u` at u = 0.6, t = log(1 / 0.6).
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for run in (
+                () -> SciMLBase.solve(
+                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, isoutofdomain = below(0.6),
+                ),
+                () -> SciMLBase.solve!(
+                    SciMLBase.init(
+                        prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, isoutofdomain = below(0.6),
+                    ),
+                ),
+            )
+            sol = run()
+            @test sol.retcode == SciMLBase.ReturnCode.Unstable
+            @test all(u -> u[1] >= 0.6, sol.u)
+            @test abs(sol.t[end] - log(1 / 0.6)) < 1.0e-4
+        end
+    end
+
     @testset "running out of steps is MaxIters" begin
         sol = SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
@@ -3685,7 +3720,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         alg = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
         @test_logs (:warn,) match_mode = :any SciMLBase.solve(
-            prob, alg; dt = 0.1, isoutofdomain = (u, p, t) -> false,
+            prob, alg; dt = 0.1, calck = false,
         )
         @test_logs (:warn,) match_mode = :any SciMLBase.solve(
             prob, alg; dt = 0.1, internalnorm = (u, t) -> maximum(abs, u),

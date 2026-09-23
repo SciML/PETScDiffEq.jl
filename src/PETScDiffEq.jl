@@ -515,6 +515,8 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     # The caller's own check on the state at each step's end, and whether it has fired.
     unstable::Any
     unstable_hit::Bool
+    # The caller's `isoutofdomain(u, p, t)`, or nothing.
+    domain::Any
     nf::Int
     nf2::Int
     njacs::Int
@@ -1482,7 +1484,6 @@ function _check_state_type(u, name)
 end
 
 const UNSUPPORTED_KWARGS = (
-    :isoutofdomain,
     :internalnorm, :calck, :alias_u0, :sensealg,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
 )
@@ -1654,6 +1655,7 @@ function _setup(
         dtmax = nothing,
         force_dtmin = false,
         unstable_check = nothing,
+        isoutofdomain = nothing,
         saveat = Float64[],
         save_everystep = nothing,
         save_start = nothing,
@@ -1931,7 +1933,7 @@ function _setup(
         slow_idxs, medium_idxs, fast_idxs,
         NaN, similar(u0), false,
         force_dtmin || dtmin === nothing ? 0.0 : abs(Float64(dtmin)), false,
-        unstable_check, false,
+        unstable_check, false, isoutofdomain,
         0, 0, 0, nothing,
     )
     h = TSHandles(
@@ -2159,7 +2161,10 @@ function _solve_unlocked(
     tstops = _with_discontinuities(tstops, d_discontinuities)
     # PETSc's MPRK step never shortens itself onto the final time, so it runs
     # through the integrator, which shortens the last step for it.
-    if !_no_callback(callback) || !isempty(tstops) || alg isa TSMPRK
+    # A step outside the caller's domain is taken again smaller, which only the
+    # integrator's own loop can do.
+    if !_no_callback(callback) || !isempty(tstops) || alg isa TSMPRK ||
+            get(kwargs, :isoutofdomain, nothing) !== nothing
         return SciMLBase.solve!(
             SciMLBase.__init(prob, alg; callback = callback, tstops = tstops, kwargs...),
         )
@@ -2752,6 +2757,29 @@ SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
 
 # The queue holds `tdir * t` for each stop, the final time included, in increasing order and
 # without repeats. step! drops each stop the integrator reaches, and terminate! empties it.
+# A step that leaves the caller's domain is undone and taken again at half the size, as
+# OrdinaryDiffEq rejects it. One that cannot be made smaller ends the solve Unstable, where
+# it last was in the domain. PETSc's rejection counter does not see these.
+function _reject_out_of_domain!(integ::PETScIntegrator, before)
+    h = integ.h
+    ctx, pl = h.ctx, h.petsclib
+    nstep, integ.dt, integ.dtcache = before
+    half = abs(integ.t - integ.tprev) / 2
+    integ.t = integ.tprev
+    copyto!(integ.u, integ.uprev)
+    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
+    LibPETSc.TSSetStepNumber(pl, h.ts, nstep)
+    if half < max(ctx.dtmin, 100 * eps(max(one(Float64), abs(integ.t))))
+        ctx.unstable_hit = true
+        _finish!(integ)
+        return nothing
+    end
+    LibPETSc.TSSetTimeStep(pl, h.ts, half)
+    LibPETSc.TSRestartStep(pl, h.ts)
+    return _step_unlocked(integ)
+end
+
 # A time the solution is not smooth at is a time to step onto, as in OrdinaryDiffEq.
 _with_discontinuities(tstops, d_discontinuities) = isempty(d_discontinuities) ? tstops :
     vcat(collect(Float64, tstops), collect(Float64, d_discontinuities))
@@ -2950,6 +2978,7 @@ function _step_unlocked(integ::PETScIntegrator)
     end
     # PETSc's proposal for the next step; `integ.dt` is the step last taken.
     dtprev = integ.tdir * Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
+    before = (Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache)
     copyto!(integ.uprev, integ.u)
     integ.tprev = integ.t
     # The last end's derivative starts this step only if nothing has moved that end since.
@@ -3008,6 +3037,9 @@ function _step_unlocked(integ::PETScIntegrator)
     end
     integ.dt = integ.t - integ.tprev
     _readvec!(integ.u, pl, h.u)
+    if ctx.domain !== nothing && ctx.domain(integ.u, ctx.p, integ.t)
+        return _reject_out_of_domain!(integ, before)
+    end
     _end_step_here!(integ)
     fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing
