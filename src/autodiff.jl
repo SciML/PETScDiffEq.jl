@@ -49,11 +49,11 @@ end
 
 (c::Counted)(args...) = (c.n[] += 1; c.f(args...))
 
-struct ADJacobian{F, B, P}
+struct ADJacobian{F, B, P, S}
     f!::F
     backend::B
     prep::P
-    du::Vector{Float64}
+    du::Vector{S}
     advice::String
 end
 
@@ -87,12 +87,12 @@ function _shifted_residual!(r, v, g!, du, u, gamma, p, t, w)
     return nothing
 end
 
-struct ADDAEJacobian{G, B, P}
+struct ADDAEJacobian{G, B, P, S}
     g!::G
     backend::B
     prep::P
-    r::Vector{Float64}
-    w::Vector{Float64}
+    r::Vector{S}
+    w::Vector{S}
     advice::String
 end
 
@@ -120,7 +120,7 @@ function _ad_dae_jacobian(backend, g!, jac_prototype, u0, p, t, calls, advice)
     r, w = similar(u0), similar(u0)
     prep = DI.prepare_jacobian(
         _shifted_residual!, r, b, copy(u0), DI.Constant(h!), DI.Constant(zero(u0)),
-        DI.Constant(copy(u0)), DI.Constant(1.0), DI.Constant(p), DI.Constant(t),
+        DI.Constant(copy(u0)), DI.Constant(one(t)), DI.Constant(p), DI.Constant(t),
         DI.Cache(w),
     )
     return ADDAEJacobian(h!, b, prep, r, w, advice)

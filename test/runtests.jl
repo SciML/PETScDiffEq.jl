@@ -380,20 +380,55 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8)
         SciMLBase.solve!(SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
         @test isempty(PETScDiffEq.POST_STEP_CTX)
-        # The other builds initialized after this package's first solve are torn down
-        # before its cleanup runs; the exit code is the assertion.
+        # Solves in the single and double builds interleave, each through its own build's
+        # post-step hook, split functions and error handler, and each gives what it gives
+        # alone. A zero pivot is a retcode in either build, with nothing printed.
+        span(F) = (zero(F), one(F))
+        never = (dt, u, p, t) -> false
+        runs = (
+            F -> SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, F[1, 2], span(F)), PETScDiffEq.TSRK("5dp");
+                dtmin = F(1.0e-6), unstable_check = never,
+            ),
+            F -> SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, F[1, 2], span(F)), PETScDiffEq.TSMPRK([1], "p2");
+                dt = F(0.01),
+            ),
+            F -> SciMLBase.solve(
+                SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 8 * u[1]; nothing), F[1], span(F)),
+                PETScDiffEq.TSImplicit("beuler"); dt = F(0.125), adaptive = false,
+            ),
+        )
+        quietly(f) = Logging.with_logger(f, Logging.NullLogger())
+        alone = Dict(F => quietly(() -> [run(F) for run in runs]) for F in (Float32, Float64))
+        for _ in 1:2, (k, run) in enumerate(runs), F in (Float32, Float64)
+            path, io = mktemp()
+            sol = redirect_stderr(() -> quietly(() -> run(F)), io)
+            close(io)
+            @test !occursin("PETSC ERROR", read(path, String))
+            @test sol.retcode == alone[F][k].retcode
+            @test eltype(sol.u[end]) === F
+            @test sol.u == alone[F][k].u
+        end
+        @test last(alone[Float32]).retcode == SciMLBase.ReturnCode.Failure
+        # Builds initialized after this package's first solve are torn down before its
+        # cleanup of the double build runs, and each build's integrators are freed before
+        # its own teardown; the exit code is the assertion.
         script = """
         using PETScDiffEq, SciMLBase
         PETSc = PETScDiffEq.PETSc
         f!(du, u, p, t) = (du[1] = -u[1]; nothing)
         prob = SciMLBase.ODEProblem(f!, [1.0], (0.0, 1.0))
+        single = SciMLBase.ODEProblem(f!, Float32[1], (0.0f0, 1.0f0))
         ok(sol) = sol.retcode == SciMLBase.ReturnCode.Success || exit(2)
         ok(SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
-        for S in (Float32, ComplexF64, ComplexF32)
+        for S in (ComplexF64, ComplexF32)
             PETSc.initialize(PETSc.getlib(; PetscScalar = S))
         end
+        ok(SciMLBase.solve(single, PETScDiffEq.TSRK("5dp"); dtmin = 1.0f-6))
         ok(SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
         SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+        SciMLBase.init(single, PETScDiffEq.TSRK("5dp"); dt = 0.1f0)
         """
         cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $script`
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
@@ -473,56 +508,220 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
-    @testset "a Float32 problem is solved in Float64" begin
-        # SciMLBase wraps the functions for Float32, and PETSc's double build calls them
-        # with Float64 arrays, which failed inside FunctionWrappers in place.
-        ref = SciMLBase.solve(
-            SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp"); dt = 0.1,
-        )
-        oop(u, p, t) = -u
-        jac32!(J, u, p, t) = (J[1, 1] = -1.0; nothing)
-        residual!(r, du, u, p, t) = (r[1] = du[1] + u[1]; nothing)
-        runs = (
-            () -> SciMLBase.solve(
-                SciMLBase.ODEProblem(decay!, Float32[1.0], (0.0f0, 1.0f0)),
+    @testset "Float32" begin
+        build(integ) = PETScDiffEq.PETSc.scalartype(integ.h.petsclib)
+        none = ["-ts_adapt_type", "none"]
+
+        @testset "the span picks the PETSc build, and the solution keeps the problem's types" begin
+            # A Float32 state runs in PETSc's single build with a Float32 span and in the double
+            # one with a Float64 span, where only its saved states stay Float32. Any other state
+            # runs in Float64, and the saved times keep the span's type. `f` sees exactly the
+            # build's types, which the wrapper SciMLBase made for the problem depends on.
+            seen = Set{Any}()
+            typed!(du, u, p, t) = (push!(seen, (typeof(u), typeof(t))); du .= -u; nothing)
+            typed(u, p, t) = (push!(seen, (typeof(u), typeof(t))); -u)
+            cases = (
+                (Float32[1], (0.0f0, 1.0f0), Float32, Float32),
+                (Float32[1], (0.0, 1.0), Float64, Float32),
+                ([1.0], (0.0f0, 1.0f0), Float64, Float64),
+                ([1.0], (0.0, 1.0), Float64, Float64),
+                ([1], (0.0, 1.0), Float64, Float64),
+            )
+            for (u0, tspan, R, U) in cases, f in (typed!, typed)
+                T = eltype(tspan)
+                prob = SciMLBase.ODEProblem(f, u0, tspan)
+                empty!(seen)
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = T(0.1))
+                @test build(integ) === R
+                @test integ.u isa Vector{R} && integ.t isa R
+                sol = SciMLBase.solve!(integ)
+                @test eltype(sol.u[end]) === U && eltype(sol.t) === T
+                @test seen == Set([(Vector{R}, R)])
+                for kw in ((;), (; saveat = T(0.25)), (; tstops = [T(0.5)]))
+                    empty!(seen)
+                    sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = T(0.1), kw...)
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test eltype(sol.u[end]) === U && eltype(sol.t) === T
+                    @test seen == Set([(Vector{R}, R)])
+                end
+            end
+            # A `dt` given in Float64 promotes the span, as DiffEqBase does for every solver.
+            promoted = SciMLBase.init(
+                SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0)),
                 PETScDiffEq.TSRK("5dp"); dt = 0.1,
-            ),
-            () -> SciMLBase.solve(
-                SciMLBase.ODEProblem(oop, Float32[1.0], (0.0, 1.0)),
-                PETScDiffEq.TSRK("5dp"); dt = 0.1,
-            ),
-            () -> SciMLBase.solve!(
-                SciMLBase.init(
+            )
+            @test build(promoted) === Float64
+        end
+
+        @testset "a Float32 state with a Float64 span is solved in Float64" begin
+            # SciMLBase wraps the functions for Float32, and PETSc's double build calls them
+            # with Float64 arrays, so they are unwrapped.
+            ref = SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+                dt = 0.1,
+            )
+            oop(u, p, t) = -u
+            jac32!(J, u, p, t) = (J[1, 1] = -1.0; nothing)
+            residual!(r, du, u, p, t) = (r[1] = du[1] + u[1]; nothing)
+            runs = (
+                () -> SciMLBase.solve(
                     SciMLBase.ODEProblem(decay!, Float32[1.0], (0.0, 1.0)),
                     PETScDiffEq.TSRK("5dp"); dt = 0.1,
                 ),
-            ),
-        )
-        for run in runs
-            sol = run()
-            @test sol.retcode == SciMLBase.ReturnCode.Success
-            @test eltype(sol.u[end]) == Float64
-            @test sol.u[end] == ref.u[end]
+                () -> SciMLBase.solve(
+                    SciMLBase.ODEProblem(oop, Float32[1.0], (0.0, 1.0)),
+                    PETScDiffEq.TSRK("5dp"); dt = 0.1,
+                ),
+                () -> SciMLBase.solve!(
+                    SciMLBase.init(
+                        SciMLBase.ODEProblem(decay!, Float32[1.0], (0.0, 1.0)),
+                        PETScDiffEq.TSRK("5dp"); dt = 0.1,
+                    ),
+                ),
+            )
+            for run in runs
+                sol = run()
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.u[end] == Float32.(ref.u[end])
+            end
+            # A Jacobian and a DAE residual are unwrapped too.
+            withjac = SciMLBase.solve(
+                SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(decay!; jac = jac32!), Float32[1.0], (0.0, 1.0),
+                ),
+                PETScDiffEq.TSImplicit("bdf"); dt = 0.01, abstol = 1.0e-8, reltol = 1.0e-8,
+            )
+            @test withjac.stats.njacs > 0
+            @test abs(withjac.u[end][1] - exp(-1)) < 1.0e-5
+            dae = SciMLBase.solve(
+                SciMLBase.DAEProblem(residual!, Float32[-1.0], Float32[1.0], (0.0, 1.0)),
+                PETScDiffEq.TSDAE("bdf"); dt = 0.001, abstol = 1.0e-8, reltol = 1.0e-8,
+            )
+            @test abs(dae.u[end][1] - exp(-1)) < 1.0e-5
+            # Whole numbers are exact in Float64, as in OrdinaryDiffEq.
+            whole = SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, [1], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
+                dt = 0.1,
+            )
+            @test whole.u[end] == ref.u[end]
         end
-        # A Jacobian and a DAE residual are unwrapped too.
-        withjac = SciMLBase.solve(
-            SciMLBase.ODEProblem(
-                SciMLBase.ODEFunction(decay!; jac = jac32!), Float32[1.0], (0.0, 1.0),
-            ),
-            PETScDiffEq.TSImplicit("bdf"); dt = 0.01, abstol = 1.0e-8, reltol = 1.0e-8,
-        )
-        @test withjac.stats.njacs > 0
-        @test abs(withjac.u[end][1] - exp(-1)) < 1.0e-5
-        dae = SciMLBase.solve(
-            SciMLBase.DAEProblem(residual!, Float32[-1.0], Float32[1.0], (0.0, 1.0)),
-            PETScDiffEq.TSDAE("bdf"); dt = 0.001, abstol = 1.0e-8, reltol = 1.0e-8,
-        )
-        @test abs(dae.u[end][1] - exp(-1)) < 1.0e-5
-        # Whole numbers are exact in Float64, as in OrdinaryDiffEq.
-        whole = SciMLBase.solve(
-            SciMLBase.ODEProblem(decay!, [1], (0.0, 1.0)), PETScDiffEq.TSRK("5dp"); dt = 0.1,
-        )
-        @test whole.u[end] == ref.u[end]
+
+        @testset "the single build converges at each method's order" begin
+            # u' = u + cos(t) grows, so every error here is at least 1e-4 of the state and
+            # far above the single build's rounding, and the step counts divide the span.
+            forced!(du, u, p, t) = (du[1] = u[1] + cos(t); nothing)
+            exact = 3 * exp(3.0) / 2 + (sin(3.0) - cos(3.0)) / 2
+            for (alg, steps, order) in (
+                    (PETScDiffEq.TSRK("4"), (6, 8, 12), 4),
+                    (PETScDiffEq.TSRK("3", none), (6, 8, 12), 3),
+                    (PETScDiffEq.TSImplicit("beuler"), (30, 60, 120), 1),
+                    (PETScDiffEq.TSImplicit("cn"), (12, 24, 48), 2),
+                    (PETScDiffEq.TSRosW("ra34pw2", none), (6, 8, 12), 3),
+                    (PETScDiffEq.TSARKIMEX("3", none), (6, 8, 12), 3),
+                    (PETScDiffEq.TSImplicit("bdf", none), (12, 24, 48), 2),
+                    (PETScDiffEq.TSIRK(2), (3, 4, 6), 4),
+                )
+                orders = map((Float32, Float64)) do F
+                    prob = SciMLBase.ODEProblem(forced!, F[1], (zero(F), F(3)))
+                    dts = [F(3) / n for n in steps]
+                    errs = map(dts) do dt
+                        sol = SciMLBase.solve(prob, alg; dt = dt)
+                        @test sol.retcode == SciMLBase.ReturnCode.Success
+                        @test eltype(sol.u[end]) === F
+                        abs(sol.u[end][1] - exact) / exact
+                    end
+                    F === Float32 && @test minimum(errs) > 5.0e-5
+                    [log(errs[i] / errs[i + 1]) / log(dts[i] / dts[i + 1]) for i in 1:2]
+                end
+                # These steps are short of the asymptotic range for the higher orders, so the
+                # order is checked against the double build's at the same steps as well.
+                @test isapprox(orders[1][end], order; atol = 0.3)
+                @test maximum(abs, orders[1] .- orders[2]) < 0.05
+            end
+        end
+
+        @testset "d_discontinuities and the step limits" begin
+            alg = PETScDiffEq.TSRK("5dp")
+            # Right-continuous, as for Float64: the step after t_d starts a ULP past it.
+            kink!(du, u, p, t) = (du[1] = t > 0.5f0 ? -1.0f0 : 1.0f0; nothing)
+            back!(du, u, p, t) = (du[1] = t < 0.5f0 ? 1.0f0 : -1.0f0; nothing)
+            for (f!, tspan) in ((kink!, (0.0f0, 1.0f0)), (back!, (1.0f0, 0.0f0))),
+                    adaptive in (false, true)
+                prob = SciMLBase.ODEProblem(f!, Float32[0], tspan)
+                dt = 0.1f0 * sign(tspan[2] - tspan[1])
+                plain = SciMLBase.solve(prob, alg; dt, adaptive, tstops = [0.5f0])
+                kinked = SciMLBase.solve(prob, alg; dt, adaptive, d_discontinuities = [0.5f0])
+                @test abs(kinked.u[end][1]) < 1.0e-6
+                @test 0.5f0 in kinked.t
+                adaptive || @test abs(plain.u[end][1]) > 1.0e-3
+            end
+            start!(du, u, p, t) = (du[1] = t > 0 ? -1.0f0 : 1.0f0; nothing)
+            begins = SciMLBase.ODEProblem(start!, Float32[0], (0.0f0, 1.0f0))
+            integ = SciMLBase.init(begins, alg; dt = 0.1f0, d_discontinuities = [0.0f0])
+            @test integ.t === nextfloat(0.0f0)
+            # The limits reach PETSc's options as numbers its single build can read.
+            slow = SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0))
+            forced = SciMLBase.solve(
+                slow, alg; dt = 0.01f0, dtmin = 0.2f0, dtmax = 0.1f0, force_dtmin = true,
+            )
+            @test forced.retcode == SciMLBase.ReturnCode.Success
+            @test all(≈(0.2f0), diff(forced.t))
+            capped = SciMLBase.solve(slow, alg; dt = 0.01f0, dtmax = 0.05f0)
+            @test maximum(diff(capped.t)) <= 0.05f0 + eps(1.0f0)
+        end
+
+        @testset "a reversed span steps as its forward mirror" begin
+            grow!(du, u, p, t) = (du[1] = u[1]; nothing)
+            back = SciMLBase.ODEProblem(decay!, Float32[1], (1.0f0, 0.0f0))
+            fwd = SciMLBase.ODEProblem(grow!, Float32[1], (-1.0f0, 0.0f0))
+            loose = (reltol = 1.0f-5, abstol = 1.0f-6)
+            for (alg, kw) in (
+                    (PETScDiffEq.TSRK("5dp"), loose), (PETScDiffEq.TSRosW("ra34pw2"), loose),
+                    (PETScDiffEq.TSImplicit("bdf"), loose), (PETScDiffEq.TSRK("3bs"), (adaptive = false,)),
+                )
+                b = SciMLBase.solve(back, alg; dt = 0.1f0, kw...)
+                f = SciMLBase.solve(fwd, alg; dt = 0.1f0, kw...)
+                @test b.retcode == SciMLBase.ReturnCode.Success
+                @test b.t[end] === 0.0f0
+                @test b.t == -f.t
+                @test b.u == f.u
+            end
+        end
+
+        @testset "a DAE, a mass matrix and every Jacobian match the double build" begin
+            # At the same fixed steps the single build differs from the double one by its
+            # rounding, which is under 2e-6 on each of these.
+            residual!(r, du, u, p, t) = (r[1] = du[1] + u[1]; r[2] = u[2] - 2u[1]; nothing)
+            mm!(du, u, p, t) = (du[1] = -2u[1]; du[2] = u[2] - u[1]; nothing)
+            dae(F) = SciMLBase.DAEProblem(residual!, F[-1, -2], F[1, 2], (zero(F), one(F)))
+            mass(F) = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(mm!; mass_matrix = F[2 0; 0 0]), F[1, 1], (zero(F), one(F)),
+            )
+            chain(F; kw...) = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(chain!; kw...), F[1, 0, 0], (zero(F), one(F)),
+            )
+            fd = PETScDiffEq.AutoFiniteDiff()
+            for (make, alg) in (
+                    (dae, PETScDiffEq.TSDAE("beuler")), (dae, PETScDiffEq.TSDAE("bdf", none)),
+                    (mass, PETScDiffEq.TSImplicit("bdf", none)),
+                    (mass, PETScDiffEq.TSRosW("ra34pw2", none)),
+                    (chain, PETScDiffEq.TSImplicit("bdf", none)),
+                    (chain, PETScDiffEq.TSImplicit("bdf", none; autodiff = fd)),
+                    (F -> chain(F; jac = chain_jac!), PETScDiffEq.TSRosW("ra34pw2", none)),
+                    (F -> chain(F; jac_prototype = CHAIN_PROTOTYPE), PETScDiffEq.TSImplicit("bdf", none)),
+                    (
+                        F -> chain(F; jac_prototype = Float32.(CHAIN_PROTOTYPE)),
+                        PETScDiffEq.TSRosW("ra34pw2", none; autodiff = fd),
+                    ),
+                )
+                single = SciMLBase.solve(make(Float32), alg; dt = 0.01f0)
+                double = SciMLBase.solve(make(Float64), alg; dt = 0.01)
+                @test single.retcode == SciMLBase.ReturnCode.Success
+                @test eltype(single.u[end]) === Float32
+                @test length(single.t) == length(double.t)
+                @test maximum(abs, single.u[end] .- double.u[end]) < 1.0e-5
+            end
+        end
     end
 
     @testset "d_discontinuities are times to step onto" begin

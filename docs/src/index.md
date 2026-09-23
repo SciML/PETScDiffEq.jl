@@ -99,6 +99,18 @@ wrong in its first digit, so keep them for a right-hand side ForwardDiff cannot 
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`
 and `terminate!`.
 
+## Number types
+
+A `Float64` state runs in PETSc's double-precision build. A `Float32` state runs in its
+single-precision build when the span is `Float32` as well, following OrdinaryDiffEq's advice
+to give a `Float32` problem a `Float32` span, and in the double build when the span is
+`Float64`, with the saved states given back as `Float32`. DiffEqBase promotes the span to
+the type of `dt`, so a single-precision solve takes `dt = 0.01f0` rather than `dt = 0.01`.
+Any other real state, whole numbers included, is solved in `Float64` and comes back in it.
+The saved times keep the span's type. The integrator's `u`, `t` and `dt` are in the types
+PETSc steps in. Tolerances finer than single precision can resolve, about `1e-7`, are
+accepted but buy nothing past its rounding.
+
 ## Adjoint sensitivities
 
 With SciMLSensitivity loaded, `PETScAdjoint` computes gradients with PETSc's own discrete
@@ -209,9 +221,6 @@ size.
 Every solve runs on `MPI.COMM_SELF`, so this package is serial. PETSc TS is built for
 large distributed problems, and reaching it from the SciML interface is what this package
 is for; use OrdinaryDiffEq.jl for serial problems where it applies.
-
-Solves run in Float64, PETSc's double build: a `Float32` or whole-number state is
-converted, and the solution comes back in Float64.
 
 On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.
