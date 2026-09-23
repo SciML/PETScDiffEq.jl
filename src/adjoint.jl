@@ -377,6 +377,8 @@ const _ADJOINT_REFUSED_KWARGS = (
         "outside PETSc's own loop, which saves no trajectory; remove them and choose a " *
         "`dt` whose steps land on the cost times",
     d_discontinuities = "PETScAdjoint does not support `d_discontinuities`; remove them",
+    isoutofdomain = "PETScAdjoint does not support `isoutofdomain`: its forward solve is " *
+        "PETSc's own, which does not take a step again that leaves the domain; remove it",
     save_idxs = "PETScAdjoint does not support `save_idxs`: `dgdu_discrete` is given " *
         "the whole state; remove it",
 )

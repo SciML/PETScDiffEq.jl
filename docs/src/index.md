@@ -55,7 +55,10 @@ only when it names them or `save_start` or `save_end` asks, and `save_everystep 
 saves every step alongside it. `dtmin` is a floor the solve keeps: once PETSc proposes a
 smaller step, the solve ends there with `ReturnCode.DtLessThanMin`. A step shortened to
 land on a stop or the final time does not count, and a fixed-step solve has no floor, as in
-OrdinaryDiffEq.
+OrdinaryDiffEq. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
+step that leaves the domain is taken again at a fifth of its size, as OrdinaryDiffEq takes it;
+one that cannot be made small enough ends the solve with `Unstable`, or `DtLessThanMin` at
+`dtmin`.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
 state stops being finite, PETSc hits an overflow, or `unstable_check(dt, u, p, t)`

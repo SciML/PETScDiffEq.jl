@@ -2764,27 +2764,46 @@ SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
 
 # The queue holds `tdir * t` for each stop, the final time included, in increasing order and
 # without repeats. step! drops each stop the integrator reaches, and terminate! empties it.
-# A step that leaves the caller's domain is undone and taken again at half the size, as
-# OrdinaryDiffEq rejects it. One that cannot be made smaller ends the solve Unstable, where
-# it last was in the domain. PETSc's rejection counter does not see these.
+# A step of an adaptive solve that leaves the caller's domain is undone and taken again at a
+# fifth of its size, OrdinaryDiffEq's default qmin. With `force_dtmin` a step that would fall
+# below `dtmin` is taken at `dtmin` whatever the domain says, as OrdinaryDiffEq takes it;
+# otherwise the solve ends where it last was in the domain, with DtLessThanMin below the
+# caller's floor and Unstable below a rounding error of the span. The step before the undone
+# one stays the step just taken. PETSc's rejection counter does not see these.
 function _reject_out_of_domain!(integ::PETScIntegrator, before)
     h = integ.h
     ctx, pl = h.ctx, h.petsclib
-    nstep, integ.dt, integ.dtcache = before
-    half = abs(integ.t - integ.tprev) / 2
+    nstep, integ.dt, integ.dtcache, ctx.pdirty, outer = before
+    taken = abs(integ.t - integ.tprev)
+    smaller = taken / 5
     integ.t = integ.tprev
     copyto!(integ.u, integ.uprev)
     PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, nstep)
-    if half < max(ctx.dtmin, 100 * eps(max(one(Float64), abs(integ.t))))
-        ctx.unstable_hit = true
+    floor = abs(Float64(something(get(integ.kwargs, :dtmin, nothing), 0.0)))
+    if get(integ.kwargs, :force_dtmin, false) === true && smaller < floor
+        LibPETSc.TSSetTimeStep(pl, h.ts, min(floor, taken))
+        LibPETSc.TSRestartStep(pl, h.ts)
+        domain, ctx.domain = ctx.domain, nothing
+        try
+            return _step_unlocked(integ, outer)
+        finally
+            ctx.domain = domain
+        end
+    end
+    below_floor = ctx.dtmin > 0 && smaller < ctx.dtmin
+    if below_floor || smaller < 100 * eps(max(abs(integ.t), abs(h.t0), abs(h.tf)))
+        below_floor ? (ctx.dt_too_small = true) : (ctx.unstable_hit = true)
+        integ.tprev = outer[1]
+        copyto!(integ.uprev, outer[2])
+        ctx.fstart = nothing
         _finish!(integ)
         return nothing
     end
-    LibPETSc.TSSetTimeStep(pl, h.ts, half)
+    LibPETSc.TSSetTimeStep(pl, h.ts, smaller)
     LibPETSc.TSRestartStep(pl, h.ts)
-    return _step_unlocked(integ)
+    return _step_unlocked(integ, outer)
 end
 
 # A time the solution is not smooth at is a time to step onto, as in OrdinaryDiffEq.
@@ -2969,7 +2988,8 @@ function _save_step!(
     return nothing
 end
 
-function _step_unlocked(integ::PETScIntegrator)
+# `outer` is the start of the last step taken, kept across the retries of an undone step.
+function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     integ.finished && throw(
         ArgumentError(
             "this integrator has finished at t = $(integ.t) and cannot step further; " *
@@ -2985,7 +3005,10 @@ function _step_unlocked(integ::PETScIntegrator)
     end
     # PETSc's proposal for the next step; `integ.dt` is the step last taken.
     dtprev = integ.tdir * Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
-    before = (Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache)
+    before = (
+        Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty,
+        outer === nothing && ctx.domain !== nothing ? (integ.tprev, copy(integ.uprev)) : outer,
+    )
     copyto!(integ.uprev, integ.u)
     integ.tprev = integ.t
     # The last end's derivative starts this step only if nothing has moved that end since.
@@ -3044,7 +3067,8 @@ function _step_unlocked(integ::PETScIntegrator)
     end
     integ.dt = integ.t - integ.tprev
     _readvec!(integ.u, pl, h.u)
-    if ctx.domain !== nothing && ctx.domain(integ.u, ctx.p, integ.t)
+    if ctx.domain !== nothing && SciMLBase.isadaptive(integ) &&
+            ctx.domain(integ.u, ctx.p, integ.t)
         return _reject_out_of_domain!(integ, before)
     end
     _end_step_here!(integ)
