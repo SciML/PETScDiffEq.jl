@@ -447,6 +447,25 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test abs(whole.u[end][1] - exp(-1)) < 1.0e-4
     end
 
+    @testset "d_discontinuities are times to step onto" begin
+        kinked = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = t < 0.5 ? 1.0 : -1.0; nothing), [0.0], (0.0, 1.0),
+        )
+        alg = PETScDiffEq.TSRK("5dp")
+        stopped = SciMLBase.solve(kinked, alg; dt = 0.1, d_discontinuities = [0.5])
+        @test 0.5 in stopped.t
+        @test stopped.retcode == SciMLBase.ReturnCode.Success
+        # Alongside tstops, and reported by the accessors like any other stop.
+        both = SciMLBase.init(
+            kinked, alg; dt = 0.1, tstops = [0.25], d_discontinuities = [0.5, 0.75],
+        )
+        @test PETScDiffEq.DiffEqBase.get_tstops_array(both) == [0.25, 0.5, 0.75, 1.0]
+        @test SciMLBase.solve!(both).t ⊇ [0.25, 0.5, 0.75]
+        @test_logs min_level = Logging.Warn SciMLBase.solve(
+            kinked, alg; dt = 0.1, d_discontinuities = [0.5],
+        )
+    end
+
     @testset "running out of steps is MaxIters" begin
         sol = SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
@@ -3639,7 +3658,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             prob, alg; dt = 0.1, isoutofdomain = (u, p, t) -> false,
         )
         @test_logs (:warn,) match_mode = :any SciMLBase.solve(
-            prob, alg; dt = 0.1, d_discontinuities = [0.5],
+            prob, alg; dt = 0.1, internalnorm = (u, t) -> maximum(abs, u),
         )
         @test_logs min_level = Logging.Warn SciMLBase.solve(prob, alg; dt = 0.1)
     end
