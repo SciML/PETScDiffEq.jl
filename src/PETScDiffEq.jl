@@ -1031,7 +1031,7 @@ end
 # straight off to a body that compiles for the concrete context type.
 function _rhs!(
         ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
+        t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
@@ -1054,11 +1054,9 @@ function _rhs_body!(ctx, t, x_ptr, f_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
-const RHS_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-
 function _split_rhs!(
         ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
+        t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
@@ -1081,11 +1079,9 @@ function _split_rhs_body!(ctx, t, x_ptr, f_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
-const SPLIT_RHS_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-
 function _ifunction!(
         ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
+        t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
@@ -1154,7 +1150,7 @@ end
 
 function _mprk_slow!(
         ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
+        t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
@@ -1165,7 +1161,7 @@ end
 
 function _mprk_medium!(
         ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
+        t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
@@ -1176,7 +1172,7 @@ end
 
 function _mprk_fast!(
         ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
+        t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
@@ -1185,18 +1181,12 @@ function _mprk_fast!(
     return _mprk_part!(ctx, t, x_ptr, f_ptr, ctx.fast_idxs)
 end
 
-const MPRK_SLOW_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-const MPRK_MEDIUM_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-const MPRK_FAST_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-
-const IFUNCTION_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-
 function _ijacobian!(
         ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
+        t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
-        shift::LibPETSc.PetscReal,
+        shift,
         A_ptr::LibPETSc.CMat,
         B_ptr::LibPETSc.CMat,
         ctx_ptr::Ptr{Cvoid},
@@ -1232,14 +1222,12 @@ function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
-const IJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-
 function _sparse_ijacobian!(
         ::LibPETSc.CTS,
-        t::LibPETSc.PetscReal,
+        t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
-        shift::LibPETSc.PetscReal,
+        shift,
         A_ptr::LibPETSc.CMat,
         B_ptr::LibPETSc.CMat,
         ctx_ptr::Ptr{Cvoid},
@@ -1271,12 +1259,10 @@ function _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
-const SPARSE_IJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-
 function _monitor!(
         ts_ptr::LibPETSc.CTS,
         step::LibPETSc.PetscInt,
-        t::LibPETSc.PetscReal,
+        t,
         x_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
@@ -1345,74 +1331,89 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
-const MONITOR_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+# The callbacks PETSc is handed take its real type, which is Float32 in its single builds
+# and Float64 in its double ones, so each real type gets a set of pointers of its own,
+# built the first time a build of that type is used.
+struct Callbacks
+    rhs::Ptr{Cvoid}
+    split_rhs::Ptr{Cvoid}
+    monitor::Ptr{Cvoid}
+    ifunction::Ptr{Cvoid}
+    ijacobian::Ptr{Cvoid}
+    sparse_ijacobian::Ptr{Cvoid}
+    mprk_slow::Ptr{Cvoid}
+    mprk_medium::Ptr{Cvoid}
+    mprk_fast::Ptr{Cvoid}
+end
 
-# `@cfunction` pointers do not survive precompilation, so they are built at load time.
+const CALLBACKS = Dict{DataType, Callbacks}()
+
+function _callbacks(petsclib)
+    R = petsclib.PetscReal
+    return get!(() -> _make_callbacks(R), CALLBACKS, R)
+end
+
+# `@cfunction` takes its argument types literally, so there is one method per real type.
+for R in (Float32, Float64)
+    @eval _make_callbacks(::Type{$R}) = Callbacks(
+        @cfunction(
+            _rhs!,
+            LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+        ),
+        @cfunction(
+            _split_rhs!,
+            LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+        ),
+        @cfunction(
+            _monitor!,
+            LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, LibPETSc.PetscInt, $R, LibPETSc.CVec, Ptr{Cvoid})
+        ),
+        @cfunction(
+            _ifunction!,
+            LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+        ),
+        @cfunction(
+            _ijacobian!,
+            LibPETSc.PetscErrorCode,
+            (
+                LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, $R, LibPETSc.CMat,
+                LibPETSc.CMat, Ptr{Cvoid},
+            )
+        ),
+        @cfunction(
+            _sparse_ijacobian!,
+            LibPETSc.PetscErrorCode,
+            (
+                LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, $R, LibPETSc.CMat,
+                LibPETSc.CMat, Ptr{Cvoid},
+            )
+        ),
+        @cfunction(
+            _mprk_slow!,
+            LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+        ),
+        @cfunction(
+            _mprk_medium!,
+            LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+        ),
+        @cfunction(
+            _mprk_fast!,
+            LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+        ),
+    )
+end
+
+# `@cfunction` pointers do not survive precompilation, so the ones that do not depend on
+# the build are made at load time.
 function __init__()
-    RHS_PTR[] = @cfunction(
-        _rhs!,
-        LibPETSc.PetscErrorCode,
-        (LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
-    )
-    SPLIT_RHS_PTR[] = @cfunction(
-        _split_rhs!,
-        LibPETSc.PetscErrorCode,
-        (LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
-    )
     POST_STEP_PTR[] = @cfunction(_post_step!, LibPETSc.PetscErrorCode, (LibPETSc.CTS,))
-    MONITOR_PTR[] = @cfunction(
-        _monitor!,
-        LibPETSc.PetscErrorCode,
-        (LibPETSc.CTS, LibPETSc.PetscInt, LibPETSc.PetscReal, LibPETSc.CVec, Ptr{Cvoid})
-    )
-    IFUNCTION_PTR[] = @cfunction(
-        _ifunction!,
-        LibPETSc.PetscErrorCode,
-        (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            LibPETSc.CVec, Ptr{Cvoid},
-        )
-    )
-    IJACOBIAN_PTR[] = @cfunction(
-        _ijacobian!,
-        LibPETSc.PetscErrorCode,
-        (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            LibPETSc.PetscReal, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid},
-        )
-    )
-    SPARSE_IJACOBIAN_PTR[] = @cfunction(
-        _sparse_ijacobian!,
-        LibPETSc.PetscErrorCode,
-        (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            LibPETSc.PetscReal, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid},
-        )
-    )
-    MPRK_SLOW_PTR[] = @cfunction(
-        _mprk_slow!,
-        LibPETSc.PetscErrorCode,
-        (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            Ptr{Cvoid},
-        )
-    )
-    MPRK_MEDIUM_PTR[] = @cfunction(
-        _mprk_medium!,
-        LibPETSc.PetscErrorCode,
-        (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            Ptr{Cvoid},
-        )
-    )
-    MPRK_FAST_PTR[] = @cfunction(
-        _mprk_fast!,
-        LibPETSc.PetscErrorCode,
-        (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            Ptr{Cvoid},
-        )
-    )
     ZERO_PIVOT_HANDLER_PTR[] = @cfunction(
         _zero_pivot_handler,
         LibPETSc.PetscErrorCode,
@@ -2038,35 +2039,36 @@ function _setup(
         LibPETSc.TSSetSolution(petsclib, ts, u)
 
         ctxptr = pointer_from_objref(ctx)
+        ptrs = _callbacks(petsclib)
         GC.@preserve ctx begin
             if _uses_ifunction(alg)
-                LibPETSc.TSSetIFunction(petsclib, ts, nothing, IFUNCTION_PTR[], ctxptr)
+                LibPETSc.TSSetIFunction(petsclib, ts, nothing, ptrs.ifunction, ctxptr)
             else
-                LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, RHS_PTR[], ctxptr)
+                LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, ptrs.rhs, ctxptr)
             end
             # MPRK steps the whole system as well as each part, so it needs the
             # plain right-hand side above in addition to these.
             if alg isa TSMPRK
-                _set_split!(petsclib, ts, "slow", slow_idxs, MPRK_SLOW_PTR[], ctxptr)
+                _set_split!(petsclib, ts, "slow", slow_idxs, ptrs.mprk_slow, ctxptr)
                 isempty(medium_idxs) || _set_split!(
-                    petsclib, ts, "medium", medium_idxs, MPRK_MEDIUM_PTR[], ctxptr,
+                    petsclib, ts, "medium", medium_idxs, ptrs.mprk_medium, ctxptr,
                 )
-                _set_split!(petsclib, ts, "fast", fast_idxs, MPRK_FAST_PTR[], ctxptr)
+                _set_split!(petsclib, ts, "fast", fast_idxs, ptrs.mprk_fast, ctxptr)
             end
             if is_split
-                LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, SPLIT_RHS_PTR[], ctxptr)
+                LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, ptrs.split_rhs, ctxptr)
             end
             if has_jac && uses_sparse_jac
                 pattern = _jacobian_pattern(J0, n, M)
                 h.jac_mat = PETSc.MatSeqAIJWithArrays(petsclib, MPI.COMM_SELF, pattern)
                 LibPETSc.TSSetIJacobian(
-                    petsclib, ts, h.jac_mat, h.jac_mat, SPARSE_IJACOBIAN_PTR[], ctxptr,
+                    petsclib, ts, h.jac_mat, h.jac_mat, ptrs.sparse_ijacobian, ctxptr,
                 )
             elseif has_jac
                 # A dense matrix gets LAPACK's pivoting LU, as PETSc's own does.
                 h.jac_mat = PETSc.MatSeqDense(petsclib, zeros(n, n))
                 LibPETSc.TSSetIJacobian(
-                    petsclib, ts, h.jac_mat, h.jac_mat, IJACOBIAN_PTR[], ctxptr,
+                    petsclib, ts, h.jac_mat, h.jac_mat, ptrs.ijacobian, ctxptr,
                 )
             elseif _uses_ifunction(alg) && prob.f.jac_prototype isa SparseArrays.AbstractSparseMatrix
                 h.fd_mat = PETSc.MatSeqAIJWithArrays(
@@ -2074,7 +2076,7 @@ function _setup(
                 )
                 _colour_jacobian!(petsclib, ts, h.fd_mat)
             end
-            LibPETSc.TSMonitorSet(petsclib, ts, MONITOR_PTR[], ctxptr)
+            LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             if ctx.dtmin > 0 || ctx.unstable !== nothing
                 _set_post_step!(petsclib, ts, ctx)
             end
@@ -2153,7 +2155,7 @@ function _setup(
                 PETSc.destroy(h.jac_mat)
                 h.jac_mat = PETSc.MatSeqAIJ(petsclib, n, n, n)
                 LibPETSc.TSSetIJacobian(
-                    petsclib, ts, h.jac_mat, h.jac_mat, IJACOBIAN_PTR[], ctxptr,
+                    petsclib, ts, h.jac_mat, h.jac_mat, ptrs.ijacobian, ctxptr,
                 )
             end
             # The options have reached the linear solve by here.

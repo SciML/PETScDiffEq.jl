@@ -371,6 +371,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         found = [PETScDiffEq._symbol(pl, :TSGetSolution) for pl in builds]
         @test allunique(found)
         @test [PETScDiffEq._symbol(pl, :TSGetSolution) for pl in builds] == found
+        # The callbacks take each build's own real type.
+        ptrs = [PETScDiffEq._callbacks(pl) for pl in builds]
+        @test ptrs[1].rhs != ptrs[2].rhs
+        @test PETScDiffEq._callbacks(builds[1]) === ptrs[1]
         # A post-step context is let go with its TS.
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8)

@@ -119,7 +119,7 @@ end
 
 function _adjoint_rhsjacobian!(
         ::LibPETSc.CTS,
-        s::LibPETSc.PetscReal,
+        s::Float64,
         x_ptr::LibPETSc.CVec,
         A_ptr::LibPETSc.CMat,
         ::LibPETSc.CMat,
@@ -148,7 +148,7 @@ const ADJ_RHSJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _adjoint_rhsjacobianp!(
         ::LibPETSc.CTS,
-        s::LibPETSc.PetscReal,
+        s::Float64,
         x_ptr::LibPETSc.CVec,
         A_ptr::LibPETSc.CMat,
         ctx_ptr::Ptr{Cvoid},
@@ -159,10 +159,10 @@ end
 
 function _adjoint_ijacobianp!(
         ::LibPETSc.CTS,
-        s::LibPETSc.PetscReal,
+        s::Float64,
         x_ptr::LibPETSc.CVec,
         ::LibPETSc.CVec,
-        ::LibPETSc.PetscReal,
+        ::Float64,
         A_ptr::LibPETSc.CMat,
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
@@ -192,7 +192,7 @@ const ADJ_IJACOBIANP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 function _adjoint_record!(
         ::LibPETSc.CTS,
         step::LibPETSc.PetscInt,
-        s::LibPETSc.PetscReal,
+        s::Float64,
         x_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
@@ -237,7 +237,7 @@ const ADJ_RECORD_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 function _adjoint_jump!(
         ::LibPETSc.CTS,
         step::LibPETSc.PetscInt,
-        ::LibPETSc.PetscReal,
+        ::Float64,
         ::LibPETSc.CVec,
         ::LibPETSc.PetscInt,
         ::Ptr{LibPETSc.CVec},
@@ -275,38 +275,39 @@ end
 const ADJ_JUMP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
 # Called from `__init__`, since `@cfunction` needs these functions defined where it appears.
+# The adjoint runs only in PETSc's double build, so its times are Float64.
 function _init_adjoint_pointers!()
     ADJ_RHSJACOBIAN_PTR[] = @cfunction(
         _adjoint_rhsjacobian!,
         LibPETSc.PetscErrorCode,
         (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CMat,
+            LibPETSc.CTS, Float64, LibPETSc.CVec, LibPETSc.CMat,
             LibPETSc.CMat, Ptr{Cvoid},
         )
     )
     ADJ_RHSJACOBIANP_PTR[] = @cfunction(
         _adjoint_rhsjacobianp!,
         LibPETSc.PetscErrorCode,
-        (LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CMat, Ptr{Cvoid})
+        (LibPETSc.CTS, Float64, LibPETSc.CVec, LibPETSc.CMat, Ptr{Cvoid})
     )
     ADJ_IJACOBIANP_PTR[] = @cfunction(
         _adjoint_ijacobianp!,
         LibPETSc.PetscErrorCode,
         (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            LibPETSc.PetscReal, LibPETSc.CMat, Ptr{Cvoid},
+            LibPETSc.CTS, Float64, LibPETSc.CVec, LibPETSc.CVec,
+            Float64, LibPETSc.CMat, Ptr{Cvoid},
         )
     )
     ADJ_RECORD_PTR[] = @cfunction(
         _adjoint_record!,
         LibPETSc.PetscErrorCode,
-        (LibPETSc.CTS, LibPETSc.PetscInt, LibPETSc.PetscReal, LibPETSc.CVec, Ptr{Cvoid})
+        (LibPETSc.CTS, LibPETSc.PetscInt, Float64, LibPETSc.CVec, Ptr{Cvoid})
     )
     ADJ_JUMP_PTR[] = @cfunction(
         _adjoint_jump!,
         LibPETSc.PetscErrorCode,
         (
-            LibPETSc.CTS, LibPETSc.PetscInt, LibPETSc.PetscReal, LibPETSc.CVec,
+            LibPETSc.CTS, LibPETSc.PetscInt, Float64, LibPETSc.CVec,
             LibPETSc.PetscInt, Ptr{LibPETSc.CVec}, Ptr{LibPETSc.CVec}, Ptr{Cvoid},
         )
     )
