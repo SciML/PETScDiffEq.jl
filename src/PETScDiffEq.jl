@@ -668,9 +668,22 @@ end
 _floor(R, dtmin, force_dtmin, adaptive) =
     force_dtmin || !adaptive || dtmin === nothing ? zero(R) : abs(R(dtmin))
 
-# A rounding error at `t` itself. A stop just after the start of a long span is still ahead,
-# where a tolerance scaled to the final time would count it as passed.
-_near(t) = 100 * eps(max(one(t), abs(t)))
+# A rounding error at `t` itself, which is what PETSc's clock can be off by after a step
+# shortened onto a stop. A stop just after the start of a long span is still ahead, where a
+# tolerance scaled to the final time would count it as passed. In double precision 100 ulps
+# of `max(1, |t|)` is still far below any step. Single precision has seven digits, so there
+# that much is a whole step near the end of a long span or an ordinary short one, and a
+# point that far from a step's end is not on it: the tolerance is a few ulps of `t` itself.
+_near(t::Float64) = 100 * eps(max(1.0, abs(t)))
+_near(t::Float32) = 4 * eps(abs(t))
+
+# The shortest step PETSc's clock can take at `t`. A step's stages lie between its ends, and
+# BDF's first step starts from its midpoint, so a step of an ulp or two puts them on an end
+# and PETSc divides by the zero between them. Double precision keeps OrdinaryDiffEq's floor
+# of one ulp, which a start has to be near 1e10 to reach; single precision reaches it at
+# t = 1e4, so its floor is four ulps.
+_min_step(t::Float64) = zero(t)
+_min_step(t::Float32) = 4 * eps(abs(t))
 
 _last_recorded(ctx, t) = !isempty(ctx.ts) && ctx.ts[end] == t
 
@@ -1575,6 +1588,10 @@ mutable struct TSHandles{CTX, L, R, S}
     pivot_raises::Bool
     # The PETSc error code a step stopped on, or 0 where none did.
     stopped::Int
+    # Whether the integrator, rather than PETSc, shortens the steps onto each stop, and
+    # whether those steps are of a fixed size.
+    matches::Bool
+    fixed::Bool
     tolvecs::Vector{Any}
     tolbufs::Vector{Vector{S}}
     destroyed::Bool
@@ -1697,7 +1714,7 @@ end
 # small default instead. It is worked in the clock's type, which is the time `f` is called
 # with, and `dtmin` and `dtmax` come in it.
 function _initial_dt(f1, f2, u0, p, t0::R, tdir, order, abstol, reltol, dtmin, dtmax) where {R}
-    dtmin_floor = nextfloat(max(dtmin, eps(t0)))
+    dtmin_floor = max(nextfloat(max(dtmin, eps(t0))), _min_step(t0))
     smalldt = max(dtmin_floor, R(1.0e-6))
     isempty(u0) && return smalldt
     norm = DiffEqBase.ODE_DEFAULT_NORM
@@ -1993,9 +2010,9 @@ function _setup(
         est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
         # With no explicit derivative to estimate from, start small as OrdinaryDiffEq does.
         dt = if is_dae
-            R(1.0e-6) * abs(tf - t0)
+            max(R(1.0e-6) * abs(tf - t0), _min_step(user_t0))
         elseif has_mass
-            max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6))
+            max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
         else
             # The abstol/reltol keywords as this function hands them to PETSc below, which
             # keeps its own 1e-4 for both when neither is given. Tolerances set through
@@ -2034,20 +2051,20 @@ function _setup(
     filter!(t -> t0 - eps(tf) <= t <= tf + eps(tf), saveat_times)
     # OrdinaryDiffEq's defaults: a saveat keeps only its own points, and an end is kept
     # when saveat names it. A save flag given explicitly wins over saveat.
-    endtol = _near(tf)
+    at_start(t) = abs(t - t0) <= _near(t0)
+    at_end(t) = abs(t - tf) <= _near(tf)
     no_saveat = !(saveat isa Number) && isempty(saveat)
     save_everystep = save_on && something(save_everystep, no_saveat)
     save_start = something(
         save_start, save_everystep || no_saveat || saveat isa Number ||
-            any(t -> abs(t - t0) <= endtol, saveat_times),
+            any(at_start, saveat_times),
     )
     save_end = something(
-        save_end, save_everystep || no_saveat || saveat isa Number ||
-            any(t -> abs(t - tf) <= endtol, saveat_times),
+        save_end, save_everystep || no_saveat || saveat isa Number || any(at_end, saveat_times),
     )
     save_on || empty!(saveat_times)
-    save_start || filter!(t -> abs(t - t0) > endtol, saveat_times)
-    save_end || filter!(t -> abs(t - tf) > endtol, saveat_times)
+    save_start || filter!(!at_start, saveat_times)
+    save_end || filter!(!at_end, saveat_times)
     M = has_mass ? Matrix{S}(mass_matrix) : nothing
     missing_diag = uses_sparse_jac ?
         [i for i in 1:n if !_stored(J0, i, i)] : Int[]
@@ -2102,7 +2119,7 @@ function _setup(
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing, ad_calls, nothing,
-        t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0,
+        t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0, false, false,
         Any[], Vector{S}[], false,
     )
     finalizer(_finalize!, h)
@@ -2281,6 +2298,20 @@ function _read_stats(h::TSHandles)
     )
 end
 
+# PETSc's single build takes the 2-norms of its Newton and Krylov vectors in single
+# precision, where a vector whose entries are all below about sqrt(floatmin(Float32))
+# squares to zero. Only the implicit methods take such norms. A state that decays there
+# from above is within any tolerance coarser than that, so only a solve that ends there
+# having started there, or having failed, is at fault.
+const _NORM_FLOOR = sqrt(floatmin(Float32))
+
+_tiny(u) = 0 < maximum(abs, u; init = 0.0f0) < _NORM_FLOOR
+
+_underflows(::TSHandles{<:Any, <:Any, Float64}, alg, uend, retcode) = false
+_underflows(h::TSHandles{<:Any, <:Any, Float32}, alg, uend, retcode) =
+    _uses_ifunction(alg) && _tiny(uend) &&
+    (_tiny(h.u0) || retcode != SciMLBase.ReturnCode.Success)
+
 function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     ctx = h.ctx
     tf, t0, tol = h.tf, h.t0, _near(h.tf)
@@ -2310,7 +2341,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
         pop!(ctx.us)
         ctx.dense && pop!(ctx.dus)
     end
-    if !h.save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= tol
+    if !h.save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= _near(t0)
         popfirst!(ctx.ts)
         popfirst!(ctx.us)
         ctx.dense && popfirst!(ctx.dus)
@@ -2340,6 +2371,12 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
             "Jacobian this package gave PETSc, so it is not solving implicitly and the " *
             "result should not be trusted; an explicit PETSc type needs `explicit = true`"
     end
+    _underflows(h, alg, uend, retcode) && @warn "`$(_warn_name(alg))` ended in PETSc's " *
+        "single-precision build on a state whose entries are all below " *
+        "$(Float32(_NORM_FLOOR)) in size, where that build's vector norms underflow to " *
+        "zero, so its Newton iteration can stop without moving the state, whether it " *
+        "reports success or fails. Rescale the problem, or give it a Float64 span to solve " *
+        "it in double precision"
     stats = SciMLBase.DEStats(
         _nf(h), ctx.nf2, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
         st.nsteps, st.nreject, 0.0,
@@ -2356,11 +2393,13 @@ function _solve_unlocked(
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
     # PETSc's MPRK step never shortens itself onto the final time, so it runs
-    # through the integrator, which shortens the last step for it.
+    # through the integrator, which shortens the last step for it, as it does in single
+    # precision, where PETSc's own landing refuses short steps.
     # A step outside the caller's domain is taken again smaller, which only the
     # integrator's own loop can do.
     if !_no_callback(callback) || !isempty(tstops) || !isempty(d_discontinuities) ||
-            alg isa TSMPRK || get(kwargs, :isoutofdomain, nothing) !== nothing
+            alg isa TSMPRK || get(kwargs, :isoutofdomain, nothing) !== nothing ||
+            first(_eltypes(prob)) === Float32
         return SciMLBase.solve!(
             SciMLBase.__init(
                 prob, alg; callback = callback, tstops = tstops,
@@ -2592,8 +2631,7 @@ function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
     t = oftype(integ.t, t)
     ctx = integ.h.ctx
     s = integ.tdir * t
-    tol = _near(integ.h.tf)
-    s < integ.tdir * integ.t - tol &&
+    s < integ.tdir * integ.t - _near(integ.t) &&
         throw(ArgumentError("cannot add a saveat at $t, behind the current time $(integ.t)"))
     i = searchsortedfirst(ctx.saveat, s)
     (i <= length(ctx.saveat) && ctx.saveat[i] == s) || insert!(ctx.saveat, i, s)
@@ -2653,19 +2691,21 @@ function SciMLBase.step!(integ::PETScIntegrator, dt, stop_at_tdt = false)
 end
 
 function _state_at_unlocked(integ::PETScIntegrator, t)
-    # A rounding error from an end of the step is that end, so `integ(integ.t - integ.dt)`
-    # is the step's start.
-    tol = _near(integ.t)
-    abs(t - integ.t) <= tol && return integ.u
-    abs(t - integ.tprev) <= tol && return integ.uprev
+    # A rounding error outside the step is the end it lies beside, so
+    # `integ(integ.t - integ.dt)` is the step's start. Inside the step only an end itself is
+    # an end: the root finder looks a hundredth of a step past an event, which in single
+    # precision can be closer to it than any rounding tolerance.
+    s, s0, s1 = integ.tdir * t, integ.tdir * integ.tprev, integ.tdir * integ.t
+    (s == s1 || s1 < s <= s1 + _near(integ.t)) && return integ.u
+    (s == s0 || s0 - _near(integ.tprev) <= s < s0) && return integ.uprev
     # Only the step just taken has both ends at hand.
-    integ.tdir * integ.tprev <= integ.tdir * t <= integ.tdir * integ.t || throw(
+    s0 <= s <= s1 || throw(
         ArgumentError(
             "PETScDiffEq can only interpolate inside the step just taken, " *
                 "$(integ.tprev) to $(integ.t), but $t was asked for",
         ),
     )
-    return _interpolate!(integ, integ.tdir * t)
+    return _interpolate!(integ, s)
 end
 
 # Times are taken in the integrator's clock, which is what PETSc interpolates in.
@@ -2958,6 +2998,7 @@ function _init_unlocked(
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = stops_given, kwargs...)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
+    _match_steps_here!(h)
     _initial_save!(h)
     stops = _tstops(stops_given, h)
     dt0 = h.tdir * LibPETSc.TSGetTimeStep(h.petsclib, h.ts)
@@ -3085,7 +3126,7 @@ SciMLBase.pop_tstop!(integ::PETScIntegrator) = popfirst!(integ.tstops)
 
 function _initial_save!(h::TSHandles)
     ctx = h.ctx
-    tol = _near(h.tf)
+    tol = _near(h.t0)
     landed = false
     while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= h.t0 + tol
         _record_end!(ctx, ctx.saveat[ctx.saveat_idx], h.u0)
@@ -3145,6 +3186,7 @@ function _reinit_unlocked(
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
+    _match_steps_here!(h)
     if !erase_sol
         append!(h.ctx.ts, old.ctx.ts)
         append!(h.ctx.us, old.ctx.us)
@@ -3224,12 +3266,10 @@ SciMLBase.terminate!(integ::PETScIntegrator, retcode = SciMLBase.ReturnCode.Term
 
 # `slack` lets a point a rounding error past `upto` count as reached. Before an event it is
 # 0, so a point just after the root waits for the state the event leaves.
-function _save_step!(
-        integ::PETScIntegrator, upto, endpoint::Bool; slack = _near(integ.h.tf),
-    )
+function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near(upto))
     h = integ.h
     ctx = h.ctx
-    tol = _near(h.tf)
+    tol = _near(integ.t)
     landed = false
     while ctx.saveat_idx <= length(ctx.saveat) &&
             ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + slack
@@ -3246,6 +3286,39 @@ function _save_step!(
         _record_end!(ctx, integ.tdir * upto, integ.u)
     return nothing
 end
+
+# PETSc's own landing on a stop, TS_EXACTFINALTIME_MATCHSTEP, refuses a step that leaves
+# less than 10 machine epsilons, in absolute time, before a stop under 1 in size. In single
+# precision that is any step under about 1.2e-6 there, so the integrator lands on each stop
+# itself, by PETSc's own rule, and PETSc steps over.
+function _match_steps_here!(h::TSHandles{<:Any, <:Any, R}) where {R}
+    pl, ts = h.petsclib, h.ts
+    R === Float32 && _exact_final_time(pl, ts) == LibPETSc.TS_EXACTFINALTIME_MATCHSTEP ||
+        return nothing
+    LibPETSc.TSSetExactFinalTime(pl, ts, LibPETSc.TS_EXACTFINALTIME_STEPOVER)
+    h.matches = true
+    h.fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, ts)) == "none"
+    return nothing
+end
+
+# PETSc's rule: a step within 1% of what is left takes all of it, and one within a factor of
+# two takes half, so no sliver is left for last. An adaptive step is PETSc's own proposal
+# before it is cut for a stop, and is the one to go on with after the stop.
+function _match_step!(integ::PETScIntegrator, remaining)
+    h = integ.h
+    pl, s = h.petsclib, integ.tdir * integ.t
+    p = LibPETSc.TSGetTimeStep(pl, h.ts)
+    h.fixed || (integ.dtcache = integ.tdir * p)
+    q = p * oftype(p, 1.01) > remaining ? remaining : 2p > remaining ? remaining / 2 : p
+    h.fixed || (q = max(q, min(remaining, _min_step(s))))
+    q == p || LibPETSc.TSSetTimeStep(pl, h.ts, q)
+    return nothing
+end
+
+# The step PETSc goes on with after landing on a stop, which it would otherwise take to be
+# the shortened one that landed there. A fixed step is the one given.
+_resumed_step(integ::PETScIntegrator, stop) = integ.h.matches && !integ.h.fixed ?
+    max(integ.tdir * integ.dtcache, _min_step(stop)) : integ.tdir * integ.dtcache
 
 # `outer` is the start of the last step taken, kept across the retries of an undone step.
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
@@ -3286,9 +3359,11 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
     target = stop === nothing ? h.tf : stop
     LibPETSc.TSSetMaxTime(pl, h.ts, target)
-    # TSAdaptChoose rejects a step that reaches past the max time, so the step
-    # onto the target is shortened here rather than by PETSc.
-    if LibPETSc.TSGetTimeStep(pl, h.ts) > target - integ.tdir * integ.t
+    if h.matches
+        _match_step!(integ, target - integ.tdir * integ.t)
+    elseif LibPETSc.TSGetTimeStep(pl, h.ts) > target - integ.tdir * integ.t
+        # TSAdaptChoose rejects a step that reaches past the max time, so the step
+        # onto the target is shortened here rather than by PETSc.
         LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
     end
     h.stopped = 0
@@ -3316,16 +3391,16 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         return nothing
     end
     if stop === nothing
-        integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
+        h.matches || (integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts))
         # Steps summed onto the final time can fall a rounding error short of it.
         if integ.tdir * integ.t != h.tf && integ.tdir * integ.t >= h.tf - tol
             integ.t = _user_t(integ.tdir, h.tf)
             LibPETSc.TSSetTime(pl, h.ts, h.tf)
         end
-    elseif integ.tdir * integ.t >= stop - tol
+    elseif integ.tdir * integ.t >= stop - _near(stop)
         integ.t = _user_t(integ.tdir, stop)
         LibPETSc.TSSetTime(pl, h.ts, stop)
-        LibPETSc.TSSetTimeStep(pl, h.ts, integ.tdir * integ.dtcache)
+        LibPETSc.TSSetTimeStep(pl, h.ts, _resumed_step(integ, stop))
     end
     integ.dt = integ.t - integ.tprev
     _readvec!(integ.u, pl, h.u)
