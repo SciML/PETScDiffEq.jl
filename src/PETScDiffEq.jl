@@ -1730,24 +1730,42 @@ end
 
 const SupportedProblem = Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}
 
+# The scalar types of the PETSc builds PETSc.jl has loaded with the index width this package
+# uses. PETSc_jll brings all four; a library set with `PETSc.set_library!` is the only one.
+_loaded_builds() = Type[
+    PETSc.scalartype(pl) for pl in PETSc.petsclibs if PETSc.inttype(pl) === LibPETSc.PetscInt
+]
+
 # The PETSc build's real and scalar types and the eltype the saved states come back in.
-# Single precision, real or complex, runs in PETSc's single builds only with a Float32 or
-# whole-number span, as OrdinaryDiffEq advises a Float32 span for Float32 work; with a
-# Float64 span it runs in the double builds and only the saved states keep single
-# precision. Every other state runs in double precision and comes back in it, as a
-# whole-number state does in OrdinaryDiffEq.
-function _eltypes(prob)
+# Single precision, real or complex, runs in PETSc's single builds only with a Float32 span,
+# as OrdinaryDiffEq advises a Float32 span for Float32 work; with a Float64 span, or where
+# the single build is not loaded, it runs in the double one and only the saved states keep
+# single precision. DiffEqBase makes a whole-number span Float64 before a solve starts.
+# Every other state runs in double precision and comes back in it, as a whole-number state
+# does in OrdinaryDiffEq.
+function _eltypes(prob, builds = _loaded_builds())
     E, tE = eltype(prob.u0), eltype(prob.tspan)
     single = E === Float32 || E === ComplexF32
-    R = single && (tE === Float32 || tE <: Integer) ? Float32 : Float64
+    R = single && tE === Float32 && (E <: Complex ? ComplexF32 : Float32) in builds ?
+        Float32 : Float64
     S = E <: Complex ? Complex{R} : R
     U = single ? E : E <: Complex ? ComplexF64 : Float64
     return R, S, U
 end
 
-# The saved times come back in the span's own type, as OrdinaryDiffEq gives them, or in the
-# clock's where the span is neither Float32 nor Float64.
-_time_type(prob, R) = eltype(prob.tspan) in (Float32, Float64) ? eltype(prob.tspan) : R
+_build_name(S) = "$(real(S)) $(S <: Complex ? "complex" : "real")"
+
+# `PETSc.getlib` has no method for a build PETSc.jl has not loaded.
+function _petsclib(S, builds = _loaded_builds())
+    S in builds && return PETSc.getlib(; PetscScalar = S)
+    throw(
+        ArgumentError(
+            "this problem needs PETSc's $(_build_name(S)) build, which PETSc.jl has not " *
+                "loaded; with a library set by `PETSc.set_library!` it loads only that one, " *
+                "and here it has loaded the $(join(map(_build_name, builds), ", ")) build",
+        ),
+    )
+end
 
 # DiffEqBase hands a prototype on as `similar` to itself, whose stored values are whatever
 # the memory held and need not even convert, so only its structure is taken.
@@ -1862,7 +1880,7 @@ function _setup(
         (Int[], Int[], Int[])
     end
 
-    petsclib = PETSc.getlib(PetscScalar = S)
+    petsclib = _petsclib(S)
     _check_inttype(petsclib)
     PETSc.initialized(petsclib) || PETSc.initialize(petsclib)
     _arm_exit_cleanup!(petsclib)
@@ -2326,7 +2344,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
         _nf(h), ctx.nf2, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
         st.nsteps, st.nreject, 0.0,
     )
-    ts, dus = _user_time(h, prob)
+    ts, dus = _user_time(h)
     return SciMLBase.build_solution(
         prob, alg, ts, ctx.us; retcode = retcode, stats = stats,
         dense = ctx.dense, interp = _interp(ctx, ts, dus),
@@ -2432,10 +2450,11 @@ The integrator `SciMLBase.init` returns for a PETSc TS algorithm. Step it with
 restart it with `reinit!`. Between steps `u`, `uprev`, `t`, `tprev` and `dt`
 are readable, and `add_tstop!` schedules a time to land on exactly.
 
-These are in the types PETSc steps in, which are the problem's own except for a
-`Float32` or `ComplexF32` state with a `Float64` span: that runs in PETSc's
-double-precision build, so the integrator's state is in double precision while the
-solution it saves is in single.
+These are in the types PETSc steps in. The clock, and so `t`, `dt` and the saved times, is
+`Float32` for a `Float32` or `ComplexF32` state with a `Float32` span and `Float64`
+otherwise, whatever the span's type. The state is the problem's own, except that a
+whole-number one is stepped in `Float64` and a single-precision one with a `Float64` span in
+double precision, while the solution it saves stays in single.
 """
 mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, Vector{S}, R}
@@ -3077,20 +3096,15 @@ function _initial_save!(h::TSHandles)
     return nothing
 end
 
-# Recorded times and derivatives are in PETSc's forward-running time, and the times go back
-# in the span's type. Forward times already in it are the recorded ones themselves, which a
-# running integrator's solution keeps up with.
-function _user_time(h::TSHandles{<:Any, <:Any, R}, prob) where {R}
-    T = _time_type(prob, R)
-    ts, dus = h.tdir > 0 ? (h.ctx.ts, h.ctx.dus) :
-        (_user_t.(h.tdir, h.ctx.ts), [-d for d in h.ctx.dus])
-    return T === R ? ts : Vector{T}(ts), dus
-end
+# Recorded times and derivatives are in PETSc's forward-running time. Forward ones are the
+# recorded ones themselves, which a running integrator's solution keeps up with.
+_user_time(h::TSHandles) = h.tdir > 0 ? (h.ctx.ts, h.ctx.dus) :
+    (_user_t.(h.tdir, h.ctx.ts), [-d for d in h.ctx.dus])
 
 _nf(h::TSHandles) = h.ctx.nf + (h.ad_calls === nothing ? 0 : h.ad_calls[])
 
 function _initial_solution(prob, alg, h::TSHandles)
-    ts, dus = _user_time(h, prob)
+    ts, dus = _user_time(h)
     return SciMLBase.build_solution(
         prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
         dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = SciMLBase.DEStats(0),

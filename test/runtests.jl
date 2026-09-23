@@ -519,8 +519,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @testset "the span picks the PETSc build, and the solution keeps the problem's types" begin
             # A Float32 state runs in PETSc's single build with a Float32 span and in the double
             # one with a Float64 span, where only its saved states stay Float32. Any other state
-            # runs in Float64, and the saved times keep the span's type. `f` sees exactly the
-            # build's types, which the wrapper SciMLBase made for the problem depends on.
+            # runs in Float64, and the times are in the clock's type whatever the span's. `f`
+            # sees exactly the build's types, which the wrapper SciMLBase made for the problem
+            # depends on.
             seen = Set{Any}()
             typed!(du, u, p, t) = (push!(seen, (typeof(u), typeof(t))); du .= -u; nothing)
             typed(u, p, t) = (push!(seen, (typeof(u), typeof(t))); -u)
@@ -539,16 +540,39 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test build(integ) === R
                 @test integ.u isa Vector{R} && integ.t isa R
                 sol = SciMLBase.solve!(integ)
-                @test eltype(sol.u[end]) === U && eltype(sol.t) === T
+                @test eltype(sol.u[end]) === U && eltype(sol.t) === R
                 @test seen == Set([(Vector{R}, R)])
                 for kw in ((;), (; saveat = T(0.25)), (; tstops = [T(0.5)]))
                     empty!(seen)
                     sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = T(0.1), kw...)
                     @test sol.retcode == SciMLBase.ReturnCode.Success
-                    @test eltype(sol.u[end]) === U && eltype(sol.t) === T
+                    @test eltype(sol.u[end]) === U && eltype(sol.t) === R
                     @test seen == Set([(Vector{R}, R)])
                 end
             end
+            # The integrator's solution keeps up with it while it steps, which a copy of the
+            # times in the span's type would not.
+            integ = SciMLBase.init(
+                SciMLBase.ODEProblem(decay!, [1.0], (0.0f0, 10.0f0)), PETScDiffEq.TSRK("5dp"),
+            )
+            foreach(_ -> SciMLBase.step!(integ), 1:3)
+            @test length(integ.sol.t) == length(integ.sol.u) == 4
+            @test integ.sol(integ.t) ≈ integ.u
+            # DiffEqBase makes a whole-number span Float64, so it runs in the double build.
+            whole = SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, Float32[1], (0, 1)), PETScDiffEq.TSRK("5dp"),
+            )
+            @test eltype(whole.t) === Float64 && eltype(whole.u[end]) === Float32
+            # With only the double build loaded, as a library set with `PETSc.set_library!`
+            # leaves it, a single-precision state runs in it, and a missing build is named.
+            single = SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0))
+            @test PETScDiffEq._eltypes(single, [Float64]) == (Float64, Float64, Float32)
+            @test PETScDiffEq._eltypes(
+                SciMLBase.remake(single; u0 = ComplexF32[1]), [Float64, ComplexF64],
+            ) == (Float64, ComplexF64, ComplexF32)
+            @test_throws "ArgumentError: this problem needs PETSc's Float64 complex build" (
+                PETScDiffEq._petsclib(ComplexF64, [Float64])
+            )
             # A `dt` given in Float64 promotes the span, as DiffEqBase does for every solver.
             promoted = SciMLBase.init(
                 SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0)),
