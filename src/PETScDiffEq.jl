@@ -2001,7 +2001,12 @@ function _setup(
                 _set_post_step!(petsclib, ts, ctxptr)
             end
             LibPETSc.TSSetTime(petsclib, ts, t0)
-            LibPETSc.TSSetTimeStep(petsclib, ts, abs(Float64(dt)))
+            # PETSc's floor clamps only the steps its adaptor chooses, not the one given.
+            LibPETSc.TSSetTimeStep(
+                petsclib, ts,
+                force_dtmin && dtmin !== nothing ? max(abs(Float64(dt)), abs(Float64(dtmin))) :
+                    abs(Float64(dt)),
+            )
             LibPETSc.TSSetMaxTime(petsclib, ts, tf)
             LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(maxiters))
             LibPETSc.TSSetExactFinalTime(
@@ -2021,10 +2026,17 @@ function _setup(
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
             # Told to keep going below the floor, the floor is PETSc's to clamp with,
             # since it takes the clamped step whatever its error.
-            force_dtmin && dtmin !== nothing && dtmin != 0 &&
+            forced = force_dtmin && dtmin !== nothing && dtmin != 0
+            forced &&
                 append!(effective_options, ["-ts_adapt_dt_min", string(abs(Float64(dtmin)))])
-            (dtmax === nothing || isinf(dtmax)) ||
-                append!(effective_options, ["-ts_adapt_dt_max", string(abs(Float64(dtmax)))])
+            # With force_dtmin the floor wins over a smaller dtmax, as in OrdinaryDiffEq.
+            (dtmax === nothing || isinf(dtmax)) || append!(
+                effective_options,
+                [
+                    "-ts_adapt_dt_max",
+                    string(_above(abs(Float64(dtmax)), forced ? abs(Float64(dtmin)) : 0.0)),
+                ],
+            )
             append!(effective_options, alg.petsc_options)
             append!(effective_options, extra_options)
             if !isempty(effective_options)
@@ -2165,15 +2177,17 @@ function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
-    tstops = _with_discontinuities(tstops, d_discontinuities)
     # PETSc's MPRK step never shortens itself onto the final time, so it runs
     # through the integrator, which shortens the last step for it.
     # A step outside the caller's domain is taken again smaller, which only the
     # integrator's own loop can do.
-    if !_no_callback(callback) || !isempty(tstops) || alg isa TSMPRK ||
-            get(kwargs, :isoutofdomain, nothing) !== nothing
+    if !_no_callback(callback) || !isempty(tstops) || !isempty(d_discontinuities) ||
+            alg isa TSMPRK || get(kwargs, :isoutofdomain, nothing) !== nothing
         return SciMLBase.solve!(
-            SciMLBase.__init(prob, alg; callback = callback, tstops = tstops, kwargs...),
+            SciMLBase.__init(
+                prob, alg; callback = callback, tstops = tstops,
+                d_discontinuities = d_discontinuities, kwargs...,
+            ),
         )
     end
     h = _setup(prob, alg; kwargs...)
@@ -2220,6 +2234,7 @@ mutable struct PETScIntegratorOpts{H}
     dtmin::Float64
     dtmax::Float64
     verbose::Bool
+    force_dtmin::Bool
 end
 
 function _setopt_unlocked(o::PETScIntegratorOpts, name::Symbol, v)
@@ -2229,14 +2244,20 @@ function _setopt_unlocked(o::PETScIntegratorOpts, name::Symbol, v)
     pl = h.petsclib
     if name === :abstol || name === :reltol
         _set_tolerances!(h, getfield(o, :abstol), getfield(o, :reltol))
+    elseif name === :dtmin && getfield(o, :force_dtmin)
+        # Under force_dtmin the floor is PETSc's clamp, and moving it keeps it so.
+        adapt = LibPETSc.TSGetAdapt(pl, h.ts)
+        _, hi = LibPETSc.TSAdaptGetStepLimits(pl, adapt)
+        lo = abs(getfield(o, :dtmin))
+        LibPETSc.TSAdaptSetStepLimits(pl, adapt, lo, _above(hi, lo))
     elseif name === :dtmin
         # The floor is kept here rather than by PETSc, whose own floor takes the step anyway.
         h.ctx.dtmin = _floor(getfield(o, :dtmin), false, getfield(o, :adaptive))
     elseif name === :dtmax
         adapt = LibPETSc.TSGetAdapt(pl, h.ts)
         lo, _ = LibPETSc.TSAdaptGetStepLimits(pl, adapt)
-        hi = getfield(o, :dtmax)
-        LibPETSc.TSAdaptSetStepLimits(pl, adapt, lo, isfinite(hi) ? hi : 1.0e308)
+        hi = abs(getfield(o, :dtmax))
+        LibPETSc.TSAdaptSetStepLimits(pl, adapt, lo, isfinite(hi) ? _above(hi, lo) : 1.0e308)
     end
     return v
 end
@@ -2276,6 +2297,10 @@ mutable struct PETScIntegrator{Alg, P, H, Pr, CB, CC} <:
     kwargs::Any
     tstops::Vector{Float64}
     tstops_cache::Vector{Float64}
+    # The d_discontinuities of this run, in the caller's time, which are also in `tstops`,
+    # and those given to `init`, which `reinit!` goes back to.
+    d_discontinuities::Vector{Float64}
+    d_discontinuities_cache::Vector{Float64}
     dtcache::Float64
     sol::Any
     finished::Bool
@@ -2335,7 +2360,7 @@ _make_opts(h, kwargs) = PETScIntegratorOpts(
     get(kwargs, :abstol, 1.0e-6), get(kwargs, :reltol, 1.0e-3),
     Float64(something(get(kwargs, :dtmin, nothing), 0.0)),
     Float64(something(get(kwargs, :dtmax, nothing), Inf)),
-    get(kwargs, :verbose, true) === true,
+    get(kwargs, :verbose, true) === true, get(kwargs, :force_dtmin, false) === true,
 )
 
 SciMLBase.isadaptive(integ::PETScIntegrator) =
@@ -2739,12 +2764,13 @@ function _init_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
-    tstops = _with_discontinuities(tstops, d_discontinuities)
+    tstops, d_discontinuities = _times(tstops), _times(d_discontinuities)
+    stops_given = vcat(tstops, d_discontinuities)
     callbacks, continuous = _split_callbacks(callback)
-    h = _setup(prob, alg; tstops = tstops, kwargs...)
+    h = _setup(prob, alg; tstops = stops_given, kwargs...)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
     _initial_save!(h)
-    stops = _tstops(tstops, h)
+    stops = _tstops(stops_given, h)
     dt0 = h.tdir * Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
     integ = PETScIntegrator(
         alg, copy(h.u0), copy(h.u0), _user_t(h.tdir, h.t0), _user_t(h.tdir, h.t0),
@@ -2753,9 +2779,11 @@ function _init_unlocked(
         copy(h.u0), similar(h.u0), similar(h.u0),
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous],
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
-        stops, collect(Float64, tstops), dt0, _initial_solution(prob, alg, h), false, false,
+        stops, tstops, d_discontinuities, d_discontinuities, dt0,
+        _initial_solution(prob, alg, h), false, false,
     )
     _initialize_callbacks!(integ, true)
+    _past_discontinuity!(integ)
     return integ
 end
 
@@ -2806,12 +2834,38 @@ function _reject_out_of_domain!(integ::PETScIntegrator, before)
     return _step_unlocked(integ, outer)
 end
 
-# A time the solution is not smooth at is a time to step onto, as in OrdinaryDiffEq.
-_with_discontinuities(tstops, d_discontinuities) = isempty(d_discontinuities) ? tstops :
-    vcat(collect(Float64, tstops), collect(Float64, d_discontinuities))
+# PETSc wants a largest step strictly above the smallest; where the floor wins, it pins the
+# step there.
+_above(hi, lo) = hi > lo ? hi : nextfloat(lo)
+
+function _take_written_state!(integ::PETScIntegrator)
+    h = integ.h
+    _readvec!(integ.ucache, h.petsclib, h.u) == integ.u && return nothing
+    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    h.ctx.pdirty = true
+    return nothing
+end
+
+# A single time is a list of one, as OrdinaryDiffEq takes it.
+_times(ts) = ts isa Number ? [Float64(ts)] : Vector{Float64}(collect(Float64, ts))
+
+# SciML's d_discontinuities are right-continuous: the step onto `t_d` ends in the old regime,
+# and the next one starts a ULP past it, where the right-hand side is in the new one. An entry
+# at the start moves the start the same way.
+function _past_discontinuity!(integ::PETScIntegrator)
+    integ.t in integ.d_discontinuities || return nothing
+    h = integ.h
+    s = nextfloat(integ.tdir * integ.t)
+    integ.t = _user_t(integ.tdir, s)
+    LibPETSc.TSSetTime(h.petsclib, h.ts, s)
+    LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    h.ctx.pdirty = true
+    return nothing
+end
 
 function _tstops(tstops, h::TSHandles)
-    stops = sort!(unique!(h.tdir .* Vector{Float64}(collect(Float64, tstops))))
+    stops = sort!(unique!(h.tdir .* _times(tstops)))
     filter!(s -> h.t0 < s < h.tf, stops)
     return push!(stops, h.tf)
 end
@@ -2882,12 +2936,14 @@ function _reinit_unlocked(
         integ::PETScIntegrator, u0 = integ.prob.u0;
         t0 = integ.prob.tspan[1], tf = integ.prob.tspan[2],
         erase_sol = true, saveat = nothing, tstops = integ.tstops_cache,
+        d_discontinuities = integ.d_discontinuities_cache,
         reinit_callbacks = true, initialize_save = true,
     )
+    tstops, d_discontinuities = _times(tstops), _times(d_discontinuities)
     old = integ.h
     prob = SciMLBase.remake(integ.prob; u0 = u0, tspan = (t0, tf))
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
-    h = _setup(prob, integ.alg; tstops = tstops, setup_kwargs...)
+    h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
     if !erase_sol
         append!(h.ctx.ts, old.ctx.ts)
@@ -2919,7 +2975,8 @@ function _reinit_unlocked(
     integ.tprev = _user_t(h.tdir, h.t0)
     integ.dt = h.tdir * Float64(LibPETSc.TSGetTimeStep(h.petsclib, h.ts))
     integ.dtcache = integ.dt
-    integ.tstops = _tstops(tstops, h)
+    integ.tstops = _tstops(vcat(tstops, d_discontinuities), h)
+    integ.d_discontinuities = d_discontinuities
     integ.finished = false
     for ev in integ.event_t
         fill!(ev, NaN)
@@ -2927,6 +2984,7 @@ function _reinit_unlocked(
     integ.derivative_discontinuity = false
     integ.sol = _initial_solution(integ.prob, integ.alg, h)
     reinit_callbacks && _initialize_callbacks!(integ, initialize_save)
+    _past_discontinuity!(integ)
     return nothing
 end
 
@@ -3003,6 +3061,9 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         _finish!(integ)
         return nothing
     end
+    # A state written to `integ.u` since the last step, as OrdinaryDiffEq allows, is the
+    # one the step starts from; PETSc steps from its own vector.
+    outer === nothing && _take_written_state!(integ)
     # PETSc's proposal for the next step; `integ.dt` is the step last taken.
     dtprev = integ.tdir * Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
     before = (
@@ -3097,6 +3158,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
             ctx.dt_too_small || Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
         _finish!(integ)
     else
+        _past_discontinuity!(integ)
         _live_stats!(integ)
     end
     return nothing

@@ -652,6 +652,86 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test abs(only(events[2][1]) - (0.5 + log(1 / 0.7) / 20)) < 1.0e-8
     end
 
+    @testset "d_discontinuities and force_dtmin as OrdinaryDiffEq has them" begin
+        alg = PETScDiffEq.TSRK("5dp")
+        # SciML's convention is right-continuous: f at t_d is the old regime, and the step
+        # after t_d starts a ULP past it. Written that way, u(tf) = 0 exactly.
+        kink!(du, u, p, t) = (du[1] = t > 0.5 ? -1.0 : 1.0; nothing)
+        back!(du, u, p, t) = (du[1] = t < 0.5 ? 1.0 : -1.0; nothing)
+        for (f!, tspan) in ((kink!, (0.0, 1.0)), (back!, (1.0, 0.0))), adaptive in (false, true)
+            prob = SciMLBase.ODEProblem(f!, [0.0], tspan)
+            dt = 0.1 * sign(tspan[2] - tspan[1])
+            plain = SciMLBase.solve(prob, alg; dt, adaptive, tstops = [0.5])
+            kinked = SciMLBase.solve(prob, alg; dt, adaptive, d_discontinuities = [0.5])
+            @test abs(kinked.u[end][1]) < 1.0e-12
+            @test 0.5 in kinked.t
+            adaptive || @test abs(plain.u[end][1]) > 1.0e-3
+        end
+        # One at the start moves the start a ULP forward.
+        start!(du, u, p, t) = (du[1] = t > 0 ? -1.0 : 1.0; nothing)
+        begins = SciMLBase.ODEProblem(start!, [0.0], (0.0, 1.0))
+        integ = SciMLBase.init(begins, alg; dt = 0.1, d_discontinuities = [0.0])
+        @test integ.t == nextfloat(0.0)
+        @test abs(SciMLBase.solve!(integ).u[end][1] + 1) < 1.0e-12
+        # reinit! keeps them apart from tstops, and takes new ones.
+        prob = SciMLBase.ODEProblem(kink!, [0.0], (0.0, 1.0))
+        integ = SciMLBase.init(prob, alg; dt = 0.1, d_discontinuities = [0.5])
+        SciMLBase.solve!(integ)
+        SciMLBase.reinit!(integ; tstops = [0.25])
+        @test PETScDiffEq.DiffEqBase.get_tstops_array(integ) == [0.25, 0.5, 1.0]
+        @test abs(SciMLBase.solve!(integ).u[end][1]) < 1.0e-12
+        SciMLBase.reinit!(integ; d_discontinuities = [0.75])
+        @test PETScDiffEq.DiffEqBase.get_tstops_array(integ) == [0.75, 1.0]
+        # A reinit! with neither goes back to what init was given, as in OrdinaryDiffEq.
+        SciMLBase.reinit!(integ)
+        @test PETScDiffEq.DiffEqBase.get_tstops_array(integ) == [0.5, 1.0]
+        # A single time is a list of one.
+        @test 0.25 in SciMLBase.solve(prob, alg; dt = 0.1, tstops = 0.25).t
+        @test 0.5 in SciMLBase.solve(prob, alg; dt = 0.1, d_discontinuities = 0.5).t
+
+        # A state written to integ.u between steps is the one the next step starts from.
+        decay = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for mark in (false, true)
+            integ = SciMLBase.init(decay, alg; dt = 0.1, adaptive = false)
+            SciMLBase.step!(integ)
+            integ.u[1] = 5.0
+            mark && SciMLBase.u_modified!(integ, true)
+            SciMLBase.step!(integ)
+            @test integ.u[1] ≈ 5exp(-0.1) rtol = 1.0e-6
+        end
+
+        # force_dtmin keeps the floor through every way of moving it.
+        fast = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = -50.0 * u[1]; nothing), [1.0], (0.0, 1.0))
+        tight = (; abstol = 1.0e-10, reltol = 1.0e-10, force_dtmin = true)
+        steps(sol) = diff(sol.t)[2:(end - 1)]
+        # A floor above dtmax wins, as in OrdinaryDiffEq.
+        over = SciMLBase.solve(fast, alg; dt = 0.01, dtmin = 0.2, dtmax = 0.1, tight...)
+        @test over.retcode == SciMLBase.ReturnCode.Success
+        @test all(≈(0.2), steps(over))
+        # A floor moved or a dtmax lowered through opts stays PETSc's.
+        integ = SciMLBase.init(fast, alg; dt = 0.01, dtmin = 0.1, tight...)
+        SciMLBase.step!(integ)
+        integ.opts.dtmin = 0.2
+        integ.opts.dtmax = 0.05
+        moved = SciMLBase.solve!(integ)
+        @test moved.retcode == SciMLBase.ReturnCode.Success
+        @test moved.t[end] == 1.0
+        # The step already proposed when the floor moved is the last at the old floor.
+        @test minimum(diff(moved.t)[3:(end - 1)]) >= 0.2 - 1.0e-12
+        # A given dt below the floor is not taken after a stop either.
+        stopped = SciMLBase.solve(fast, alg; dt = 0.001, dtmin = 0.01, tstops = [0.5], tight...)
+        @test minimum(diff(stopped.t)) >= 0.01 - 1.0e-12
+        # The floor's sign does not matter, and petsc_options still override it.
+        @test SciMLBase.solve(fast, alg; dt = 0.01, dtmin = -0.1, tight...).t ==
+            SciMLBase.solve(fast, alg; dt = 0.01, dtmin = 0.1, tight...).t
+        own = SciMLBase.solve(
+            fast, PETScDiffEq.TSRK("5dp", ["-ts_adapt_dt_min", "0.05"]);
+            dt = 0.01, dtmin = 0.1, tight...,
+        )
+        # Up to the steps PETSc shortens to land on the final time.
+        @test all(≈(0.05), diff(own.t)[1:(end - 3)])
+    end
+
     @testset "running out of steps is MaxIters" begin
         sol = SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
