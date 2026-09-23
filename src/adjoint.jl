@@ -626,6 +626,20 @@ function _discrete_adjoint_unlocked(
                 ctx.err === nothing && adj.err === nothing && rethrow()
             end
             _throw_callback_error(ctx, adj)
+            stopped_at = _user_t(h.tdir, LibPETSc.TSGetTime(pl, ts))
+            ctx.unstable_hit && throw(
+                ArgumentError(
+                    "the forward solve's `unstable_check` fired at t = $stopped_at, which " *
+                        "`solve` reports as ReturnCode.Unstable, so there is no gradient to compute",
+                ),
+            )
+            ctx.dt_too_small && throw(
+                ArgumentError(
+                    "the forward solve's step fell below `dtmin` at t = $stopped_at, which " *
+                        "`solve` reports as ReturnCode.DtLessThanMin, so there is no gradient to " *
+                        "compute; lower `dtmin` or tighten the tolerances",
+                ),
+            )
             reason = LibPETSc.TSGetConvergedReason(pl, ts)
             reason == LibPETSc.TS_CONVERGED_TIME || throw(
                 ArgumentError(

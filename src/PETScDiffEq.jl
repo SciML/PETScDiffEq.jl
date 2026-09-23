@@ -515,6 +515,8 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     # The caller's own check on the state at each step's end, and whether it has fired.
     unstable::Any
     unstable_hit::Bool
+    # The caller's time direction, which the checks above are given their times in.
+    tdir::Float64
     # The caller's `isoutofdomain(u, p, t)`, or nothing.
     domain::Any
     nf::Int
@@ -544,9 +546,12 @@ function _record_end!(ctx, t, x)
     return nothing
 end
 
-# After each step TSSolve takes, the checks that end a solve early: the caller's floor, kept
-# here because PETSc's own `dt_min` clamps the step and takes it whatever its error, and the
-# caller's `unstable_check(dt, u, p, t)`, given the step just taken. TSSolve calls this
+# After each step TSSolve takes, the checks that end a solve early, as OrdinaryDiffEq makes
+# them before its next step: the caller's floor, kept here because PETSc's own `dt_min`
+# clamps the step and takes it whatever its error, and the caller's
+# `unstable_check(dt, u, p, t)`, given the step about to be taken in the caller's time.
+# Neither applies after a step that failed or after the last one, and a step PETSc has
+# shortened to land on the final time does not count against the floor. TSSolve calls this
 # before it decides whether to go on, so a reason set here ends the solve on this step.
 function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
     ctxptr = Ref{Ptr{Cvoid}}(C_NULL)
@@ -557,17 +562,24 @@ function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
     try
         pl = ctx.petsclib
         ts = LibPETSc.TS(ts_ptr, pl)
+        Int(LibPETSc.TSGetConvergedReason(pl, ts)) < 0 && return LibPETSc.PetscErrorCode(0)
+        s = Float64(LibPETSc.TSGetTime(pl, ts))
+        smax = Float64(LibPETSc.TSGetMaxTime(pl, ts))
+        s >= smax - _near(smax) && return LibPETSc.PetscErrorCode(0)
+        hnext = Float64(LibPETSc.TSGetTimeStep(pl, ts))
         stop = false
-        if ctx.dtmin > 0 && abs(Float64(LibPETSc.TSGetTimeStep(pl, ts))) < ctx.dtmin
+        if ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
             ctx.dt_too_small = stop = true
         end
-        if ctx.unstable !== nothing
-            t = Float64(LibPETSc.TSGetTime(pl, ts))
-            dt = t - Float64(LibPETSc.TSGetPrevTime(pl, ts))
+        if !stop && ctx.unstable !== nothing
             x = Ref{LibPETSc.CVec}(C_NULL)
-            ccall(get_solution, LibPETSc.PetscErrorCode, (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x)
+            ccall(
+                get_solution, LibPETSc.PetscErrorCode, (LibPETSc.CTS, Ptr{LibPETSc.CVec}),
+                ts_ptr, x,
+            )
             u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
-            ctx.unstable(dt, u, ctx.p, t) && (ctx.unstable_hit = stop = true)
+            ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s)) &&
+                (ctx.unstable_hit = stop = true)
         end
         stop && LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_CONVERGED_USER)
     catch e
@@ -601,6 +613,11 @@ const POST_STEP_FNS = Ref((C_NULL, C_NULL))
 
 # Exactly the same time: accepted steps near a singularity can be far closer than any
 # tolerance and are still points of the solution.
+# The caller's floor on the step, which OrdinaryDiffEq applies only to an adaptive solve and
+# which `force_dtmin` hands to PETSc instead.
+_floor(dtmin, force_dtmin, adaptive) =
+    force_dtmin || !adaptive || dtmin === nothing ? 0.0 : abs(Float64(dtmin))
+
 # A rounding error at `t` itself. A stop just after the start of a long span is still ahead,
 # where a tolerance scaled to the final time would count it as passed.
 _near(t) = 100 * eps(max(one(Float64), abs(t)))
@@ -1470,19 +1487,6 @@ _default_options(::TSIRK) = ["-pc_type", "pbjacobi"]
 _default_options(alg::TSMPRK) =
     ["-ts_mprk_type", alg.subtype, "-ts_use_splitrhsfunction", "true"]
 
-# PETSc ships single precision and complex builds, but this package drives the double one,
-# so a state it would have to convert is refused rather than converted out of sight. Whole
-# numbers are exact in Float64, as they are in OrdinaryDiffEq.
-function _check_state_type(u, name)
-    eltype(u) <: Union{Float64, Integer} && return nothing
-    throw(
-        ArgumentError(
-            "PETScDiffEq solves in Float64, and `$name` has eltype $(eltype(u)); convert " *
-                "the problem first, as in `remake(prob; u0 = Float64.(prob.u0))`",
-        ),
-    )
-end
-
 const UNSUPPORTED_KWARGS = (
     :internalnorm, :calck, :alias_u0, :sensealg,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
@@ -1674,8 +1678,6 @@ function _setup(
     end
     prob.u0 isa AbstractVector{<:Real} ||
         throw(ArgumentError("PETScDiffEq requires a real AbstractVector u0"))
-    _check_state_type(prob.u0, "u0")
-    prob isa SciMLBase.AbstractDAEProblem && _check_state_type(prob.du0, "du0")
     dt_given = dt !== nothing
     if !dt_given && !(adaptive && _adapts(alg) === true)
         throw(
@@ -1741,10 +1743,14 @@ function _setup(
     _arm_exit_cleanup!()
 
     iip = SciMLBase.isinplace(prob)
-    f1 = is_split ? prob.f.f1.f : prob.f.f
+    # SciMLBase wraps the functions for the problem's own eltype, and PETSc's double build
+    # calls them with Float64 arrays, so a problem in another eltype gets them unwrapped
+    # and is solved in Float64, as a whole-number state is.
+    unwrap = eltype(prob.u0) === Float64 ? identity : SciMLBase.unwrapped_f
+    f1 = unwrap(is_split ? prob.f.f1.f : prob.f.f)
     is_dae && !iip &&
         throw(ArgumentError("PETScDiffEq requires an in-place DAEProblem residual"))
-    f2 = is_split ? prob.f.f2.f : nothing
+    f2 = is_split ? unwrap(prob.f.f2.f) : nothing
     for g in (f1, f2)
         # An AbstractSciMLOperator ignores the f(du,u,p,t) call this package
         # makes, leaving the derivative buffer untouched rather than erroring.
@@ -1812,7 +1818,8 @@ function _setup(
             ),
         )
     end
-    jac_fn = has_jac ? (is_dae ? prob.f.jac : _as_inplace_jac(prob.f.jac, iip)) : nothing
+    jac_fn = has_jac ?
+        (is_dae ? unwrap(prob.f.jac) : _as_inplace_jac(unwrap(prob.f.jac), iip)) : nothing
     _check_tol(abstol, n, "abstol")
     _check_tol(reltol, n, "reltol")
     if !dt_given
@@ -1932,8 +1939,8 @@ function _setup(
         NaN, similar(u0), t0, copy(u0), nothing, nothing, false,
         slow_idxs, medium_idxs, fast_idxs,
         NaN, similar(u0), false,
-        force_dtmin || dtmin === nothing ? 0.0 : abs(Float64(dtmin)), false,
-        unstable_check, false, isoutofdomain,
+        _floor(dtmin, force_dtmin, adaptive && _adapts(alg) !== false), false,
+        unstable_check, false, tdir, isoutofdomain,
         0, 0, 0, nothing,
     )
     h = TSHandles(
@@ -2224,7 +2231,7 @@ function _setopt_unlocked(o::PETScIntegratorOpts, name::Symbol, v)
         _set_tolerances!(h, getfield(o, :abstol), getfield(o, :reltol))
     elseif name === :dtmin
         # The floor is kept here rather than by PETSc, whose own floor takes the step anyway.
-        h.ctx.dtmin = getfield(o, :dtmin)
+        h.ctx.dtmin = _floor(getfield(o, :dtmin), false, getfield(o, :adaptive))
     elseif name === :dtmax
         adapt = LibPETSc.TSGetAdapt(pl, h.ts)
         lo, _ = LibPETSc.TSAdaptGetStepLimits(pl, adapt)
@@ -3050,15 +3057,19 @@ function _step_unlocked(integ::PETScIntegrator)
         popfirst!(integ.tstops)
     end
     integ.finished && return nothing
-    if ctx.unstable !== nothing && ctx.unstable(integ.dt, integ.u, ctx.p, integ.t)
-        ctx.unstable_hit = true
-        _finish!(integ)
-        return nothing
+    # The same checks the solve path makes after a step, on the step about to be taken.
+    if integ.tdir * integ.t < h.tf - tol
+        hnext = Float64(LibPETSc.TSGetTimeStep(pl, h.ts))
+        limit = isempty(integ.tstops) ? h.tf : min(integ.tstops[1], h.tf)
+        if ctx.dtmin > 0 && hnext < ctx.dtmin && integ.tdir * integ.t + hnext < limit - tol
+            ctx.dt_too_small = true
+        elseif ctx.unstable !== nothing &&
+                ctx.unstable(integ.tdir * hnext, integ.u, ctx.p, integ.t)
+            ctx.unstable_hit = true
+        end
     end
-    # The step PETSc proposes next is smaller than the caller's floor.
-    ctx.dtmin > 0 && Float64(LibPETSc.TSGetTimeStep(pl, h.ts)) < ctx.dtmin &&
-        (ctx.dt_too_small = true)
     if !all(isfinite, integ.u) || integ.tdir * integ.t >= h.tf - tol ||
+            ctx.unstable_hit ||
             ctx.dt_too_small || Int(LibPETSc.TSGetStepNumber(pl, h.ts)) >= h.maxiters
         _finish!(integ)
     else

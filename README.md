@@ -74,10 +74,14 @@ honour emit a warning rather than being silently dropped.
 Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
 only when it names them or `save_start` or `save_end` asks, and `save_everystep = true`
 saves every step alongside it. `dtmin` is a floor the solve keeps: once PETSc proposes a
-smaller step, the solve ends there with `ReturnCode.DtLessThanMin`.
+smaller step, the solve ends there with `ReturnCode.DtLessThanMin`. A step shortened to
+land on a stop or the final time does not count, and a fixed-step solve has no floor, as in
+OrdinaryDiffEq.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
-state stops being finite or PETSc hits an overflow, `ConvergenceFailure` when a nonlinear
+state stops being finite, PETSc hits an overflow, or `unstable_check(dt, u, p, t)`
+returns true, which is asked before each step with the step about to be taken, as
+OrdinaryDiffEq asks it, `ConvergenceFailure` when a nonlinear
 solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are taken, and
 `Failure` for a zero pivot, with a warning, or another step PETSc cannot take. Where
 `petsc_options` asks PETSc to raise, with `-ksp_error_if_not_converged`,
@@ -111,6 +115,9 @@ documentation cover what it needs, what it refuses and how to check `jac` and `p
 Every solve runs on `MPI.COMM_SELF`, so this package is serial. PETSc TS is built for
 large distributed problems, and reaching it from the SciML interface is what this package
 is for; use OrdinaryDiffEq.jl for serial problems where it applies.
+
+Solves run in Float64, PETSc's double build: a `Float32` or whole-number state is
+converted, and the solution comes back in Float64.
 
 On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.
