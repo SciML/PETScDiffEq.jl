@@ -563,6 +563,95 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test quiet.t[end] == 1.0
     end
 
+    @testset "isoutofdomain takes a step again smaller, as OrdinaryDiffEq does" begin
+        below(c) = (u, p, t) -> any(<(c), u)
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp")
+        # A domain no step can stay in ends the solve Unstable where it last held, which for
+        # `u' = -u` and u >= 0.6 is t = log(1 / 0.6), at any scale of time.
+        for scale in (1.0, 1.0e-12)
+            scaled = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = -u[1] / scale; nothing), [1.0], (0.0, scale),
+            )
+            for run in (
+                    () -> SciMLBase.solve(scaled, alg; dt = 0.1scale, isoutofdomain = below(0.6)),
+                    () -> SciMLBase.solve!(
+                        SciMLBase.init(scaled, alg; dt = 0.1scale, isoutofdomain = below(0.6)),
+                    ),
+                )
+                sol = run()
+                @test sol.retcode == SciMLBase.ReturnCode.Unstable
+                @test all(u -> u[1] >= 0.6, sol.u)
+                @test abs(sol.t[end] / scale - log(1 / 0.6)) < 1.0e-6
+            end
+        end
+        # The step before the undone ones stays the step just taken.
+        integ = SciMLBase.init(prob, alg; dt = 0.1, isoutofdomain = below(0.6))
+        SciMLBase.solve!(integ)
+        @test integ.t - integ.tprev ≈ integ.dt
+        @test integ(integ.t - integ.dt / 2) ≈ integ.sol(integ.t - integ.dt / 2)
+
+        # An undone step is taken again at a fifth of its size, OrdinaryDiffEq's default qmin,
+        # within the same step! call, and is not counted as a step.
+        tried = Float64[]
+        once = (u, p, t) -> (push!(tried, t); length(tried) == 1)
+        integ = SciMLBase.init(prob, alg; dt = 0.1, isoutofdomain = once)
+        SciMLBase.step!(integ)
+        @test tried ≈ [0.1, 0.02]
+        @test integ.t ≈ 0.02
+        @test !integ.finished
+        every_other = Ref(0)
+        alternate = (u, p, t) -> (every_other[] += 1; isodd(every_other[]))
+        capped = SciMLBase.solve(prob, alg; dt = 1.0e-3, maxiters = 10, isoutofdomain = alternate)
+        @test capped.retcode == SciMLBase.ReturnCode.MaxIters
+        @test every_other[] == 20
+        @test capped.stats.naccept == 10 == length(capped.t) - 1
+
+        # dtmin ends it with DtLessThanMin instead, and force_dtmin takes the step at the floor
+        # and goes on, as in OrdinaryDiffEq.
+        floored = SciMLBase.solve(prob, alg; dt = 0.1, dtmin = 0.01, isoutofdomain = below(0.6))
+        @test floored.retcode == SciMLBase.ReturnCode.DtLessThanMin
+        @test minimum(diff(floored.t)) >= 0.01
+        forced = SciMLBase.solve(
+            prob, alg; dt = 0.1, dtmin = 0.01, force_dtmin = true, isoutofdomain = below(0.6),
+        )
+        @test forced.retcode == SciMLBase.ReturnCode.Success
+        @test forced.t[end] == 1.0
+        @test minimum(diff(forced.t)[1:(end - 1)]) >= 0.01
+
+        # A fixed-step solve does not ask, as in OrdinaryDiffEq.
+        asked = Ref(0)
+        SciMLBase.solve(
+            prob, alg; dt = 0.25, adaptive = false,
+            isoutofdomain = (u, p, t) -> (asked[] += 1; false),
+        )
+        @test asked[] == 0
+
+        # A step undone after a callback changed p is taken again with the new p: an event
+        # in it lands where it does with no undone step.
+        rate!(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
+        events = map((false, true)) do reject
+            hits = Float64[]
+            undone = Ref(false)
+            change_p = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> t == 0.5, integ -> (integ.p[1] = 20.0; nothing),
+            )
+            cross = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.7, integ -> push!(hits, integ.t),
+            )
+            first_after = (u, p, t) -> reject && p[1] == 20.0 && !undone[] && (undone[] = true)
+            SciMLBase.solve(
+                SciMLBase.ODEProblem(rate!, [1.0], (0.0, 1.0), [0.0]), PETScDiffEq.TSRK("3bs");
+                dt = 0.1, abstol = 1.0e-8, reltol = 1.0e-8, tstops = [0.5],
+                callback = SciMLBase.CallbackSet(change_p, cross), isoutofdomain = first_after,
+            )
+            (hits, undone[])
+        end
+        @test events[2][2]
+        @test abs(only(events[2][1]) - only(events[1][1])) < 1.0e-8
+        @test abs(only(events[2][1]) - (0.5 + log(1 / 0.7) / 20)) < 1.0e-8
+    end
+
     @testset "running out of steps is MaxIters" begin
         sol = SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
@@ -3780,7 +3869,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         alg = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
         @test_logs (:warn,) match_mode = :any SciMLBase.solve(
-            prob, alg; dt = 0.1, isoutofdomain = (u, p, t) -> false,
+            prob, alg; dt = 0.1, calck = false,
         )
         @test_logs (:warn,) match_mode = :any SciMLBase.solve(
             prob, alg; dt = 0.1, internalnorm = (u, t) -> maximum(abs, u),
@@ -5278,6 +5367,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     (
                         "PETScAdjoint does not support `tstops`",
                         () -> grad(prob, TSRK("4"); tstops = [0.5]),
+                    ),
+                    (
+                        "PETScAdjoint does not support `isoutofdomain`",
+                        () -> grad(prob, TSRK("4"); isoutofdomain = (u, p, t) -> false),
                     ),
                     (
                         "the forward solve's `unstable_check` fired at t = 0.5",
