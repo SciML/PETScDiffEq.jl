@@ -1665,20 +1665,23 @@ _tolscalar(R, tol, default) =
     R(tol === nothing || tol isa AbstractVector ? default : tol)
 
 # PETSc's clock and its weighted norms are real, so a time or a tolerance with an imaginary
-# part is refused rather than having it dropped.
-function _check_real(x, name)
-    x === nothing || all(v -> v isa Real, x) || throw(
+# part is refused rather than having it dropped. A tolerance given as a complex number with
+# a zero imaginary part is its real part.
+function _check_real(x, name; accept = v -> v isa Real)
+    x === nothing || all(accept, x) || throw(
         ArgumentError("`$name` must be real, even for a complex state; got $(repr(x))"),
     )
     return nothing
 end
 
+_check_real_tol(tol, name) = _check_real(tol, name; accept = isreal)
+
 function _check_tol(tol, n, name)
-    _check_real(tol, name)
+    _check_real_tol(tol, name)
     tol isa AbstractVector || return nothing
     length(tol) == n ||
         throw(ArgumentError("`$name` has length $(length(tol)), but the state has $n"))
-    all(t -> t >= 0, tol) || throw(ArgumentError("`$name` has a negative entry"))
+    all(t -> real(t) >= 0, tol) || throw(ArgumentError("`$name` has a negative entry"))
     return nothing
 end
 
@@ -2454,7 +2457,7 @@ end
 
 function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {H, R}
     h = getfield(o, :h)
-    name in (:abstol, :reltol) && _check_real(v, name)
+    name in (:abstol, :reltol) && _check_real_tol(v, name)
     setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : v)
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib

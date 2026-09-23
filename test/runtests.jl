@@ -1107,10 +1107,13 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             conj_residual!(r, du, u, p, t) = (r .= du .+ im .* conj.(u); nothing)
             holomorphic = "the problem's function is not holomorphic in the complex state"
             @testset "$message" for (message, call) in (
-                    ("`abstol` must be real", () -> SciMLBase.solve(prob, rk; abstol = 1.0e-6 + 0im)),
+                    (
+                        "`abstol` must be real",
+                        () -> SciMLBase.solve(prob, rk; abstol = 1.0e-6 + 1.0e-9im),
+                    ),
                     (
                         "`reltol` must be real",
-                        () -> SciMLBase.solve(prob, rk; reltol = fill(1.0e-3 + 0im, n)),
+                        () -> SciMLBase.solve(prob, rk; reltol = fill(1.0e-3 + 1.0e-9im, n)),
                     ),
                     ("`dt` must be real", () -> SciMLBase.__solve(prob, rk; dt = 0.1 + 0im)),
                     ("`saveat` must be real", () -> SciMLBase.solve(prob, rk; saveat = [0.5 + 0im])),
@@ -1152,6 +1155,16 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test SciMLBase.solve(
                 SciMLBase.ODEProblem(nonlinear!, u0, (0.0, 1.0)), PETScDiffEq.TSRK("4"); dt = 0.01,
             ).retcode == SciMLBase.ReturnCode.Success
+            # A tolerance whose imaginary part is zero is its real part, for any state.
+            real_prob = SciMLBase.ODEProblem(decay!, [1.0, 2.0], (0.0, 1.0))
+            plain = SciMLBase.solve(real_prob, rk; abstol = 1.0e-6, reltol = [1.0e-3, 1.0e-3])
+            zero_im = SciMLBase.solve(
+                real_prob, rk; abstol = 1.0e-6 + 0im, reltol = [1.0e-3, 1.0e-3] .+ 0im,
+            )
+            @test zero_im.t == plain.t && zero_im.u == plain.u
+            integ = SciMLBase.init(real_prob, rk; dt = 0.1)
+            integ.opts.abstol = 1.0e-7 + 0im
+            @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
         end
     end
 

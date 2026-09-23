@@ -135,7 +135,8 @@ warns when a solve starts on such a state, or fails on one; a state that decays 
 above is within any coarser tolerance. Rescale the problem, or give it a `Float64` span.
 
 With a complex state, times, `dt`, `saveat`, `tstops` and the tolerances stay real, and
-PETSc's error norms take each component's modulus. A `ContinuousCallback`'s condition has
+PETSc's error norms take each component's modulus; a tolerance given as a complex number
+with a zero imaginary part is taken as its real part. A `ContinuousCallback`'s condition has
 to return a real number, such as `real(u[1]) - 0.5`, since a root is a sign change. The
 implicit methods' Newton iteration needs a holomorphic `f`, one that does not go through
 `conj`, `abs`, `real` or `imag` of the state. ForwardDiff takes no complex numbers, so
