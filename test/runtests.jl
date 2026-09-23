@@ -179,8 +179,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
         @test SciMLBase.solve(halves(-2000.0, -1.0), bounded; dt = 0.01).retcode ==
             SciMLBase.ReturnCode.Success
-        @test SciMLBase.solve(halves(-1.0, -2000.0), bounded; dt = 0.01).retcode !=
-            SciMLBase.ReturnCode.Success
+        # With an exact Jacobian the solve can run to the end, leaving the divergence in
+        # the answer: 1.9e35 on PETSc 3.25, where the true value is 1e-87.
+        reversed = SciMLBase.solve(halves(-1.0, -2000.0), bounded; dt = 0.01)
+        @test reversed.retcode != SciMLBase.ReturnCode.Success || abs(reversed.u[end][1]) > 1
 
         @testset "a zero pivot fails the solve rather than raising" begin
             printed(f) = mktemp() do path, io
