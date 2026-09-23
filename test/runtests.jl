@@ -363,6 +363,38 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
     end
 
+    @testset "several PETSc builds in one process" begin
+        # Each build is a library of its own, and a symbol from one reads another's objects
+        # at the wrong offsets.
+        PETSc = PETScDiffEq.PETSc
+        builds = [PETSc.getlib(; PetscScalar = S) for S in (Float64, Float32)]
+        found = [PETScDiffEq._symbol(pl, :TSGetSolution) for pl in builds]
+        @test allunique(found)
+        @test [PETScDiffEq._symbol(pl, :TSGetSolution) for pl in builds] == found
+        # A post-step context is let go with its TS.
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8)
+        SciMLBase.solve!(SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
+        @test isempty(PETScDiffEq.POST_STEP_CTX)
+        # The other builds initialized after this package's first solve are torn down
+        # before its cleanup runs; the exit code is the assertion.
+        script = """
+        using PETScDiffEq, SciMLBase
+        PETSc = PETScDiffEq.PETSc
+        f!(du, u, p, t) = (du[1] = -u[1]; nothing)
+        prob = SciMLBase.ODEProblem(f!, [1.0], (0.0, 1.0))
+        ok(sol) = sol.retcode == SciMLBase.ReturnCode.Success || exit(2)
+        ok(SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
+        for S in (Float32, ComplexF64, ComplexF32)
+            PETSc.initialize(PETSc.getlib(; PetscScalar = S))
+        end
+        ok(SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
+        SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+        """
+        cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $script`
+        @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
+    end
+
     @testset "a threaded ensemble runs its solves one at a time" begin
         # PETSc's options stack and MPI are shared by the process, so concurrent solves
         # crashed it; the exit code of a process with four threads is the assertion.

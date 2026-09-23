@@ -595,10 +595,7 @@ end
 # shortened to land on the final time does not count against the floor. TSSolve calls this
 # before it decides whether to go on, so a reason set here ends the solve on this step.
 function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
-    ctxptr = Ref{Ptr{Cvoid}}(C_NULL)
-    get_ctx, get_solution = POST_STEP_FNS[]
-    ccall(get_ctx, LibPETSc.PetscErrorCode, (LibPETSc.CTS, Ptr{Ptr{Cvoid}}), ts_ptr, ctxptr)
-    ctx = unsafe_pointer_to_objref(ctxptr[])::TSContext
+    ctx = POST_STEP_CTX[ts_ptr]::TSContext
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
     try
         pl = ctx.petsclib
@@ -615,8 +612,8 @@ function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
         if !stop && ctx.unstable !== nothing
             x = Ref{LibPETSc.CVec}(C_NULL)
             ccall(
-                get_solution, LibPETSc.PetscErrorCode, (LibPETSc.CTS, Ptr{LibPETSc.CVec}),
-                ts_ptr, x,
+                _symbol(pl, :TSGetSolution), LibPETSc.PetscErrorCode,
+                (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x,
             )
             u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
             ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s)) &&
@@ -632,25 +629,27 @@ end
 
 const POST_STEP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
-# The post-step callback carries no context of its own, so the context rides on the TS.
-function _set_post_step!(pl, ts, ctxptr)
-    lib = Libdl.dlopen(pl.petsc_library)
-    POST_STEP_FNS[][1] == C_NULL && (
-        POST_STEP_FNS[] = (
-            Libdl.dlsym(lib, :TSGetApplicationContext), Libdl.dlsym(lib, :TSGetSolution),
-        )
-    )
+# The post-step callback carries no context of its own, so each TS's context is kept here
+# until the TS is destroyed. Asking the TS for it would take a symbol from one PETSc build,
+# which reads another build's TS at the wrong offsets.
+const POST_STEP_CTX = Dict{LibPETSc.CTS, Any}()
+
+function _set_post_step!(pl, ts, ctx)
+    POST_STEP_CTX[ts.ptr] = ctx
     ccall(
-        Libdl.dlsym(lib, :TSSetApplicationContext), LibPETSc.PetscErrorCode,
-        (LibPETSc.CTS, Ptr{Cvoid}), ts, ctxptr,
-    )
-    ccall(
-        Libdl.dlsym(lib, :TSSetPostStep), LibPETSc.PetscErrorCode,
+        _symbol(pl, :TSSetPostStep), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Ptr{Cvoid}), ts, POST_STEP_PTR[],
     )
     return nothing
 end
-const POST_STEP_FNS = Ref((C_NULL, C_NULL))
+
+# Each PETSc build is a library of its own, and several can be loaded at once, so a symbol
+# is looked up in the build whose objects it will be handed.
+const PETSC_SYMBOLS = Dict{Tuple{String, Symbol}, Ptr{Cvoid}}()
+
+_symbol(petsclib, name::Symbol) = get!(PETSC_SYMBOLS, (petsclib.petsc_library, name)) do
+    Libdl.dlsym(Libdl.dlopen(petsclib.petsc_library), name)
+end
 
 # Exactly the same time: accepted steps near a singularity can be far closer than any
 # tolerance and are still points of the solution.
@@ -818,28 +817,21 @@ function _zero_pivot_handler(
 end
 
 const ZERO_PIVOT_HANDLER_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-const ERROR_HANDLER_FNS = Ref((C_NULL, C_NULL, C_NULL))
 
 # Runs `f` with the handler above in front of PETSc's. This wraps every step, so the
-# symbols are looked up once.
+# symbols come from the cache rather than a fresh lookup.
 function _quiet_errors(f, h)
     QUIET_FAILED_STEPS[] = !h.pivot_raises
-    if ERROR_HANDLER_FNS[][1] == C_NULL
-        lib = Libdl.dlopen(h.petsclib.petsc_library)
-        ERROR_HANDLER_FNS[] = (
-            Libdl.dlsym(lib, :PetscPushErrorHandler), Libdl.dlsym(lib, :PetscPopErrorHandler),
-            Libdl.dlsym(lib, :PetscTraceBackErrorHandler),
-        )
-    end
-    push, pop, traceback = ERROR_HANDLER_FNS[]
+    pl = h.petsclib
     ccall(
-        push, LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
-        ZERO_PIVOT_HANDLER_PTR[], traceback,
+        _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
+        (Ptr{Cvoid}, Ptr{Cvoid}), ZERO_PIVOT_HANDLER_PTR[],
+        _symbol(pl, :PetscTraceBackErrorHandler),
     )
     try
         return f()
     finally
-        ccall(pop, LibPETSc.PetscErrorCode, ())
+        ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ())
     end
 end
 
@@ -1196,10 +1188,6 @@ end
 const MPRK_SLOW_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 const MPRK_MEDIUM_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 const MPRK_FAST_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-# PETSc.jl wraps `TSRHSSplitSetRHSFunction` with an opaque function type and no room
-# for a context, so the symbol is called directly the way PETSc.jl itself does for
-# `TSSetRHSFunction`.
-const TSRHSSPLIT_SET_RHS = Ref{Ptr{Cvoid}}(C_NULL)
 
 const IFUNCTION_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
@@ -1437,19 +1425,9 @@ function __init__()
     return nothing
 end
 
-# `LibPETSc.PetscInt` is a fixed `Int64` in PETSc.jl rather than a property of the
-# library that got loaded, so on a platform offering only 32-bit-index builds the
-# index vectors handed to PETSc would be the wrong width and nothing would say so.
-function _split_rhs_symbol(petsclib)
-    TSRHSSPLIT_SET_RHS[] == C_NULL && (
-        TSRHSSPLIT_SET_RHS[] = Libdl.dlsym(
-            Libdl.dlopen(petsclib.petsc_library), :TSRHSSplitSetRHSFunction,
-        )
-    )
-    return TSRHSSPLIT_SET_RHS[]
-end
-
-# One part of the split: the rows `idxs` own, filled by `fptr`.
+# One part of the split: the rows `idxs` own, filled by `fptr`. PETSc.jl wraps
+# `TSRHSSplitSetRHSFunction` with an opaque function type and no room for a context, so
+# the symbol is called directly the way PETSc.jl itself does for `TSSetRHSFunction`.
 function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr)
     n = LibPETSc.PetscInt(length(idxs))
     is = LibPETSc.ISCreateGeneral(
@@ -1458,7 +1436,7 @@ function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr)
     )
     LibPETSc.TSRHSSplitSetIS(petsclib, ts, name, is)
     code = ccall(
-        _split_rhs_symbol(petsclib), LibPETSc.PetscErrorCode,
+        _symbol(petsclib, :TSRHSSplitSetRHSFunction), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Cstring, LibPETSc.CVec, Ptr{Cvoid}, Ptr{Cvoid}),
         ts, name, C_NULL, fptr, ctxptr,
     )
@@ -1467,6 +1445,9 @@ function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr)
     return nothing
 end
 
+# `LibPETSc.PetscInt` is a fixed `Int64` in PETSc.jl rather than a property of the
+# library that got loaded, so on a platform offering only 32-bit-index builds the
+# index vectors handed to PETSc would be the wrong width and nothing would say so.
 function _check_inttype(petsclib)
     PETSc.inttype(petsclib) === LibPETSc.PetscInt || error(
         "PETScDiffEq needs a PETSc built with $(LibPETSc.PetscInt) indices, but the " *
@@ -1592,21 +1573,23 @@ end
 # freeing a PETSc object aborts the process. Handles are tracked weakly so that an
 # integrator dropped part-way is still torn down while PETSc is alive.
 const LIVE_HANDLES = WeakKeyDict{Any, Nothing}()
-const EXIT_CLEANUP_ARMED = Ref(false)
+const EXIT_CLEANUP_ARMED = Set{String}()
 
-# PETSc.jl registers its own teardown when it initializes, which is later than this
-# module's `__init__`, and exit hooks run newest first. Arming here rather than in
-# `__init__` is what puts this one ahead of PETSc's.
-function _arm_exit_cleanup!()
-    EXIT_CLEANUP_ARMED[] && return nothing
-    EXIT_CLEANUP_ARMED[] = true
-    atexit(_destroy_live_handles!)
+# PETSc.jl registers each build's teardown when it initializes that build, which is later
+# than this module's `__init__`, and exit hooks run newest first. Arming here, once per
+# build and after it is initialized, is what puts each build's cleanup ahead of its
+# teardown, however the builds' initializations interleave.
+function _arm_exit_cleanup!(petsclib)
+    lib = petsclib.petsc_library
+    lib in EXIT_CLEANUP_ARMED && return nothing
+    push!(EXIT_CLEANUP_ARMED, lib)
+    atexit(() -> _destroy_live_handles!(lib))
     return nothing
 end
 
-function _destroy_live_handles!()
+function _destroy_live_handles!(lib)
     for h in collect(keys(LIVE_HANDLES))
-        _destroy!(h)
+        h.petsclib.petsc_library == lib && _destroy!(h)
     end
     return nothing
 end
@@ -1633,6 +1616,7 @@ end
 function _destroy!(h::TSHandles)
     h.destroyed && return nothing
     h.destroyed = true
+    h.ts === nothing || delete!(POST_STEP_CTX, h.ts.ptr)
     # Once PETSc has finalized (at process exit) its objects are already gone
     # and calling into it reaches MPI after MPI has shut down, so an integrator
     # collected late must not try to free anything.
@@ -1816,7 +1800,7 @@ function _setup(
     petsclib = PETSc.getlib(PetscScalar = Float64)
     _check_inttype(petsclib)
     PETSc.initialized(petsclib) || PETSc.initialize(petsclib)
-    _arm_exit_cleanup!()
+    _arm_exit_cleanup!(petsclib)
 
     iip = SciMLBase.isinplace(prob)
     # SciMLBase wraps the functions for the problem's own eltype, and PETSc's double build
@@ -2092,7 +2076,7 @@ function _setup(
             end
             LibPETSc.TSMonitorSet(petsclib, ts, MONITOR_PTR[], ctxptr)
             if ctx.dtmin > 0 || ctx.unstable !== nothing
-                _set_post_step!(petsclib, ts, ctxptr)
+                _set_post_step!(petsclib, ts, ctx)
             end
             LibPETSc.TSSetTime(petsclib, ts, t0)
             # PETSc's floor clamps only the steps its adaptor chooses, not the one given.

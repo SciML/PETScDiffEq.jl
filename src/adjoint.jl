@@ -315,13 +315,7 @@ end
 
 # PETSc.jl's wrappers for these pin the callback context to `nothing`, hand PETSc an array
 # that lives only for the call when PETSc keeps a pointer to it, or drop the value they
-# fetch, so the symbols are called directly.
-const ADJOINT_SYMBOLS = Dict{Symbol, Ptr{Cvoid}}()
-
-_adjoint_symbol(petsclib, name::Symbol) = get!(ADJOINT_SYMBOLS, name) do
-    Libdl.dlsym(Libdl.dlopen(petsclib.petsc_library), name)
-end
-
+# fetch, so the symbols are called directly and their codes checked here.
 function _check_code(code, name)
     iszero(code) || throw(ErrorException("$name failed with $code"))
     return nothing
@@ -330,7 +324,7 @@ end
 function _exact_final_time(petsclib, ts)
     opt = Ref{LibPETSc.TSExactFinalTimeOption}()
     code = ccall(
-        _adjoint_symbol(petsclib, :TSGetExactFinalTime), LibPETSc.PetscErrorCode,
+        _symbol(petsclib, :TSGetExactFinalTime), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Ptr{LibPETSc.TSExactFinalTimeOption}), ts, opt,
     )
     _check_code(code, "TSGetExactFinalTime")
@@ -340,14 +334,14 @@ end
 function _trajectory_type(petsclib, ts)
     tj = Ref{Ptr{Cvoid}}(C_NULL)
     code = ccall(
-        _adjoint_symbol(petsclib, :TSGetTrajectory), LibPETSc.PetscErrorCode,
+        _symbol(petsclib, :TSGetTrajectory), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Ptr{Ptr{Cvoid}}), ts, tj,
     )
     _check_code(code, "TSGetTrajectory")
     tj[] == C_NULL && return "none"
     name = Ref{Ptr{Cchar}}(C_NULL)
     code = ccall(
-        _adjoint_symbol(petsclib, :TSTrajectoryGetType), LibPETSc.PetscErrorCode,
+        _symbol(petsclib, :TSTrajectoryGetType), LibPETSc.PetscErrorCode,
         (Ptr{Cvoid}, LibPETSc.CTS, Ptr{Ptr{Cchar}}), tj[], ts, name,
     )
     _check_code(code, "TSTrajectoryGetType")
@@ -612,7 +606,7 @@ function _discrete_adjoint_unlocked(
                     PETSc.MatSeqAIJWithArrays(pl, MPI.COMM_SELF, _jacobian_pattern(J, n)) :
                     PETSc.MatSeqDense(pl, J)
                 code = ccall(
-                    _adjoint_symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
+                    _symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
                     (LibPETSc.CTS, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
                     ts, adj.jac_mat.ptr, adj.jac_mat.ptr, ADJ_RHSJACOBIAN_PTR[], adjptr,
                 )
@@ -622,7 +616,7 @@ function _discrete_adjoint_unlocked(
                 adj.pmat = PETSc.MatSeqDense(pl, adj.pJ)
                 name = implicit ? :TSSetIJacobianP : :TSSetRHSJacobianP
                 code = ccall(
-                    _adjoint_symbol(pl, name), LibPETSc.PetscErrorCode,
+                    _symbol(pl, name), LibPETSc.PetscErrorCode,
                     (LibPETSc.CTS, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
                     ts, adj.pmat.ptr,
                     implicit ? ADJ_IJACOBIANP_PTR[] : ADJ_RHSJACOBIANP_PTR[], adjptr,
@@ -635,7 +629,7 @@ function _discrete_adjoint_unlocked(
             push!(adj.lamarr, adj.lam.ptr)
             LibPETSc.TSMonitorSet(pl, ts, ADJ_RECORD_PTR[], adjptr)
             code = ccall(
-                _adjoint_symbol(pl, :TSAdjointMonitorSet), LibPETSc.PetscErrorCode,
+                _symbol(pl, :TSAdjointMonitorSet), LibPETSc.PetscErrorCode,
                 (LibPETSc.CTS, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
                 ts, ADJ_JUMP_PTR[], adjptr, C_NULL,
             )
@@ -698,7 +692,7 @@ function _discrete_adjoint_unlocked(
             # fails PETSc's own check for cost gradients instead of running before the
             # costs are recorded.
             code = ccall(
-                _adjoint_symbol(pl, :TSSetCostGradients), LibPETSc.PetscErrorCode,
+                _symbol(pl, :TSSetCostGradients), LibPETSc.PetscErrorCode,
                 (LibPETSc.CTS, LibPETSc.PetscInt, Ptr{LibPETSc.CVec}, Ptr{LibPETSc.CVec}),
                 ts, LibPETSc.PetscInt(1), pointer(adj.lamarr),
                 np > 0 ? pointer(adj.muarr) : Ptr{LibPETSc.CVec}(C_NULL),
