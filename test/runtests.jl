@@ -6380,6 +6380,22 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test mixed[1] isa Vector{Float32}
                 @test mixed[2] == double[2]
             end
+            # With `dt` repeated as the single-precision solve was given it, the times that
+            # solve saved are its steps, though PETSc's double build steps a rounding error
+            # off them. Measured within 5.9e-8 of the double problem's gradients.
+            for alg in (TSRK("4"), TSImplicit("cn", exact))
+                prob = adj_prob(u32, p32, (0.0f0, 1.0f0))
+                sol = SciMLBase.solve(prob, alg; dt = 0.01f0, adaptive = false)
+                for t in (sol.t, sol.t[1:10:end])
+                    single = grad(prob, alg; t, dt = 0.01f0)
+                    double = grad(
+                        adj_prob(Float64.(u32), Float64.(p32), (0.0, 1.0)), alg;
+                        t = collect(range(0.0, 1.0; length = length(t))),
+                    )
+                    @test relerr(single[1], double[1]) < 5.0e-7
+                    @test relerr(vec(single[2]), vec(double[2])) < 5.0e-7
+                end
+            end
         end
 
         @testset "what it refuses, and why" begin

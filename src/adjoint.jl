@@ -36,7 +36,9 @@ compare it against a gradient computed without it.
 
 The adjoint runs in PETSc's double real build. A `Float32` problem is solved there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
-`du0` and `dp` come back as `Float32` where `u0` and `p` are. A complex state is refused.
+`du0` and `dp` come back as `Float32` where `u0` and `p` are. Its cost times are matched to
+the steps at single precision, so the times its own `solve` saved are accepted with `dt`
+repeated as that `solve` was given it. A complex state is refused.
 
 Costs are discrete: at each `t[i]`, `dgdu_discrete(out, u, p, t, i)` writes the cost's
 derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`, if given, its
@@ -89,6 +91,8 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     order::Vector{Int}
     next::Int
     s_prev::Float64
+    # The type of the clock `solve` ran this problem on, which its saved times come from.
+    clock::DataType
     cost_at_step::Dict{Int, Vector{Int}}
     u_at_step::Dict{Int, Vector{Float64}}
     u::Vector{Float64}
@@ -212,9 +216,12 @@ function _adjoint_record_body!(adj, step, s, x_ptr)
         # Steps are the step just taken apart, so a cost time within a small fraction of
         # it belongs to this step and cannot be nearer the previous one. PETSc adds each
         # step to its time, which rounds by up to an ulp per step, so the allowance grows
-        # with the step count.
+        # with the step count. It is an ulp of the clock `solve` ran on, whose saved times
+        # a single-precision problem's costs are taken at.
+        R = adj.clock
         tol = max(
-            sqrt(eps(Float64)) * (s - adj.s_prev), (step + 100) * eps(max(1.0, abs(s))),
+            sqrt(Float64(eps(R))) * (s - adj.s_prev),
+            (step + 100) * Float64(eps(R(max(1.0, abs(s))))),
         )
         adj.s_prev = s
         order, cost_s = adj.order, adj.cost_s
@@ -605,7 +612,7 @@ function _discrete_adjoint_unlocked(
                 _as_inplace_jac(prob.f.paramjac, iip),
             zeros(n, np),
             implicit ? -h.tdir : h.tdir, dgdu_discrete, Bool(no_start),
-            cost_t, cost_s, sortperm(cost_s), 1, h.t0,
+            cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
