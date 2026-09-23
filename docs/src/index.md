@@ -45,9 +45,10 @@ estimate. `TSGeneric` needs it too, since which of its types adapt is not known 
 
 The options available in `solve` are documented
 [at the common solver options page](https://docs.sciml.ai/DiffEqDocs/stable/basics/common_solver_opts/).
-This package supports `dt`, `adaptive`, `dtmin`, `dtmax`, `reltol` and `abstol` (either
-may be a vector of per-component tolerances), `saveat`, `save_everystep`, `save_start`,
-`save_end`, `save_on`, `save_idxs`, `dense`, `callback` and `tstops`. Keywords it cannot
+This package supports `dt`, `adaptive`, `dtmin`, `force_dtmin`, `dtmax`, `reltol` and
+`abstol` (either may be a vector of per-component tolerances), `saveat`, `save_everystep`,
+`save_start`, `save_end`, `save_on`, `save_idxs`, `dense`, `callback`, `tstops`,
+`d_discontinuities`, `unstable_check` and `isoutofdomain`. Keywords it cannot
 honour emit a warning rather than being silently dropped.
 
 Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
@@ -55,7 +56,10 @@ only when it names them or `save_start` or `save_end` asks, and `save_everystep 
 saves every step alongside it. `dtmin` is a floor the solve keeps: once PETSc proposes a
 smaller step, the solve ends there with `ReturnCode.DtLessThanMin`. A step shortened to
 land on a stop or the final time does not count, and a fixed-step solve has no floor, as in
-OrdinaryDiffEq. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
+OrdinaryDiffEq. With `force_dtmin = true` the solve goes on at `dtmin` instead, and the floor
+wins over a smaller `dtmax`. `d_discontinuities` are stepped onto, and, as SciML defines them,
+the step after each starts one ULP past it, so the right-hand side there sees the new regime
+when written as `if t > t_d`. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
 step that leaves the domain is taken again at a fifth of its size, as OrdinaryDiffEq takes it;
 one that cannot be made small enough ends the solve with `Unstable`, or `DtLessThanMin` at
 `dtmin`.
