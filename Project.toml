@@ -4,7 +4,10 @@ authors = ["Harsh Singh"]
 version = "0.5.11"
 
 [deps]
+ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
 DiffEqBase = "2b5f629d-d688-5b77-993f-72d75c75574e"
+DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
@@ -13,6 +16,7 @@ PETSc_jll = "8fa3689e-f0b9-5420-9873-adf6ccf46f2d"
 SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
 SciMLOperators = "c0aeaf25-5076-4817-a8d5-81caf7dfa961"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+SparseMatrixColorings = "0a514795-09f3-496d-8182-132a7b665d35"
 
 [weakdeps]
 SciMLSensitivity = "1ed8b502-d754-442c-8d5d-10ac956f44a1"
@@ -21,8 +25,11 @@ SciMLSensitivity = "1ed8b502-d754-442c-8d5d-10ac956f44a1"
 PETScDiffEqSciMLSensitivityExt = "SciMLSensitivity"
 
 [compat]
+ADTypes = "1.22.0"
 DiffEqBase = "7"
 DiffEqCallbacks = "4"
+DifferentiationInterface = "0.7.18"
+ForwardDiff = "1.3.3"
 Libdl = "1"
 LinearAlgebra = "1"
 Logging = "1"
@@ -33,6 +40,7 @@ SciMLBase = "3.1"
 SciMLOperators = "0.3, 1"
 SciMLSensitivity = "7.119.8"
 SparseArrays = "1"
+SparseMatrixColorings = "0.4.23"
 Test = "1"
 julia = "1.10"
 

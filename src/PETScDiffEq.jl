@@ -1,6 +1,9 @@
 module PETScDiffEq
 
+using ADTypes: ADTypes, AutoFiniteDiff, AutoForwardDiff
 using DiffEqBase: DiffEqBase
+using DifferentiationInterface: DifferentiationInterface as DI
+using ForwardDiff: ForwardDiff
 using LinearAlgebra: LinearAlgebra, mul!
 using MPI: MPI
 using PETSc: PETSc
@@ -10,6 +13,7 @@ using SciMLBase: SciMLBase
 using SciMLOperators: SciMLOperators
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
     sparse
+using SparseMatrixColorings: SparseMatrixColorings
 
 export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSDAE, TSMPRK, TSGeneric,
     PETScIntegrator, PETScAdjoint
@@ -44,16 +48,19 @@ TSRK(subtype::AbstractString = "5dp", petsc_options::AbstractVector{<:AbstractSt
     TSRK(String(subtype), String[String(o) for o in petsc_options])
 
 """
-    TSRosW(subtype = "ra34pw2", petsc_options = String[])
+    TSRosW(subtype = "ra34pw2", petsc_options = String[]; autodiff = AutoForwardDiff())
 
 Rosenbrock-W from PETSc's `TSROSW`. `subtype` is a PETSc `TSRosWType` without
 its prefix, such as `"2m"`, `"ra34pw2"` or `"r34prw"`.
 
 Adapts on its embedded error estimate, except for `"theta1"` and `"theta2"`,
 which PETSc gives none, so they step at the `dt` you give and warn if you pass
-a tolerance. Linearly implicit, so it uses an `ODEFunction`'s `jac` when one is
-given and PETSc's finite-difference fallback otherwise, and it accepts a mass
-matrix.
+a tolerance. Linearly implicit, so it uses an `ODEFunction`'s `jac`, and it
+accepts a mass matrix.
+
+Without a `jac` the Jacobian comes from `autodiff`: ForwardDiff by default, colouring a
+sparse `jac_prototype`, or `AutoFiniteDiff()` to have PETSc difference the step's own
+equations, colouring a sparse prototype too.
 
 PETSc's implementation assumes a right-hand side that does not depend on `t`.
 When it does, `"2p"`, `"2m"`, `"ra3pw"`, `"ra34pw2"`, `"r34prw"` and `"assp3p3s1c"`
@@ -62,28 +69,32 @@ converges at first order with or without a `jac`. Carrying `t` as an extra state
 whose derivative is 1 restores their order.
 
 On a linear right-hand side that does not depend on `t`, `"ra3pw"`'s embedded error
-estimate is zero with a `jac` and far too small without one, so an adaptive solve
+estimate is zero with an exact Jacobian and far too small with a differenced one, so an adaptive solve
 reports success with an error well above the tolerance. Step it with a fixed `dt` on
 such problems.
 
-`"assp3p3s1c"` needs a `jac` and cannot take a mass matrix, which PETSc leaves out of
-its explicit first stage. `"lassp3p4s2c"`, `"llssp3p4s2c"` and `"ark3"` are refused.
-They end on an explicit stage: without a `jac` PETSc stops and asks for one, and with
+`"assp3p3s1c"` needs a Jacobian, which `AutoFiniteDiff()` does not give it, and cannot
+take a mass matrix, which PETSc leaves out of its explicit first stage. `"lassp3p4s2c"`, `"llssp3p4s2c"` and `"ark3"` are refused.
+They end on an explicit stage: without a Jacobian PETSc stops and asks for one, and with
 one it does not restore its Jacobian lag after that stage, so an adaptive solve fails
 within its first two steps and a fixed-step solve diverges.
 """
 struct TSRosW <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
+    autodiff::ADTypes.AbstractADType
 end
 
-TSRosW(subtype::AbstractString = "ra34pw2", petsc_options::AbstractVector{<:AbstractString} = String[]) =
-    TSRosW(String(subtype), String[String(o) for o in petsc_options])
+TSRosW(
+    subtype::AbstractString = "ra34pw2",
+    petsc_options::AbstractVector{<:AbstractString} = String[];
+    autodiff = AutoForwardDiff(),
+) = TSRosW(String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff))
 
 """
-    TSImplicit(subtype = "beuler")
-    TSImplicit(subtype, theta)
-    TSImplicit(subtype, [theta,] petsc_options)
+    TSImplicit(subtype = "beuler"; order = nothing, autodiff = AutoForwardDiff())
+    TSImplicit(subtype, theta; ...)
+    TSImplicit(subtype, [theta,] petsc_options; ...)
 
 Fully implicit methods from PETSc: `"beuler"`, `"cn"`, `"theta"` and `"bdf"`.
 `theta` sets the parameter of the theta method, where `0.5` is Crank-Nicolson
@@ -95,14 +106,19 @@ method, so raise it when comparing against one.
 
 Only `"bdf"` carries an embedded error estimate and adapts; the others step at
 the `dt` you give and warn if you pass a tolerance. All of them use an
-`ODEFunction`'s `jac` when one is given and accept a mass matrix, which makes
-a singular mass matrix an index-1 differential-algebraic problem.
+`ODEFunction`'s `jac` and accept a mass matrix, which makes a singular mass
+matrix an index-1 differential-algebraic problem.
+
+Without a `jac` the Jacobian comes from `autodiff`: ForwardDiff by default, colouring a
+sparse `jac_prototype`, or `AutoFiniteDiff()` to have PETSc difference the step's own
+equations, colouring a sparse prototype too.
 """
 struct TSImplicit <: PETScTSAlgorithm
     subtype::String
     theta::Union{Nothing, Float64}
     order::Union{Nothing, Int}
     petsc_options::Vector{String}
+    autodiff::ADTypes.AbstractADType
 end
 
 function _bdf_order(subtype, order)
@@ -113,27 +129,35 @@ function _bdf_order(subtype, order)
     return Int(order)
 end
 
-TSImplicit(subtype::AbstractString = "beuler"; order = nothing) =
-    TSImplicit(String(subtype), nothing, _bdf_order(subtype, order), String[])
-TSImplicit(subtype::AbstractString, theta::Real; order = nothing) =
-    TSImplicit(String(subtype), Float64(theta), _bdf_order(subtype, order), String[])
+TSImplicit(
+    subtype::AbstractString = "beuler"; order = nothing, autodiff = AutoForwardDiff(),
+) = TSImplicit(
+    String(subtype), nothing, _bdf_order(subtype, order), String[], _check_autodiff(autodiff),
+)
+TSImplicit(
+    subtype::AbstractString, theta::Real; order = nothing, autodiff = AutoForwardDiff(),
+) = TSImplicit(
+    String(subtype), Float64(theta), _bdf_order(subtype, order), String[],
+    _check_autodiff(autodiff),
+)
 TSImplicit(
     subtype::AbstractString, petsc_options::AbstractVector{<:AbstractString};
-    order = nothing,
+    order = nothing, autodiff = AutoForwardDiff(),
 ) = TSImplicit(
     String(subtype), nothing, _bdf_order(subtype, order),
-    String[String(o) for o in petsc_options],
+    String[String(o) for o in petsc_options], _check_autodiff(autodiff),
 )
 TSImplicit(
     subtype::AbstractString, theta::Real,
     petsc_options::AbstractVector{<:AbstractString}; order = nothing,
+    autodiff = AutoForwardDiff(),
 ) = TSImplicit(
     String(subtype), Float64(theta), _bdf_order(subtype, order),
-    String[String(o) for o in petsc_options],
+    String[String(o) for o in petsc_options], _check_autodiff(autodiff),
 )
 
 """
-    TSIRK(nstages = 3, petsc_options = String[])
+    TSIRK(nstages = 3, petsc_options = String[]; autodiff = AutoForwardDiff())
 
 Gauss-Legendre implicit Runge-Kutta from PETSc's `TSIRK`, of order `2 *
 nstages`: one stage is the implicit midpoint rule at order 2, two stages give
@@ -142,15 +166,15 @@ order 4 and three give order 6. Measured at each of those.
 Fixed step: PETSc gives this family no embedded error estimate, so it steps at
 the `dt` you give and warns if you pass a tolerance.
 
-Needs an `ODEFunction` `jac`, and says so rather than letting PETSc fail, since
-it solves all stages as one coupled system whose matrix it cannot build from a
-finite-difference fallback. That coupled matrix is a Kronecker product with the
+Needs a Jacobian, from the `ODEFunction`'s `jac` or from `autodiff`, and refuses
+`AutoFiniteDiff()` rather than letting PETSc fail, since it solves all stages as
+one coupled system whose matrix it cannot build from finite differences. That coupled matrix is a Kronecker product with the
 Jacobian, which has no LU factorisation, so this algorithm defaults to
 `-pc_type pbjacobi`; your own `petsc_options` are parsed afterwards and win.
 
 A wrong Jacobian is not caught here. Where the other implicit families fail to
 converge, this one reports success and returns a wrong answer, so check a
-hand-written `jac` against a finite-difference solve before trusting it.
+hand-written `jac` against a solve without one before trusting it.
 
 A mass matrix is rejected. PETSc's coupled-stage matrix assumes `dF/du̇ = I`,
 and with a non-identity mass matrix the answer drifts further from the true one
@@ -159,13 +183,16 @@ as `dt` shrinks instead of failing, which is worse than an error.
 struct TSIRK <: PETScTSAlgorithm
     nstages::Int
     petsc_options::Vector{String}
+    autodiff::ADTypes.AbstractADType
 end
 
-TSIRK(nstages::Integer = 3, petsc_options::AbstractVector{<:AbstractString} = String[]) =
-    TSIRK(Int(nstages), String[String(o) for o in petsc_options])
+TSIRK(
+    nstages::Integer = 3, petsc_options::AbstractVector{<:AbstractString} = String[];
+    autodiff = AutoForwardDiff(),
+) = TSIRK(Int(nstages), String[String(o) for o in petsc_options], _check_autodiff(autodiff))
 
 """
-    TSDAE(subtype = "bdf", petsc_options = String[])
+    TSDAE(subtype = "bdf", petsc_options = String[]; order = nothing, autodiff = AutoForwardDiff())
 
 Fully implicit methods applied to a `DAEProblem`, whose residual `G(t, u, u') = 0`
 is exactly the form PETSc's `IFunction` takes. `subtype` is `"beuler"`, `"cn"`,
@@ -173,7 +200,8 @@ is exactly the form PETSc's `IFunction` takes. `subtype` is `"beuler"`, `"cn"`,
 
 A `DAEFunction`'s `jac(J, du, u, p, gamma, t)` is `gamma * dG/du' + dG/du`,
 which is what PETSc's `IJacobian` wants whole, so it is passed straight through
-and `gamma` is PETSc's shift. Without one PETSc differences the residual.
+and `gamma` is PETSc's shift. Without one the Jacobian comes from `autodiff`, as for
+[`TSImplicit`](@ref).
 
 `order` sets the BDF order, 1 through 6, and carries the same warning as
 [`TSImplicit`](@ref): PETSc's own default is 2.
@@ -185,25 +213,28 @@ struct TSDAE <: PETScTSDAEAlgorithm
     subtype::String
     order::Union{Nothing, Int}
     petsc_options::Vector{String}
+    autodiff::ADTypes.AbstractADType
 end
 
 TSDAE(
     subtype::AbstractString = "bdf",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    order = nothing,
+    order = nothing, autodiff = AutoForwardDiff(),
 ) = TSDAE(
     String(subtype), _bdf_order(subtype, order), String[String(o) for o in petsc_options],
+    _check_autodiff(autodiff),
 )
 
 """
-    TSARKIMEX(subtype = "3", petsc_options = String[])
+    TSARKIMEX(subtype = "3", petsc_options = String[]; autodiff = AutoForwardDiff())
 
 Additive Runge-Kutta IMEX from PETSc's `TSARKIMEX`. `subtype` is a PETSc
 `TSARKIMEXType` without its prefix, such as `"2e"`, `"3"`, `"4"` or `"5"`.
 
 Takes a `SplitODEProblem` whose `f1` is integrated implicitly and whose `f2`
 is integrated explicitly, and uses `f1`'s Jacobian when the problem carries
-one. A plain `ODEProblem` is treated as fully implicit with the explicit part
+one. Without one, `f1`'s Jacobian comes from `autodiff`, as for
+[`TSImplicit`](@ref). A plain `ODEProblem` is treated as fully implicit with the explicit part
 left at zero, which is PETSc's own default. Adapts on its embedded error
 estimate, except for `"prssp2"`, `"ars443"` and `"bpr3"`, which PETSc gives
 none, so they step at the `dt` you give and warn if you pass a tolerance.
@@ -218,10 +249,16 @@ plain `ODEProblem` PETSc does not use its explicit tableau, and it keeps order 3
 struct TSARKIMEX <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
+    autodiff::ADTypes.AbstractADType
 end
 
-TSARKIMEX(subtype::AbstractString = "3", petsc_options::AbstractVector{<:AbstractString} = String[]) =
-    TSARKIMEX(String(subtype), String[String(o) for o in petsc_options])
+TSARKIMEX(
+    subtype::AbstractString = "3",
+    petsc_options::AbstractVector{<:AbstractString} = String[];
+    autodiff = AutoForwardDiff(),
+) = TSARKIMEX(
+    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+)
 
 const _MPRK_TWO_WAY = ("2a22", "2a32", "p2", "p3")
 const _MPRK_THREE_WAY = ("2a23", "2a33")
@@ -303,13 +340,14 @@ TSMPRK(
 )
 
 """
-    TSGeneric(ts_type, petsc_options = String[]; explicit = false)
+    TSGeneric(ts_type, petsc_options = String[]; explicit = false, autodiff = AutoForwardDiff())
 
 Any other PETSc `TSType` by name. An implicit one such as `"alpha"` works with
 the default; an explicit one such as `"euler"` or `"ssp"` needs
 `explicit = true`, since PETSc then wants the right-hand side rather than the
 implicit residual. The constructor refuses a type given the wrong `explicit`.
-An explicit type also ignores a `jac` and rejects a mass matrix.
+An explicit type also ignores a `jac` and rejects a mass matrix. An implicit one without
+a `jac` gets its Jacobian from `autodiff`, as for [`TSImplicit`](@ref).
 
 Whether the named type adapts is not known here, so no tolerance warning is
 issued for it. Only `"euler"` and `"alpha"` have been run through this
@@ -323,6 +361,7 @@ struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
     explicit::Bool
     petsc_options::Vector{String}
+    autodiff::ADTypes.AbstractADType
 end
 
 # These PETSc types are driven through a setup call this package does not make, so
@@ -349,7 +388,7 @@ const _ROSW_NO_STEP = ("lassp3p4s2c", "llssp3p4s2c", "ark3")
 function TSGeneric(
         ts_type::AbstractString,
         petsc_options::AbstractVector{<:AbstractString} = String[];
-        explicit::Bool = false,
+        explicit::Bool = false, autodiff = AutoForwardDiff(),
     )
     t = String(ts_type)
     haskey(_NEEDS_OTHER_SETUP, t) && throw(
@@ -358,7 +397,9 @@ function TSGeneric(
     !explicit && t in _EXPLICIT_ONLY && throw(
         ArgumentError("`$t` is an explicit PETSc type, so it needs `explicit = true`"),
     )
-    return TSGeneric(t, explicit, String[String(o) for o in petsc_options])
+    return TSGeneric(
+        t, explicit, String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    )
 end
 
 _uses_ifunction(::TSRK) = false
@@ -717,6 +758,28 @@ function _pivot_raises(pl, ts)
     return raises[] == LibPETSc.PETSC_TRUE || snes_raises[] == LibPETSc.PETSC_TRUE
 end
 
+# With no `jac`, PETSc differences the step's equations to get their Jacobian. Handed a
+# matrix with the pattern, it perturbs every column of one colour together, rather than
+# each column in turn as it does on the dense matrix it makes for itself.
+function _colour_jacobian!(pl, ts, mat)
+    lib = Libdl.dlopen(pl.petsc_library)
+    snes = Ref{LibPETSc.CSNES}(C_NULL)
+    ccall(
+        Libdl.dlsym(lib, :TSGetSNES), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
+    )
+    code = ccall(
+        Libdl.dlsym(lib, :SNESSetJacobian), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
+        snes[], mat, mat, Libdl.dlsym(lib, :SNESComputeJacobianDefaultColor), C_NULL,
+    )
+    code == 0 || throw(LibPETSc.PetscError(code))
+    return nothing
+end
+
+_fd_pattern(jac_prototype, M, n) =
+    _jacobian_pattern(SparseMatrixCSC{Float64, Int}(jac_prototype), n, M)
+
 # PETSc applies the last setting of an option, matches its name without regard to case, and
 # reads a bare flag as true. PETSc 3.22 has no getter for this one, so it is read here.
 function _option_flag(opts, name)
@@ -859,7 +922,9 @@ function _setrows!(ctx, A, n)
     return nothing
 end
 
-function _row_structure(J::SparseMatrixCSC, n)
+# The shift lands on the diagonal and on every entry of the mass matrix, so those get a
+# slot even where the prototype has none, with no Jacobian entry behind it.
+function _row_structure(J::SparseMatrixCSC, n, M = nothing)
     cols = [Int[] for _ in 1:n]
     src = [Int[] for _ in 1:n]
     for j in 1:n, k in J.colptr[j]:(J.colptr[j + 1] - 1)
@@ -868,8 +933,10 @@ function _row_structure(J::SparseMatrixCSC, n)
         push!(src[i], k)
     end
     for i in 1:n
-        if !(i in cols[i])
-            push!(cols[i], i)
+        for j in (M === nothing ? (i:i) : 1:n)
+            (j == i || M[i, j] != 0) || continue
+            j in cols[i] && continue
+            push!(cols[i], j)
             push!(src[i], 0)
         end
         perm = sortperm(cols[i])
@@ -1414,10 +1481,16 @@ end
 # PETSc built with 32-bit indices.
 _maxsteps(maxiters) = LibPETSc.PetscInt(min(maxiters, typemax(LibPETSc.PetscInt)))
 
-function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer)
+function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothing)
     rows, cols, _ = findnz(jac_prototype)
     all_rows = vcat(rows, 1:n)
     all_cols = vcat(cols, 1:n)
+    if M !== nothing
+        for ij in findall(!iszero, M)
+            push!(all_rows, ij[1])
+            push!(all_cols, ij[2])
+        end
+    end
     return sparse(all_rows, all_cols, ones(length(all_rows)), n, n)
 end
 
@@ -1498,6 +1571,7 @@ mutable struct TSHandles{CTX, T}
     ts::Any
     u::Any
     jac_mat::Any
+    fd_mat::Any
     opts::Any
     t0::Float64
     tf::Float64
@@ -1565,6 +1639,7 @@ function _destroy!(h::TSHandles)
     (PETSc.finalized(h.petsclib) || MPI.Finalized()) && return nothing
     h.opts === nothing || PETSc.destroy(h.opts)
     h.jac_mat === nothing || PETSc.destroy(h.jac_mat)
+    h.fd_mat === nothing || PETSc.destroy(h.fd_mat)
     for v in h.tolvecs
         v.ptr == C_NULL || PETSc.destroy(v)
     end
@@ -1763,13 +1838,15 @@ function _setup(
     end
     f1 = is_dae ? f1 : _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
-    has_jac = _uses_ifunction(alg) && prob.f.jac !== nothing
+    # Without a `jac` one is built with `autodiff`, unless that asks PETSc to difference.
+    builds_jac = _uses_ifunction(alg) && prob.f.jac === nothing && !_petsc_differences(alg)
+    has_jac = _uses_ifunction(alg) && (prob.f.jac !== nothing || builds_jac)
     if alg isa TSIRK && !has_jac
         throw(
             ArgumentError(
-                "TSIRK needs an analytic Jacobian; give the ODEFunction a `jac`, since " *
-                    "PETSc builds its coupled-stage matrix from one and has no " *
-                    "finite-difference fallback for it",
+                "TSIRK needs a Jacobian; give the ODEFunction a `jac` or leave `autodiff` " *
+                    "at a backend other than `AutoFiniteDiff()`, since PETSc builds its " *
+                    "coupled-stage matrix from one and has no finite-difference fallback for it",
             ),
         )
     end
@@ -1795,9 +1872,10 @@ function _setup(
     if alg isa TSRosW && alg.subtype == "assp3p3s1c" && !has_jac
         throw(
             ArgumentError(
-                "TSRosW(\"assp3p3s1c\") needs an analytic Jacobian; give the ODEFunction " *
-                    "a `jac`, since PETSc asks for one at the start of every step and has " *
-                    "no finite-difference fallback there",
+                "TSRosW(\"assp3p3s1c\") needs a Jacobian; give the ODEFunction a `jac` " *
+                    "or leave `autodiff` at a backend other than `AutoFiniteDiff()`, since " *
+                    "PETSc asks for one at the start of every step and has no " *
+                    "finite-difference fallback there",
             ),
         )
     end
@@ -1818,8 +1896,21 @@ function _setup(
             ),
         )
     end
-    jac_fn = has_jac ?
-        (is_dae ? unwrap(prob.f.jac) : _as_inplace_jac(unwrap(prob.f.jac), iip)) : nothing
+    jac_fn = if !has_jac
+        nothing
+    elseif builds_jac
+        # Dual numbers need the function itself, not the wrapper SciMLBase made for Float64.
+        f_ad = SciMLBase.unwrapped_f(is_split ? prob.f.f1.f : prob.f.f)
+        user_t0 = Float64(prob.tspan[1])
+        is_dae ?
+            _ad_dae_jacobian(_autodiff(alg), f_ad, prob.f.jac_prototype, u0, prob.p, user_t0) :
+            _ad_jacobian(
+                _autodiff(alg), _as_inplace(f_ad, iip), prob.f.jac_prototype, u0, prob.p,
+                user_t0,
+            )
+    else
+        is_dae ? unwrap(prob.f.jac) : _as_inplace_jac(unwrap(prob.f.jac), iip)
+    end
     _check_tol(abstol, n, "abstol")
     _check_tol(reltol, n, "reltol")
     if !dt_given
@@ -1883,21 +1974,12 @@ function _setup(
     save_start || filter!(t -> abs(t - t0) > endtol, saveat_times)
     save_end || filter!(t -> abs(t - tf) > endtol, saveat_times)
     M = has_mass ? Matrix{Float64}(mass_matrix) : nothing
-    if M !== nothing && uses_sparse_jac &&
-            any(M[i, j] != 0 for i in 1:n, j in 1:n if i != j)
-        throw(
-            ArgumentError(
-                "PETScDiffEq supports a jac_prototype only with a diagonal mass " *
-                    "matrix; the off-diagonal entries have no preallocated slot",
-            ),
-        )
-    end
     missing_diag = uses_sparse_jac ?
         [i for i in 1:n if !_stored(J0, i, i)] : Int[]
     W0 = has_jac && !uses_sparse_jac ? zeros(n, n) : zeros(0, 0)
     idx0 = has_jac && !uses_sparse_jac ?
         LibPETSc.PetscInt[i - 1 for i in 1:n] : LibPETSc.PetscInt[]
-    row_cols0, row_src, row_buf = uses_sparse_jac ? _row_structure(J0, n) :
+    row_cols0, row_src, row_buf = uses_sparse_jac ? _row_structure(J0, n, M) :
         (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
     kept = if save_idxs === nothing
         nothing
@@ -1944,7 +2026,7 @@ function _setup(
         0, 0, 0, nothing,
     )
     h = TSHandles(
-        ctx, petsclib, nothing, nothing, nothing, nothing,
+        ctx, petsclib, nothing, nothing, nothing, nothing, nothing,
         t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0,
         Any[], Vector{Float64}[], false,
     )
@@ -1985,7 +2067,7 @@ function _setup(
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, SPLIT_RHS_PTR[], ctxptr)
             end
             if has_jac && uses_sparse_jac
-                pattern = _jacobian_pattern(J0, n)
+                pattern = _jacobian_pattern(J0, n, M)
                 h.jac_mat = PETSc.MatSeqAIJWithArrays(petsclib, MPI.COMM_SELF, pattern)
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, SPARSE_IJACOBIAN_PTR[], ctxptr,
@@ -1995,6 +2077,11 @@ function _setup(
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, IJACOBIAN_PTR[], ctxptr,
                 )
+            elseif _uses_ifunction(alg) && prob.f.jac_prototype isa SparseArrays.AbstractSparseMatrix
+                h.fd_mat = PETSc.MatSeqAIJWithArrays(
+                    petsclib, MPI.COMM_SELF, _fd_pattern(prob.f.jac_prototype, M, n),
+                )
+                _colour_jacobian!(petsclib, ts, h.fd_mat)
             end
             LibPETSc.TSMonitorSet(petsclib, ts, MONITOR_PTR[], ctxptr)
             if ctx.dtmin > 0 || ctx.unstable !== nothing
@@ -3177,6 +3264,7 @@ SciMLBase.solve!(integ::PETScIntegrator) = _locked(() -> _solve_integrator_unloc
 
 SciMLBase.done(integ::PETScIntegrator) = integ.finished
 
+include("autodiff.jl")
 include("adjoint.jl")
 
 end

@@ -24,12 +24,15 @@ Saving keywords are ignored, and `callback`, `tstops`, `d_discontinuities` and
 
 Supported: an `ODEProblem` without a mass matrix, in place or out of place, solved with
 `TSRK` of any subtype, `TSImplicit("beuler")` or `TSImplicit("cn")`, in either time
-direction. The `ODEFunction` needs a `jac`, and a `paramjac` unless `p` is `nothing` or
-empty; a sparse `jac_prototype` is used. `paramjac` takes the form `jac` does,
-`paramjac(pJ, u, p, t)` in place or `paramjac(u, p, t)` out of place, with a row per state
-and a column per entry of `p`, which therefore has to be a vector of real numbers. Both
-Jacobians go into the gradient unchecked, so a wrong one gives a wrong gradient without
-an error; compare them against finite differences before relying on them.
+direction. The `ODEFunction`'s `jac` and `paramjac` are used when given, and otherwise
+built as the forward solve builds a missing `jac`: with the algorithm's `autodiff`, and
+with ForwardDiff for a `TSRK`. Under `AutoFiniteDiff()` both have to be given, since
+PETSc's own differences never reach its adjoint. A sparse `jac_prototype` is used.
+`paramjac` takes the form `jac` does, `paramjac(pJ, u, p, t)` in place or
+`paramjac(u, p, t)` out of place, with a row per state and a column per entry of `p`,
+which therefore has to be a vector of real numbers. A hand-written `jac` or `paramjac`
+goes into the gradient unchecked, so a wrong one gives a wrong gradient without an error;
+compare it against a gradient computed without it.
 
 Costs are discrete: at each `t[i]`, `dgdu_discrete(out, u, p, t, i)` writes the cost's
 derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`, if given, its
@@ -434,10 +437,14 @@ function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_disc
                 "assumes a constant one and none of these methods has been verified with one",
         ),
     )
-    prob.f.jac === nothing && throw(
+    # PETSc's own differences never reach the adjoint, which multiplies by the Jacobian it
+    # is given, so under `AutoFiniteDiff()` both Jacobians have to be the caller's.
+    differences = _petsc_differences(alg)
+    differences && prob.f.jac === nothing && throw(
         ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `jac`: PETSc's adjoint step multiplies " *
-                "by the Jacobian it is given and has no other source for it",
+            "PETScAdjoint needs the ODEFunction's `jac` under `autodiff = AutoFiniteDiff()`: " *
+                "PETSc's adjoint step multiplies by the Jacobian it is given and has no " *
+                "other source for it",
         ),
     )
     p = prob.p
@@ -448,10 +455,11 @@ function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_disc
                 "`paramjac` fills a matrix with a column per entry of `p`; got $(typeof(p))",
         ),
     )
-    has_p && !isempty(p) && prob.f.paramjac === nothing && throw(
+    has_p && !isempty(p) && differences && prob.f.paramjac === nothing && throw(
         ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `paramjac` when the problem has " *
-                "parameters: PETSc builds the parameter gradient from it",
+            "PETScAdjoint needs the ODEFunction's `paramjac` under " *
+                "`autodiff = AutoFiniteDiff()` when the problem has parameters: PETSc " *
+                "builds the parameter gradient from it",
         ),
     )
     !has_p && dgdp_discrete !== nothing && throw(
@@ -566,9 +574,15 @@ function _discrete_adjoint_unlocked(
         cost_s = h.tdir .* cost_t
         implicit = _check_adjoint_ts(h, alg, cost_s)
         iip = SciMLBase.isinplace(prob)
+        # A TSRK has no `autodiff` of its own and differentiates with ForwardDiff.
+        backend = something(_autodiff(alg), AutoForwardDiff())
+        f_ad = _as_inplace(SciMLBase.unwrapped_f(prob.f.f), iip)
+        user_t0 = Float64(prob.tspan[1])
         jac, J = nothing, zeros(0, 0)
         if !implicit
-            jac = _as_inplace_jac(prob.f.jac, iip)
+            jac = prob.f.jac === nothing ?
+                _ad_jacobian(backend, f_ad, prob.f.jac_prototype, h.u0, p, user_t0) :
+                _as_inplace_jac(prob.f.jac, iip)
             h.tdir < 0 && (jac = _reverse_jac(jac))
             proto = prob.f.jac_prototype
             J = proto isa SparseMatrixCSC ? SparseMatrixCSC{Float64, Int}(proto) : zeros(n, n)
@@ -577,7 +591,10 @@ function _discrete_adjoint_unlocked(
             (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
         adj = AdjointContext(
             pl, h.tdir, p, jac, J, rows...,
-            np > 0 ? _as_inplace_jac(prob.f.paramjac, iip) : nothing, zeros(n, np),
+            np == 0 ? nothing : prob.f.paramjac === nothing ?
+                _ad_paramjacobian(backend, f_ad, h.u0, p, user_t0) :
+                _as_inplace_jac(prob.f.paramjac, iip),
+            zeros(n, np),
             implicit ? -h.tdir : h.tdir, dgdu_discrete, Bool(no_start),
             cost_t, cost_s, sortperm(cost_s), 1, h.t0,
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
