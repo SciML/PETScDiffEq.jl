@@ -1468,19 +1468,6 @@ _default_options(::TSIRK) = ["-pc_type", "pbjacobi"]
 _default_options(alg::TSMPRK) =
     ["-ts_mprk_type", alg.subtype, "-ts_use_splitrhsfunction", "true"]
 
-# PETSc ships single precision and complex builds, but this package drives the double one,
-# so a state it would have to convert is refused rather than converted out of sight. Whole
-# numbers are exact in Float64, as they are in OrdinaryDiffEq.
-function _check_state_type(u, name)
-    eltype(u) <: Union{Float64, Integer} && return nothing
-    throw(
-        ArgumentError(
-            "PETScDiffEq solves in Float64, and `$name` has eltype $(eltype(u)); convert " *
-                "the problem first, as in `remake(prob; u0 = Float64.(prob.u0))`",
-        ),
-    )
-end
-
 const UNSUPPORTED_KWARGS = (
     :isoutofdomain,
     :internalnorm, :calck, :alias_u0, :sensealg,
@@ -1672,8 +1659,6 @@ function _setup(
     end
     prob.u0 isa AbstractVector{<:Real} ||
         throw(ArgumentError("PETScDiffEq requires a real AbstractVector u0"))
-    _check_state_type(prob.u0, "u0")
-    prob isa SciMLBase.AbstractDAEProblem && _check_state_type(prob.du0, "du0")
     dt_given = dt !== nothing
     if !dt_given && !(adaptive && _adapts(alg) === true)
         throw(
@@ -1739,10 +1724,14 @@ function _setup(
     _arm_exit_cleanup!()
 
     iip = SciMLBase.isinplace(prob)
-    f1 = is_split ? prob.f.f1.f : prob.f.f
+    # SciMLBase wraps the functions for the problem's own eltype, and PETSc's double build
+    # calls them with Float64 arrays, so a problem in another eltype gets them unwrapped
+    # and is solved in Float64, as a whole-number state is.
+    unwrap = eltype(prob.u0) === Float64 ? identity : SciMLBase.unwrapped_f
+    f1 = unwrap(is_split ? prob.f.f1.f : prob.f.f)
     is_dae && !iip &&
         throw(ArgumentError("PETScDiffEq requires an in-place DAEProblem residual"))
-    f2 = is_split ? prob.f.f2.f : nothing
+    f2 = is_split ? unwrap(prob.f.f2.f) : nothing
     for g in (f1, f2)
         # An AbstractSciMLOperator ignores the f(du,u,p,t) call this package
         # makes, leaving the derivative buffer untouched rather than erroring.
@@ -1810,7 +1799,8 @@ function _setup(
             ),
         )
     end
-    jac_fn = has_jac ? (is_dae ? prob.f.jac : _as_inplace_jac(prob.f.jac, iip)) : nothing
+    jac_fn = has_jac ?
+        (is_dae ? unwrap(prob.f.jac) : _as_inplace_jac(unwrap(prob.f.jac), iip)) : nothing
     _check_tol(abstol, n, "abstol")
     _check_tol(reltol, n, "reltol")
     if !dt_given
