@@ -189,6 +189,9 @@ Every solve runs on `MPI.COMM_SELF`, so this package is serial. PETSc TS is buil
 large distributed problems, and reaching it from the SciML interface is what this package
 is for; use OrdinaryDiffEq.jl for serial problems where it applies.
 
+Solves run in Float64, PETSc's double build: a `Float32` or whole-number state is
+converted, and the solution comes back in Float64.
+
 On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.
 
