@@ -2808,7 +2808,7 @@ function _reject_out_of_domain!(integ::PETScIntegrator, before)
     copyto!(integ.u, integ.uprev)
     PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
-    LibPETSc.TSSetStepNumber(pl, h.ts, nstep)
+    LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
     floor = abs(Float64(something(get(integ.kwargs, :dtmin, nothing), 0.0)))
     if get(integ.kwargs, :force_dtmin, false) === true && smaller < floor
         LibPETSc.TSSetTimeStep(pl, h.ts, min(floor, taken))
