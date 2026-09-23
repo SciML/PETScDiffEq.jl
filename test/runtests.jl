@@ -466,6 +466,34 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
     end
 
+    @testset "unstable_check ends the solve where it fires" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp")
+        below(cut) = (dt, u, p, t) -> any(<(cut), u)
+        sol = SciMLBase.solve(prob, alg; dt = 0.1, unstable_check = below(0.7))
+        @test sol.retcode == SciMLBase.ReturnCode.Unstable
+        @test 0.0 < sol.t[end] < 1.0
+        @test sol.u[end][1] < 0.7
+        # The step it is given is the one just taken.
+        seen = Float64[]
+        SciMLBase.solve(
+            prob, alg; dt = 0.1, adaptive = false,
+            unstable_check = (dt, u, p, t) -> (push!(seen, dt); false),
+        )
+        @test all(≈(0.1), seen)
+        # The integrator path stops in the same place.
+        integ = SciMLBase.init(prob, alg; dt = 0.1, unstable_check = below(0.7))
+        stepped = SciMLBase.solve!(integ)
+        @test stepped.retcode == SciMLBase.ReturnCode.Unstable
+        @test stepped.t[end] ≈ sol.t[end]
+        # A check that never fires leaves the solve alone, and neither warns.
+        quiet = @test_logs min_level = Logging.Warn SciMLBase.solve(
+            prob, alg; dt = 0.1, unstable_check = below(-1.0),
+        )
+        @test quiet.retcode == SciMLBase.ReturnCode.Success
+        @test quiet.t[end] == 1.0
+    end
+
     @testset "running out of steps is MaxIters" begin
         sol = SciMLBase.solve(
             SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
@@ -1307,6 +1335,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test SciMLBase.done(stepped)
             @test stepped.sol.retcode == SciMLBase.ReturnCode.DtLessThanMin
             @test stepped.sol.t[end] < 1.0
+            # Both paths stop on the step whose successor would fall below the floor.
+            @test stepped.sol.t[end] == floored.t[end]
 
             # force_dtmin keeps the solve going at the floor, as in OrdinaryDiffEq.
             forced = SciMLBase.solve(

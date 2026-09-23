@@ -512,6 +512,9 @@ mutable struct TSContext{F, F2, JAC, JBUF, P, T, V}
     # The smallest step the caller allows, 0.0 when none, and whether one was asked for.
     dtmin::Float64
     dt_too_small::Bool
+    # The caller's own check on the state at each step's end, and whether it has fired.
+    unstable::Any
+    unstable_hit::Bool
     nf::Int
     nf2::Int
     njacs::Int
@@ -539,17 +542,60 @@ function _record_end!(ctx, t, x)
     return nothing
 end
 
-# PETSc's own `dt_min` clamps the step and takes it anyway, error estimate or not, so the
-# caller's floor ends the solve here instead, as OrdinaryDiffEq's does. A reason set here
-# would not survive, since the next step resets it, so the step count is what stops PETSc.
-function _stop_below_dtmin!(ctx, ts_ptr, step)
-    (ctx.dtmin > 0 && step > 0 && !ctx.dt_too_small) || return nothing
-    ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
-    abs(Float64(LibPETSc.TSGetTimeStep(ctx.petsclib, ts))) < ctx.dtmin || return nothing
-    ctx.dt_too_small = true
-    LibPETSc.TSSetMaxSteps(ctx.petsclib, ts, step)
+# After each step TSSolve takes, the checks that end a solve early: the caller's floor, kept
+# here because PETSc's own `dt_min` clamps the step and takes it whatever its error, and the
+# caller's `unstable_check(dt, u, p, t)`, given the step just taken. TSSolve calls this
+# before it decides whether to go on, so a reason set here ends the solve on this step.
+function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
+    ctxptr = Ref{Ptr{Cvoid}}(C_NULL)
+    get_ctx, get_solution = POST_STEP_FNS[]
+    ccall(get_ctx, LibPETSc.PetscErrorCode, (LibPETSc.CTS, Ptr{Ptr{Cvoid}}), ts_ptr, ctxptr)
+    ctx = unsafe_pointer_to_objref(ctxptr[])::TSContext
+    ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
+    try
+        pl = ctx.petsclib
+        ts = LibPETSc.TS(ts_ptr, pl)
+        stop = false
+        if ctx.dtmin > 0 && abs(Float64(LibPETSc.TSGetTimeStep(pl, ts))) < ctx.dtmin
+            ctx.dt_too_small = stop = true
+        end
+        if ctx.unstable !== nothing
+            t = Float64(LibPETSc.TSGetTime(pl, ts))
+            dt = t - Float64(LibPETSc.TSGetPrevTime(pl, ts))
+            x = Ref{LibPETSc.CVec}(C_NULL)
+            ccall(get_solution, LibPETSc.PetscErrorCode, (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x)
+            u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
+            ctx.unstable(dt, u, ctx.p, t) && (ctx.unstable_hit = stop = true)
+        end
+        stop && LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_CONVERGED_USER)
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+const POST_STEP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
+# The post-step callback carries no context of its own, so the context rides on the TS.
+function _set_post_step!(pl, ts, ctxptr)
+    lib = Libdl.dlopen(pl.petsc_library)
+    POST_STEP_FNS[][1] == C_NULL && (
+        POST_STEP_FNS[] = (
+            Libdl.dlsym(lib, :TSGetApplicationContext), Libdl.dlsym(lib, :TSGetSolution),
+        )
+    )
+    ccall(
+        Libdl.dlsym(lib, :TSSetApplicationContext), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{Cvoid}), ts, ctxptr,
+    )
+    ccall(
+        Libdl.dlsym(lib, :TSSetPostStep), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{Cvoid}), ts, POST_STEP_PTR[],
+    )
     return nothing
 end
+const POST_STEP_FNS = Ref((C_NULL, C_NULL))
 
 # Exactly the same time: accepted steps near a singularity can be far closer than any
 # tolerance and are still points of the solution.
@@ -1219,7 +1265,7 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
             ctx.fend = nothing
             ctx.pdirty = false
         end
-        _stop_below_dtmin!(ctx, ts_ptr, step)
+
     catch e
         ctx.err = e
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
@@ -1241,6 +1287,7 @@ function __init__()
         LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
     )
+    POST_STEP_PTR[] = @cfunction(_post_step!, LibPETSc.PetscErrorCode, (LibPETSc.CTS,))
     MONITOR_PTR[] = @cfunction(
         _monitor!,
         LibPETSc.PetscErrorCode,
@@ -1436,7 +1483,7 @@ end
 
 const UNSUPPORTED_KWARGS = (
     :isoutofdomain,
-    :unstable_check, :internalnorm, :calck, :alias_u0, :sensealg,
+    :internalnorm, :calck, :alias_u0, :sensealg,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
 )
 
@@ -1606,6 +1653,7 @@ function _setup(
         dtmin = nothing,
         dtmax = nothing,
         force_dtmin = false,
+        unstable_check = nothing,
         saveat = Float64[],
         save_everystep = nothing,
         save_start = nothing,
@@ -1883,6 +1931,7 @@ function _setup(
         slow_idxs, medium_idxs, fast_idxs,
         NaN, similar(u0), false,
         force_dtmin || dtmin === nothing ? 0.0 : abs(Float64(dtmin)), false,
+        unstable_check, false,
         0, 0, 0, nothing,
     )
     h = TSHandles(
@@ -1939,6 +1988,9 @@ function _setup(
                 )
             end
             LibPETSc.TSMonitorSet(petsclib, ts, MONITOR_PTR[], ctxptr)
+            if ctx.dtmin > 0 || ctx.unstable !== nothing
+                _set_post_step!(petsclib, ts, ctxptr)
+            end
             LibPETSc.TSSetTime(petsclib, ts, t0)
             LibPETSc.TSSetTimeStep(petsclib, ts, abs(Float64(dt)))
             LibPETSc.TSSetMaxTime(petsclib, ts, tf)
@@ -2069,7 +2121,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
 
     finite = all(isfinite, uend)
     # PETSc's own reason says what stopped a solve short of the final time.
-    retcode = if !finite || h.stopped == PETSC_ERR_FP
+    retcode = if !finite || h.stopped == PETSC_ERR_FP || ctx.unstable_hit
         SciMLBase.ReturnCode.Unstable
     elseif tend >= tf - tol
         SciMLBase.ReturnCode.Success
@@ -2966,6 +3018,11 @@ function _step_unlocked(integ::PETScIntegrator)
         popfirst!(integ.tstops)
     end
     integ.finished && return nothing
+    if ctx.unstable !== nothing && ctx.unstable(integ.dt, integ.u, ctx.p, integ.t)
+        ctx.unstable_hit = true
+        _finish!(integ)
+        return nothing
+    end
     # The step PETSc proposes next is smaller than the caller's floor.
     ctx.dtmin > 0 && Float64(LibPETSc.TSGetTimeStep(pl, h.ts)) < ctx.dtmin &&
         (ctx.dt_too_small = true)
