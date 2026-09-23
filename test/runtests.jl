@@ -3375,10 +3375,142 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 e
             end
             @test err isa ArgumentError
-            @test occursin("autodiff = AutoFiniteDiff()", err.msg)
+            @test occursin("autodiff = PETScDiffEq.AutoFiniteDiff()", err.msg)
+            sol = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf"; autodiff = fd))
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            # A typed signature, a type assertion and TSIRK, which needs the Jacobian.
+            typed!(du::Vector{Float64}, u::Vector{Float64}, p, t) = (du .= -u; nothing)
+            asserted!(du, u, p, t) = (du[1] = -(u[1]::Float64); nothing)
+            for (f, alg) in (
+                    (typed!, PETScDiffEq.TSImplicit("bdf")),
+                    (asserted!, PETScDiffEq.TSRosW()),
+                    (typed!, PETScDiffEq.TSIRK(2)),
+                )
+                err = try
+                    SciMLBase.solve(
+                        SciMLBase.ODEProblem(f, [1.0], (0.0, 1.0)), alg; dt = 0.1,
+                        adaptive = !(alg isa PETScDiffEq.TSIRK),
+                    )
+                catch e
+                    e
+                end
+                @test err isa ArgumentError
+                @test occursin("PETScDiffEq.AutoFiniteDiff()", err.msg)
+            end
+        end
+
+        @testset "a non-finite derivative of a finite f is an error, not a stop at t0" begin
+            # d/du of norm(u) * u is NaN at u = 0 in ForwardDiff, and 0 exactly.
+            pushed!(du, u, p, t) = (du .= -LinearAlgebra.norm(u) .* u; du[1] += 1.0; nothing)
+            prob = SciMLBase.ODEProblem(pushed!, [0.0, 0.0], (0.0, 1.0))
+            for alg in (PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW())
+                @test_throws r"non-finite entry" SciMLBase.solve(prob, alg)
+            end
+            @test_throws r"non-finite entry" SciMLBase.solve(
+                prob, PETScDiffEq.TSIRK(2); dt = 0.1,
+            )
             sol = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf"; autodiff = fd))
             @test sol.retcode == SciMLBase.ReturnCode.Success
         end
+
+        @testset "nf counts the Jacobian's evaluations of f" begin
+            duals = Ref(0)
+            function lv!(du, u, p, t)
+                eltype(u) <: Float64 || (duals[] += 1)
+                du[1] = 1.5u[1] - u[1] * u[2]
+                du[2] = -3u[2] + u[1] * u[2]
+                return nothing
+            end
+            function lv_jac!(J, u, p, t)
+                J[1, 1] = 1.5 - u[2]
+                J[1, 2] = -u[1]
+                J[2, 1] = u[2]
+                J[2, 2] = -3 + u[1]
+                return nothing
+            end
+            kw = (; abstol = 1.0e-8, reltol = 1.0e-8)
+            given = SciMLBase.solve(
+                SciMLBase.ODEProblem(SciMLBase.ODEFunction(lv!; jac = lv_jac!), [1.0, 1.0], (0.0, 5.0)),
+                PETScDiffEq.TSImplicit("bdf"); kw...,
+            )
+            duals[] = 0
+            plain = SciMLBase.solve(
+                SciMLBase.ODEProblem(lv!, [1.0, 1.0], (0.0, 5.0)), PETScDiffEq.TSImplicit("bdf");
+                kw...,
+            )
+            @test duals[] > 0
+            @test plain.stats.nf == given.stats.nf + duals[]
+        end
+
+        @testset "a sparse backend the caller passes colours the prototype" begin
+            n = 20
+            function lap!(du, u, p, t)
+                for i in 1:n
+                    du[i] = (i > 1 ? u[i - 1] : 0.0) - 2u[i] + (i < n ? u[i + 1] : 0.0) - u[i]^3
+                end
+                return nothing
+            end
+            proto = spdiagm(-1 => ones(n - 1), 0 => ones(n), 1 => ones(n - 1))
+            prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(lap!; jac_prototype = proto), ones(n), (0.0, 1.0),
+            )
+            default = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf"))
+            bare = SciMLBase.solve(
+                prob, PETScDiffEq.TSImplicit(
+                    "bdf"; autodiff = PETScDiffEq.ADTypes.AutoSparse(PETScDiffEq.AutoForwardDiff()),
+                ),
+            )
+            @test bare.retcode == SciMLBase.ReturnCode.Success
+            @test bare.u[end] ≈ default.u[end] rtol = 1.0e-12
+        end
+
+        @testset "options that make SNES matrix-free" begin
+            f!(du, u, p, t) = (du[1] = -u[1] + u[2]^2; du[2] = -2u[2]; nothing)
+            prob = SciMLBase.ODEProblem(f!, [1.0, 0.5], (0.0, 1.0))
+            default = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("beuler"); dt = 0.01)
+            for opts in (["-snes_mf"], ["-snes_mf_operator"], ["-snes_fd"])
+                sol = @test_logs min_level = Logging.Warn SciMLBase.solve(
+                    prob, PETScDiffEq.TSImplicit("beuler", opts); dt = 0.01,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.u[end] ≈ default.u[end] rtol = 1.0e-6
+            end
+        end
+
+        @testset "a zero on the Newton matrix's diagonal" begin
+            # The (1, 1) entry is zero: row 1 is the algebraic equation. A dense matrix
+            # pivots, and a sparse one has its rows swapped.
+            function resid!(r, du, u, p, t)
+                r[1] = u[2] - 0.5 * sin(t) - 0.5
+                r[2] = -du[1] - u[1] + u[2]
+                return nothing
+            end
+            function resid_jac!(J, du, u, p, gamma, t)
+                J[1, 1] = 0.0
+                J[1, 2] = 1.0
+                J[2, 1] = -gamma - 1.0
+                J[2, 2] = 1.0
+                return nothing
+            end
+            exact = 0.5 + 0.25 * (sin(1.0) - cos(1.0)) + 0.75 * exp(-1.0)
+            full = sparse(ones(2, 2))
+            for (f, ad) in (
+                    (SciMLBase.DAEFunction(resid!), PETScDiffEq.AutoForwardDiff()),
+                    (SciMLBase.DAEFunction(resid!; jac_prototype = full), PETScDiffEq.AutoForwardDiff()),
+                    (SciMLBase.DAEFunction(resid!; jac = resid_jac!, jac_prototype = full), PETScDiffEq.AutoForwardDiff()),
+                    (SciMLBase.DAEFunction(resid!; jac_prototype = full), fd),
+                )
+                sol = SciMLBase.solve(
+                    SciMLBase.DAEProblem(
+                        f, [-0.5, 0.0], [1.0, 0.5], (0.0, 1.0); differential_vars = [false, true],
+                    ),
+                    PETScDiffEq.TSDAE("bdf"; autodiff = ad); abstol = 1.0e-8, reltol = 1.0e-8,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test abs(sol.u[end][1] - exact) < 1.0e-5
+            end
+        end
+
 
         @testset "autodiff takes an ADTypes backend" begin
             @test_throws r"ADTypes backend" PETScDiffEq.TSImplicit("bdf"; autodiff = true)
@@ -5575,6 +5707,22 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test plain[1] ≈ given[1] rtol = 1.0e-12
                 @test plain[2] ≈ given[2] rtol = 1.0e-12
             end
+            # `p` as a view, which the parameter Jacobian is prepared for as it comes.
+            given = grad(adj_prob(copy(u0), copy(p0), (0.0, 1.0)), TSRK("4"))
+            viewed = grad(
+                SciMLBase.ODEProblem(adj_f!, copy(u0), (0.0, 1.0), view([0.0; p0], 2:5)),
+                TSRK("4"),
+            )
+            @test viewed[2] ≈ given[2] rtol = 1.0e-12
+            # A chunk size picked for eight states is more than the two parameters take.
+            decay!(du, u, p, t) = (du .= -p[1] .* u .+ p[2]; nothing)
+            eight = SciMLBase.ODEProblem(decay!, ones(8), (0.0, 1.0), [1.0, 0.5])
+            chunked = grad(
+                eight, TSImplicit(
+                    "beuler", exact; autodiff = PETScDiffEq.AutoForwardDiff(; chunksize = 8),
+                ),
+            )
+            @test chunked[2] ≈ grad(eight, TSImplicit("beuler", exact))[2] rtol = 1.0e-12
         end
 
         @testset "a user exception reaches the caller and leaves nothing behind" begin

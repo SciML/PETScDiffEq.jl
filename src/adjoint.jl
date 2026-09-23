@@ -565,6 +565,7 @@ function _discrete_adjoint_unlocked(
         prob, alg; solve_kwargs...,
         saveat = Float64[], save_everystep = false, save_start = true, save_end = true,
         dense = false, extra_options = vcat(_ADJOINT_TRAJECTORY, sensealg.petsc_options),
+        jac_advice = _ADJOINT_JAC_ADVICE,
     )
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
     n = length(h.u0)
@@ -581,7 +582,10 @@ function _discrete_adjoint_unlocked(
         jac, J = nothing, zeros(0, 0)
         if !implicit
             jac = prob.f.jac === nothing ?
-                _ad_jacobian(backend, f_ad, prob.f.jac_prototype, h.u0, p, user_t0) :
+                _ad_jacobian(
+                    backend, f_ad, prob.f.jac_prototype, h.u0, p, user_t0, Ref(0),
+                    _ADJOINT_JAC_ADVICE,
+                ) :
                 _as_inplace_jac(prob.f.jac, iip)
             h.tdir < 0 && (jac = _reverse_jac(jac))
             proto = prob.f.jac_prototype
@@ -592,7 +596,7 @@ function _discrete_adjoint_unlocked(
         adj = AdjointContext(
             pl, h.tdir, p, jac, J, rows...,
             np == 0 ? nothing : prob.f.paramjac === nothing ?
-                _ad_paramjacobian(backend, f_ad, h.u0, p, user_t0) :
+                _ad_paramjacobian(backend, f_ad, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE) :
                 _as_inplace_jac(prob.f.paramjac, iip),
             zeros(n, np),
             implicit ? -h.tdir : h.tdir, dgdu_discrete, Bool(no_start),

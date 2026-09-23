@@ -108,8 +108,10 @@ anything sparse: without one the Jacobian is dense and forces a dense factorizat
 
 Without a `jac`, the implicit algorithms build the Jacobian with ForwardDiff, as
 OrdinaryDiffEq does, and colour a sparse `jac_prototype`, so a tridiagonal problem costs
-one dual evaluation of `f` per Jacobian rather than one evaluation per state. Passing
-ADTypes' `AutoFiniteDiff()` as the algorithm's `autodiff` leaves the Jacobian to PETSc's
+one dual evaluation of `f` per Jacobian rather than one evaluation per state. The
+prototype has to hold every entry the Jacobian can have: one it leaves out is left out of
+the Jacobian, which then costs Newton iterations. Passing
+`autodiff = PETScDiffEq.AutoFiniteDiff()` to the algorithm leaves the Jacobian to PETSc's
 finite differences, coloured by a sparse prototype too. On a badly scaled stiff problem such as
 Robertson's, those are far enough off that the solve reports success with an answer
 wrong in its first digit, so keep them for a right-hand side ForwardDiff cannot run.

@@ -932,13 +932,15 @@ function _row_structure(J::SparseMatrixCSC, n, M = nothing)
         push!(cols[i], j)
         push!(src[i], k)
     end
+    shifted = [CartesianIndex(i, i) for i in 1:n]
+    M === nothing || append!(shifted, findall(!iszero, M))
+    for ij in shifted
+        i, j = ij[1], ij[2]
+        j in cols[i] && continue
+        push!(cols[i], j)
+        push!(src[i], 0)
+    end
     for i in 1:n
-        for j in (M === nothing ? (i:i) : 1:n)
-            (j == i || M[i, j] != 0) || continue
-            j in cols[i] && continue
-            push!(cols[i], j)
-            push!(src[i], 0)
-        end
         perm = sortperm(cols[i])
         cols[i] = cols[i][perm]
         src[i] = src[i][perm]
@@ -1230,12 +1232,11 @@ function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         @inbounds for j in 1:n, i in 1:n
             ctx.W[j, i] = ctx.dae ? ctx.J[i, j] : shift * _mass(ctx, i, j) - ctx.J[i, j]
         end
-        _setblock!(ctx, A, n)
-        PETSc.assemble!(A)
-        if B.ptr != A.ptr
-            _setblock!(ctx, B, n)
-            PETSc.assemble!(B)
-        end
+        _setblock!(ctx, B, n)
+        PETSc.assemble!(B)
+        # Under `-snes_mf_operator` the operator is PETSc's matrix-free one, which takes no
+        # values and is assembled only to pick up the new state.
+        B.ptr == A.ptr || PETSc.assemble!(A)
     catch e
         ctx.err = e
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
@@ -1272,12 +1273,9 @@ function _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         # structure is the prototype's pattern unioned with the diagonal, which
         # is what was preallocated, and it never changes.
         _fill_rows!(ctx, shift, n)
-        _setrows!(ctx, A, n)
-        PETSc.assemble!(A)
-        if B.ptr != A.ptr
-            _setrows!(ctx, B, n)
-            PETSc.assemble!(B)
-        end
+        _setrows!(ctx, B, n)
+        PETSc.assemble!(B)
+        B.ptr == A.ptr || PETSc.assemble!(A)
     catch e
         ctx.err = e
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
@@ -1572,6 +1570,8 @@ mutable struct TSHandles{CTX, T}
     u::Any
     jac_mat::Any
     fd_mat::Any
+    # The evaluations of `f` an automatic-differentiation Jacobian makes, or `nothing`.
+    ad_calls::Union{Nothing, Base.RefValue{Int}}
     opts::Any
     t0::Float64
     tf::Float64
@@ -1744,6 +1744,7 @@ function _setup(
         save_idxs = nothing,
         tstops = (),
         extra_options = String[],
+        jac_advice = nothing,
         kwargs...,
     )
     for key in UNSUPPORTED_KWARGS
@@ -1896,17 +1897,22 @@ function _setup(
             ),
         )
     end
+    ad_calls = builds_jac ? Ref(0) : nothing
     jac_fn = if !has_jac
         nothing
     elseif builds_jac
         # Dual numbers need the function itself, not the wrapper SciMLBase made for Float64.
         f_ad = SciMLBase.unwrapped_f(is_split ? prob.f.f1.f : prob.f.f)
         user_t0 = Float64(prob.tspan[1])
+        advice = something(jac_advice, is_dae ? _DAE_ADVICE : _ODE_ADVICE)
         is_dae ?
-            _ad_dae_jacobian(_autodiff(alg), f_ad, prob.f.jac_prototype, u0, prob.p, user_t0) :
+            _ad_dae_jacobian(
+                _autodiff(alg), f_ad, prob.f.jac_prototype, u0, prob.p, user_t0, ad_calls,
+                advice,
+            ) :
             _ad_jacobian(
                 _autodiff(alg), _as_inplace(f_ad, iip), prob.f.jac_prototype, u0, prob.p,
-                user_t0,
+                user_t0, ad_calls, advice,
             )
     else
         is_dae ? unwrap(prob.f.jac) : _as_inplace_jac(unwrap(prob.f.jac), iip)
@@ -2026,7 +2032,7 @@ function _setup(
         0, 0, 0, nothing,
     )
     h = TSHandles(
-        ctx, petsclib, nothing, nothing, nothing, nothing, nothing,
+        ctx, petsclib, nothing, nothing, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0,
         Any[], Vector{Float64}[], false,
     )
@@ -2073,7 +2079,8 @@ function _setup(
                     petsclib, ts, h.jac_mat, h.jac_mat, SPARSE_IJACOBIAN_PTR[], ctxptr,
                 )
             elseif has_jac
-                h.jac_mat = PETSc.MatSeqAIJ(petsclib, n, n, n)
+                # A dense matrix gets LAPACK's pivoting LU, as PETSc's own does.
+                h.jac_mat = PETSc.MatSeqDense(petsclib, zeros(n, n))
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, IJACOBIAN_PTR[], ctxptr,
                 )
@@ -2110,6 +2117,10 @@ function _setup(
             # than raised, which leaves argument errors still raising.
             effective_options = ["-ts_error_if_step_fails", "false"]
             append!(effective_options, _default_options(alg))
+            # PETSc's sparse factorisations do not pivot, and an algebraic row of an index-1
+            # system has a zero on the diagonal, so rows are swapped to move it off.
+            (h.jac_mat !== nothing && uses_sparse_jac || h.fd_mat !== nothing) &&
+                append!(effective_options, ["-pc_factor_nonzeros_along_diagonal"])
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
             # Told to keep going below the floor, the floor is PETSc's to clamp with,
             # since it takes the clamped step whatever its error.
@@ -2152,6 +2163,15 @@ function _setup(
                         "`TSGeneric(\"$chosen\"; explicit = true)` rather than an option",
                 ),
             )
+            # IRK builds its coupled-stage matrix from an AIJ Jacobian and takes no other,
+            # whichever way it was asked for.
+            if chosen == "irk" && has_jac && !uses_sparse_jac
+                PETSc.destroy(h.jac_mat)
+                h.jac_mat = PETSc.MatSeqAIJ(petsclib, n, n, n)
+                LibPETSc.TSSetIJacobian(
+                    petsclib, ts, h.jac_mat, h.jac_mat, IJACOBIAN_PTR[], ctxptr,
+                )
+            end
             # The options have reached the linear solve by here.
             h.pivot_raises = _pivot_raises(petsclib, ts) ||
                 _option_flag(effective_options, "ts_error_if_step_fails")
@@ -2243,14 +2263,16 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
         SciMLBase.ReturnCode.Failure
     end
     # A method that solves implicitly calls the Jacobian on its first step.
-    # One that never calls it is not solving implicitly, whatever it reports.
-    if h.jac_mat !== nothing && st.nsteps > 0 && ctx.njacs == 0
+    # One that never calls it is not solving implicitly, whatever it reports. A Jacobian
+    # this package built is not asked about, since options such as `-snes_mf` leave any
+    # Jacobian unused on purpose.
+    if h.jac_mat !== nothing && h.ad_calls === nothing && st.nsteps > 0 && ctx.njacs == 0
         @warn "`$(_ts_type(alg))` took $(st.nsteps) steps without ever calling the " *
             "Jacobian this package gave PETSc, so it is not solving implicitly and the " *
             "result should not be trusted; an explicit PETSc type needs `explicit = true`"
     end
     stats = SciMLBase.DEStats(
-        ctx.nf, ctx.nf2, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
+        _nf(h), ctx.nf2, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
         st.nsteps, st.nreject, 0.0,
     )
     ts, dus = _user_time(h)
@@ -2997,6 +3019,8 @@ end
 _user_time(h::TSHandles) = h.tdir > 0 ? (h.ctx.ts, h.ctx.dus) :
     (_user_t.(h.tdir, h.ctx.ts), [-d for d in h.ctx.dus])
 
+_nf(h::TSHandles) = h.ctx.nf + (h.ad_calls === nothing ? 0 : h.ad_calls[])
+
 function _initial_solution(prob, alg, h::TSHandles)
     ts, dus = _user_time(h)
     return SciMLBase.build_solution(
@@ -3010,7 +3034,7 @@ function _live_stats!(integ::PETScIntegrator)
     stats = integ.sol.stats
     stats === nothing && return nothing
     ctx, st = integ.h.ctx, _read_stats(integ.h)
-    stats.nf, stats.nf2, stats.njacs = ctx.nf, ctx.nf2, ctx.njacs
+    stats.nf, stats.nf2, stats.njacs = _nf(integ.h), ctx.nf2, ctx.njacs
     stats.nnonliniter, stats.nnonlinconvfail = st.nnonliniter, st.nnonlinfail
     stats.naccept, stats.nreject = st.nsteps, st.nreject
     return nothing
