@@ -9,13 +9,11 @@ _check_autodiff(ad) = throw(
 _autodiff(alg::Union{TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX, TSGeneric}) = alg.autodiff
 _autodiff(::Union{TSRK, TSMPRK}) = nothing
 
-# `AutoFiniteDiff()` means PETSc differences the Jacobian itself, not FiniteDiff.jl.
 function _petsc_differences(alg)
     ad = _autodiff(alg)
     return ad !== nothing && ADTypes.dense_ad(ad) isa AutoFiniteDiff
 end
 
-# J is stored in the prototype's pattern, so that pattern overrides the backend's detector.
 function _with_pattern(backend, proto)
     if proto isa SparseArrays.AbstractSparseMatrix
         coloring = backend isa ADTypes.AutoSparse ? ADTypes.coloring_algorithm(backend) :
@@ -285,17 +283,14 @@ function _ad_dae_jacobian(
         DI.Constant(zero(u0)), DI.Constant(copy(u0)), DI.Constant(one(t)), DI.Constant(p),
         DI.Constant(t),
     )
-    # The shifted residual at du = 0, gamma = 1, u = v.
     v = _off(u0)
     _check_holomorphic(z -> (r = similar(z); h!(r, z .- v, z, p, t); r), v, b, advice)
     return ADComplexDAEJacobian(h!, b, prep, x, y, out, Jr, similar(u0), advice)
 end
 
-# Off u0 and uneven, so a symmetric state like zero can't hide a `conj` or `abs`.
 _direction(R, n) = [one(R) + R(k) / n for k in 1:n]
 _off(u0) = (R = real(eltype(u0)); u0 .+ complex(R(0.01), R(0.02)) .* (1 .+ abs.(u0)) .* _direction(R, length(u0)))
 
-# Dense on purpose: a prototype missing an entry would skew a coloured check.
 function _check_holomorphic(h, v, backend, advice)
     n = length(v)
     n == 0 && return nothing
@@ -351,7 +346,6 @@ function (j::ADParamJacobian)(pJ, u, p, t)
     return nothing
 end
 
-# A chunk size picked for the state can exceed length(p).
 _param_backend(b, np) = b
 _param_backend(b::AutoForwardDiff{C}, np) where {C} =
     C === nothing || C <= np ? b : AutoForwardDiff(; tag = b.tag)
@@ -365,7 +359,6 @@ function _ad_paramjacobian(backend, f!, u0, p, t, advice)
     return ADParamJacobian(f!, b, prep, du, advice)
 end
 
-# Float64-only code fails on duals as a MethodError, TypeError or conversion error.
 _has_dual(x) = _is_dual(x) || (x isa Type && _is_dual_type(x)) ||
     (x isa AbstractArray && _is_dual_type(eltype(x)))
 _is_dual(x) = x isa Union{ForwardDiff.Dual, Complex{<:ForwardDiff.Dual}}
@@ -385,7 +378,6 @@ _dual_error(e, backend, advice) = ArgumentError(
 _stored_values(J::SparseArrays.AbstractSparseMatrix) = SparseArrays.nonzeros(J)
 _stored_values(J) = J
 
-# f is evaluated again since the dual pass's value can be NaN where f is finite.
 function _check_finite(value, J, t, advice)
     all(isfinite, _stored_values(J)) && return nothing
     all(isfinite, value()) || return nothing

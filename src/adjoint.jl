@@ -110,7 +110,6 @@ end
 
 _load_jacobian!(::AdjointContext{<:Any, <:Any, <:Any, Matrix{Float64}}, A) = nothing
 
-# PETSc's matrix holds the prototype's pattern plus the diagonal.
 function _load_jacobian!(adj::AdjointContext{<:Any, <:Any, <:Any, <:SparseMatrixCSC}, A)
     n = length(adj.u)
     @inbounds for i in 1:n
@@ -177,8 +176,7 @@ function _adjoint_ijacobianp!(
     return _adjoint_paramjac_body!(adj, s, x_ptr, A_ptr)
 end
 
-# PETSc steps dv/ds = tdir * f(v, p, tdir * s), so explicit methods want tdir * f_p
-# and implicit ones, which solve dv/ds - tdir * f = 0, want -tdir * f_p.
+# Explicit methods take tdir * f_p, implicit ones (dv/ds - tdir * f = 0) take -tdir * f_p.
 function _adjoint_paramjac_body!(adj, s, x_ptr, A_ptr)
     pl = adj.petsclib
     try
@@ -207,13 +205,9 @@ function _adjoint_record!(
     return _adjoint_record_body!(adj, Int(step), Float64(s), x_ptr)
 end
 
-# A memory trajectory reports the steps it recomputes during the adjoint to the monitors
-# again. Each cost time is consumed once, so those repeats record nothing.
 function _adjoint_record_body!(adj, step, s, x_ptr)
     pl = adj.petsclib
     try
-        # PETSc sums step sizes into its time, so the ulp allowance grows with the step
-        # count. Ulps are of `solve`'s clock so Float32 saved times match.
         R = adj.clock
         tol = max(
             sqrt(Float64(eps(R))) * (s - adj.s_prev),
@@ -255,8 +249,7 @@ function _adjoint_jump!(
     return _adjoint_jump_body!(adj, Int(step))
 end
 
-# A memory trajectory hands this monitor a stale state, and at step 0 a stale time,
-# so costs are keyed by step and use the state recorded going forward.
+# A memory trajectory gives this monitor a stale state (and time at step 0), so key by step.
 function _adjoint_jump_body!(adj, step)
     ks = get(adj.cost_at_step, step, nothing)
     ks === nothing && return LibPETSc.PetscErrorCode(0)
@@ -280,7 +273,6 @@ end
 
 const ADJ_JUMP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
-# The adjoint runs only in PETSc's double build, so times are Float64.
 function _init_adjoint_pointers!()
     ADJ_RHSJACOBIAN_PTR[] = @cfunction(
         _adjoint_rhsjacobian!,
@@ -319,8 +311,7 @@ function _init_adjoint_pointers!()
     return nothing
 end
 
-# PETSc.jl's wrappers for these pin ctx to `nothing`, pass arrays PETSc keeps but that
-# die after the call, or drop the fetched value, so we ccall them directly.
+# PETSc.jl's wrappers lose ctx, free arrays PETSc keeps, or drop results, so ccall these.
 function _check_code(code, name)
     iszero(code) || throw(ErrorException("$name failed with $code"))
     return nothing
@@ -356,7 +347,6 @@ end
 const _ADJOINT_TYPES = "TSRK, TSImplicit(\"beuler\") or TSImplicit(\"cn\")"
 
 _adjoint_unsupported(::TSRK) = nothing
-# Its PETSc type is known only after options apply, see `_check_adjoint_ts`.
 _adjoint_unsupported(::TSGeneric) = nothing
 function _adjoint_unsupported(alg::TSImplicit)
     alg.subtype in ("beuler", "cn") && return nothing
@@ -385,11 +375,9 @@ const _ADJOINT_REFUSED_KWARGS = (
         "the whole state; remove it",
 )
 
-# Safe to drop: these don't change the steps, or the adjoint sets them itself.
 const _ADJOINT_OWNED_KWARGS =
     (:saveat, :save_everystep, :save_start, :save_end, :dense, :extra_options, :sensealg)
 
-# PETSc option names are case-insensitive and may carry `=value`.
 _names_option(opt, name) =
     startswith(opt, "-") && lowercase(first(split(opt[2:end], "="))) == name
 

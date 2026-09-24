@@ -296,8 +296,6 @@ struct TSMPRK <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
 
-    # Checks go here, not in an outer constructor: the default inner one would shadow
-    # an outer one for these concrete argument types.
     function TSMPRK(
             slow::Vector{Int}, medium::Vector{Int}, subtype::String,
             petsc_options::Vector{String},
@@ -368,7 +366,6 @@ struct TSGeneric <: PETScTSAlgorithm
     autodiff::ADTypes.AbstractADType
 end
 
-# Without these setup calls PETSc crashes, or integrates to zero and reports success.
 const _NEEDS_OTHER_SETUP = Dict(
     "alpha2" => "is for second-order systems and needs TSSetI2Function",
     "discgrad" => "needs TSDiscGradSetFormulation",
@@ -378,7 +375,6 @@ const _NEEDS_OTHER_SETUP = Dict(
     "pseudo" => "is pseudo-transient continuation toward a steady state and runs past the final time",
 )
 
-# Given an implicit residual these integrate nothing, and `glee` still reports success.
 const _EXPLICIT_ONLY = ("euler", "glee", "rk", "ssp")
 
 const _ROSW_NO_STEP = ("lassp3p4s2c", "llssp3p4s2c", "ark3")
@@ -409,7 +405,6 @@ _uses_ifunction(::TSARKIMEX) = true
 _uses_ifunction(::TSMPRK) = false
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
-# PETSc registers these without embedded weights and gives them the `none` adaptor.
 const _RK_NO_ESTIMATE = ("1fe", "2b", "3", "4")
 const _ROSW_NO_ESTIMATE = ("theta1", "theta2")
 const _ARKIMEX_NO_ESTIMATE = ("prssp2", "ars443", "bpr3")
@@ -423,17 +418,14 @@ _adapts(alg::TSImplicit) = alg.subtype == "bdf"
 _adapts(::TSMPRK) = false
 _adapts(::TSGeneric) = nothing
 
-# PETSc's interpolant is at least cubic for these. The rest use cubic Hermite.
 const _RK_CUBIC_INTERP = ("5dp",)
 const _ROSW_CUBIC_INTERP = ("ra34pw2", "lassp3p4s2c", "llssp3p4s2c", "ark3")
 const _ARKIMEX_CUBIC_INTERP = ("4", "5")
-# PETSc registers these with no interpolant.
 const _ROSW_NO_INTERP = (
     "r34prw", "r3prl2", "rodas3", "rodaspr", "rodaspr2", "grk4t", "shamp4", "veldd4", "4l",
 )
 const _ARKIMEX_NO_INTERP = ("prssp2", "ars443", "bpr3")
 
-# BDF interpolates through its step history, so it keeps the method's order.
 _petsc_interpolant(alg::TSRK) = alg.subtype in _RK_CUBIC_INTERP
 _petsc_interpolant(alg::TSRosW) = alg.subtype in _ROSW_CUBIC_INTERP
 _petsc_interpolant(alg::TSARKIMEX) = alg.subtype in _ARKIMEX_CUBIC_INTERP
@@ -441,7 +433,6 @@ _petsc_interpolant(alg::Union{TSImplicit, TSDAE}) = alg.subtype == "bdf"
 _petsc_interpolant(::Union{TSIRK, TSMPRK, TSGeneric}) = false
 
 # TSIRK's TSInterpolate leaves the output untouched instead of failing.
-# `nothing` means PETSc has to be asked at run time.
 _interpolates(::TSRK) = true
 _interpolates(alg::TSRosW) = !(alg.subtype in _ROSW_NO_INTERP)
 _interpolates(alg::TSARKIMEX) = !(alg.subtype in _ARKIMEX_NO_INTERP)
@@ -449,7 +440,6 @@ _interpolates(::Union{TSImplicit, TSDAE}) = true
 _interpolates(::Union{TSIRK, TSMPRK}) = false
 _interpolates(::TSGeneric) = nothing
 
-# GaussAdjoint sizes its quadrature from these orders.
 const _RK_ORDER = Dict(
     "1fe" => 1, "2a" => 2, "2b" => 2, "3" => 3, "3bs" => 3, "4" => 4,
     "5f" => 5, "5dp" => 5, "5bs" => 5, "6vr" => 6, "7vr" => 7, "8vr" => 8,
@@ -493,7 +483,6 @@ function _implicit_order(subtype, theta, order)
     throw(ArgumentError("no order is known for implicit subtype \"$subtype\""))
 end
 
-# R is the build's real type (the clock), S its scalar type (the state), U the saved eltype.
 mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
     petsclib::L
     f!::F
@@ -526,15 +515,12 @@ mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
     hermite::Bool
     interpolates::Union{Nothing, Bool}
     alg_name::String
-    # Start of the step the next TSSolve monitor call ends.
     step_t::R
     step_u::Vector{S}
-    # The step's end as reached, before any callback moved it.
     end_s::R
     end_u::Vector{S}
     fstart::Union{Nothing, Vector{S}}
     fend::Union{Nothing, Vector{S}}
-    # A parameter may have changed since `fend` was taken.
     pdirty::Bool
     slow_idxs::Vector{Int}
     medium_idxs::Vector{Int}
@@ -547,7 +533,6 @@ mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
     unstable::Any
     unstable_hit::Bool
     tdir::R
-    # The caller's `isoutofdomain`, or nothing.
     domain::Any
     nf::Int
     nf2::Int
@@ -559,7 +544,6 @@ function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     full = Vector{S}(x)
     idxs = ctx.save_idxs
     push!(ctx.ts, R(t))
-    # The derivative needs the whole state, even when only part is kept.
     if ctx.dense
         du === nothing && (du = _derivative(ctx, R(t), full))
         push!(ctx.dus, _select(du, idxs))
@@ -568,15 +552,13 @@ function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     return du
 end
 
-# Dense output and the interpolant share the step end's derivative.
 function _record_end!(ctx, t, x)
     du = _record!(ctx, t, x, ctx.fend)
     ctx.hermite && (ctx.fend = du)
     return nothing
 end
 
-# PETSc's `dt_min` clamps the step and takes it whatever its error, so the caller's
-# floor is checked here. A reason set here ends TSSolve on this step.
+# PETSc's `dt_min` clamps and takes the step whatever its error, so check the floor here.
 function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
     ctx = POST_STEP_CTX[ts_ptr]::TSContext
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
@@ -612,8 +594,7 @@ end
 
 const POST_STEP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
-# The post-step callback gets no context. Asking the TS for one would use one build's
-# symbol on another build's TS, at the wrong offsets.
+# The post-step callback gets no context, and asking the TS may use another build's symbol.
 const POST_STEP_CTX = Dict{LibPETSc.CTS, Any}()
 
 function _set_post_step!(pl, ts, ctx)
@@ -625,7 +606,6 @@ function _set_post_step!(pl, ts, ctx)
     return nothing
 end
 
-# Several PETSc builds can be loaded at once, so symbols are looked up per build.
 const PETSC_SYMBOLS = Dict{Tuple{String, Symbol}, Ptr{Cvoid}}()
 
 _symbol(petsclib, name::Symbol) = get!(PETSC_SYMBOLS, (petsclib.petsc_library, name)) do
@@ -636,13 +616,10 @@ end
 _floor(R, dtmin, force_dtmin, adaptive) =
     force_dtmin || !adaptive || dtmin === nothing ? zero(R) : abs(R(dtmin))
 
-# PETSc's clock error at `t`, scaled to `t` so an early stop is not counted as passed.
-# Float32 gets only a few ulps, since 100 would be a whole step.
 _near(t::Float64) = 100 * eps(max(1.0, abs(t)))
 _near(t::Float32) = 4 * eps(abs(t))
 
-# A step of an ulp or two puts its stages on an end, and PETSc divides by zero.
-# Float64 relies on OrdinaryDiffEq's one-ulp floor, Float32 needs four ulps.
+# PETSc divides by zero on a step of a few ulps. Float64 already has a one-ulp floor.
 _min_step(t::Float64) = zero(t)
 _min_step(t::Float32) = 4 * eps(abs(t))
 
@@ -671,7 +648,6 @@ _saved(ctx::TSContext{R, S, U}, u) where {R, S, U} =
 _interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, dus) :
     SciMLBase.LinearInterpolation(ts, ctx.us)
 
-# Same formula as SciMLBase's HermiteInterpolation, so it matches dense output.
 function _hermite!(out, ctx, s, s0, u0, s1, u1)
     ctx.fstart === nothing && (ctx.fstart = _derivative(ctx, s0, u0))
     ctx.fend === nothing && (ctx.fend = _derivative(ctx, s1, u1))
@@ -690,19 +666,16 @@ _no_interpolant(ctx) = ArgumentError(
         "as BDF, or keep saveat times on step ends and pass `rootfind = NoRootFind`",
 )
 
-# PETSc.jl does not carry PETSc's error codes.
 const PETSC_ERR_SUP = 56
 const PETSC_ERR_MAT_LU_ZRPVT = 71
 const PETSC_ERR_FP = 72
 const CALLBACK_THREW = 1
 
-# Dense LU raises on a zero pivot whatever -ts_error_if_step_fails says, so a zero
-# pivot or FP error counts as a failed step unless the options ask to raise.
+# Dense LU raises on a zero pivot whatever -ts_error_if_step_fails says.
 _failed_step(e, h) =
     e isa LibPETSc.PetscError && !h.pivot_raises &&
     (e.code == PETSC_ERR_MAT_LU_ZRPVT || e.code == PETSC_ERR_FP)
 
-# PETSc's rejection counters miss this stop, so the warning is the only trace of it.
 function _warn_failed_step(alg, code)
     why = code == PETSC_ERR_FP ?
         "PETSc hit a floating point exception, an overflow or a NaN in the step or in " *
@@ -754,8 +727,7 @@ end
 
 _fd_pattern(jac_prototype, M, n) = _jacobian_pattern(SparseMatrixCSC(jac_prototype), n, M)
 
-# PETSc 3.22 has no getter for this. As in PETSc, the last setting wins, names are
-# case-insensitive and a bare flag is true.
+# PETSc 3.22 has no getter for this, so the options are parsed as PETSc would.
 function _option_flag(opts, name)
     value = false
     for (i, opt) in enumerate(opts)
@@ -767,11 +739,9 @@ function _option_flag(opts, name)
     return value
 end
 
-# One global is enough, since PETSC_LOCK runs one task at a time.
 const QUIET_FAILED_STEPS = Ref(true)
 
-# Printing nothing for these also stops PETSc from treating the next error's traceback
-# as a continuation of this one.
+# Printing nothing also stops PETSc treating the next traceback as part of this one.
 function _zero_pivot_handler(
         comm::MPI.API.MPI_Comm, line::Cint, fun::Ptr{Cchar}, file::Ptr{Cchar},
         n::LibPETSc.PetscErrorCode, p::Cint, mess::Ptr{Cchar}, traceback::Ptr{Cvoid},
@@ -790,7 +760,6 @@ end
 
 const ZERO_PIVOT_HANDLER_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
-# Runs on every step, so the symbols come from the cache.
 function _quiet_errors(f, h)
     QUIET_FAILED_STEPS[] = !h.pivot_raises
     pl = h.petsclib
@@ -881,8 +850,7 @@ function _setrows!(ctx, A, n)
     return nothing
 end
 
-# The shift lands on the diagonal and on M's nonzeros, so those get a slot (src 0)
-# even where the prototype has none.
+# The shift lands on the diagonal and M's nonzeros, so those always get a slot (src 0).
 function _row_structure(J::SparseMatrixCSC, n, M = nothing)
     cols = [Int[] for _ in 1:n]
     src = [Int[] for _ in 1:n]
@@ -937,7 +905,6 @@ _user_t(tdir, s) = tdir * s + zero(s)
 
 _copy_jac!(J::AbstractMatrix, A) = (copyto!(J, A); nothing)
 
-# The pattern is fixed at setup, so an undeclared entry must throw, not be inserted.
 function _setstored!(J::SparseMatrixCSC, i, j, v)
     r = J.colptr[j]:(J.colptr[j + 1] - 1)
     k = findfirst(==(i), @view J.rowval[r])
@@ -968,7 +935,7 @@ function _copy_jac!(J::SparseMatrixCSC, A::AbstractMatrix)
     return nothing
 end
 
-# PETSc.jl's array accessor allocates on every call, which dominates small problems.
+# PETSc.jl's array accessor allocates on every call.
 function _readvec!(dest, pl, v)
     a = LibPETSc.VecGetArrayRead(pl, v)
     try
@@ -989,7 +956,6 @@ function _writevec!(pl, v, src)
     return nothing
 end
 
-# Function barrier: the context arrives untyped, so each callback calls a typed body.
 function _rhs!(
         ::LibPETSc.CTS,
         t,
@@ -1077,12 +1043,10 @@ function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
-# PETSc passes the whole state and wants only this part's rows back.
 function _mprk_part!(ctx, t, x_ptr, f_ptr, idxs)
     pl = ctx.petsclib
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        # PETSc asks for each part of a stage in turn, so `du` is reused within a stage.
         if !(ctx.part_valid && ctx.part_t == t && ctx.part_u == ctx.u)
             ctx.f!(ctx.du, ctx.u, ctx.p, t)
             ctx.nf += 1
@@ -1380,8 +1344,7 @@ function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr)
     return nothing
 end
 
-# PETSc.jl fixes `LibPETSc.PetscInt` at Int64 whatever the loaded library uses, so a
-# 32-bit-index build would silently get indices of the wrong width.
+# PETSc.jl fixes `LibPETSc.PetscInt` at Int64 whatever the loaded library uses.
 function _check_inttype(petsclib)
     PETSc.inttype(petsclib) === LibPETSc.PetscInt || error(
         "PETScDiffEq needs a PETSc built with $(LibPETSc.PetscInt) indices, but the " *
@@ -1390,7 +1353,6 @@ function _check_inttype(petsclib)
     return nothing
 end
 
-# SciML's `maxiters = typemax(Int)` means no limit and overflows a 32-bit PetscInt.
 _maxsteps(maxiters) = LibPETSc.PetscInt(min(maxiters, typemax(LibPETSc.PetscInt)))
 
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothing)
@@ -1418,7 +1380,6 @@ _ts_type(alg::TSGeneric) = alg.ts_type
 _warn_name(alg::Union{TSRK, TSRosW, TSARKIMEX}) = "$(_ts_type(alg)) $(alg.subtype)"
 _warn_name(alg) = _ts_type(alg)
 
-# Same format as `_warn_name`, which it is compared against.
 function _running_name(petsclib, ts)
     type = LibPETSc.TSGetType(petsclib, ts)
     type == "rk" && return "rk $(LibPETSc.TSRKGetType(petsclib, ts))"
@@ -1487,7 +1448,6 @@ mutable struct TSHandles{CTX, L, R, S}
     save_end::Bool
     pivot_raises::Bool
     stopped::Int
-    # `matches`: the integrator, not PETSc, lands steps on stops.
     matches::Bool
     fixed::Bool
     tolvecs::Vector{Any}
@@ -1495,13 +1455,11 @@ mutable struct TSHandles{CTX, L, R, S}
     destroyed::Bool
 end
 
-# Finalizers run after atexit hooks, when freeing a PETSc object aborts, so live
-# handles are destroyed at exit instead.
+# Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
 const LIVE_HANDLES = WeakKeyDict{Any, Nothing}()
 const EXIT_CLEANUP_ARMED = Set{String}()
 
-# atexit hooks run newest first, so arming after a build initializes puts this cleanup
-# ahead of PETSc.jl's teardown of that build.
+# atexit runs newest first, so arming after init puts this ahead of the build's teardown.
 function _arm_exit_cleanup!(petsclib)
     lib = petsclib.petsc_library
     lib in EXIT_CLEANUP_ARMED && return nothing
@@ -1517,8 +1475,6 @@ function _destroy_live_handles!(lib)
     return nothing
 end
 
-# MPI runs THREAD_SERIALIZED and PETSc's options stack is global, so every entry
-# point takes this lock.
 const PETSC_LOCK = ReentrantLock()
 _locked(f) = lock(f, PETSC_LOCK)
 
@@ -1540,7 +1496,6 @@ function _destroy!(h::TSHandles)
     h.destroyed && return nothing
     h.destroyed = true
     h.ts === nothing || delete!(POST_STEP_CTX, h.ts.ptr)
-    # After PETSc or MPI has finalized, freeing anything aborts.
     (PETScCompat.isfinalized(h.petsclib) || MPI.Finalized()) && return nothing
     h.opts === nothing || PETScCompat.destroy!(h.opts)
     h.jac_mat === nothing || PETScCompat.destroy!(h.jac_mat)
@@ -1557,7 +1512,6 @@ end
 _tolscalar(R, tol, default) =
     R(tol === nothing || tol isa AbstractVector ? default : tol)
 
-# PETSc's clock and norms are real, so an imaginary part is refused, not dropped.
 function _check_real(x, name; accept = v -> v isa Real)
     x === nothing || all(accept, x) || throw(
         ArgumentError("`$name` must be real, even for a complex state; got $(repr(x))"),
@@ -1576,7 +1530,6 @@ function _check_tol(tol, n, name)
     return nothing
 end
 
-# PETSc uses the vector when one is given, the scalar otherwise.
 function _set_tolerances!(h::TSHandles{<:Any, <:Any, R}, abstol, reltol) where {R}
     pl, n = h.petsclib, length(h.u0)
     novec = LibPETSc.PetscVec{typeof(pl)}()
@@ -1592,7 +1545,6 @@ end
 function _tolvec(h::TSHandles{<:Any, <:Any, R, S}, petsclib, tol, n, name) where {R, S}
     tol isa AbstractVector || return nothing
     # PETSc borrows `buf` and reads it every step, so the handle keeps it alive.
-    # It has to be in the build's scalar type. PETSc reads the real part.
     buf = Vector{S}(collect(tol))
     push!(h.tolbufs, buf)
     v = PETScCompat.PetscVec(petsclib, buf)
@@ -1600,8 +1552,7 @@ function _tolvec(h::TSHandles{<:Any, <:Any, R, S}, petsclib, tol, n, name) where
     return v
 end
 
-# OrdinaryDiffEq's Hairer-Wanner first step, in the user's time before `f` is reversed.
-# Where OrdinaryDiffEq would fall to its floor or NaN, this returns the small default.
+# Takes the user's `f` and time, so it runs before `f` is reversed.
 function _initial_dt(f1, f2, u0, p, t0::R, tdir, order, abstol, reltol, dtmin, dtmax) where {R}
     dtmin_floor = max(nextfloat(max(dtmin, eps(t0))), _min_step(t0))
     smalldt = max(dtmin_floor, R(1.0e-6))
@@ -1636,8 +1587,7 @@ end
 
 const SupportedProblem = Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}
 
-# On 32-bit x86 PETSc_jll's single builds fail BDF and ARKIMEX at stops, so Float32
-# runs in the double build there.
+# On i686 PETSc_jll's single builds fail BDF and ARKIMEX at stops.
 const _SINGLE_BUILDS = Sys.ARCH !== :i686
 
 _loaded_builds() = Type[
@@ -1646,7 +1596,6 @@ _loaded_builds() = Type[
         (_SINGLE_BUILDS || real(PETSc.scalartype(pl)) !== Float32)
 ]
 
-# A single build needs a Float32 span too. Otherwise it runs double and saves single.
 function _eltypes(prob, builds = _loaded_builds())
     E, tE = eltype(prob.u0), eltype(prob.tspan)
     single = E === Float32 || E === ComplexF32
@@ -1678,7 +1627,7 @@ function _structure(S, P::SparseMatrixCSC)
     )
 end
 
-# PETSc cannot parse Julia's Float32 printing (`1.0f-5`). The Float64 rounds back exactly.
+# PETSc cannot parse Julia's Float32 printing (`1.0f-5`).
 _option(x::Real) = string(Float64(x))
 
 function _setup(
@@ -1794,7 +1743,6 @@ function _setup(
         throw(ArgumentError("PETScDiffEq requires an in-place DAEProblem residual"))
     f2 = is_split ? unwrap(prob.f.f2.f) : nothing
     for g in (f1, f2)
-        # An operator silently ignores f(du, u, p, t) and leaves `du` untouched.
         g isa SciMLOperators.AbstractSciMLOperator && throw(
             ArgumentError(
                 "PETScDiffEq does not support an operator-valued right-hand side; " *
@@ -1886,13 +1834,11 @@ function _setup(
     if !dt_given
         user_t0 = R(prob.tspan[1])
         est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
-        # No explicit derivative here, so start small as OrdinaryDiffEq does.
         dt = if is_dae
             max(R(1.0e-6) * abs(tf - t0), _min_step(user_t0))
         elseif has_mass
             max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
         else
-            # Tolerances set through petsc_options are not seen here.
             est_abstol = something(abstol, reltol === nothing ? 1.0e-4 : 1.0e-6)
             est_reltol = something(reltol, abstol === nothing ? 1.0e-4 : 1.0e-3)
             user_dtmax = dtmax === nothing || isinf(dtmax) ? R(Inf) : abs(R(dtmax))
@@ -1925,7 +1871,6 @@ function _setup(
         collect(R, t0:abs(R(saveat)):tf) :
         sort!(tdir .* Vector{R}(collect(saveat)))
     filter!(t -> t0 - eps(tf) <= t <= tf + eps(tf), saveat_times)
-    # OrdinaryDiffEq's defaults. An explicit save flag wins over saveat.
     at_start(t) = abs(t - t0) <= _near(t0)
     at_end(t) = abs(t - tf) <= _near(tf)
     no_saveat = !(saveat isa Number) && isempty(saveat)
@@ -2022,7 +1967,6 @@ function _setup(
             else
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, ptrs.rhs, ctxptr)
             end
-            # MPRK also needs the whole right-hand side set above.
             if alg isa TSMPRK
                 _set_split!(petsclib, ts, "slow", slow_idxs, ptrs.mprk_slow, ctxptr)
                 isempty(medium_idxs) || _set_split!(
@@ -2042,7 +1986,6 @@ function _setup(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.sparse_ijacobian, ctxptr,
                 )
             elseif has_jac
-                # A dense matrix gets LAPACK's pivoting LU, as PETSc's own does.
                 h.jac_mat = PETScCompat.PetscMat(petsclib, zeros(S, n, n))
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.ijacobian, ctxptr,
@@ -2073,7 +2016,6 @@ function _setup(
                 @warn "`$(_warn_name(alg))` has no embedded error estimate in PETSc, so " *
                     "it steps at the requested dt and ignores reltol/abstol"
             end
-            # SciML's defaults, not PETSc's 1e-4, to match what `integrator.opts` reports.
             _set_tolerances!(h, something(abstol, 1.0e-6), something(reltol, 1.0e-3))
             effective_options = ["-ts_error_if_step_fails", "false"]
             append!(effective_options, _default_options(alg))
@@ -2081,11 +2023,9 @@ function _setup(
             (h.jac_mat !== nothing && uses_sparse_jac || h.fd_mat !== nothing) &&
                 append!(effective_options, ["-pc_factor_nonzeros_along_diagonal"])
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
-            # Under force_dtmin PETSc clamps to the floor and takes the step regardless.
             forced = force_dtmin && dtmin !== nothing && dtmin != 0
             forced &&
                 append!(effective_options, ["-ts_adapt_dt_min", _option(abs(R(dtmin)))])
-            # With force_dtmin the floor wins over a smaller dtmax, as in OrdinaryDiffEq.
             (dtmax === nothing || isinf(dtmax)) || append!(
                 effective_options,
                 [
@@ -2141,7 +2081,6 @@ function _setup(
                     ),
                 )
             end
-            # If an option changed the (sub)type, ask PETSc whether it interpolates.
             running = _running_name(petsclib, ts)
             if running != ctx.alg_name
                 ctx.hermite = !has_mass && !is_dae
@@ -2167,14 +2106,11 @@ function _read_stats(h::TSHandles)
     )
 end
 
-# PETSc's single build takes Newton and Krylov 2-norms in Float32, which underflow to
-# zero below this. Only implicit methods take them.
 const _NORM_FLOOR = sqrt(floatmin(Float32))
 
 _tiny(u) = 0 < maximum(abs, u; init = 0.0f0) < _NORM_FLOOR
 
 _underflows(::TSHandles{<:Any, <:Any, Float64}, alg, uend, retcode) = false
-# Decaying below the floor is harmless, so warn only if u0 was there or the solve failed.
 _underflows(h::TSHandles{<:Any, <:Any, Float32}, alg, uend, retcode) =
     _uses_ifunction(alg) && _tiny(uend) &&
     (_tiny(h.u0) || retcode != SciMLBase.ReturnCode.Success)
@@ -2193,7 +2129,6 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
             isempty(ctx.ts) || ctx.ts[end] < tend - tol ||
                 (ctx.ts[end] <= tend + tol && ctx.us[end] != _saved(ctx, uend))
         )
-        # A step that stopped part way left this time recorded with a stale state.
         if !isempty(ctx.ts) && abs(ctx.ts[end] - tend) <= tol
             pop!(ctx.ts)
             pop!(ctx.us)
@@ -2226,8 +2161,6 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     else
         SciMLBase.ReturnCode.Failure
     end
-    # An implicit method calls the Jacobian on its first step. An AD one is exempt,
-    # since options such as -snes_mf leave it unused on purpose.
     if h.jac_mat !== nothing && h.ad_calls === nothing && st.nsteps > 0 && ctx.njacs == 0
         @warn "`$(_ts_type(alg))` took $(st.nsteps) steps without ever calling the " *
             "Jacobian this package gave PETSc, so it is not solving implicitly and the " *
@@ -2254,8 +2187,7 @@ function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
-    # MPRK never lands on tf, PETSc's Float32 landing refuses short steps, and
-    # isoutofdomain retries steps. Only the integrator loop handles these.
+    # MPRK misses tf, Float32 landing refuses short steps, and isoutofdomain retries steps.
     if !_no_callback(callback) || !isempty(tstops) || !isempty(d_discontinuities) ||
             alg isa TSMPRK || get(kwargs, :isoutofdomain, nothing) !== nothing ||
             first(_eltypes(prob)) === Float32
@@ -2276,7 +2208,6 @@ function _solve_unlocked(
                     LibPETSc.TSSolve(pl, h.ts, h.u)
                 end
             catch e
-                # If a callback threw, the user's exception is rethrown below instead.
                 ctx.err === nothing && !_failed_step(e, h) && rethrow()
                 h.stopped = e.code
             end
@@ -2296,7 +2227,6 @@ end
 SciMLBase.__solve(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
     _locked(() -> _solve_unlocked(prob, alg; kwargs...))
 
-# Callbacks set these mid-solve, so writes reach PETSc.
 mutable struct PETScIntegratorOpts{H, R}
     h::H
     adaptive::Bool
@@ -2317,13 +2247,11 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
     if name === :abstol || name === :reltol
         _set_tolerances!(h, getfield(o, :abstol), getfield(o, :reltol))
     elseif name === :dtmin && getfield(o, :force_dtmin)
-        # Under force_dtmin the floor is PETSc's own clamp.
         adapt = LibPETSc.TSGetAdapt(pl, h.ts)
         _, hi = LibPETSc.TSAdaptGetStepLimits(pl, adapt)
         lo = abs(getfield(o, :dtmin))
         LibPETSc.TSAdaptSetStepLimits(pl, adapt, lo, _above(hi, lo))
     elseif name === :dtmin
-        # PETSc's own floor takes the step anyway, so the floor is checked here.
         h.ctx.dtmin = _floor(R, getfield(o, :dtmin), false, getfield(o, :adaptive))
     elseif name === :dtmax
         adapt = LibPETSc.TSGetAdapt(pl, h.ts)
@@ -2375,7 +2303,6 @@ mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC} <:
     kwargs::Any
     tstops::Vector{R}
     tstops_cache::Vector{R}
-    # In the caller's time and also in `tstops`. The cache is what `reinit!` restores.
     d_discontinuities::Vector{R}
     d_discontinuities_cache::Vector{R}
     dtcache::R
@@ -2384,7 +2311,6 @@ mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC} <:
     derivative_discontinuity::Bool
 end
 
-# `solve` can pass an empty `CallbackSet` where no callback was given.
 _no_callback(cb) = cb === nothing || (
     cb isa SciMLBase.CallbackSet &&
         isempty(cb.discrete_callbacks) && isempty(cb.continuous_callbacks)
@@ -2529,7 +2455,6 @@ end
 SciMLBase.savevalues!(integ::PETScIntegrator, force_save = false) =
     _locked(() -> _savevalues_unlocked(integ, force_save))
 
-# SciMLBase's version steps once more at the end, which a finished integrator refuses.
 function SciMLBase.step!(integ::PETScIntegrator, dt, stop_at_tdt = false)
     integ.tdir * dt < 0 && throw(ArgumentError("cannot step backward in time"))
     next_t = integ.t + oftype(integ.t, dt)
@@ -2542,8 +2467,7 @@ function SciMLBase.step!(integ::PETScIntegrator, dt, stop_at_tdt = false)
 end
 
 function _state_at_unlocked(integ::PETScIntegrator, t)
-    # Snap to an end only from outside the step. The root finder probes a hundredth of a
-    # step past an event, which in Float32 can be within rounding of the end.
+    # Snap only from outside the step: Float32 root-finder probes can round onto an end.
     s, s0, s1 = integ.tdir * t, integ.tdir * integ.tprev, integ.tdir * integ.t
     (s == s1 || s1 < s <= s1 + _near(integ.t)) && return integ.u
     (s == s0 || s0 - _near(integ.tprev) <= s < s0) && return integ.uprev
@@ -2575,7 +2499,6 @@ function _interpolate!(integ::PETScIntegrator, s)
     )
 end
 
-# A finished integrator has freed the TS and its interpolant, so this uses Hermite.
 function _interpolate_finished!(integ::PETScIntegrator, s)
     ctx = integ.h.ctx
     (ctx.M === nothing && !ctx.dae) || throw(
@@ -2591,7 +2514,6 @@ function _interpolate_finished!(integ::PETScIntegrator, s)
     )
 end
 
-# Takes the step's end derivatives before an affect! can change the parameters.
 function _pin_step!(integ::PETScIntegrator)
     ctx = integ.h.ctx
     ctx.hermite || return nothing
@@ -2625,8 +2547,6 @@ function _fill_conditions!(
     return out
 end
 
-# SciMLBase's rule: a crossing needs a handler for its direction, and a condition
-# starting at zero is not a crossing.
 function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
     return (
         (prev < 0 && cb.affect! !== nothing) || (prev > 0 && cb.affect_neg! !== nothing)
@@ -2634,7 +2554,6 @@ function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
 end
 _is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev * next <= 0
 
-# `buf` is scratch, so the caller's condition values are not overwritten.
 function _event_root(integ::PETScIntegrator, cb, lo, hi, i::Int, buf)
     condition(t, _) = _fill_conditions!(buf, integ, cb, t)[i]
     return DiffEqBase.find_root(condition, (lo, hi), cb.rootfind)
@@ -2658,8 +2577,6 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
     sk = Vector{Float64}(undef, m)
     buf = Vector{Float64}(undef, m)
     _fill_conditions!(s0, integ, cb, t0)
-    # A component that fired at t0 and still sits on its root is read a nudge past t0,
-    # so it does not fire on the same root again.
     ev, residual = integ.event_t[k], integ.event_residual[k]
     nudged = [ev[i] == t0 && abs(s0[i] - residual[i]) <= cb.abstol for i in 1:m]
     start = fill(t0, m)
@@ -2689,7 +2606,6 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
                     for i in hit
             ]
             first_root = roots[argmin(integ.tdir .* roots)]
-            # Roots this close to the first are one crossing seen through rounding.
             together = 10 * eps(first_root)
             keep = [
                 hit[j] for j in eachindex(hit)
@@ -2729,7 +2645,6 @@ function _fire!(integ::PETScIntegrator, cb::SciMLBase.VectorContinuousCallback, 
     return nothing
 end
 
-# TSRestartStep makes a multistep method drop history across the event.
 function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
     t, dt = oftype(integ.t, t), oftype(integ.t, dt)
     h = integ.h
@@ -2740,7 +2655,6 @@ function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
         _end_step_here!(integ)
     end
     integ.t = t
-    # An affect! may change `p`, which only the next step's start derivative sees.
     h.ctx.pdirty = true
     PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
@@ -2752,7 +2666,6 @@ function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
     return nothing
 end
 
-# Returns whether an event fired, which moves the step's end to the root.
 function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     isempty(integ.continuous) && return false
     best, best_cb, best_crossing, best_k = nothing, nothing, nothing, 0
@@ -2767,7 +2680,6 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     ctx = integ.h.ctx
     _save_step!(integ, best, false; slack = zero(best))
     _rollback!(integ, best, dt, true)
-    # The repeat check compares against the condition at the root before the affect!.
     residual = integ.event_residual[best_k]
     best_cb.rootfind === SciMLBase.NoRootFind ? fill!(residual, 0.0) :
         _fill_conditions!(residual, integ, best_cb, integ.t)
@@ -2788,7 +2700,6 @@ function _apply_callbacks!(integ::PETScIntegrator)
     for cb in integ.callbacks
         integ.finished && return nothing
         cb.condition(integ.u, integ.t, integ) || continue
-        # An affect! can opt out with derivative_discontinuity!(integ, false).
         integ.derivative_discontinuity = true
         _pin_step!(integ)
         cb.affect!(integ)
@@ -2805,7 +2716,6 @@ function _apply_callbacks!(integ::PETScIntegrator)
     return nothing
 end
 
-# PETSc steps from its own vector, not from `integ.u`.
 function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     h = integ.h
     cbs = (integ.callbacks..., integ.continuous...)
@@ -2859,8 +2769,6 @@ end
 SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
     _locked(() -> _init_unlocked(prob, alg; kwargs...))
 
-# Retries at a fifth of the step, OrdinaryDiffEq's default qmin. PETSc's rejection
-# counter does not see these retries.
 function _reject_out_of_domain!(integ::PETScIntegrator, before)
     h = integ.h
     ctx, pl = h.ctx, h.petsclib
@@ -2913,7 +2821,6 @@ function _take_written_state!(integ::PETScIntegrator)
     return nothing
 end
 
-# In the clock's type, so a stop compares exactly against `integ.t`.
 _times(R, ts) = ts isa Number ? [R(ts)] : collect(R, ts)
 
 # d_discontinuities are right-continuous, so the next step starts an ulp past one.
@@ -2928,7 +2835,6 @@ function _past_discontinuity!(integ::PETScIntegrator)
     return nothing
 end
 
-# The queue holds `tdir * t` for each stop, tf included, sorted and without repeats.
 function _tstops(tstops, h::TSHandles{<:Any, <:Any, R}) where {R}
     stops = sort!(unique!(h.tdir .* _times(R, tstops)))
     filter!(s -> h.t0 < s < h.tf, stops)
@@ -2994,7 +2900,6 @@ function _live_stats!(integ::PETScIntegrator)
     return nothing
 end
 
-# Builds fresh PETSc objects, since a finished solve has freed the old ones.
 function _reinit_unlocked(
         integ::PETScIntegrator, u0 = integ.prob.u0;
         t0 = integ.prob.tspan[1], tf = integ.prob.tspan[2],
@@ -3007,7 +2912,6 @@ function _reinit_unlocked(
     R = typeof(integ.t)
     tstops, d_discontinuities = _times(R, tstops), _times(R, d_discontinuities)
     old = integ.h
-    # Keep the problem's own types, so the PETSc build does not change.
     prob = SciMLBase.remake(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
     )
@@ -3090,7 +2994,6 @@ end
 SciMLBase.terminate!(integ::PETScIntegrator, retcode = SciMLBase.ReturnCode.Terminated) =
     _locked(() -> _terminate_unlocked(integ, retcode))
 
-# `slack` is 0 before an event, so a point just past the root waits for the affect!.
 function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near(upto))
     h = integ.h
     ctx = h.ctx
@@ -3112,8 +3015,7 @@ function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near
     return nothing
 end
 
-# MATCHSTEP refuses a step leaving under 10 eps of absolute time before a stop, about
-# 1.2e-6 in Float32, so the integrator lands on stops itself there.
+# MATCHSTEP refuses a step leaving under 10 eps (1.2e-6 in Float32) before a stop.
 function _match_steps_here!(h::TSHandles{<:Any, <:Any, R}) where {R}
     pl, ts = h.petsclib, h.ts
     R === Float32 && _exact_final_time(pl, ts) == LibPETSc.TS_EXACTFINALTIME_MATCHSTEP ||
@@ -3124,8 +3026,7 @@ function _match_steps_here!(h::TSHandles{<:Any, <:Any, R}) where {R}
     return nothing
 end
 
-# PETSc's MATCHSTEP rule, so no sliver is left before the stop. The uncut proposal is
-# cached to resume with after the stop.
+# PETSc's MATCHSTEP rule, so no sliver is left before the stop.
 function _match_step!(integ::PETScIntegrator, remaining)
     h = integ.h
     pl, s = h.petsclib, integ.tdir * integ.t
@@ -3137,11 +3038,9 @@ function _match_step!(integ::PETScIntegrator, remaining)
     return nothing
 end
 
-# Otherwise PETSc would go on with the step shortened onto the stop.
 _resumed_step(integ::PETScIntegrator, stop) = integ.h.matches && !integ.h.fixed ?
     max(integ.tdir * integ.dtcache, _min_step(stop)) : integ.tdir * integ.dtcache
 
-# `outer` is the start of the last step taken, kept across the retries of an undone step.
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     integ.finished && throw(
         ArgumentError(
@@ -3155,9 +3054,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         _finish!(integ)
         return nothing
     end
-    # PETSc steps from its own vector, so pick up any write to `integ.u`.
     outer === nothing && _take_written_state!(integ)
-    # PETSc's proposed next step. `integ.dt` is the step last taken.
     dtprev = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     before = (
         Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty,
@@ -3200,14 +3097,12 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     end
     h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped)
     integ.t = _user_t(integ.tdir, LibPETSc.TSGetTime(pl, h.ts))
-    # A failed step leaves the clock in place, which would spin `while !done` forever.
     if integ.tdir * integ.t <= integ.tdir * integ.tprev
         _finish!(integ)
         return nothing
     end
     if stop === nothing
         h.matches || (integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts))
-        # Steps summed onto the final time can fall a rounding error short of it.
         if integ.tdir * integ.t != h.tf && integ.tdir * integ.t >= h.tf - tol
             integ.t = _user_t(integ.tdir, h.tf)
             LibPETSc.TSSetTime(pl, h.ts, h.tf)
@@ -3233,7 +3128,6 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         popfirst!(integ.tstops)
     end
     integ.finished && return nothing
-    # Mirrors `_post_step!` on the solve path.
     if integ.tdir * integ.t < h.tf - tol
         hnext = LibPETSc.TSGetTimeStep(pl, h.ts)
         limit = isempty(integ.tstops) ? h.tf : min(integ.tstops[1], h.tf)
