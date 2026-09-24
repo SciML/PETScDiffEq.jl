@@ -175,7 +175,8 @@ Needs a Jacobian, from the `ODEFunction`'s `jac` or from `autodiff`, and refuses
 `AutoFiniteDiff()` rather than letting PETSc fail, since it solves all stages as
 one coupled system whose matrix it cannot build from finite differences. That coupled matrix is a Kronecker product with the
 Jacobian, which has no LU factorisation, so this algorithm defaults to
-`-pc_type pbjacobi`; your own `petsc_options` are parsed afterwards and win.
+`-pc_type pbjacobi` unless your own `petsc_options` set a `-pc_type`. So does `"irk"`
+picked by [`TSGeneric`](@ref) or by `-ts_type`.
 
 A wrong Jacobian is not caught here. Where the other implicit families fail to
 converge, this one reports success and returns a wrong answer, so check a
@@ -707,6 +708,29 @@ function _pivot_raises(pl, ts)
         (LibPETSc.CSNES, Ptr{LibPETSc.PetscBool}), snes[], snes_raises,
     )
     return raises[] == LibPETSc.PETSC_TRUE || snes_raises[] == LibPETSc.PETSC_TRUE
+end
+
+function _set_pc_type!(pl, ts, type)
+    lib = Libdl.dlopen(pl.petsc_library)
+    snes, ksp = Ref{LibPETSc.CSNES}(C_NULL), Ref{LibPETSc.CKSP}(C_NULL)
+    pc = Ref{Ptr{Cvoid}}(C_NULL)
+    ccall(
+        Libdl.dlsym(lib, :TSGetSNES), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
+    )
+    ccall(
+        Libdl.dlsym(lib, :SNESGetKSP), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}), snes[], ksp,
+    )
+    ccall(
+        Libdl.dlsym(lib, :KSPGetPC), LibPETSc.PetscErrorCode,
+        (LibPETSc.CKSP, Ptr{Ptr{Cvoid}}), ksp[], pc,
+    )
+    code = ccall(
+        Libdl.dlsym(lib, :PCSetType), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Cstring), pc[], type,
+    )
+    code == 0 || throw(LibPETSc.PetscError(code))
+    return nothing
 end
 
 function _colour_jacobian!(pl, ts, mat)
@@ -1488,8 +1512,6 @@ _set_subtype!(petsclib, ts, ::TSMPRK) = nothing
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 _default_options(::AnyPETScTS) = String[]
-# PETSc's default LU cannot factor IRK's Kronecker-product stage matrix.
-_default_options(::TSIRK) = ["-pc_type", "pbjacobi"]
 # Without -ts_use_splitrhsfunction PETSc never calls the per-part functions.
 _default_options(alg::TSMPRK) =
     ["-ts_mprk_type", alg.subtype, "-ts_use_splitrhsfunction", "true"]
@@ -2076,6 +2098,9 @@ function _setup(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.ijacobian, ctxptr,
                 )
             end
+            # PETSc's default LU cannot factor IRK's Kronecker-product stage matrix.
+            chosen == "irk" && !any(o -> _names_option(o, "pc_type"), effective_options) &&
+                _set_pc_type!(petsclib, ts, "pbjacobi")
             # Only valid once TSSetFromOptions has reached the linear solve.
             h.pivot_raises = _pivot_raises(petsclib, ts) ||
                 _option_flag(effective_options, "ts_error_if_step_fails")

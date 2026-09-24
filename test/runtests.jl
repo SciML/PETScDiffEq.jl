@@ -2441,6 +2441,18 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test abs(sol.u[end][1] - exp(-1)) < 1.0e-10
         end
 
+        @testset "irk picked by TSGeneric or an option gets the same preconditioner" begin
+            for pr in (prob, SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)))
+                irk = SciMLBase.solve(pr, PETScDiffEq.TSIRK(); dt = 0.1, adaptive = false)
+                for alg in (
+                        PETScDiffEq.TSGeneric("irk"),
+                        PETScDiffEq.TSImplicit("beuler", ["-ts_type", "irk"]),
+                    )
+                    @test SciMLBase.solve(pr, alg; dt = 0.1, adaptive = false).u == irk.u
+                end
+            end
+        end
+
         @testset "a stiff system through the integrator" begin
             function stiff!(du, u, p, t)
                 du[1] = -1000 * (u[1] - cos(t))
