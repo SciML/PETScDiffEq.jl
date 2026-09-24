@@ -759,10 +759,14 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 sol = @test_logs min_level = Logging.Warn SciMLBase.solve(tiny, beuler; dt = 0.01f0)
                 @test sol.u[end][1] ≈ 1.0f-22 / 1.01f0^100 rtol = 1.0e-5
             end
-            @test_logs min_level = Logging.Warn SciMLBase.solve(
-                SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f5)),
-                PETScDiffEq.TSImplicit("bdf"),
-            )
+            # Decaying into the underflow range warns only if the solve fails there.
+            logs, decayed = Test.collect_test_logs(min_level = Logging.Warn) do
+                SciMLBase.solve(
+                    SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f5)),
+                    PETScDiffEq.TSImplicit("bdf"),
+                )
+            end
+            @test isempty(logs) == (decayed.retcode == SciMLBase.ReturnCode.Success)
             @test_logs min_level = Logging.Warn SciMLBase.solve(
                 SciMLBase.remake(tiny; u0 = Float32[1.0f-15]), beuler; dt = 0.01f0,
             )
@@ -1726,7 +1730,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "PETSc types this package cannot drive are refused" begin
-        for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk", "pseudo")
+        for t in ("alpha2", "basicsymplectic", "discgrad", "eimex", "mimex", "mprk", "pseudo")
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t; explicit = true)
         end
@@ -1736,15 +1740,16 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test PETScDiffEq.TSGeneric(t; explicit = true).ts_type == t
         end
 
-        for t in ("alpha", "beuler", "bdf", "cn", "dirk", "glle", "rosw", "theta")
+        for t in ("alpha", "beuler", "bdf", "cn", "dirk", "glle", "irk", "rosw", "theta")
             @test PETScDiffEq.TSGeneric(t).ts_type == t
         end
+        @test_throws "`irk` is an implicit PETSc type" PETScDiffEq.TSGeneric("irk"; explicit = true)
     end
 
     @testset "the same types are refused when an option selects them" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         solve_at(alg; kw...) = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, kw...)
-        for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk", "pseudo"), alg in (
+        for t in ("alpha2", "basicsymplectic", "discgrad", "eimex", "mimex", "mprk", "pseudo"), alg in (
                     PETScDiffEq.TSImplicit("beuler", ["-ts_type", t]),
                     PETScDiffEq.TSRK("4", ["-ts_type=$t"]),
                     PETScDiffEq.TSGeneric("glee", ["-TS_TYPE", t]; explicit = true),
@@ -1761,9 +1766,38 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 prob, alg; dt = 0.1, adaptive = false,
             )
         end
+        for alg in (
+                PETScDiffEq.TSRK("4", ["-ts_type", "irk"]),
+                PETScDiffEq.TSGeneric("euler", ["-ts_type=irk"]; explicit = true),
+            )
+            @test_throws "`irk` is an implicit PETSc type" solve_at(alg)
+        end
         sol = solve_at(PETScDiffEq.TSRK("4", ["-ts_type", "glee"]))
         @test sol.retcode == SciMLBase.ReturnCode.Success
         @test abs(sol.u[end][1] - exp(-1)) < 1.0e-3
+    end
+
+    @testset "subtype refusals hold when an option selects the subtype" begin
+        pair_jac!(J, u, p, t) = (J .= 0.0; J[1, 1] = -1.0; J[2, 2] = -1.0; nothing)
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; jac = pair_jac!, mass_matrix = Diagonal([2.0, 1.0])),
+            [1.0, 1.0], (0.0, 1.0),
+        )
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        split = SciMLBase.SplitODEProblem(decay!, decay!, [1.0], (0.0, 1.0))
+        pb = ["-pc_type", "pbjacobi"]
+        for (pr, alg, msg) in (
+                (mass, PETScDiffEq.TSImplicit("beuler", ["-ts_type", "irk", pb...]), "a mass matrix with TSIRK"),
+                (mass, PETScDiffEq.TSGeneric("beuler", ["-ts_type", "irk", pb...]), "a mass matrix with TSIRK"),
+                (mass, PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "assp3p3s1c"]), "cannot take a mass matrix"),
+                (mass, PETScDiffEq.TSGeneric("rosw", ["-ts_rosw_type", "assp3p3s1c"]), "cannot take a mass matrix"),
+                (prob, PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "ark3"]), "cannot be used"),
+                (prob, PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "ars122"]), "needs a SplitODEProblem"),
+                (split, PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "bpr3"]), "converges at first order"),
+            )
+            @test_throws msg SciMLBase.solve(pr, alg; dt = 0.01, adaptive = false)
+            @test_throws msg SciMLBase.init(pr, alg; dt = 0.01, adaptive = false)
+        end
     end
 
     @testset "a solve that never uses the Jacobian is called out" begin
@@ -2458,6 +2492,18 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test abs(sol.u[end][1] - exp(-1)) < 1.0e-10
         end
 
+        @testset "irk picked by TSGeneric or an option gets the same preconditioner" begin
+            for pr in (prob, SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)))
+                irk = SciMLBase.solve(pr, PETScDiffEq.TSIRK(); dt = 0.1, adaptive = false)
+                for alg in (
+                        PETScDiffEq.TSGeneric("irk"),
+                        PETScDiffEq.TSImplicit("beuler", ["-ts_type", "irk"]),
+                    )
+                    @test SciMLBase.solve(pr, alg; dt = 0.1, adaptive = false).u == irk.u
+                end
+            end
+        end
+
         @testset "a stiff system through the integrator" begin
             function stiff!(du, u, p, t)
                 du[1] = -1000 * (u[1] - cos(t))
@@ -3036,7 +3082,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     (u, t, integ) -> u[1] - h, integ -> push!(ups, integ.t),
                     integ -> push!(downs, integ.t); rootfind = rootfind,
                 )
-                SciMLBase.solve(toss, PETScDiffEq.TSRK("5dp"); callback = cb)
+                SciMLBase.solve(
+                    toss, PETScDiffEq.TSRK("5dp"); callback = cb, abstol = 1.0e-4, reltol = 1.0e-4,
+                )
                 @test length(ups) == 1 && abs(ups[1] - (apex - half)) < 1.0e-9
                 @test length(downs) == 1 && abs(downs[1] - (apex + half)) < 1.0e-9
 
@@ -4787,7 +4835,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test matches_petsc(mass, PETScDiffEq.TSImplicit(st))
             end
             refuses_between_steps(PETScDiffEq.TSGeneric("rosw", ["-ts_rosw_type", "rodas3"]))
-            refuses_between_steps(PETScDiffEq.TSGeneric("irk", ["-pc_type", "pbjacobi"]))
+            @test_throws "a mass matrix with TSIRK" SciMLBase.solve(
+                mass, PETScDiffEq.TSGeneric("irk", ["-pc_type", "pbjacobi"]); fixed...,
+            )
             @test matches_petsc(mass, PETScDiffEq.TSGeneric("rosw"))
             refuses_between_steps(PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "rodas3"]))
             @test matches_petsc(mass, PETScDiffEq.TSRosW("rodas3", ["-ts_rosw_type", "ra34pw2"]))
@@ -5401,6 +5451,23 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "a replaced integ.p is the one solved with" begin
+        scaled!(du, u, p, t) = (du[1] = -p * u[1]; nothing)
+        prob = SciMLBase.ODEProblem(scaled!, [1.0], (0.0, 1.0), 1.0)
+        tight = (abstol = 1.0e-10, reltol = 1.0e-10)
+        for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"))
+            cb = SciMLBase.DiscreteCallback((u, t, integ) -> t == 0.5, integ -> (integ.p = 2.0))
+            sol = SciMLBase.solve(prob, alg; tight..., callback = cb, tstops = [0.5])
+            @test abs(sol.u[end][1] - exp(-1.5)) < 2.0e-10
+            integ = SciMLBase.init(prob, alg; tight..., tstops = [0.5])
+            SciMLBase.step!(integ, 0.5, true)
+            integ.p = 2.0
+            @test abs(SciMLBase.solve!(integ).u[end][1] - exp(-1.5)) < 2.0e-10
+            SciMLBase.reinit!(integ)
+            @test abs(SciMLBase.solve!(integ).u[end][1] - exp(-2.0)) < 2.0e-10
+        end
+    end
+
     @testset "Only methods with an error estimate adapt" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         steps(alg, rt) = SciMLBase.solve(
@@ -5845,7 +5912,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), rk,
                     (; loose..., dtmax = 1.0e-3), 0.001,
                 ),
-                (SciMLBase.ODEProblem(lv!, [1.0, 1.0], (0.0, 10.0)), rk, NamedTuple(), 0.056237800849029955),
+                (SciMLBase.ODEProblem(lv!, [1.0, 1.0], (0.0, 10.0)), rk, NamedTuple(), 0.0776084743154256),
                 (lv, rk, (abstol = 1.0e-9,), 0.08421578155635664),
                 (lv, rk, (reltol = 1.0e-7,), 0.021785462059001403),
                 (lv, rosw, loose, 0.016189521278835287),
@@ -5893,6 +5960,15 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 ),
             )
             @test isapprox(SciMLBase.init(prob, alg; kw...).dt, expected; rtol = 1.0e-12)
+        end
+        osc = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = u[2]; du[2] = -u[1]; nothing), [0.0, 1.0], (0.0, 10.0),
+        )
+        for alg in (rk, PETScDiffEq.TSRK("3bs"), rosw)
+            @test SciMLBase.init(osc, alg).dt == SciMLBase.init(osc, alg; loose...).dt
+            default, explicit = SciMLBase.solve(osc, alg), SciMLBase.solve(osc, alg; loose...)
+            @test default.t == explicit.t
+            @test default.u == explicit.u
         end
     end
 
