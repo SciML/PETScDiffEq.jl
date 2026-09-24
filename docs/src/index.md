@@ -65,7 +65,8 @@ one that cannot be made small enough ends the solve with `Unstable`, or `DtLessT
 `dtmin`.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
-state stops being finite, PETSc hits an overflow, or `unstable_check(dt, u, p, t)`
+state stops being finite, PETSc hits an overflow, an adaptive step is too small to move
+`t`, or `unstable_check(dt, u, p, t)`
 returns true, which is asked before each step with the step about to be taken, as
 OrdinaryDiffEq asks it, `ConvergenceFailure` when a nonlinear
 solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are taken, and
