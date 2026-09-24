@@ -91,7 +91,6 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     order::Vector{Int}
     next::Int
     s_prev::Float64
-    # The type of the clock `solve` ran this problem on, which its saved times come from.
     clock::DataType
     cost_at_step::Dict{Int, Vector{Int}}
     u_at_step::Dict{Int, Vector{Float64}}
@@ -111,7 +110,7 @@ end
 
 _load_jacobian!(::AdjointContext{<:Any, <:Any, <:Any, Matrix{Float64}}, A) = nothing
 
-# PETSc's sparse matrix holds the prototype's pattern plus the diagonal, row by row.
+# PETSc's matrix holds the prototype's pattern plus the diagonal.
 function _load_jacobian!(adj::AdjointContext{<:Any, <:Any, <:Any, <:SparseMatrixCSC}, A)
     n = length(adj.u)
     @inbounds for i in 1:n
@@ -178,8 +177,8 @@ function _adjoint_ijacobianp!(
     return _adjoint_paramjac_body!(adj, s, x_ptr, A_ptr)
 end
 
-# PETSc steps dv/ds = tdir * f(v, p, tdir * s), so an explicit method wants tdir * f_p
-# and the residual dv/ds - tdir * f an implicit one solves has derivative -tdir * f_p.
+# PETSc steps dv/ds = tdir * f(v, p, tdir * s), so explicit methods want tdir * f_p
+# and implicit ones, which solve dv/ds - tdir * f = 0, want -tdir * f_p.
 function _adjoint_paramjac_body!(adj, s, x_ptr, A_ptr)
     pl = adj.petsclib
     try
@@ -208,16 +207,13 @@ function _adjoint_record!(
     return _adjoint_record_body!(adj, Int(step), Float64(s), x_ptr)
 end
 
-# Cost times are taken in order and each only once, so the steps a memory trajectory
-# recomputes during the adjoint, which it reports to the monitors again, record nothing.
+# A memory trajectory reports the steps it recomputes during the adjoint to the monitors
+# again. Each cost time is consumed once, so those repeats record nothing.
 function _adjoint_record_body!(adj, step, s, x_ptr)
     pl = adj.petsclib
     try
-        # Steps are the step just taken apart, so a cost time within a small fraction of
-        # it belongs to this step and cannot be nearer the previous one. PETSc adds each
-        # step to its time, which rounds by up to an ulp per step, so the allowance grows
-        # with the step count. It is an ulp of the clock `solve` ran on, whose saved times
-        # a single-precision problem's costs are taken at.
+        # PETSc sums step sizes into its time, so the ulp allowance grows with the step
+        # count. Ulps are of `solve`'s clock so Float32 saved times match.
         R = adj.clock
         tol = max(
             sqrt(Float64(eps(R))) * (s - adj.s_prev),
@@ -259,9 +255,8 @@ function _adjoint_jump!(
     return _adjoint_jump_body!(adj, Int(step))
 end
 
-# A memory trajectory reloads the stages for each adjoint step but not the state the
-# monitor is handed, and at step 0 not the time either, so the cost is found by step
-# number and evaluated on the state recorded going forward.
+# A memory trajectory hands this monitor a stale state, and at step 0 a stale time,
+# so costs are keyed by step and use the state recorded going forward.
 function _adjoint_jump_body!(adj, step)
     ks = get(adj.cost_at_step, step, nothing)
     ks === nothing && return LibPETSc.PetscErrorCode(0)
@@ -285,8 +280,7 @@ end
 
 const ADJ_JUMP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
-# Called from `__init__`, since `@cfunction` needs these functions defined where it appears.
-# The adjoint runs only in PETSc's double build, so its times are Float64.
+# The adjoint runs only in PETSc's double build, so times are Float64.
 function _init_adjoint_pointers!()
     ADJ_RHSJACOBIAN_PTR[] = @cfunction(
         _adjoint_rhsjacobian!,
@@ -325,9 +319,8 @@ function _init_adjoint_pointers!()
     return nothing
 end
 
-# PETSc.jl's wrappers for these pin the callback context to `nothing`, hand PETSc an array
-# that lives only for the call when PETSc keeps a pointer to it, or drop the value they
-# fetch, so the symbols are called directly and their codes checked here.
+# PETSc.jl's wrappers for these pin ctx to `nothing`, pass arrays PETSc keeps but that
+# die after the call, or drop the fetched value, so we ccall them directly.
 function _check_code(code, name)
     iszero(code) || throw(ErrorException("$name failed with $code"))
     return nothing
@@ -363,7 +356,7 @@ end
 const _ADJOINT_TYPES = "TSRK, TSImplicit(\"beuler\") or TSImplicit(\"cn\")"
 
 _adjoint_unsupported(::TSRK) = nothing
-# The PETSc type is known only once the options are applied, so it is checked then.
+# Its PETSc type is known only after options apply, see `_check_adjoint_ts`.
 _adjoint_unsupported(::TSGeneric) = nothing
 function _adjoint_unsupported(alg::TSImplicit)
     alg.subtype in ("beuler", "cn") && return nothing
@@ -392,12 +385,11 @@ const _ADJOINT_REFUSED_KWARGS = (
         "the whole state; remove it",
 )
 
-# Saving and `sensealg` do not change the steps a solve takes, and the adjoint does its
-# own saving.
+# Safe to drop: these don't change the steps, or the adjoint sets them itself.
 const _ADJOINT_OWNED_KWARGS =
     (:saveat, :save_everystep, :save_start, :save_end, :dense, :extra_options, :sensealg)
 
-# PETSc matches option names without regard to case, and a value can follow `=`.
+# PETSc option names are case-insensitive and may carry `=value`.
 _names_option(opt, name) =
     startswith(opt, "-") && lowercase(first(split(opt[2:end], "="))) == name
 
@@ -408,8 +400,7 @@ function _adjoint_solve_kwargs(prob, kwargs)
     call = values(kwargs)
     merged = merge(given, call)
     for (key, why) in pairs(_ADJOINT_REFUSED_KWARGS)
-        # `solve` combines a callback on the problem with one given to the call, where
-        # any other keyword given to the call replaces the problem's.
+        # `solve` merges the problem's callback with the call's. Other keywords override.
         vals = key === :callback ? (get(given, key, nothing), get(call, key, nothing)) :
             (get(merged, key, nothing),)
         all(_unset, vals) || throw(ArgumentError(why))
@@ -449,8 +440,6 @@ function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_disc
                 "assumes a constant one and none of these methods has been verified with one",
         ),
     )
-    # PETSc's own differences never reach the adjoint, which multiplies by the Jacobian it
-    # is given, so under `AutoFiniteDiff()` both Jacobians have to be the caller's.
     differences = _petsc_differences(alg)
     differences && prob.f.jac === nothing && throw(
         ArgumentError(
@@ -587,7 +576,6 @@ function _discrete_adjoint_unlocked(
         cost_s = h.tdir .* cost_t
         implicit = _check_adjoint_ts(h, alg, cost_s)
         iip = SciMLBase.isinplace(prob)
-        # A TSRK has no `autodiff` of its own and differentiates with ForwardDiff.
         backend = something(_autodiff(alg), AutoForwardDiff())
         f_ad = _as_inplace(SciMLBase.unwrapped_f(prob.f.f), iip)
         user_t0 = Float64(prob.tspan[1])
@@ -684,7 +672,7 @@ function _discrete_adjoint_unlocked(
                         "find out why the steps failed",
                 ),
             )
-            # PETSc reports reaching the end even when the steps overflowed on the way.
+            # PETSc reports TS_CONVERGED_TIME even when the state overflowed.
             all(isfinite, _readvec!(zeros(n), pl, h.u)) || throw(
                 ArgumentError(
                     "the forward solve ended on a state that is not finite, which `solve` " *
@@ -706,9 +694,8 @@ function _discrete_adjoint_unlocked(
                 ),
             )
 
-            # Given only now, so that an adjoint started from inside the forward solve
-            # fails PETSc's own check for cost gradients instead of running before the
-            # costs are recorded.
+            # Set only now, so an adjoint started inside TSSolve fails instead of running
+            # before the costs are recorded.
             code = ccall(
                 _symbol(pl, :TSSetCostGradients), LibPETSc.PetscErrorCode,
                 (LibPETSc.CTS, LibPETSc.PetscInt, Ptr{LibPETSc.CVec}, Ptr{LibPETSc.CVec}),
@@ -752,7 +739,6 @@ function _discrete_adjoint_unlocked(
     return _like(prob.u0, du0), has_p ? _like(p, dp)' : nothing
 end
 
-# A gradient comes back in the precision of what it is the gradient of.
 _like(x, g) = eltype(x) === Float32 ? Float32.(g) : g
 
 _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...) =

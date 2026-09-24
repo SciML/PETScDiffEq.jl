@@ -57,8 +57,7 @@ function damped_oscillator_jac!(J, u, p, t)
     J[2, 1] = -1.0
     return J[2, 2] = -0.5
 end
-# Deliberately omits the structural zero at (1,1): u1' = u2 does not depend
-# on u1 at all, so a correct sparsity pattern must not reserve that entry.
+# No (1,1) entry: u1' = u2 does not depend on u1.
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
 @testset "PETScDiffEq.jl" begin
@@ -158,7 +157,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "an IMEX split whose explicit part reads u" begin
-        # u' = (a+b)u split into an implicit a*u and an explicit b*u.
         halves(a, b) = SciMLBase.SplitODEProblem(
             (du, u, p, t) -> (du[1] = a * u[1]; nothing),
             (du, u, p, t) -> (du[1] = b * u[1]; nothing), [1.0], (0.0, 0.1),
@@ -172,15 +170,12 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test all(o -> isapprox(o, 3; atol = 0.25), orders)
         @test isapprox(orders[end], 3; atol = 0.15)
 
-        # The stiff half has to land on the implicit side: dt * 2000 is far
-        # outside any explicit stability region, so the reversed split diverges.
         bounded = PETScDiffEq.TSARKIMEX(
             "3", ["-ts_adapt_type", "none", "-ts_max_snes_failures", "1"],
         )
         @test SciMLBase.solve(halves(-2000.0, -1.0), bounded; dt = 0.01).retcode ==
             SciMLBase.ReturnCode.Success
-        # With an exact Jacobian the solve can run to the end, leaving the divergence in
-        # the answer: 1.9e35 on PETSc 3.25, where the true value is 1e-87.
+        # Reversed, it diverges but may still finish: 1.9e35 on PETSc 3.25, true value 1e-87.
         reversed = SciMLBase.solve(halves(-1.0, -2000.0), bounded; dt = 0.01)
         @test reversed.retcode != SciMLBase.ReturnCode.Success || abs(reversed.u[end][1]) > 1
 
@@ -190,8 +185,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 flush(io)
                 return result, read(path, String)
             end
-            # With no cap on the line search's step, u grows until PETSc's finite-difference
-            # Jacobian is exactly zero, and its dense LU hits a zero pivot on the fifth step.
+            # Uncapped, u grows until PETSc's FD Jacobian is zero: a zero pivot on step 5.
             pivots = PETScDiffEq.TSARKIMEX(
                 "3", [bounded.petsc_options; "-snes_linesearch_maxstep"; "1e300"];
                 autodiff = PETScDiffEq.AutoFiniteDiff(),
@@ -205,7 +199,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             sol, text = printed(() -> SciMLBase.solve(prob, pivots; dt = 0.01))
             @test sol.retcode == SciMLBase.ReturnCode.Failure
             @test !occursin("PETSC ERROR", text)
-            # The solve ends on the last step PETSc finished.
             @test sol.t == upto.t
             @test sol.u == upto.u
             @test sol.stats.naccept == upto.stats.naccept
@@ -213,7 +206,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test ends.retcode == SciMLBase.ReturnCode.Failure
             @test ends.t == [0.0, upto.t[end]]
             @test ends.u[end] == upto.u[end]
-            # A step that failed this way leaves the rejection counters untouched.
             @test sol.stats.nreject == upto.stats.nreject
             @test_logs (:warn, r"zero pivot") match_mode = :any SciMLBase.solve(
                 prob, pivots; dt = 0.01,
@@ -230,7 +222,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test !occursin("PETSC ERROR", text)
             @test isol.t == upto.t
             @test isol.u == upto.u
-            # The integrator ends as on any other failed step, with stats and finalize.
             @test isol.stats.naccept == upto.stats.naccept
             @test n_fin[] == 1
             @test_throws ArgumentError SciMLBase.step!(integ)
@@ -238,8 +229,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 SciMLBase.init(prob, pivots; dt = 0.01),
             )
 
-            # PETSc's differenced Newton matrix is singular from the outset, so it pivots
-            # before any step. The exact one is not, and that solve succeeds.
+            # Only PETSc's differenced Newton matrix is singular from the start.
             index1 = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(
                     (du, u, p, t) -> (du[1] = -u[1]; du[2] = u[1] - u[2]; nothing);
@@ -263,7 +253,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test exact.retcode == SciMLBase.ReturnCode.Success
             @test exact.u[end] ≈ fill(exp(-0.1), 2) rtol = 1.0e-7
 
-            # An error the options ask PETSc to raise still raises, with its traceback.
             plain = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
             raising = PETScDiffEq.TSImplicit(
                 "beuler", ["-snes_max_it", "0", "-snes_error_if_not_converged"],
@@ -285,7 +274,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test occursin("PETSC ERROR", text)
             end
 
-            # A zero pivot the options ask to raise is the error the user asked for.
             singular = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(
                     (du, u, p, t) -> (du[1] = p[1] * u[1]; nothing);
@@ -293,7 +281,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     paramjac = (pJ, u, p, t) -> (pJ[1, 1] = u[1]; nothing),
                 ), [1.0], (0.0, 1.0), [10.0],
             )
-            # Backward Euler at this step shifts by 10, so `shift - J` is exactly zero.
+            # beuler shifts by 1/dt = 10, so shift - J is exactly zero.
             zrpvt = PETScDiffEq.TSImplicit(
                 "beuler",
                 ["-ksp_type", "preonly", "-pc_type", "lu", "-ksp_error_if_not_converged"],
@@ -321,11 +309,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test occursin("Zero pivot", text)
             end
 
-            # PETSc's own dense path raises too, whichever switch asks for it.
             dense_singular = SciMLBase.ODEProblem(
                 (du, u, p, t) -> (du[1] = 8.0 * u[1]; nothing), [1.0], (0.0, 1.0),
             )
-            # Backward Euler at 0.125 shifts by 8, so `shift - J` is exactly zero.
+            # beuler shifts by 1/dt = 8, so shift - J is exactly zero.
             @test SciMLBase.solve(
                 dense_singular, PETScDiffEq.TSImplicit("beuler"; autodiff = PETScDiffEq.AutoFiniteDiff());
                 dt = 0.125, adaptive = false,
@@ -351,8 +338,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "an integrator dropped part-way still exits cleanly" begin
-        # PETSc objects freed after MPI shuts down abort the process, so this can
-        # only be seen from the outside: the exit code is the assertion.
+        # Freeing PETSc objects after MPI shuts down aborts, so the exit code is the assertion.
         script = """
         using PETScDiffEq, SciMLBase
         f!(du, u, p, t) = (du[1] = -u[1]; nothing)
@@ -366,25 +352,19 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "several PETSc builds in one process" begin
-        # Each build is a library of its own, and a symbol from one reads another's objects
-        # at the wrong offsets.
         PETSc = PETScDiffEq.PETSc
         builds = [PETSc.getlib(; PetscScalar = S) for S in (Float64, Float32)]
         found = [PETScDiffEq._symbol(pl, :TSGetSolution) for pl in builds]
         @test allunique(found)
         @test [PETScDiffEq._symbol(pl, :TSGetSolution) for pl in builds] == found
-        # The callbacks take each build's own real type.
         ptrs = [PETScDiffEq._callbacks(pl) for pl in builds]
         @test ptrs[1].rhs != ptrs[2].rhs
         @test PETScDiffEq._callbacks(builds[1]) === ptrs[1]
-        # A post-step context is let go with its TS.
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8)
         SciMLBase.solve!(SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
         @test isempty(PETScDiffEq.POST_STEP_CTX)
-        # Solves in all four builds interleave, each through its own build's post-step hook,
-        # split functions and error handler, and each gives what it gives alone. A zero pivot
-        # is a retcode in every build, with nothing printed.
+        # The beuler run is a zero pivot in every build.
         span(S) = (zero(real(S)), one(real(S)))
         never = (dt, u, p, t) -> false
         runs = (
@@ -414,9 +394,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test sol.u == alone[S][k].u
         end
         @test all(S -> last(alone[S]).retcode == SciMLBase.ReturnCode.Failure, scalars)
-        # Builds initialized after this package's first solve are torn down before its
-        # cleanup of the double build runs, and each build's integrators are freed before
-        # its own teardown; the exit code is the assertion.
+        # Later builds tear down before the double build, each after its own integrators.
+        # Getting that wrong aborts at exit, so the exit code is the assertion.
         script = """
         using PETScDiffEq, SciMLBase
         PETSc = PETScDiffEq.PETSc
@@ -439,8 +418,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "a threaded ensemble runs its solves one at a time" begin
-        # PETSc's options stack and MPI are shared by the process, so concurrent solves
-        # crashed it; the exit code of a process with four threads is the assertion.
+        # PETSc's options stack and MPI are process-wide. The exit code is the assertion.
         script = """
         using PETScDiffEq, SciMLBase
         f!(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
@@ -463,7 +441,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "stops and saved points near an event or the start" begin
-        # A stop just after the start of a long span is still ahead of the solve.
         decay_long = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0e6))
         hits = Float64[]
         early = SciMLBase.solve(
@@ -473,7 +450,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test hits == [1.0e-9]
         @test 1.0e-9 in early.t
 
-        # A saved point a hair after an event root takes the state the event leaves.
         ramp = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 1.0; nothing), [0.0], (0.0, 1.0))
         jump = SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.5, integ -> (integ.u[1] += 10.0))
         after = SciMLBase.solve(
@@ -515,17 +491,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     @testset "Float32" begin
         build(integ) = PETScDiffEq.PETSc.scalartype(integ.h.petsclib)
         none = ["-ts_adapt_type", "none"]
-        # On 32-bit x86 PETSc's single build is left out, and a Float32 state with a Float32
-        # span runs on the double build's clock instead.
+        # PETSc's single build is left out on 32-bit x86, so Float32 runs on the double clock.
         single_build = Float32 in PETScDiffEq._loaded_builds()
         clock32 = single_build ? Float32 : Float64
 
         @testset "the span picks the PETSc build, and the solution keeps the problem's types" begin
-            # A Float32 state runs in PETSc's single build with a Float32 span, where that build
-            # is used, and in the double one with a Float64 span, where only its saved states
-            # stay Float32. Any other state runs in Float64, and the times are in the clock's
-            # type whatever the span's. `f` sees exactly the build's types, which the wrapper
-            # SciMLBase made for the problem depends on.
             seen = Set{Any}()
             typed!(du, u, p, t) = (push!(seen, (typeof(u), typeof(t))); du .= -u; nothing)
             typed(u, p, t) = (push!(seen, (typeof(u), typeof(t))); -u)
@@ -554,21 +524,18 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     @test seen == Set([(Vector{R}, R)])
                 end
             end
-            # The integrator's solution keeps up with it while it steps, which a copy of the
-            # times in the span's type would not.
             integ = SciMLBase.init(
                 SciMLBase.ODEProblem(decay!, [1.0], (0.0f0, 10.0f0)), PETScDiffEq.TSRK("5dp"),
             )
             foreach(_ -> SciMLBase.step!(integ), 1:3)
             @test length(integ.sol.t) == length(integ.sol.u) == 4
             @test integ.sol(integ.t) ≈ integ.u
-            # DiffEqBase makes a whole-number span Float64, so it runs in the double build.
+            # DiffEqBase promotes an integer span to Float64.
             whole = SciMLBase.solve(
                 SciMLBase.ODEProblem(decay!, Float32[1], (0, 1)), PETScDiffEq.TSRK("5dp"),
             )
             @test eltype(whole.t) === Float64 && eltype(whole.u[end]) === Float32
-            # With only the double build loaded, as a library set with `PETSc.set_library!`
-            # leaves it, a single-precision state runs in it, and a missing build is named.
+            # Only the double build loaded, as `PETSc.set_library!` leaves it.
             single = SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0))
             @test PETScDiffEq._eltypes(single, [Float64]) == (Float64, Float64, Float32)
             @test PETScDiffEq._eltypes(
@@ -577,7 +544,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test_throws "ArgumentError: this problem needs PETSc's Float64 complex build" (
                 PETScDiffEq._petsclib(ComplexF64, [Float64])
             )
-            # A `dt` given in Float64 promotes the span, as DiffEqBase does for every solver.
+            # A Float64 dt promotes the span, as DiffEqBase does.
             promoted = SciMLBase.init(
                 SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0)),
                 PETScDiffEq.TSRK("5dp"); dt = 0.1,
@@ -586,8 +553,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a Float32 state with a Float64 span is solved in Float64" begin
-            # SciMLBase wraps the functions for Float32, and PETSc's double build calls them
-            # with Float64 arrays, so they are unwrapped.
             ref = SciMLBase.solve(
                 SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
                 dt = 0.1,
@@ -616,7 +581,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test sol.retcode == SciMLBase.ReturnCode.Success
                 @test sol.u[end] == Float32.(ref.u[end])
             end
-            # A Jacobian and a DAE residual are unwrapped too.
             withjac = SciMLBase.solve(
                 SciMLBase.ODEProblem(
                     SciMLBase.ODEFunction(decay!; jac = jac32!), Float32[1.0], (0.0, 1.0),
@@ -630,7 +594,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 PETScDiffEq.TSDAE("bdf"); dt = 0.001, abstol = 1.0e-8, reltol = 1.0e-8,
             )
             @test abs(dae.u[end][1] - exp(-1)) < 1.0e-5
-            # Whole numbers are exact in Float64, as in OrdinaryDiffEq.
             whole = SciMLBase.solve(
                 SciMLBase.ODEProblem(decay!, [1], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
                 dt = 0.1,
@@ -639,8 +602,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "the single build converges at each method's order" begin
-            # u' = u + cos(t) grows, so every error here is at least 1e-4 of the state and
-            # far above the single build's rounding, and the step counts divide the span.
+            # A growing solution keeps every error far above single-precision rounding.
             forced!(du, u, p, t) = (du[1] = u[1] + cos(t); nothing)
             exact = 3 * exp(3.0) / 2 + (sin(3.0) - cos(3.0)) / 2
             for (alg, steps, order) in (
@@ -665,8 +627,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     F === Float32 && @test minimum(errs) > 5.0e-5
                     [log(errs[i] / errs[i + 1]) / log(dts[i] / dts[i + 1]) for i in 1:2]
                 end
-                # These steps are short of the asymptotic range for the higher orders, so the
-                # order is checked against the double build's at the same steps as well.
+                # Short of the asymptotic range, so also checked against the double build.
                 @test isapprox(orders[1][end], order; atol = 0.3)
                 @test maximum(abs, orders[1] .- orders[2]) < 0.05
             end
@@ -674,7 +635,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
         @testset "d_discontinuities and the step limits" begin
             alg = PETScDiffEq.TSRK("5dp")
-            # Right-continuous, as for Float64: the step after t_d starts a ULP past it.
             kink!(du, u, p, t) = (du[1] = t > 0.5f0 ? -1.0f0 : 1.0f0; nothing)
             back!(du, u, p, t) = (du[1] = t < 0.5f0 ? 1.0f0 : -1.0f0; nothing)
             for (f!, tspan) in ((kink!, (0.0f0, 1.0f0)), (back!, (1.0f0, 0.0f0))),
@@ -691,7 +651,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             begins = SciMLBase.ODEProblem(start!, Float32[0], (0.0f0, 1.0f0))
             integ = SciMLBase.init(begins, alg; dt = 0.1f0, d_discontinuities = [0.0f0])
             @test integ.t === nextfloat(zero(clock32))
-            # The limits reach PETSc's options as numbers its single build can read.
             slow = SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0))
             forced = SciMLBase.solve(
                 slow, alg; dt = 0.01f0, dtmin = 0.2f0, dtmax = 0.1f0, force_dtmin = true,
@@ -721,9 +680,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "stops, saved times and events land where they are asked for" begin
-            # A single-precision clock's ulp is 1e-3 at t = 1e4, so a hundred of them is a step
-            # of 0.1, and a step that ends that close to a stop or a saved time is not on it.
-            # u' = 1 makes u = t in exact arithmetic, and PETSc adds the same steps to both.
+            # At t = 1e4 a Float32 ulp is 1e-3, so a 0.1 step is only 100 ulps.
+            # With u' = 1, fe rounds u and t the same way, so u == t exactly.
             one!(du, u, p, t) = (du[1] = 1; nothing)
             line = SciMLBase.ODEProblem(one!, Float32[0], (0.0f0, 1.0f4))
             fixed = (; dt = 0.1f0, adaptive = false)
@@ -738,10 +696,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test sol.t == kw.saveat
                 @test [u[1] for u in sol.u] == sol.t
             end
-            # Single build only: on i686 the double build can hit PETSc's `bad hmax` over these spans.
+            # On i686 the double build can hit PETSc's `bad hmax` over these spans.
             if single_build
-                # Saved times near either end of a long span are neither dropped, nor joined by t0,
-                # nor given an end's state.
                 osc!(du, u, p, t) = (du[1] = u[2]; du[2] = -u[1]; nothing)
                 ring = SciMLBase.ODEProblem(osc!, Float32[0, 1], (0.0f0, 1000.0f0))
                 tight = (; reltol = 1.0f-6, abstol = 1.0f-6)
@@ -750,18 +706,15 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 for kw in ((;), (; save_start = false, save_end = false), (; tstops = [500.0f0]))
                     sol = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tight..., saveat = want, kw...)
                     @test sol.t == want
-                    # Measured 5.5e-7 from sin(t).
+                    # Measured 5.5e-7.
                     @test maximum(k -> abs(sol.u[k][1] - sin(Float64(want[k]))), 1:3) < 2.0e-6
                     @test sol.u[end] != final
                 end
-                # A stop within 100 ulps of the end is still landed on.
                 fired = Float32[]
                 kick = SciMLBase.DiscreteCallback((u, t, i) -> t == 999.995f0, i -> push!(fired, i.t))
                 sol = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tstops = [999.995f0], callback = kick)
                 @test fired == [999.995f0]
                 @test 999.995f0 in sol.t
-                # Each crossing fires once: the root finder looks a hundredth of a step past an
-                # event, which is closer than 100 ulps.
                 for span in ((100.0f0, 104.0f0), (0.0f0, 100.0f0)),
                         alg in (PETScDiffEq.TSRK("3bs"), PETScDiffEq.TSRK("5dp"))
                     crossings = Ref(0)
@@ -775,18 +728,16 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
         @testset "steps the single-precision clock can take" begin
             if single_build
-                # PETSc's stages need room between a step's ends, which one or two ulps of t do not
-                # leave; an ulp is 1e-3 at t = 1e4, where the starting step is 1.4e-3.
+                # At t = 1e4 an ulp is about the first step, too tight for PETSc's stages.
                 implicit = (
                     PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW(), PETScDiffEq.TSARKIMEX("3"),
                 )
                 for t0 in (1.0f4, 1.0f5), alg in implicit
                     sol = SciMLBase.solve(SciMLBase.ODEProblem(decay!, Float32[1], (t0, t0 + 10)), alg)
                     @test sol.retcode == SciMLBase.ReturnCode.Success
-                    # At the default tolerances, measured at most 11% of exp(-10), as in double.
+                    # Measured at most 11%, as in double.
                     @test abs(sol.u[end][1] - exp(-10)) < 0.2 * exp(-10)
                 end
-                # After a stop the step goes on at the one PETSc last proposed, not the first.
                 for span in ((0.0f0, 1.0f6), (0.0f0, 1.0f5)), alg in implicit
                     stops = [span[2] / 7 * k for k in 1:6]
                     sol = SciMLBase.solve(
@@ -797,8 +748,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     @test sol.t[end] == span[2]
                     @test stops ⊆ sol.t
                 end
-                # PETSc's own landing on the final time refuses a step under 1.2e-6 before a final
-                # time below 1, so the integrator lands there, fixed step or adaptive.
+                # PETSc won't land on tf < 1 with a step under 1.2e-6, so we land it.
                 scaled!(du, u, p, t) = (du .= p .* u; nothing)
                 for (F, p) in ((Float32, -0.5f0), (ComplexF32, -0.5f0 + 2.0f0im)),
                         alg in (PETScDiffEq.TSRK("4"), PETScDiffEq.TSImplicit("cn"))
@@ -808,7 +758,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     @test sol.retcode == SciMLBase.ReturnCode.Success
                     @test sol.t[end] == 1.0f-3
                     @test sol.stats.naccept == 1000
-                    # Single precision's rounding over 1000 steps, measured at most 2.5e-5.
+                    # Measured 2.5e-5.
                     @test abs(sol.u[end][1] - exp(p * 1.0e-3)) < 1.0e-4
                     stiff = SciMLBase.solve(
                         SciMLBase.ODEProblem(scaled!, F[1], (0.0f0, 1.0f-4), -3.0f6),
@@ -821,19 +771,15 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a state too small for single precision's norms is warned about" begin
-            # Below about 1e-19 the norms PETSc's Newton iteration stops on are zero in the
-            # single build, and a solve that starts there returns the state it was given.
+            # Below about 1e-19 PETSc's Newton norms underflow to zero in the single build.
             tiny = SciMLBase.ODEProblem(decay!, Float32[1.0f-22], (0.0f0, 1.0f0))
             beuler = PETScDiffEq.TSImplicit("beuler")
             if single_build
                 @test_logs (:warn, r"norms underflow") SciMLBase.solve(tiny, beuler; dt = 0.01f0)
             else
-                # The double build's norms do not underflow there, and the state decays by
-                # backward Euler's 0.99^100.
                 sol = @test_logs min_level = Logging.Warn SciMLBase.solve(tiny, beuler; dt = 0.01f0)
                 @test sol.u[end][1] ≈ 1.0f-22 / 1.01f0^100 rtol = 1.0e-5
             end
-            # A state that decays there from above is within any tolerance coarser than that.
             @test_logs min_level = Logging.Warn SciMLBase.solve(
                 SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f5)),
                 PETScDiffEq.TSImplicit("bdf"),
@@ -844,8 +790,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a DAE, a mass matrix and every Jacobian match the double build" begin
-            # At the same fixed steps the single build differs from the double one by its
-            # rounding, which is under 2e-6 on each of these.
+            # Single and double differ by rounding, measured under 2e-6.
             residual!(r, du, u, p, t) = (r[1] = du[1] + u[1]; r[2] = u[2] - 2u[1]; nothing)
             mm!(du, u, p, t) = (du[1] = -2u[1]; du[2] = u[2] - u[1]; nothing)
             dae(F) = SciMLBase.DAEProblem(residual!, F[-1, -2], F[1, 2], (zero(F), one(F)))
@@ -880,12 +825,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "complex states" begin
-        # The Schrodinger equation u' = -iHu for a real, symmetric, tridiagonal H, whose
-        # solution exp(-iHt) u0 keeps its norm.
         n = 8
         H = SymTridiagonal(collect(range(0.5, 2.0; length = n)), fill(-1.0, n - 1))
         schr!(du, u, p, t) = (mul!(du, H, u); du .*= -im; nothing)
-        # Entry by entry, since broadcasting into a sparse buffer can change its structure.
+        # Entry by entry: broadcasting into a sparse J can change its structure.
         function schr_jac!(J, u, p, t)
             for i in 1:n
                 J[i, i] = -im * H[i, i]
@@ -899,7 +842,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         none = ["-ts_adapt_type", "none"]
         build(integ) = PETScDiffEq.PETSc.scalartype(integ.h.petsclib)
         order(errs, dts) = [log(errs[i] / errs[i + 1]) / log(dts[i] / dts[i + 1]) for i in 1:2]
-        # On 32-bit x86 PETSc's single complex build is left out, as the real one is.
+        # PETSc's single complex build is left out on 32-bit x86.
         clock32 = ComplexF32 in PETScDiffEq._loaded_builds() ? Float32 : Float64
 
         @testset "the state picks a complex build and keeps its type" begin
@@ -939,8 +882,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             prob = SciMLBase.ODEProblem(schr!, u0, (0.0, 2.0))
             dts = [2.0 / k for k in (20, 40, 80)]
             sols = [SciMLBase.solve(prob, PETScDiffEq.TSImplicit("cn", lu); dt) for dt in dts]
-            # Every step is unitary, so the norm drifts only by rounding, measured at 2 ulps;
-            # backward Euler loses 2 percent over the same span.
+            # Measured 2 ulps of norm drift.
             for sol in sols
                 @test maximum(u -> abs(norm(u) - norm(u0)), sol.u) < 1.0e-13
             end
@@ -950,9 +892,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "every source of the Jacobian gives the same solve" begin
-            # A holomorphic f's Jacobian from AD, coloured AD, PETSc's differences or a
-            # hand-written jac. The AD ones match the hand-written one to rounding, measured
-            # below 1e-16, and PETSc's differences to 2e-10.
+            # Measured: AD below 1e-16 of the hand-written jac, PETSc's differences 2e-10.
             pattern = sparse(Matrix(H) .!= 0) * 1.0
             fd = PETScDiffEq.AutoFiniteDiff()
             solve_with(f, alg) = SciMLBase.solve(SciMLBase.ODEProblem(f, u0, (0.0, 1.0)), alg; dt = 0.05)
@@ -982,8 +922,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test sol.retcode == SciMLBase.ReturnCode.Success
                 @test maximum(abs, sol.u[end] - ref.u[end]) < tol
             end
-            # The other implicit families take the same Jacobian; the worst error at 0.05, BDF2's,
-            # was measured at 1.1e-3.
+            # Measured at most 1.1e-3 (BDF2).
             for alg in (
                     PETScDiffEq.TSRosW("ra34pw2", none), PETScDiffEq.TSIRK(2),
                     PETScDiffEq.TSImplicit("bdf", none), PETScDiffEq.TSARKIMEX("3", none),
@@ -996,8 +935,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a sparse backend's pattern, and a prototype that leaves an entry out" begin
-            # The real map has two rows for each of the state's, so a pattern the backend was
-            # given is stacked on itself as a prototype's is, and matches dense AD exactly.
             pattern = sparse(Matrix(H) .!= 0) * 1.0
             known = PETScDiffEq.ADTypes.AutoSparse(
                 PETScDiffEq.AutoForwardDiff();
@@ -1014,9 +951,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 PETScDiffEq.TSDAE("bdf", [none; lu]; autodiff = ad)
             @test SciMLBase.solve(dae, bdf(known); dt = 0.01).u ==
                 SciMLBase.solve(dae, bdf(); dt = 0.01).u
-            # A holomorphic f whose prototype leaves out the subdiagonal is not refused: the
-            # missing entries cost Newton iterations, as they do for a real state. Measured
-            # 3.0e-9 from dense AD for the real state and 2.2e-9 for the complex one.
+            # Measured 3.0e-9 for the real state, 2.2e-9 for the complex one.
             chainc!(du, u, p, t) = (
                 for i in 1:n
                     du[i] = -2u[i] + (i > 1 ? u[i - 1] : 0) + (i < n ? u[i + 1] : 0) + p * u[i]^2
@@ -1037,7 +972,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test partial.retcode == SciMLBase.ReturnCode.Success
                 @test maximum(abs, partial.u[end] - full.u[end]) < 1.0e-7
             end
-            # The check still refuses a function that is not holomorphic, with either prototype.
             conj!(du, u, p, t) = (du .= -im .* conj.(u); nothing)
             @test_throws "not holomorphic" SciMLBase.solve(
                 SciMLBase.ODEProblem(SciMLBase.ODEFunction(conj!; jac_prototype = upper), u0, (0.0, 1.0)),
@@ -1053,7 +987,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             solve_dae(f, alg) =
                 SciMLBase.solve(SciMLBase.DAEProblem(f, du0, u0, (0.0, 1.0)), alg; dt = 0.01)
             ref = solve_dae(SciMLBase.DAEFunction(residual!; jac = residual_jac!), bdf)
-            # BDF2 at 0.01, measured 4.6e-5 from the exact solution, and differenced to 2e-12.
+            # Measured 4.6e-5 from exact, and differenced to 2e-12.
             @test maximum(abs, ref.u[end] - exact(1.0)) < 2.0e-4
             fd = PETScDiffEq.TSDAE("bdf", [none; lu]; autodiff = PETScDiffEq.AutoFiniteDiff())
             for (f, alg, tol) in (
@@ -1066,14 +1000,13 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 )
                 @test maximum(abs, solve_dae(f, alg).u[end] - ref.u[end]) < tol
             end
-            # 2u' = -2iHu is the same equation, and a complex mass matrix is taken too.
             twice!(du, u, p, t) = (mul!(du, H, u); du .*= -2im; nothing)
             for (M, expected) in ((Matrix(2.0I, n, n), exact(1.0)), (Matrix(2.0im * I, n, n), exp(-Matrix(H)) * u0))
                 sol = SciMLBase.solve(
                     SciMLBase.ODEProblem(SciMLBase.ODEFunction(twice!; mass_matrix = M), u0, (0.0, 1.0)),
                     PETScDiffEq.TSImplicit("cn", lu); dt = 0.01,
                 )
-                # Crank-Nicolson at 0.01, measured 1.1e-5 and 6.4e-6.
+                # Measured 1.1e-5 and 6.4e-6.
                 @test maximum(abs, sol.u[end] - expected) < 5.0e-5
             end
             back = SciMLBase.solve(
@@ -1090,17 +1023,15 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             sols = [SciMLBase.solve(prob, PETScDiffEq.TSRK("4"); dt) for dt in dts]
             @test all(s -> eltype(s.u[end]) === ComplexF32, sols)
             errs = [maximum(abs, s.u[end] - exact(2.0)) for s in sols]
-            # Every error is above 1.5e-4, far from single precision's rounding, and the
-            # orders were measured at 3.89 and 3.95.
+            # Measured: errors above 1.5e-4, orders 3.89 and 3.95.
             @test minimum(errs) > 1.0e-4
             @test all(o -> isapprox(o, 4; atol = 0.2), order(errs, dts))
             cn = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("cn", lu); dt = 0.05f0)
-            # One ulp of the norm, measured.
+            # Measured one ulp.
             @test maximum(u -> abs(norm(u) - norm(ComplexF32.(u0))), cn.u) < 1.0e-6
         end
 
         @testset "a callback's condition is real" begin
-            # A root is a sign change, so the condition is a real function of the state.
             for (F, tol) in ((ComplexF64, 1.0e-9), (ComplexF32, 1.0e-6))
                 R = real(F)
                 roots = R[]
@@ -1111,7 +1042,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     SciMLBase.ODEProblem(schr!, F.(u0), (zero(R), R(2))), PETScDiffEq.TSRK("5dp");
                     abstol = R(1.0e-10), reltol = R(1.0e-10), callback = cb,
                 )
-                # Measured 2.7e-11 and 3.2e-8 from the exact root's condition.
+                # Measured 2.7e-11 and 3.2e-8.
                 @test length(roots) == 1
                 @test abs(real(exact(roots[1])[4]) - 0.1) < tol
             end
@@ -1169,11 +1100,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 )
                 @test_throws "ArgumentError: $message" call()
             end
-            # An explicit method needs no Jacobian, so a function that is not holomorphic runs.
             @test SciMLBase.solve(
                 SciMLBase.ODEProblem(nonlinear!, u0, (0.0, 1.0)), PETScDiffEq.TSRK("4"); dt = 0.01,
             ).retcode == SciMLBase.ReturnCode.Success
-            # A tolerance whose imaginary part is zero is its real part, for any state.
             real_prob = SciMLBase.ODEProblem(decay!, [1.0, 2.0], (0.0, 1.0))
             plain = SciMLBase.solve(real_prob, rk; abstol = 1.0e-6, reltol = [1.0e-3, 1.0e-3])
             zero_im = SciMLBase.solve(
@@ -1194,7 +1123,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         stopped = SciMLBase.solve(kinked, alg; dt = 0.1, d_discontinuities = [0.5])
         @test 0.5 in stopped.t
         @test stopped.retcode == SciMLBase.ReturnCode.Success
-        # Alongside tstops, and reported by the accessors like any other stop.
         both = SciMLBase.init(
             kinked, alg; dt = 0.1, tstops = [0.25], d_discontinuities = [0.5, 0.75],
         )
@@ -1219,8 +1147,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test sol.retcode == SciMLBase.ReturnCode.Unstable
             @test 0.0 < sol.t[end] < 1.0
             @test sol.u[end][1] < 0.7
-            # It is given the time just reached and the step about to be taken, and is not
-            # asked about the final state.
+            # Called with the time just reached and the next step, never at the final state.
             seen = Tuple{Float64, Float64}[]
             full = run(
                 prob; dt = 0.01, abstol = 1.0e-8, reltol = 1.0e-8,
@@ -1232,7 +1159,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test !(first.(seen) ≈ diff(full.t)[1:(end - 1)])
             @test run(prob; dt = 0.1, unstable_check = (dt, u, p, t) -> t >= 1.0).retcode ==
                 SciMLBase.ReturnCode.Success
-            # In the caller's time on a reversed span, so a check on t stops where Tsit5 does.
+            # On a reversed span t is the caller's time and dt is negative, as for Tsit5.
             empty!(seen)
             back = run(
                 grow; dt = 0.1, adaptive = false,
@@ -1242,13 +1169,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test back.t[end] ≈ 0.4
             @test last.(seen) ≈ back.t[2:end]
             @test all(<(0), first.(seen))
-            # An exception from the check is the caller's.
             @test_throws "check threw" run(
                 prob; dt = 0.1, unstable_check = (dt, u, p, t) -> t > 0.5 && error("check threw"),
             )
         end
-        # Callbacks run first, so the check sees the state an event leaves, and a terminate!
-        # on the same step wins.
+        # Callbacks run before the check, so it sees the event's state and a terminate! wins.
         halve = SciMLBase.ContinuousCallback(
             (u, t, integ) -> u[1] - 0.8, integ -> (integ.u[1] /= 2),
         )
@@ -1263,7 +1188,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             prob, alg; dt = 0.1, adaptive = false, callback = ends,
             unstable_check = (dt, u, p, t) -> t > 0.42,
         ).retcode == SciMLBase.ReturnCode.Terminated
-        # A check that never fires leaves the solve alone, and neither warns.
         quiet = @test_logs min_level = Logging.Warn SciMLBase.solve(
             prob, alg; dt = 0.1, unstable_check = below(-1.0),
         )
@@ -1275,8 +1199,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         below(c) = (u, p, t) -> any(<(c), u)
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         alg = PETScDiffEq.TSRK("5dp")
-        # A domain no step can stay in ends the solve Unstable where it last held, which for
-        # `u' = -u` and u >= 0.6 is t = log(1 / 0.6), at any scale of time.
         for scale in (1.0, 1.0e-12)
             scaled = SciMLBase.ODEProblem(
                 (du, u, p, t) -> (du[1] = -u[1] / scale; nothing), [1.0], (0.0, scale),
@@ -1293,14 +1215,12 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test abs(sol.t[end] / scale - log(1 / 0.6)) < 1.0e-6
             end
         end
-        # The step before the undone ones stays the step just taken.
         integ = SciMLBase.init(prob, alg; dt = 0.1, isoutofdomain = below(0.6))
         SciMLBase.solve!(integ)
         @test integ.t - integ.tprev ≈ integ.dt
         @test integ(integ.t - integ.dt / 2) ≈ integ.sol(integ.t - integ.dt / 2)
 
-        # An undone step is taken again at a fifth of its size, OrdinaryDiffEq's default qmin,
-        # within the same step! call, and is not counted as a step.
+        # Retried at a fifth of its size, OrdinaryDiffEq's default qmin.
         tried = Float64[]
         once = (u, p, t) -> (push!(tried, t); length(tried) == 1)
         integ = SciMLBase.init(prob, alg; dt = 0.1, isoutofdomain = once)
@@ -1315,8 +1235,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test every_other[] == 20
         @test capped.stats.naccept == 10 == length(capped.t) - 1
 
-        # dtmin ends it with DtLessThanMin instead, and force_dtmin takes the step at the floor
-        # and goes on, as in OrdinaryDiffEq.
         floored = SciMLBase.solve(prob, alg; dt = 0.1, dtmin = 0.01, isoutofdomain = below(0.6))
         @test floored.retcode == SciMLBase.ReturnCode.DtLessThanMin
         @test minimum(diff(floored.t)) >= 0.01
@@ -1327,7 +1245,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test forced.t[end] == 1.0
         @test minimum(diff(forced.t)[1:(end - 1)]) >= 0.01
 
-        # A fixed-step solve does not ask, as in OrdinaryDiffEq.
+        # Not asked when fixed-step, as in OrdinaryDiffEq.
         asked = Ref(0)
         SciMLBase.solve(
             prob, alg; dt = 0.25, adaptive = false,
@@ -1335,8 +1253,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
         @test asked[] == 0
 
-        # A step undone after a callback changed p is taken again with the new p: an event
-        # in it lands where it does with no undone step.
         rate!(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
         events = map((false, true)) do reject
             hits = Float64[]
@@ -1362,8 +1278,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
     @testset "d_discontinuities and force_dtmin as OrdinaryDiffEq has them" begin
         alg = PETScDiffEq.TSRK("5dp")
-        # SciML's convention is right-continuous: f at t_d is the old regime, and the step
-        # after t_d starts a ULP past it. Written that way, u(tf) = 0 exactly.
+        # Right-continuous, as in SciML: the step after t_d starts a ULP past it.
         kink!(du, u, p, t) = (du[1] = t > 0.5 ? -1.0 : 1.0; nothing)
         back!(du, u, p, t) = (du[1] = t < 0.5 ? 1.0 : -1.0; nothing)
         for (f!, tspan) in ((kink!, (0.0, 1.0)), (back!, (1.0, 0.0))), adaptive in (false, true)
@@ -1375,13 +1290,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test 0.5 in kinked.t
             adaptive || @test abs(plain.u[end][1]) > 1.0e-3
         end
-        # One at the start moves the start a ULP forward.
         start!(du, u, p, t) = (du[1] = t > 0 ? -1.0 : 1.0; nothing)
         begins = SciMLBase.ODEProblem(start!, [0.0], (0.0, 1.0))
         integ = SciMLBase.init(begins, alg; dt = 0.1, d_discontinuities = [0.0])
         @test integ.t == nextfloat(0.0)
         @test abs(SciMLBase.solve!(integ).u[end][1] + 1) < 1.0e-12
-        # reinit! keeps them apart from tstops, and takes new ones.
         prob = SciMLBase.ODEProblem(kink!, [0.0], (0.0, 1.0))
         integ = SciMLBase.init(prob, alg; dt = 0.1, d_discontinuities = [0.5])
         SciMLBase.solve!(integ)
@@ -1390,14 +1303,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test abs(SciMLBase.solve!(integ).u[end][1]) < 1.0e-12
         SciMLBase.reinit!(integ; d_discontinuities = [0.75])
         @test PETScDiffEq.DiffEqBase.get_tstops_array(integ) == [0.75, 1.0]
-        # A reinit! with neither goes back to what init was given, as in OrdinaryDiffEq.
         SciMLBase.reinit!(integ)
         @test PETScDiffEq.DiffEqBase.get_tstops_array(integ) == [0.5, 1.0]
-        # A single time is a list of one.
         @test 0.25 in SciMLBase.solve(prob, alg; dt = 0.1, tstops = 0.25).t
         @test 0.5 in SciMLBase.solve(prob, alg; dt = 0.1, d_discontinuities = 0.5).t
 
-        # A state written to integ.u between steps is the one the next step starts from.
         decay = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         for mark in (false, true)
             integ = SciMLBase.init(decay, alg; dt = 0.1, adaptive = false)
@@ -1408,7 +1318,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test integ.u[1] ≈ 5exp(-0.1) rtol = 1.0e-6
         end
 
-        # force_dtmin keeps the floor through every way of moving it.
         fast = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = -50.0 * u[1]; nothing), [1.0], (0.0, 1.0))
         tight = (; abstol = 1.0e-10, reltol = 1.0e-10, force_dtmin = true)
         steps(sol) = diff(sol.t)[2:(end - 1)]
@@ -1416,7 +1325,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         over = SciMLBase.solve(fast, alg; dt = 0.01, dtmin = 0.2, dtmax = 0.1, tight...)
         @test over.retcode == SciMLBase.ReturnCode.Success
         @test all(≈(0.2), steps(over))
-        # A floor moved or a dtmax lowered through opts stays PETSc's.
         integ = SciMLBase.init(fast, alg; dt = 0.01, dtmin = 0.1, tight...)
         SciMLBase.step!(integ)
         integ.opts.dtmin = 0.2
@@ -1424,19 +1332,17 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         moved = SciMLBase.solve!(integ)
         @test moved.retcode == SciMLBase.ReturnCode.Success
         @test moved.t[end] == 1.0
-        # The step already proposed when the floor moved is the last at the old floor.
+        # The step proposed before the move still uses the old floor.
         @test minimum(diff(moved.t)[3:(end - 1)]) >= 0.2 - 1.0e-12
-        # A given dt below the floor is not taken after a stop either.
         stopped = SciMLBase.solve(fast, alg; dt = 0.001, dtmin = 0.01, tstops = [0.5], tight...)
         @test minimum(diff(stopped.t)) >= 0.01 - 1.0e-12
-        # The floor's sign does not matter, and petsc_options still override it.
         @test SciMLBase.solve(fast, alg; dt = 0.01, dtmin = -0.1, tight...).t ==
             SciMLBase.solve(fast, alg; dt = 0.01, dtmin = 0.1, tight...).t
         own = SciMLBase.solve(
             fast, PETScDiffEq.TSRK("5dp", ["-ts_adapt_dt_min", "0.05"]);
             dt = 0.01, dtmin = 0.1, tight...,
         )
-        # Up to the steps PETSc shortens to land on the final time.
+        # PETSc shortens the last steps to land on the final time.
         @test all(≈(0.05), diff(own.t)[1:(end - 3)])
     end
 
@@ -1457,7 +1363,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
         @test implicit.stats.nnonliniter > implicit.stats.naccept
         @test implicit.stats.nnonlinconvfail == 0
-        # An explicit method runs no nonlinear solve at all.
         explicit = SciMLBase.solve(
             prob, PETScDiffEq.TSRK("5dp"); dt = 0.01, adaptive = false,
         )
@@ -1465,8 +1370,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "maxiters that no PetscInt can hold" begin
-        # SciML spells "no limit" as typemax(Int), which need not fit a PetscInt.
-        # Which of the two is wider depends on the platform, so clamp to the smaller.
         @test PETScDiffEq._maxsteps(typemax(Int)) ==
             min(typemax(Int), typemax(PETScDiffEq.LibPETSc.PetscInt))
         @test PETScDiffEq._maxsteps(100) == 100
@@ -1480,15 +1383,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     @testset "the loaded PETSc has the index width the wrappers assume" begin
         lib = PETScDiffEq.PETSc.getlib(PetscScalar = Float64)
         @test PETScDiffEq._check_inttype(lib) === nothing
-        # The index vectors PETSc is handed are typed at precompile time from a
-        # constant, so a library with a different index width would corrupt silently.
         @test PETScDiffEq.PETSc.inttype(lib) === PETScDiffEq.LibPETSc.PetscInt
     end
 
     @testset "which side of the bracket the root lands on" begin
         rootprob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
-        # The condition falls through zero, so the left end of the bracket is
-        # still positive while the right end has already crossed.
         function crossed(rootfind)
             conds = Float64[]
             cb = SciMLBase.ContinuousCallback(
@@ -1503,7 +1402,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test length(right) == 1
         @test left[1] >= 0
         @test right[1] <= 0
-        # Both ends are resolved to machine precision, not merely to the step.
         @test abs(left[1]) < 1.0e-14
         @test abs(right[1]) < 1.0e-14
     end
@@ -1719,7 +1617,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "TSMPRK" begin
-        # u1' = -u1 on the slow side, u2' = -100u2 on the fast side.
         two!(du, u, p, t) = (du[1] = -u[1]; du[2] = -100.0 * u[2]; nothing)
         mprob = SciMLBase.ODEProblem(two!, [1.0, 1.0], (0.0, 1.0))
 
@@ -1771,7 +1668,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
             @test split3.t[end] == 1.0
             @test abs(split3.u[end][1] - exp(-1.0)) < 1.0e-2
-            # Backward in time the fast row has to decay as well, so its sign flips.
+            # Backward in time, +10u2 is the decaying fast row.
             back!(du, u, p, t) = (du[1] = -u[1]; du[2] = 10.0 * u[2]; nothing)
             rev = SciMLBase.solve(
                 SciMLBase.ODEProblem(back!, [1.0, 1.0], (1.0, 0.0)),
@@ -1783,8 +1680,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "which half is slow is the caller's to say" begin
-            # Naming component 2 slow puts the stiff row on the outer step, which
-            # a two-component problem still integrates correctly.
             sol = SciMLBase.solve(
                 mprob, PETScDiffEq.TSMPRK([2]); dt = 0.001, adaptive = false,
             )
@@ -1808,9 +1703,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "the fast part is actually substepped" begin
-            # The whole point. At this step the fast row is unstable for a
-            # single-rate explicit method and stable for MPRK, which is only
-            # true if PETSc is running its split path over our two callbacks.
+            # At dt = 0.0325 the fast row is unstable single-rate, stable only if MPRK substeps.
             stiff!(du, u, p, t) = (du[1] = -u[1]; du[2] = -100.0 * u[2]; nothing)
             sprob = SciMLBase.ODEProblem(stiff!, [1.0, 1.0], (0.0, 1.0))
             settled(alg, dt) = abs(
@@ -1819,7 +1712,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test !settled(PETScDiffEq.TSRK("5dp"), 0.0325)
             @test settled(PETScDiffEq.TSMPRK([1], "p2"), 0.0325)
             @test settled(PETScDiffEq.TSMPRK([1], "p3"), 0.0325)
-            # and single rate still wins at a step small enough for both
             @test settled(PETScDiffEq.TSRK("5dp"), 0.02)
         end
 
@@ -1834,14 +1726,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 SciMLBase.solve(cprob, alg; dt = 0.01, adaptive = false);
                 counted[]
             )
-            # Both parts of a stage share one evaluation of the user's `f`, so
-            # the multirate run costs no more than the single rate one.
             @test calls(PETScDiffEq.TSMPRK([1], "p2")) <
                 calls(PETScDiffEq.TSRK("5dp"))
         end
 
         @testset "a three-way split" begin
-            # u1 slow, u2 medium, u3 fast.
             three!(du, u, p, t) = (
                 du[1] = -u[1]; du[2] = -10.0 * u[2]; du[3] = -100.0 * u[3]; nothing
             )
@@ -1880,22 +1769,16 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "PETSc types this package cannot drive are refused" begin
-        # Each of these is set up through a PETSc call this package does not make.
-        # Given only a residual, PETSc reaches its solve with half a problem:
-        # alpha2, discgrad and mimex abort the process, eimex integrates to zero
-        # and reports success.
         for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk", "pseudo")
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t; explicit = true)
         end
 
-        # Handed an implicit residual these integrate nothing, and glee still reports success.
         for t in ("euler", "glee", "rk", "ssp")
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
             @test PETScDiffEq.TSGeneric(t; explicit = true).ts_type == t
         end
 
-        # The implicit types are untouched.
         for t in ("alpha", "beuler", "bdf", "cn", "dirk", "glle", "rosw", "theta")
             @test PETScDiffEq.TSGeneric(t).ts_type == t
         end
@@ -1921,7 +1804,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 prob, alg; dt = 0.1, adaptive = false,
             )
         end
-        # Given the right-hand side, an explicit type chosen by an option runs.
         sol = solve_at(PETScDiffEq.TSRK("4", ["-ts_type", "glee"]))
         @test sol.retcode == SciMLBase.ReturnCode.Success
         @test abs(sol.u[end][1] - exp(-1)) < 1.0e-3
@@ -1942,7 +1824,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "an empty callback set leaves the solve to TSSolve" begin
-            # GLLE has no step of its own, so it runs only through TSSolve.
+            # GLLE runs only through TSSolve.
             sol = SciMLBase.solve(
                 prob, PETScDiffEq.TSGeneric("glle"); dt = 0.1, adaptive = false,
                 callback = SciMLBase.CallbackSet(),
@@ -1982,7 +1864,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "it changes the integration" begin
-            # PETSc defaults to order 2, which costs steps against a higher order.
             low = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf"; order = 1); kw...)
             high = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf"; order = 5); kw...)
             @test low.stats.naccept > high.stats.naccept
@@ -2006,8 +1887,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "DAEProblem" begin
-        # u1' = -u1 with the algebraic constraint u2 = u1, so both are exp(-t).
-        # Integrating the second row as an ODE instead would give cosh(1).
         function resid!(r, du, u, p, t)
             r[1] = du[1] + u[1]
             return r[2] = u[2] - u[1]
@@ -2095,7 +1974,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a Jacobian that depends on du" begin
-            # u' = -cbrt(u), so dG/du' is 3du^2 rather than a constant.
             function cubic_resid!(r, du, u, p, t)
                 r[1] = du[1]^3 + u[1]
                 return r[2] = u[2] - u[1]
@@ -2147,7 +2025,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
         @testset "what a DAE cannot ask for" begin
             prob = SciMLBase.DAEProblem(withjac, du0, u0, tspan)
-            # An ODE algorithm and a DAEProblem are an incompatible pairing.
             @test_throws Exception SciMLBase.solve(
                 prob, PETScDiffEq.TSRK("5dp"); dt = 1.0e-3,
             )
@@ -2201,7 +2078,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
             @test length(sim.u) == n
             @test all(s -> s.retcode == SciMLBase.ReturnCode.Success, sim.u)
-            # Each trajectory carries its own decay rate.
             @test all(abs(sim.u[i].u[end][1] - exp(-i)) < tol for i in 1:n)
         end
     end
@@ -2233,7 +2109,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         sol = SciMLBase.solve(
             stiff, PETScDiffEq.TSImplicit("beuler"); dt = 1.0, adaptive = false,
         )
-        # PETSc stops this one in its nonlinear solve.
         @test sol.retcode == SciMLBase.ReturnCode.ConvergenceFailure
         @test sol.t[end] > 0.0
         @test allunique(sol.t)
@@ -2246,7 +2121,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.step!(integ)
             n += 1
         end
-        # A step PETSc cannot take returns without advancing, and step! ends the integrator there.
         @test SciMLBase.done(integ)
         @test integ.sol.retcode == SciMLBase.ReturnCode.ConvergenceFailure
         @test allunique(integ.sol.t)
@@ -2281,11 +2155,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test SciMLBase.done(stepped)
             @test stepped.sol.retcode == SciMLBase.ReturnCode.DtLessThanMin
             @test stepped.sol.t[end] < 1.0
-            # Both paths stop on the step whose successor would fall below the floor.
             @test stepped.sol.t[end] == floored.t[end]
 
-            # A step shortened to land on the final time or a stop does not count, and a
-            # fixed-step solve has no floor, as in OrdinaryDiffEq.
+            # As in OrdinaryDiffEq, landing steps and fixed steps ignore the floor.
             line = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 1.0; nothing), [0.0], (0.0, 1.0))
             for kw in ((; dt = 0.95), (; dt = 0.45, tstops = [0.5]))
                 landed = SciMLBase.solve(line, PETScDiffEq.TSRK("5dp"); kw..., dtmin = 0.1)
@@ -2300,7 +2172,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test fixed.retcode == SciMLBase.ReturnCode.Success
             @test fixed.t[end] == 1.0
 
-            # A nonlinear failure is still ConvergenceFailure with a floor set.
             breaks = SciMLBase.ODEProblem(
                 (du, u, p, t) -> (du[1] = t > 0.7 ? NaN : -1.0; nothing), [1.0], (0.0, 1.0),
             )
@@ -2310,19 +2181,17 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test SciMLBase.solve!(SciMLBase.init(breaks, bdf; dt = 0.1, dtmin = 0.1)).retcode ==
                 SciMLBase.ReturnCode.ConvergenceFailure
 
-            # force_dtmin keeps the solve going at the floor, as in OrdinaryDiffEq.
             forced = SciMLBase.solve(
                 quick, PETScDiffEq.TSRK("5dp"); kw..., force_dtmin = true,
             )
             @test forced.retcode == SciMLBase.ReturnCode.Success
             @test forced.t[end] == 1.0
-            # The given dt starts the solve, and the floor holds every step after it.
+            # The first step is the given dt, below the floor.
             @test minimum(diff(forced.t)[2:end]) > 0.9 * 0.1
             @test_logs min_level = Logging.Warn SciMLBase.solve(
                 quick, PETScDiffEq.TSRK("5dp"); kw..., force_dtmin = true,
             )
 
-            # Without a floor the same solve runs to the end.
             free = SciMLBase.solve(
                 quick, PETScDiffEq.TSRK("5dp"); dt = 0.01, abstol = 1.0e-10, reltol = 1.0e-10,
             )
@@ -2330,14 +2199,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test free.t[end] == 1.0
         end
 
-        # Choosing an explicit type through the implicit path is a misuse, and
-        # stays an exception rather than a quiet failure code.
         plain = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         @test_throws Exception SciMLBase.solve(
             plain, PETScDiffEq.TSGeneric("euler"); dt = 0.01, adaptive = false,
         )
 
-        # A user's own exception still reaches the caller unchanged.
         boom!(du, u, p, t) = error("boom")
         @test_throws "boom" SciMLBase.solve(
             SciMLBase.ODEProblem(boom!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
@@ -2377,7 +2243,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.step!(integ)
             @test SciMLBase.isadaptive(integ)
             @test length(SciMLBase.get_tmp_cache(integ)) >= 2
-            # What the callbacks actually ask of it.
             @test integ.f isa SciMLBase.AbstractODEFunction
             @test SciMLBase.isinplace(integ.f)
             @test integ.opts.abstol isa Real
@@ -2641,7 +2506,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         for alg in (
                 PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRK("5dp"),
                 PETScDiffEq.TSRosW("ra34pw2"),
-                # An arbitrary named type may or may not adapt.
+                # A type given by name may or may not adapt.
                 PETScDiffEq.TSGeneric("alpha"),
             )
             @test_logs min_level = Logging.Warn SciMLBase.solve(
@@ -2651,8 +2516,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "the exported names carry a docstring" begin
-        # `Base.doc` is not available on every supported version, and `@doc`
-        # reports a docstring even for a name that has none.
+        # Read from source: `Base.doc` is not on every version, and `@doc` never reports none.
         lines = reduce(
             vcat,
             split(read(joinpath(@__DIR__, "..", "src", file), String), '\n')
@@ -2715,7 +2579,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             sol = SciMLBase.solve(prob, alg; tols..., callback = cb)
             @test sol.retcode == SciMLBase.ReturnCode.Success
             @test length(events) == 2
-            # exp(-2t) reaches 1/2 first, at half the time exp(-t) does.
             @test abs(events[1][1] - log(2.0) / 2) < 1.0e-9
             @test events[1][2] == Int8[0, -1]
             @test abs(events[2][1] - log(2.0)) < 1.0e-9
@@ -2736,8 +2599,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "components crossing together share one event far from t = 0" begin
-            # y = 3x, so both levels are reached at 50 log 2, where rounding leaves the two
-            # roots a few ulps apart.
+            # Both levels are hit at 50 log 2, a few ulps apart after rounding.
             slow!(du, u, p, t) = (du[1] = -u[1] / 50; du[2] = -u[2] / 50; nothing)
             events = Tuple{Float64, Vector{Int8}}[]
             cb = SciMLBase.VectorContinuousCallback(
@@ -2754,8 +2616,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "components crossing apart fire apart whatever abstol is" begin
-            # The levels are reached at log 2 and 1e-3 later, well inside an `abstol` of
-            # 1e-2, which bounds a condition value and not a time.
+            # `abstol` bounds a condition value, not a time.
             events = Tuple{Float64, Vector{Int8}}[]
             cb = SciMLBase.VectorContinuousCallback(
                 (out, u, t, integ) -> (out[1] = u[1] - 0.5; out[2] = u[1] - 0.4995; nothing),
@@ -2805,8 +2666,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             sol = SciMLBase.solve(prob, alg; tols..., callback = cb)
             @test sol.retcode == SciMLBase.ReturnCode.Terminated
             @test abs(sol.t[end] - log(2.0)) < 1.0e-9
-            # Lifted at its own earlier crossing, the second component is at 3/4
-            # when the first triggers, against 1/4 without the lift.
+            # 3/4 with the earlier lift, 1/4 without.
             @test abs(sol.u[end][2] - 0.75) < 1.0e-7
         end
 
@@ -2867,7 +2727,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "the entries apply per component" begin
-            # Only the stiff second component carries error worth controlling.
             slow = steps((abstol = [1.0e-12, 1.0],))
             stiff = steps((abstol = [1.0, 1.0e-12],))
             loose = steps((abstol = [1.0, 1.0],))
@@ -3019,15 +2878,13 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             J = copy(declared)
             PETScDiffEq._copy_jac!(J, sparse([1, 1, 2], [1, 2, 2], [1.0, 7.0, 2.0], 2, 2))
             @test J[1, 2] == 7.0
-            # The buffer is reused every step, so an entry the new Jacobian does
-            # not have must not keep the old one's value.
+            # The buffer is reused, so an entry the new Jacobian lacks must be zeroed.
             PETScDiffEq._copy_jac!(J, sparse([1, 2], [1, 2], [3.0, 4.0], 2, 2))
             @test J[1, 1] == 3.0
             @test J[2, 2] == 4.0
             @test J[1, 2] == 0.0
 
-            # A dense Jacobian's zeros land where the prototype declares nothing,
-            # so they have to be skipped rather than written.
+            # Zeros outside the prototype's pattern are skipped, not written.
             diagonly = sparse([1, 2], [1, 2], [1.0, 1.0], 2, 2)
             PETScDiffEq._copy_jac!(diagonly, [5.0 0.0; 0.0 6.0])
             @test diagonly[1, 1] == 5.0
@@ -3067,7 +2924,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
     @testset "ContinuousCallback" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 2.0))
-        # exp(-t) hits 1/2 at log 2; the affect! lifts it to 3/2, which hits 1/2 at log 6.
         jump(hits) = SciMLBase.ContinuousCallback(
             (u, t, integ) -> u[1] - 0.5, integ -> (push!(hits, integ.t); integ.u[1] += 1.0),
         )
@@ -3094,7 +2950,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "the root does not move with the callback's abstol" begin
-            # `abstol` gates repeated events and plays no part in where the root lands.
             loose(hits, abstol) = SciMLBase.ContinuousCallback(
                 (u, t, integ) -> u[1] - 0.5,
                 integ -> (push!(hits, integ.t); integ.u[1] += 1.0);
@@ -3111,8 +2966,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test abs(hits[1] - log(2.0)) < 1.0e-9
                 @test abs(hits[2] - log(6.0)) < 1.0e-9
             end
-            # A falling ball's height is a quadratic the integrator reproduces to rounding,
-            # so its impact is located to within a few ulps.
+            # 5dp reproduces the quadratic height, so the impact is exact to a few ulps.
             fall!(du, u, p, t) = (du[1] = u[2]; du[2] = -9.81; nothing)
             drop = SciMLBase.ODEProblem(fall!, [1.0, 0.0], (0.0, 1.0))
             impact = sqrt(2 / 9.81)
@@ -3130,9 +2984,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a crossing skipped as a repeat hides nothing after it" begin
-            # u[1] is a mode the affect! switches at 0.2345. From there the condition stays
-            # within `abstol` of its value at the root, reaches zero inside the nudge of the
-            # 0.1 step, and falls through zero for real at 0.2495 in the same step.
+            # After the switch at 0.2345 the condition stays within `abstol`, hits zero inside
+            # the nudge, then truly crosses at 0.2495 in the same step.
             hold!(du, u, p, t) = (du[1] = 0.0; nothing)
             function level(u, t, integ)
                 u[1] == 0 && return 0.2345 - t
@@ -3155,9 +3008,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a condition the affect! moves off its root can fire again at once" begin
-            # Each reset leaves the condition 1e-3 below zero, far outside the default
-            # `abstol`, and it rises through zero again 1e-3 later, inside the nudge of a
-            # 0.25 step.
+            # Each reset is 1e-3: outside the default `abstol`, inside the 0.25 step's nudge.
             function fires(; kw...)
                 hits = Float64[]
                 cb = SciMLBase.ContinuousCallback(
@@ -3174,19 +3025,16 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             hits = fires()
             @test length(hits) == 3
             @test all(abs.(hits .- [0.01, 0.011, 0.012]) .< 1.0e-12)
-            # An `abstol` wider than the reset makes the next crossing the same event.
             @test length(fires(abstol = 1.0e-2)) == 1
         end
 
         @testset "a crossing just after an event is found" begin
             fall!(du, u, p, t) = (du[1] = u[2]; du[2] = -9.81; nothing)
             toss = SciMLBase.ODEProblem(fall!, [0.0, 5.0], (0.0, 1.0))
-            # A sensor just below the apex is passed going up and again 0.0314 later coming
-            # down, inside the first tenth of the step after the first pass.
+            # h is just below the apex, so the down crossing follows the up one by 0.0314.
             h = 1.273
             apex, half = 5.0 / 9.81, sqrt(5.0^2 - 2 * 9.81 * h) / 9.81
-            # Checked at its ends only, the step after the up crossing at 0.25 starts on
-            # that root and ends past the down crossing at 0.32.
+            # With interp_points = 0, the step after the 0.25 root ends past the 0.32 one.
             band = SciMLBase.ODEProblem(ramp!, [0.0], (0.0, 1.0))
             for rootfind in (SciMLBase.LeftRootFind, SciMLBase.RightRootFind)
                 ups, downs = Float64[], Float64[]
@@ -3213,8 +3061,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a crossing inside the nudge is not seen" begin
-            # A nudge of half the step puts the down crossing at 0.29 behind 0.3045, where
-            # the step after the up crossing at 0.2545 is first read.
+            # A half-step nudge first reads the next step at 0.3045, past the 0.29 crossing.
             ups, downs = Float64[], Float64[]
             cb = SciMLBase.ContinuousCallback(
                 (u, t, integ) -> (u[1] - 0.2545) * (0.29 - u[1]),
@@ -3230,9 +3077,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "only the step right after an event starts past it" begin
-            # A tstop 1e-5 past the up crossing ends the step after it. The down crossing,
-            # 5e-4 later, is in the step after that, which starts with the condition still
-            # within `abstol` of its value at the up root.
+            # The tstop ends the step after the up root, so the down crossing falls in the
+            # next step, which starts within `abstol` of the up root's value.
             ups, downs = Float64[], Float64[]
             cb = SciMLBase.ContinuousCallback(
                 (u, t, integ) -> (u[1] - 0.2545) * (0.255 - u[1]),
@@ -3248,8 +3094,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "locating a root takes few condition evaluations" begin
-            # One fixed step reaches the root and one more ends the solve, so all but a
-            # handful of the evaluations go to the root.
             n = Ref(0)
             cb = SciMLBase.ContinuousCallback(
                 (u, t, integ) -> (n[] += 1; u[1] - 0.5), integ -> nothing; interp_points = 0,
@@ -3278,7 +3122,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test sol.retcode == SciMLBase.ReturnCode.Success
             @test length(bounces) == 4
             @test abs(bounces[1] - sqrt(2 / 9.81)) < 1.0e-12
-            # Each flight is 0.9 of the one before it, the restitution coefficient.
             gaps = diff(bounces)
             @test all(isapprox(0.9; atol = 1.0e-6), gaps[2:end] ./ gaps[1:(end - 1)])
             @test minimum(u[1] for u in sol.u) > -1.0e-10
@@ -3323,7 +3166,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 dt = 0.05, reltol = 1.0e-10, abstol = 1.0e-12, callback = cb,
             )
             @test sol.retcode == SciMLBase.ReturnCode.Success
-            # An affect! that changes nothing must still fire once per crossing.
             @test length(downs) == 1 && abs(downs[1] - pi) < 1.0e-9
             @test length(ups) == 1 && abs(ups[1] - 2pi) < 1.0e-9
         end
@@ -3420,14 +3262,12 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
             SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = cb)
             @test !isempty(hits)
-            # exp(-t) is first below 1/2 at the step ending at 0.7.
             @test hits[1] > log(2.0)
             @test abs(hits[1] - 0.7) < 1.0e-8
         end
 
         @testset "without root finding a repeat is judged against zero" begin
-            # The condition is 2.5e-5 when the up crossing fires at 0.3, and falls back
-            # through zero at 0.3005, inside the nudge of the next 0.1 step.
+            # 2.5e-5 at the 0.3 up crossing, back through zero at 0.3005, inside the next nudge.
             function downs(; kw...)
                 found = Float64[]
                 cb = SciMLBase.ContinuousCallback(
@@ -3536,8 +3376,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "the queue is keyed on the direction of integration" begin
-            # Forward the key and the time are the same number, so this needs a
-            # reversed span.
             back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
             integ = SciMLBase.init(back, PETScDiffEq.TSRK("5dp"); dt = 0.1)
             @test integ.tdir == -1
@@ -3551,8 +3389,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
         @testset "every tstop accessor reads the one queue" begin
             DEB = PETScDiffEq.DiffEqBase
-            # `queued` is the queue OrdinaryDiffEq's Tsit5 holds in the same state, as keys
-            # `tdir * t`, with each stop once.
+            # `queued` is what Tsit5 holds in the same state: keys `tdir * t`, each stop once.
             function check_queue(integ, queued)
                 @test DEB.get_tstops(integ) === integ.tstops
                 @test DEB.get_tstops_array(integ) === integ.tstops
@@ -3850,13 +3687,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         fd = PETScDiffEq.AutoFiniteDiff()
 
         @testset "Robertson solves as it does with the analytic one" begin
-            # Hairer and Wanner's values at t = 1e11. PETSc's differenced Jacobian is far
-            # enough off here that these solves reported success wrong in the first digit.
+            # Hairer and Wanner's values at t = 1e11.
             ref = [0.2083340149701255e-7, 0.8333360770334713e-13, 0.999999979166505]
             span = (0.0, 1.0e11)
-            # PETSc's 32-bit build can stop BDF and ARKIMEX over this span on its own check
-            # of where the last step ends (`bad hmax in TSAdaptChoose`), with a Jacobian or
-            # without, since that check allows only an absolute 2.2e-15 at t = 1e11.
+            # On 32-bit, PETSc's `bad hmax in TSAdaptChoose` check can stop BDF and ARKIMEX
+            # here: it allows only an absolute 2.2e-15 at t = 1e11.
             algs = Sys.WORD_SIZE == 64 ?
                 (
                     PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW(),
@@ -3922,14 +3757,13 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     SciMLBase.ODEFunction(heat!; jac = heat_jac!, jac_prototype = proto),
                     make(ad),
                 )
-                # Three colours, so each Jacobian is one pass of `f` on dual numbers.
+                # Three colours, so each Jacobian is one pass of `f` on duals.
                 coloured, ncoloured = run(
                     SciMLBase.ODEFunction(heat!; jac_prototype = proto), make(ad),
                 )
                 @test coloured.u[end] ≈ given.u[end] rtol = 1.0e-12
                 @test ncoloured < ncalls + 3 * coloured.stats.njacs
-                # PETSc's own differences are coloured by the prototype too, where on the
-                # dense matrix it makes for itself it perturbs each column in turn.
+                # PETSc's FD colours by the prototype too. Dense, it perturbs every column.
                 dense, ndense = run(SciMLBase.ODEFunction(heat!), make(fd))
                 sparse_fd, nsparse = run(
                     SciMLBase.ODEFunction(heat!; jac_prototype = proto), make(fd),
@@ -3968,7 +3802,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     @test sol.u[end] ≈ dense.u[end] rtol = 1.0e-10
                 end
             end
-            # The shift lands on the mass matrix's (1, 2) entry, which the prototype leaves out.
+            # The shift lands on M's (1, 2) entry, which the prototype leaves out.
             g!(du, u, p, t) = (du[1] = -u[1]; du[2] = -10u[2]; nothing)
             sol = SciMLBase.solve(
                 SciMLBase.ODEProblem(
@@ -4080,7 +3914,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test occursin("autodiff = PETScDiffEq.AutoFiniteDiff()", err.msg)
             sol = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf"; autodiff = fd))
             @test sol.retcode == SciMLBase.ReturnCode.Success
-            # A typed signature, a type assertion and TSIRK, which needs the Jacobian.
             typed!(du::Vector{Float64}, u::Vector{Float64}, p, t) = (du .= -u; nothing)
             asserted!(du, u, p, t) = (du[1] = -(u[1]::Float64); nothing)
             for (f, alg) in (
@@ -4102,7 +3935,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a non-finite derivative of a finite f is an error, not a stop at t0" begin
-            # d/du of norm(u) * u is NaN at u = 0 in ForwardDiff, and 0 exactly.
+            # ForwardDiff gives NaN for d/du of norm(u) * u at u = 0, where it is exactly 0.
             pushed!(du, u, p, t) = (du .= -LinearAlgebra.norm(u) .* u; du[1] += 1.0; nothing)
             prob = SciMLBase.ODEProblem(pushed!, [0.0, 0.0], (0.0, 1.0))
             for alg in (PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW())
@@ -4180,8 +4013,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a zero on the Newton matrix's diagonal" begin
-            # The (1, 1) entry is zero: row 1 is the algebraic equation. A dense matrix
-            # pivots, and a sparse one has its rows swapped.
             function resid!(r, du, u, p, t)
                 r[1] = u[2] - 0.5 * sin(t) - 0.5
                 r[2] = -du[1] - u[1] + u[2]
@@ -4297,8 +4128,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "an asymmetric Jacobian is not transposed" begin
-            # The dense block is handed to PETSc row-major, so a transposition
-            # would survive any symmetric test. du1 = -u1 + 3u2, du2 = -2u2.
             asym!(du, u, p, t) = (du[1] = -u[1] + 3.0 * u[2]; du[2] = -2.0 * u[2]; nothing)
             function asym_jac!(J, u, p, t)
                 J[1, 1] = -1.0
@@ -4462,26 +4291,21 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 prob, alg; dt = 0.1, saveat = [0.3, 0.7], save_start = true, save_end = true,
             )
             @test ends.t ≈ [0.0, 0.3, 0.7, 1.0]
-            # interpolated points must carry the solver's accuracy, not a
-            # linear fallback between stored steps
             for sol in (scalar, vec), i in eachindex(sol.t)
                 @test abs(sol.u[i][1] - exact(sol.t[i])) < 1.0e-7
             end
         end
 
         @testset "the saving flags combine as in OrdinaryDiffEq" begin
-            # Every step and the saveat points together, with one point per time.
             both = SciMLBase.solve(
                 prob, alg; dt = 0.25, saveat = [0.3], save_everystep = true, tstops = [0.5],
             )
             @test both.t ≈ [0.0, 0.25, 0.3, 0.5, 0.75, 1.0]
             @test allunique(both.t)
-            # A saveat that names no time in the span saves nothing.
             @test isempty(SciMLBase.solve(prob, alg; dt = 0.1, saveat = [5.0]).t)
             # save_on = false keeps only the ends saveat does not rule out.
             @test SciMLBase.solve(prob, alg; dt = 0.1, save_on = false).t == [0.0, 1.0]
             @test isempty(SciMLBase.solve(prob, alg; dt = 0.1, saveat = [0.5], save_on = false).t)
-            # A saveat added to an integrator leaves every-step saving on.
             integ = SciMLBase.init(prob, alg; dt = 0.25, adaptive = false)
             SciMLBase.step!(integ)
             SciMLBase.add_saveat!(integ, 0.6)
@@ -4499,8 +4323,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test noend.t ≈ [0.0, 0.3]
             @test SciMLBase.solve(prob, alg; dt = 0.25, save_end = false).t ≈
                 [0.0, 0.25, 0.5, 0.75]
-            # Without saveat the first saved point is t0 itself, which is the
-            # only case where it has to be dropped.
             everystep = SciMLBase.solve(prob, alg; dt = 0.25, save_start = false)
             @test everystep.t ≈ [0.25, 0.5, 0.75, 1.0]
             noend = SciMLBase.solve(
@@ -4528,8 +4350,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         f = SciMLBase.ODEFunction(three!; jac = three_jac!)
         fixed = (dt = 0.1, adaptive = false)
         inner = (save_start = false, save_end = false)
-        # Forward and reversed, each with the times saved at and a level the first
-        # component crosses.
         spans = (
             (SciMLBase.ODEProblem(f, u0, (0.0, 1.0)), [0.25, 0.55, 0.85], 0.5),
             (SciMLBase.ODEProblem(f, u0, (1.0, 0.0)), [0.85, 0.55, 0.25], 2.0),
@@ -4539,7 +4359,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             PETScDiffEq.LibPETSc.TSInterpolate(h.petsclib, h.ts, integ.tdir * t, h.ctx.work)
             return PETScDiffEq._readvec!(similar(integ.u), h.petsclib, h.ctx.work)
         end
-        # Whether the integrator gives PETSc's own interpolant inside every step.
         function matches_petsc(prob, alg)
             integ = SciMLBase.init(prob, alg; fixed...)
             same = true
@@ -4588,7 +4407,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 algs,
                 PETScDiffEq.TSGeneric(st) for st in ("alpha", "theta", "beuler", "cn", "bdf", "arkimex", "rosw")
             )
-            # An option can change the subtype, which leaves only PETSc knowing its interpolant.
+            # A subtype set by an option is unknown to us, so it falls back to the Hermite.
             push!(
                 algs, PETScDiffEq.TSRK("5dp", ["-ts_rk_type", "8vr"]),
                 PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "rodas3"]),
@@ -4605,8 +4424,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             for (family, table, skip) in families, st in sort(collect(keys(table)))
                 st in skip || push!(algs, family(st))
             end
-            # The interpolant dense output uses, so saved values, the event state and
-            # the root agree with it to rounding.
             for alg in algs, (prob, want, level) in spans
                 dense = SciMLBase.solve(prob, alg; fixed...)
                 expected = [dense(t) for t in want]
@@ -4626,7 +4443,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test u_hit == dense(t_hit)
                 @test abs(t_hit - dense_root(dense, level)) < 5.0e-15
             end
-            # glle only solves whole, with no step for the integrator to take.
+            # glle only solves whole, with no step for an integrator to take.
             glle = PETScDiffEq.TSGeneric("glle")
             for (prob, want, _) in spans
                 dense = SciMLBase.solve(prob, glle; fixed...)
@@ -4645,7 +4462,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test SciMLBase.solve!(SciMLBase.init(prob, alg; kw...)).u ==
                     [dense(t) for t in want]
             end
-            # A right-hand side that depends on time, on a reversed span.
             driven!(du, u, p, t) = (du[1] = -u[1] + cos(3t); du[2] = sin(2t) * u[1]; nothing)
             function driven_jac!(J, u, p, t)
                 J .= 0.0
@@ -4688,11 +4504,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test nf(save_everystep = false, callback = idle) == plain
             @test nf(saveat = [0.2, 0.5]) == plain
             @test nf_init(saveat = [0.2, 0.5]) == plain
-            # 0.28 reuses 0.25's ends. 0.35 starts where that step ended, so only its
-            # far end is new.
+            # 0.25 costs two ends, 0.28 reuses them, 0.35 adds only its far end.
             @test nf(saveat = [0.25, 0.28, 0.35]) == plain + 3
             @test nf_init(saveat = [0.25, 0.28, 0.35]) == plain + 3
-            # A saved time on a step's end reuses the derivative already taken there.
             for count in (nf, nf_init)
                 @test count(saveat = [0.25, 0.3], dense = true) ==
                     count(saveat = [0.25], dense = true)
@@ -4700,7 +4514,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test count(saveat = [0.3, 0.35], dense = true) ==
                     count(saveat = [0.3], dense = true) + 2
             end
-            # A root finder asks for many points per step, all inside the same two ends.
             never = SciMLBase.ContinuousCallback((u, t, integ) -> u[1] + 1.0, integ -> nothing)
             @test nf(callback = never) == nf()
         end
@@ -4714,12 +4527,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 return @. (1 - Θ) * u0 + Θ * u1 +
                     Θ * (Θ - 1) * ((1 - 2Θ) * (u1 - u0) + (Θ - 1) * dt * f0 + Θ * dt * f1)
             end
-            # What the integrator should give inside its current step.
             expected(integ, t, rhs) = hermite(
                 t, integ.tprev, integ.uprev, rhs(integ.uprev, integ.tprev),
                 integ.t, integ.u, rhs(integ.u, integ.t),
             )
-            # Five steps in, with both derivatives of the last step already taken.
+            # Interpolating once caches both end derivatives.
             function halfway(pr)
                 integ = SciMLBase.init(pr, alg; fixed...)
                 for _ in 1:5
@@ -4756,7 +4568,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test integ(0.55) == expected(integ, 0.55, (u, t) -> -3.0 .* u)
             SciMLBase.terminate!(integ)
 
-            # Values saved after an affect! match dense output of the same run.
             lift = SciMLBase.ContinuousCallback(
                 (u, t, integ) -> u[1] - 0.5, integ -> (integ.u[1] += 1.0),
             )
@@ -4774,8 +4585,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
 
             midstep(integ) = integ((integ.tprev + integ.t) / 2)
-            # The same with an affect! that reads inside the step, then changes a
-            # parameter the end derivative depends on.
             retuned = Ref(false)
             retune! = integ -> (midstep(integ); integ.p[1] = 3.0; retuned[] = true)
             retunes = (
@@ -4799,8 +4608,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test [at.u[findfirst(==(t), at.t)] for t in want] == [dense(t) for t in want]
             end
 
-            # A parameter changed at a step's end leaves that step's interpolant alone. The
-            # step was taken with the old value, and only the next one answers to the new.
+            # A step's interpolant keeps the p it was taken with, whatever changes at its end.
             tuned = Vector{Float64}[]
             tuned_yet = Ref(false)
             looked_after = Ref(false)
@@ -4837,8 +4645,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 push!(peeked, tuned[1])
             end
 
-            # The same holds when nothing looked inside the step before the change, whatever
-            # the solve saves.
             retune_blind! = integ -> begin
                 integ.p[1] = 3.0
                 push!(tuned, midstep(integ))
@@ -4854,7 +4660,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
             tunable.p[1] = 1.0
 
-            # A change to the state at a step's end leaves the step before it as it was.
             driven = SciMLBase.ODEProblem(forced!, [1.0], (0.0, 1.0))
             for a in (alg, PETScDiffEq.TSRosW("2m"))
                 seen = Vector{Float64}[]
@@ -4884,7 +4689,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                         driven, a; fixed..., callback = SciMLBase.CallbackSet(cb, later),
                     )
                     @test seen == fill(seen[1], 3)
-                    # A step an event cut short ends at the root, as dense output has it.
                     @test seen[1] == sol(peeked_at[])
                 end
 
@@ -4914,8 +4718,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @testset "saved times outside the step at hand" begin
             prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
             back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
-            # PETSc steps past tf and interpolates back with its own interpolant, and the
-            # value saved at tf is the one the solve ends on.
+            # With this option PETSc steps past tf and interpolates back.
             overshoot = ["-ts_exact_final_time", "interpolate"]
             algs = (PETScDiffEq.TSRK("3bs", overshoot), PETScDiffEq.TSRK("5dp", overshoot))
             cases = ((prob, [0.5, 0.95, 1.0]), (back, [0.5, 0.05, 0.0]))
@@ -4926,7 +4729,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test sol.u[end] ==
                     SciMLBase.solve(pr, alg; long..., save_everystep = false).u[end]
             end
-            # A time already passed lies outside the step either interpolant covers.
             for alg in (PETScDiffEq.TSRK("4"), PETScDiffEq.TSRK("5dp"))
                 integ = SciMLBase.init(prob, alg; fixed...)
                 for _ in 1:4
@@ -4970,7 +4772,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     @test err isa ArgumentError && occursin("no interpolant", err.msg)
                     @test isempty(printed)
                 end
-                # Nothing between step ends is asked for here.
                 @test SciMLBase.solve(mass, alg; fixed..., saveat = [0.2, 0.5]).t ==
                     [0.2, 0.5]
                 @test SciMLBase.solve(
@@ -4995,16 +4796,12 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             for st in ("beuler", "cn", "theta", "bdf")
                 @test matches_petsc(mass, PETScDiffEq.TSImplicit(st))
             end
-            # Whether a type given by name interpolates is only found out by asking PETSc.
             refuses_between_steps(PETScDiffEq.TSGeneric("rosw", ["-ts_rosw_type", "rodas3"]))
-            # A type whose interpolant is registered but writes nothing is refused as well,
-            # rather than passing the untouched vector back as an answer.
+            # PETSc's irk registers an interpolant that writes nothing.
             refuses_between_steps(PETScDiffEq.TSGeneric("irk", ["-pc_type", "pbjacobi"]))
             @test matches_petsc(mass, PETScDiffEq.TSGeneric("rosw"))
-            # So is a subtype an option changes.
             refuses_between_steps(PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "rodas3"]))
             @test matches_petsc(mass, PETScDiffEq.TSRosW("rodas3", ["-ts_rosw_type", "ra34pw2"]))
-            # Once a saved time cannot be given, PETSc is not left to integrate to the end.
             calls = Ref(0)
             counting!(du, u, p, t) = (calls[] += 1; three!(du, u, p, t))
             counted = SciMLBase.ODEProblem(
@@ -5019,7 +4816,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 whole = SciMLBase.solve(counted, alg; fixed...).stats.nf
                 calls[] = 0
                 quietly(() -> SciMLBase.solve(counted, alg; fixed..., saveat = [0.25]))
-                # 0.25 lies in the third of ten steps, and PETSc takes one more.
+                # 0.25 is in the third of ten steps, and PETSc takes one more.
                 @test calls[] <= 5 * whole / 10
             end
 
@@ -5057,8 +4854,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "No Jacobian buffer is allocated when none is used" begin
-        # An explicit method never forms a Jacobian, so a solve must not pay
-        # for a dense n-by-n buffer. At n = 500 that buffer would be ~1.9 MiB.
+        # A dense 500x500 buffer would be about 1.9 MiB.
         n = 500
         prob = SciMLBase.ODEProblem(decay!, ones(n), (0.0, 1.0))
         alg = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
@@ -5105,9 +4901,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a singular M gives the index-1 DAE, not an ODE" begin
-            # u1' = -u1 with the algebraic constraint 0 = u2 - u1, so both
-            # components follow exp(-t). Integrating the second row as an ODE
-            # instead would give cosh(1).
             dae!(du, u, p, t) = (du[1] = -u[1]; du[2] = u[2] - u[1]; nothing)
             dae_prob = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(dae!; mass_matrix = [1.0 0.0; 0.0 0.0]),
@@ -5131,8 +4924,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a mass matrix that couples the components" begin
-            # M u' = -u with M = [2 0.5; 0 1] has the closed form
-            # u1 = 1.5exp(-t/2) - 0.5exp(-t), u2 = exp(-t).
             coupled = [2.0 0.5; 0.0 1.0]
             exact = [1.5exp(-0.5) - 0.5exp(-1.0), exp(-1.0)]
             for f in (
@@ -5155,10 +4946,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "the mass matrix reaches the Jacobian, not just the residual" begin
-            # The residual multiplies by M directly, so dropping M's off-diagonal
-            # leaves the answer right and only W wrong, and Newton still finds the
-            # root. Under a strong coupling it stops finding it at all.
-            # M = [1 5; 0 1] gives u1 = (5t + 1)exp(-t), u2 = exp(-t).
+            # A W without M's off-diagonal only fails Newton under a strong coupling like this.
             strong = SciMLBase.ODEFunction(
                 scaled!; mass_matrix = [1.0 5.0; 0.0 1.0], jac = scaled_jac!,
             )
@@ -5190,8 +4978,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     jac_prototype = proto,
                 ), [1.0, 1.0], (0.0, 1.0),
             )
-            # The shift lands on the mass matrix's (1, 2) entry, which the prototype leaves
-            # out. u2 = e^-t, and 2 u1' + u2' / 2 = -u1 gives u1 = 1.5 e^(-t/2) - 0.5 e^-t.
+            # The shift lands on M's (1, 2) entry, which the prototype leaves out.
             sol = SciMLBase.solve(
                 offdiag, PETScDiffEq.TSImplicit("bdf");
                 dt = 0.005, reltol = 1.0e-11, abstol = 1.0e-13,
@@ -5221,7 +5008,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         fixed = SciMLBase.solve(prob, alg; dt = 0.05, adaptive = false)
         @test fixed.stats.naccept == 20
         @test abs(fixed.u[end][1] - exp(-1.0)) < 1.0e-8
-        # the default controller is PETSc's own, so dt is only the first step
         @test SciMLBase.solve(prob, alg; dt = 0.05).stats.naccept < 20
     end
 
@@ -5236,7 +5022,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "Subtype setters take effect" begin
-        # Each subtype here differs in order from its family's default.
+        # Each differs in order from its family's default.
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         exact = exp(-1.0)
         function finest_order(alg)
@@ -5288,27 +5074,22 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 t = PETScDiffEq.LibPETSc.TSGetTolerances(integ.h.petsclib, integ.h.ts);
                 (t[1], t[3])
             )
-            # SciML's default tolerances reach PETSc, and opts reports them.
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
             @test (integ.opts.abstol, integ.opts.reltol) == (1.0e-6, 1.0e-3)
             @test held(integ) == (1.0e-6, 1.0e-3)
-            # Writing one tolerance leaves the other where it was.
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, reltol = 1.0e-5)
             integ.opts.abstol = 1.0e-9
             @test held(integ) == (1.0e-9, 1.0e-5)
 
-            # integ.dt is the step just taken; the next one is get_proposed_dt.
             SciMLBase.step!(integ)
             SciMLBase.step!(integ)
             @test integ.dt == integ.t - integ.tprev
             @test integ(integ.t - integ.dt) == integ.uprev
-            # The counters are live during the solve.
             @test integ.sol.stats.naccept == 2
             @test integ.sol.stats.nf > 0
             saved, exactly = SciMLBase.savevalues!(integ)
             @test (saved, exactly) == (false, false)
 
-            # A cap of no steps takes none, callback or not.
             never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
             capped = SciMLBase.solve(
                 prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, maxiters = 0,
@@ -5317,7 +5098,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test capped.retcode == SciMLBase.ReturnCode.MaxIters
             @test capped.t == [0.0]
 
-            # A floor written through opts is the one the solve keeps.
             fast!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
             quick = SciMLBase.ODEProblem(fast!, [1.0], (0.0, 1.0))
             integ = SciMLBase.init(
@@ -5328,7 +5108,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "the last step after the integrator has finished" begin
-            # The solution's dense output answers it, whichever interpolant ran before.
             for alg in (
                     PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
                     PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSARKIMEX("4"),
@@ -5341,7 +5120,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test abs(integ(t)[1] - exp(-t)) < 1.0e-3
             end
 
-            # An affect! that ends the solve finishes the integrator too.
             stop = SciMLBase.DiscreteCallback((u, t, integ) -> t >= 0.5, SciMLBase.terminate!)
             integ = SciMLBase.init(
                 prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = stop,
@@ -5425,7 +5203,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 SciMLBase.step!(integ, 0.3)
             end
             @test integ.t == 1.0
-            # Past the end of the span it returns, rather than stepping a finished integrator.
             SciMLBase.step!(integ, 0.3)
             @test integ.t == 1.0
             @test SciMLBase.done(integ)
@@ -5470,8 +5247,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "saveat matches solve exactly" begin
-            # The accuracy bound is per method: 5dp resolves exp(-t) to 1e-7 at
-            # dt = 0.1, second-order BDF only to about 1e-3.
             for (alg, kw, tol) in (
                     (PETScDiffEq.TSRK("5dp"), (; saveat = 0.25), 1.0e-7),
                     (PETScDiffEq.TSRK("5dp"), (; saveat = [0.3, 0.7]), 1.0e-7),
@@ -5495,7 +5270,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 (u, t, integ) -> t >= 0.5 && !fired[],
                 integ -> (integ.u[1] += 1.0; fired[] = true; nothing),
             )
-            # exp(-t) until the jump, then (exp(-0.5) + 1) exp(-(t - 0.5)) after it
             expected(t) = t < 0.5 ? exp(-t) : (exp(-0.5) + 1.0) * exp(-(t - 0.5))
 
             @testset "affect! changes the state PETSc integrates from" begin
@@ -5505,7 +5279,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     @test sol.retcode == SciMLBase.ReturnCode.Success
                     @test fired[]
                     @test abs(sol.u[end][1] - expected(1.0)) < 5.0e-3
-                    # save_positions defaults to (true, true): both sides of the jump
+                    # save_positions defaults to (true, true), so 0.5 is saved twice.
                     i = findfirst(==(0.5), sol.t)
                     @test i !== nothing && sol.t[i + 1] == 0.5
                     @test sol.u[i + 1][1] ≈ sol.u[i][1] + 1.0
@@ -5565,7 +5339,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     callback = quiet, save_everystep = false,
                 )
                 @test touched[] == 10
-                # no TSRestartStep, so BDF keeps its history and the answer is unchanged
+                # No TSRestartStep, so BDF keeps its history.
                 @test sol.u[end] == ref.u[end]
             end
 
@@ -5577,7 +5351,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test integ.t ≈ 0.05
                 @test SciMLBase.get_dt(integ) ≈ 0.05
                 n = length(integ.sol.t)
-                # Every step is saved already, so only a forced save adds a point.
                 @test SciMLBase.savevalues!(integ) == (false, false)
                 @test length(integ.sol.t) == n
                 @test SciMLBase.savevalues!(integ, true) == (true, true)
@@ -5617,7 +5390,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test_logs (:warn,) match_mode = :any SciMLBase.solve(
                     prob, alg; dt = 1.0e-3, reltol = 1.0e-8, abstol = 1.0e-10,
                 )
-                # fixed dt over a unit span, whatever the tolerance
                 @test steps(alg, 1.0e-3) == 1000
                 @test steps(alg, 1.0e-10) == 1000
             end
@@ -5790,14 +5562,14 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test_throws ArgumentError SciMLBase.solve(
             split, PETScDiffEq.TSARKIMEX("bpr3"); dt = 0.01, adaptive = false,
         )
-        # No embedded estimate, so the given dt is the step throughout.
+        # bpr3 has no embedded estimate, so dt is the step throughout.
         sol = SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX("bpr3"); dt = 0.01)
         @test sol.retcode == SciMLBase.ReturnCode.Success
         @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-7
     end
 
     @testset "Requested subtypes actually take effect" begin
-        # Each of these differs in order from its family's PETSc default.
+        # Each differs in order from its family's PETSc default.
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         exact = exp(-1.0)
         function measured_order(alg)
@@ -5808,14 +5580,14 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
             return log2(errs[end - 1] / errs[end])
         end
-        # rk defaults to 3bs (order 3); asking for 5dp must give order 5
+        # PETSc's rk defaults to 3bs, order 3.
         @test measured_order(
             PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"]),
         ) > 4.5
         @test measured_order(
             PETScDiffEq.TSRK("3bs", ["-ts_adapt_type", "none"]),
         ) < 3.5
-        # theta defaults to 0.5 (order 2); theta = 1 is backward Euler, order 1
+        # PETSc's theta defaults to 0.5, order 2.
         @test measured_order(
             PETScDiffEq.TSImplicit("theta", 1.0, ["-ts_adapt_type", "none"]),
         ) < 1.5
@@ -5830,8 +5602,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         tight = (dt = 0.1, reltol = 1.0e-10, abstol = 1.0e-12)
 
         @testset "steps exactly as the forward mirror problem" begin
-            # PETSc steps u' = -u from t = 1 down to 0 as v' = v from s = -1 up to 0, so that
-            # forward problem runs the same clock and matches bit for bit, BDF history included.
+            # A reversed span runs as v' = v on s = -t, so this mirror matches bit for bit.
             fwd = SciMLBase.ODEProblem(grow!, [1.0], (-1.0, 0.0))
             for (alg, kw) in (
                     (PETScDiffEq.TSRK("5dp"), (reltol = 1.0e-8, abstol = 1.0e-10)),
@@ -5906,7 +5677,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             preset = PresetTimeCallback([0.25, 0.75], integ -> push!(hits, integ.t))
             sol = SciMLBase.solve(back, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = preset)
             @test hits == [0.75, 0.25]
-            # save_positions defaults to (true, true), so each stop is saved twice
+            # save_positions defaults to (true, true), so each stop is saved twice.
             @test issorted(sol.t; rev = true)
             @test count(==(0.75), sol.t) == 2
             empty!(hits)
@@ -5959,7 +5730,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
             sol = SciMLBase.solve(dae, PETScDiffEq.TSDAE("bdf"); kw...)
             @test abs(sol.u[end][1] - exp(1.0)) < 1.0e-4
-            # sin is odd, so a right-hand side handed PETSc's own time would flip the answer.
+            # sin is odd, so f given PETSc's negated time would flip the answer.
             sine!(du, u, p, t) = (du[1] = sin(t); nothing)
             sol = SciMLBase.solve(
                 SciMLBase.ODEProblem(sine!, [0.0], (1.0, 0.0)), PETScDiffEq.TSRK("5dp"); kw...,
@@ -6023,7 +5794,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             (du, u, p, t) -> (du[1] = sin(10t); nothing), [2.0], (0.0, 1.0),
         )
         oop = SciMLBase.ODEProblem((u, p, t) -> [-u[1] + sin(10t)], [2.0], (2.0, 0.0))
-        # Expected values are OrdinaryDiffEq's init dt: Tsit5 for order 5, BS3 for order 3.
+        # OrdinaryDiffEq's init dt: Tsit5 for order 5, BS3 for order 3.
         for (prob, alg, kw, expected) in (
                 (forced, rk, tight, -0.020195969921921846),
                 (forced, rosw, tight, -0.001497756427620111),
@@ -6050,10 +5821,10 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             )
             @test isapprox(SciMLBase.init(prob, rk; kw...).dt, expected; rtol = 1.0e-12)
         end
-        # Infinite at u0: OrdinaryDiffEq returns its floor near 1e-323, this the small default.
+        # Infinite f at u0: OrdinaryDiffEq returns ~1e-323, this the 1e-6 default.
         blowup = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 1 / u[1]; nothing), [0.0], (0.0, 1.0))
         @test SciMLBase.init(blowup, rk; loose...).dt == 1.0e-6
-        # NaN only after the trial step: OrdinaryDiffEq returns NaN, this the small default.
+        # NaN after the trial step: OrdinaryDiffEq returns NaN, this the 1e-6 default.
         nan_after = SciMLBase.ODEProblem(
             (du, u, p, t) -> (du[1] = u[1] < 1 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
         )
@@ -6096,7 +5867,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test sol.retcode == SciMLBase.ReturnCode.Success
             @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-5
         end
-        # abstol = 0 gives the zero component a scale of 0, so the estimate's norms are NaN.
+        # abstol = 0 and a zero component make the error norm 0/0.
         zero_start = SciMLBase.ODEProblem(decay!, [0.0, 1.0], (0.0, 1.0))
         sol = SciMLBase.solve(zero_start, PETScDiffEq.TSRK("5dp"); abstol = 0.0, reltol = 1.0e-6)
         @test sol.retcode == SciMLBase.ReturnCode.Success
@@ -6108,7 +5879,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),
         )
         pair = SciMLBase.ODEProblem(decay!, [1.0, 1.0], (0.0, 1.0))
-        # Each of these is stepped at a fixed size, so it still needs dt.
+        # Stepped at a fixed size, so these still need dt.
         for (p, alg) in (
                 (prob, PETScDiffEq.TSRK("4")), (prob, PETScDiffEq.TSRK("1fe")),
                 (prob, PETScDiffEq.TSRosW("theta1")), (prob, PETScDiffEq.TSARKIMEX("prssp2")),
@@ -6132,7 +5903,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "PETScAdjoint" begin
-        # Nonlinear and explicitly time dependent, so every term of an adjoint step counts.
+        # Nonlinear and time dependent, so every adjoint term is exercised.
         function adj_f!(du, u, p, t)
             du[1] = -p[1] * u[1] + p[2] * u[1] * u[2]
             du[2] = p[3] * u[1] - p[4] * u[2]^2 + p[1] * sin(t)
@@ -6170,7 +5941,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
         u0, p0 = [1.0, 0.5], [0.7, 0.3, 0.4, 0.2]
         forward_t, backward_t = collect(0.0:0.1:1.0), collect(1.0:-0.1:0.0)
-        # Tight Newton and direct linear solves keep solver tolerances out of the differences.
+        # Tight Newton and a direct solve keep solver error out of the differences.
         exact = [
             "-snes_rtol", "1e-13", "-snes_atol", "1e-15", "-ksp_type", "preonly", "-pc_type", "lu",
         ]
@@ -6220,8 +5991,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     "a trajectory of states only", TSRK("4"), (0.0, 1.0), forward_t,
                     (sensealg = ["-ts_trajectory_solution_only", "1"],),
                 ),
-                # PETSc's 32-bit build fails its trajectory's file writes and reads now and then,
-                # in different ways from run to run.
+                # PETSc's 32-bit build fails trajectory file I/O intermittently.
                 (
                     Sys.WORD_SIZE == 64 ? (
                             (
@@ -6275,7 +6045,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                         if !(no_start && i == 1)
                 )
             end
-            # The worst case measured 6.9e-10, the floor of central differences at h = 1e-6.
+            # Measured 6.9e-10, the central-difference floor at h = 1e-6.
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-9
         end
 
@@ -6387,7 +6157,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 PETScAdjoint(petsc_options = ["-ts_trajectory_solution_only", "1"]);
                 t = ts, dgdu_discrete = half_norm_du!, dt, adaptive = false,
             )
-            # Forward Euler multiplies the state by a = 1 - p dt on every step.
+            # Forward Euler multiplies the state by a = 1 - p dt every step.
             a, k = 1 - 0.05 * dt, round.(Int, ts ./ dt)
             expected_du0 = sum(a .^ (2k))
             expected_dp = -sum(k .* dt .* a .^ (2k .- 1))
@@ -6415,14 +6185,13 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test plain[1] ≈ given[1] rtol = 1.0e-12
                 @test plain[2] ≈ given[2] rtol = 1.0e-12
             end
-            # `p` as a view, which the parameter Jacobian is prepared for as it comes.
             given = grad(adj_prob(copy(u0), copy(p0), (0.0, 1.0)), TSRK("4"))
             viewed = grad(
                 SciMLBase.ODEProblem(adj_f!, copy(u0), (0.0, 1.0), view([0.0; p0], 2:5)),
                 TSRK("4"),
             )
             @test viewed[2] ≈ given[2] rtol = 1.0e-12
-            # A chunk size picked for eight states is more than the two parameters take.
+            # Eight states make a chunk size larger than the two parameters need.
             decay!(du, u, p, t) = (du .= -p[1] .* u .+ p[2]; nothing)
             eight = SciMLBase.ODEProblem(decay!, ones(8), (0.0, 1.0), [1.0, 0.5])
             chunked = grad(
@@ -6452,8 +6221,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "a Float32 problem is differentiated in the double build" begin
-            # Its values are exact in Float64, so its gradients are the Float64 problem's
-            # rounded once to Float32, and a Float64 part keeps its own precision.
+            # The inputs are exact in Float64, so gradients are the Float64 ones rounded once.
             plain(u, p, tspan) = SciMLBase.ODEProblem(adj_f!, u, tspan, p)
             u32, p32 = Float32.(u0), Float32.(p0)
             for make in (adj_prob, plain), alg in (TSRK("4"), TSImplicit("cn", exact))
@@ -6467,9 +6235,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test mixed[1] isa Vector{Float32}
                 @test mixed[2] == double[2]
             end
-            # With `dt` repeated as the single-precision solve was given it, the times that
-            # solve saved are its steps, though PETSc's double build steps a rounding error
-            # off them. Measured within 5.9e-8 of the double problem's gradients.
+            # The double build steps a rounding off these Float32 times. Measured 5.9e-8.
             for alg in (TSRK("4"), TSImplicit("cn", exact))
                 prob = adj_prob(u32, p32, (0.0f0, 1.0f0))
                 sol = SciMLBase.solve(prob, alg; dt = 0.01f0, adaptive = false)
