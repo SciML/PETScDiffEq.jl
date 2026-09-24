@@ -1,6 +1,6 @@
 using MPI, PETScDiffEq, SciMLBase, Test
 using PETScDiffEq: PETSc
-using SciMLBase: ODEProblem, ODEFunction, DAEProblem, DiscreteCallback, ReturnCode, init, solve
+using SciMLBase: ODEProblem, ODEFunction, DiscreteCallback, ReturnCode, init, solve
 using SciMLBase: ContinuousCallback, VectorContinuousCallback, CallbackSet, terminate!, step!,
     solve!, reinit!, set_u!, get_du, add_tstop!, add_saveat!, savevalues!,
     change_t_via_interpolation!, set_proposed_dt!
@@ -463,16 +463,9 @@ crossing_last_row(idx, level) =
 
     @testset "refusals" begin
         prob = decay_problem(rows)
-        for alg in (
-                TSRosW(; comm), TSImplicit("beuler"; comm), TSIRK(2; comm), TSARKIMEX(; comm),
-                TSMPRK([1]; comm), TSGeneric("alpha"; comm),
-            )
-            @test refused(() -> solve(prob, alg; dt = 0.1), "runs only TSRK")
+        for alg in (TSMPRK([1]; comm), TSGeneric("alpha"; comm))
+            @test refused(() -> solve(prob, alg; dt = 0.1), "cannot run")
         end
-        dae = DAEProblem(
-            (r, du, u, p, t) -> (r .= du .+ u; nothing), -decay0(rows), decay0(rows), (0.0, 1.0),
-        )
-        @test refused(() -> solve(dae, TSDAE(; comm); dt = 0.1), "runs only TSRK")
         n = length(rows)
         jac = ODEFunction(decay!; jac = (J, u, p, t) -> nothing)
         @test refused(
