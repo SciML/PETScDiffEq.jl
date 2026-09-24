@@ -1260,8 +1260,11 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
             ctx.fend = nothing
             ctx.pdirty = false
         end
-        ctx.end_s = t
-        _readvec!(ctx.end_u, ctx.petsclib, x)
+        # Steps below the spacing of t still change the state, so keep the first one at t.
+        if step == 0 || t != ctx.end_s
+            ctx.end_s = t
+            _readvec!(ctx.end_u, ctx.petsclib, x)
+        end
 
     catch e
         ctx.err = e
@@ -2969,7 +2972,7 @@ end
 
 function _live_stats!(integ::PETScIntegrator)
     stats = integ.sol.stats
-    stats === nothing && return nothing
+    stats isa SciMLBase.DEStats || return nothing
     ctx, st = integ.h.ctx, _read_stats(integ.h)
     stats.nf, stats.nf2, stats.njacs = _nf(integ.h), ctx.nf2, ctx.njacs
     stats.nnonliniter, stats.nnonlinconvfail = st.nnonliniter, st.nnonlinfail
