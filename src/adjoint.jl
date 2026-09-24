@@ -34,6 +34,12 @@ which therefore has to be a vector of real numbers. A hand-written `jac` or `par
 goes into the gradient unchecked, so a wrong one gives a wrong gradient without an error;
 compare it against a gradient computed without it.
 
+The adjoint runs in PETSc's double real build. A `Float32` problem is solved there in
+`Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
+`du0` and `dp` come back as `Float32` where `u0` and `p` are. Its cost times are matched to
+the steps at single precision, so the times its own `solve` saved are accepted with `dt`
+repeated as that `solve` was given it. A complex state is refused.
+
 Costs are discrete: at each `t[i]`, `dgdu_discrete(out, u, p, t, i)` writes the cost's
 derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`, if given, its
 direct derivative with respect to `p`; `no_start = true` leaves out `t[1]`. PETSc's
@@ -85,6 +91,8 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     order::Vector{Int}
     next::Int
     s_prev::Float64
+    # The type of the clock `solve` ran this problem on, which its saved times come from.
+    clock::DataType
     cost_at_step::Dict{Int, Vector{Int}}
     u_at_step::Dict{Int, Vector{Float64}}
     u::Vector{Float64}
@@ -119,7 +127,7 @@ end
 
 function _adjoint_rhsjacobian!(
         ::LibPETSc.CTS,
-        s::LibPETSc.PetscReal,
+        s::Float64,
         x_ptr::LibPETSc.CVec,
         A_ptr::LibPETSc.CMat,
         ::LibPETSc.CMat,
@@ -148,7 +156,7 @@ const ADJ_RHSJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _adjoint_rhsjacobianp!(
         ::LibPETSc.CTS,
-        s::LibPETSc.PetscReal,
+        s::Float64,
         x_ptr::LibPETSc.CVec,
         A_ptr::LibPETSc.CMat,
         ctx_ptr::Ptr{Cvoid},
@@ -159,10 +167,10 @@ end
 
 function _adjoint_ijacobianp!(
         ::LibPETSc.CTS,
-        s::LibPETSc.PetscReal,
+        s::Float64,
         x_ptr::LibPETSc.CVec,
         ::LibPETSc.CVec,
-        ::LibPETSc.PetscReal,
+        ::Float64,
         A_ptr::LibPETSc.CMat,
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
@@ -192,7 +200,7 @@ const ADJ_IJACOBIANP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 function _adjoint_record!(
         ::LibPETSc.CTS,
         step::LibPETSc.PetscInt,
-        s::LibPETSc.PetscReal,
+        s::Float64,
         x_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
@@ -208,9 +216,12 @@ function _adjoint_record_body!(adj, step, s, x_ptr)
         # Steps are the step just taken apart, so a cost time within a small fraction of
         # it belongs to this step and cannot be nearer the previous one. PETSc adds each
         # step to its time, which rounds by up to an ulp per step, so the allowance grows
-        # with the step count.
+        # with the step count. It is an ulp of the clock `solve` ran on, whose saved times
+        # a single-precision problem's costs are taken at.
+        R = adj.clock
         tol = max(
-            sqrt(eps(Float64)) * (s - adj.s_prev), (step + 100) * eps(max(1.0, abs(s))),
+            sqrt(Float64(eps(R))) * (s - adj.s_prev),
+            (step + 100) * Float64(eps(R(max(1.0, abs(s))))),
         )
         adj.s_prev = s
         order, cost_s = adj.order, adj.cost_s
@@ -237,7 +248,7 @@ const ADJ_RECORD_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 function _adjoint_jump!(
         ::LibPETSc.CTS,
         step::LibPETSc.PetscInt,
-        ::LibPETSc.PetscReal,
+        ::Float64,
         ::LibPETSc.CVec,
         ::LibPETSc.PetscInt,
         ::Ptr{LibPETSc.CVec},
@@ -275,38 +286,39 @@ end
 const ADJ_JUMP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
 # Called from `__init__`, since `@cfunction` needs these functions defined where it appears.
+# The adjoint runs only in PETSc's double build, so its times are Float64.
 function _init_adjoint_pointers!()
     ADJ_RHSJACOBIAN_PTR[] = @cfunction(
         _adjoint_rhsjacobian!,
         LibPETSc.PetscErrorCode,
         (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CMat,
+            LibPETSc.CTS, Float64, LibPETSc.CVec, LibPETSc.CMat,
             LibPETSc.CMat, Ptr{Cvoid},
         )
     )
     ADJ_RHSJACOBIANP_PTR[] = @cfunction(
         _adjoint_rhsjacobianp!,
         LibPETSc.PetscErrorCode,
-        (LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CMat, Ptr{Cvoid})
+        (LibPETSc.CTS, Float64, LibPETSc.CVec, LibPETSc.CMat, Ptr{Cvoid})
     )
     ADJ_IJACOBIANP_PTR[] = @cfunction(
         _adjoint_ijacobianp!,
         LibPETSc.PetscErrorCode,
         (
-            LibPETSc.CTS, LibPETSc.PetscReal, LibPETSc.CVec, LibPETSc.CVec,
-            LibPETSc.PetscReal, LibPETSc.CMat, Ptr{Cvoid},
+            LibPETSc.CTS, Float64, LibPETSc.CVec, LibPETSc.CVec,
+            Float64, LibPETSc.CMat, Ptr{Cvoid},
         )
     )
     ADJ_RECORD_PTR[] = @cfunction(
         _adjoint_record!,
         LibPETSc.PetscErrorCode,
-        (LibPETSc.CTS, LibPETSc.PetscInt, LibPETSc.PetscReal, LibPETSc.CVec, Ptr{Cvoid})
+        (LibPETSc.CTS, LibPETSc.PetscInt, Float64, LibPETSc.CVec, Ptr{Cvoid})
     )
     ADJ_JUMP_PTR[] = @cfunction(
         _adjoint_jump!,
         LibPETSc.PetscErrorCode,
         (
-            LibPETSc.CTS, LibPETSc.PetscInt, LibPETSc.PetscReal, LibPETSc.CVec,
+            LibPETSc.CTS, LibPETSc.PetscInt, Float64, LibPETSc.CVec,
             LibPETSc.PetscInt, Ptr{LibPETSc.CVec}, Ptr{LibPETSc.CVec}, Ptr{Cvoid},
         )
     )
@@ -315,13 +327,7 @@ end
 
 # PETSc.jl's wrappers for these pin the callback context to `nothing`, hand PETSc an array
 # that lives only for the call when PETSc keeps a pointer to it, or drop the value they
-# fetch, so the symbols are called directly.
-const ADJOINT_SYMBOLS = Dict{Symbol, Ptr{Cvoid}}()
-
-_adjoint_symbol(petsclib, name::Symbol) = get!(ADJOINT_SYMBOLS, name) do
-    Libdl.dlsym(Libdl.dlopen(petsclib.petsc_library), name)
-end
-
+# fetch, so the symbols are called directly and their codes checked here.
 function _check_code(code, name)
     iszero(code) || throw(ErrorException("$name failed with $code"))
     return nothing
@@ -330,7 +336,7 @@ end
 function _exact_final_time(petsclib, ts)
     opt = Ref{LibPETSc.TSExactFinalTimeOption}()
     code = ccall(
-        _adjoint_symbol(petsclib, :TSGetExactFinalTime), LibPETSc.PetscErrorCode,
+        _symbol(petsclib, :TSGetExactFinalTime), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Ptr{LibPETSc.TSExactFinalTimeOption}), ts, opt,
     )
     _check_code(code, "TSGetExactFinalTime")
@@ -340,14 +346,14 @@ end
 function _trajectory_type(petsclib, ts)
     tj = Ref{Ptr{Cvoid}}(C_NULL)
     code = ccall(
-        _adjoint_symbol(petsclib, :TSGetTrajectory), LibPETSc.PetscErrorCode,
+        _symbol(petsclib, :TSGetTrajectory), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Ptr{Ptr{Cvoid}}), ts, tj,
     )
     _check_code(code, "TSGetTrajectory")
     tj[] == C_NULL && return "none"
     name = Ref{Ptr{Cchar}}(C_NULL)
     code = ccall(
-        _adjoint_symbol(petsclib, :TSTrajectoryGetType), LibPETSc.PetscErrorCode,
+        _symbol(petsclib, :TSTrajectoryGetType), LibPETSc.PetscErrorCode,
         (Ptr{Cvoid}, LibPETSc.CTS, Ptr{Ptr{Cchar}}), tj[], ts, name,
     )
     _check_code(code, "TSTrajectoryGetType")
@@ -417,6 +423,12 @@ function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_disc
         throw(
         ArgumentError(
             "PETScAdjoint supports an ODEProblem, not a DAEProblem or SplitODEProblem",
+        ),
+    )
+    eltype(prob.u0) <: Real || throw(
+        ArgumentError(
+            "PETScAdjoint supports a real state only; it runs in PETSc's double real " *
+                "build, which cannot hold a $(eltype(prob.u0)) one",
         ),
     )
     why = _adjoint_unsupported(alg)
@@ -565,7 +577,7 @@ function _discrete_adjoint_unlocked(
         prob, alg; solve_kwargs...,
         saveat = Float64[], save_everystep = false, save_start = true, save_end = true,
         dense = false, extra_options = vcat(_ADJOINT_TRAJECTORY, sensealg.petsc_options),
-        jac_advice = _ADJOINT_JAC_ADVICE,
+        jac_advice = _ADJOINT_JAC_ADVICE, eltypes = (Float64, Float64, Float64),
     )
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
     n = length(h.u0)
@@ -600,7 +612,7 @@ function _discrete_adjoint_unlocked(
                 _as_inplace_jac(prob.f.paramjac, iip),
             zeros(n, np),
             implicit ? -h.tdir : h.tdir, dgdu_discrete, Bool(no_start),
-            cost_t, cost_s, sortperm(cost_s), 1, h.t0,
+            cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
@@ -612,7 +624,7 @@ function _discrete_adjoint_unlocked(
                     PETSc.MatSeqAIJWithArrays(pl, MPI.COMM_SELF, _jacobian_pattern(J, n)) :
                     PETSc.MatSeqDense(pl, J)
                 code = ccall(
-                    _adjoint_symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
+                    _symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
                     (LibPETSc.CTS, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
                     ts, adj.jac_mat.ptr, adj.jac_mat.ptr, ADJ_RHSJACOBIAN_PTR[], adjptr,
                 )
@@ -622,7 +634,7 @@ function _discrete_adjoint_unlocked(
                 adj.pmat = PETSc.MatSeqDense(pl, adj.pJ)
                 name = implicit ? :TSSetIJacobianP : :TSSetRHSJacobianP
                 code = ccall(
-                    _adjoint_symbol(pl, name), LibPETSc.PetscErrorCode,
+                    _symbol(pl, name), LibPETSc.PetscErrorCode,
                     (LibPETSc.CTS, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
                     ts, adj.pmat.ptr,
                     implicit ? ADJ_IJACOBIANP_PTR[] : ADJ_RHSJACOBIANP_PTR[], adjptr,
@@ -635,7 +647,7 @@ function _discrete_adjoint_unlocked(
             push!(adj.lamarr, adj.lam.ptr)
             LibPETSc.TSMonitorSet(pl, ts, ADJ_RECORD_PTR[], adjptr)
             code = ccall(
-                _adjoint_symbol(pl, :TSAdjointMonitorSet), LibPETSc.PetscErrorCode,
+                _symbol(pl, :TSAdjointMonitorSet), LibPETSc.PetscErrorCode,
                 (LibPETSc.CTS, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
                 ts, ADJ_JUMP_PTR[], adjptr, C_NULL,
             )
@@ -698,7 +710,7 @@ function _discrete_adjoint_unlocked(
             # fails PETSc's own check for cost gradients instead of running before the
             # costs are recorded.
             code = ccall(
-                _adjoint_symbol(pl, :TSSetCostGradients), LibPETSc.PetscErrorCode,
+                _symbol(pl, :TSSetCostGradients), LibPETSc.PetscErrorCode,
                 (LibPETSc.CTS, LibPETSc.PetscInt, Ptr{LibPETSc.CVec}, Ptr{LibPETSc.CVec}),
                 ts, LibPETSc.PetscInt(1), pointer(adj.lamarr),
                 np > 0 ? pointer(adj.muarr) : Ptr{LibPETSc.CVec}(C_NULL),
@@ -737,8 +749,11 @@ function _discrete_adjoint_unlocked(
             dp .+= gp
         end
     end
-    return du0, has_p ? dp' : nothing
+    return _like(prob.u0, du0), has_p ? _like(p, dp)' : nothing
 end
+
+# A gradient comes back in the precision of what it is the gradient of.
+_like(x, g) = eltype(x) === Float32 ? Float32.(g) : g
 
 _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...) =
     _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; kwargs...))
