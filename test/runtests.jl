@@ -5238,6 +5238,40 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test abs(sol.u[end][1] - expected(1.0)) < 1.0e-6
             end
 
+            @testset "save_positions[1] saves the state before affect!" begin
+                double(sp) = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t == 0.5, integ -> (integ.u .*= 2; nothing);
+                    save_positions = sp,
+                )
+                alg = PETScDiffEq.TSRK("5dp")
+                kw = (tstops = [0.5], abstol = 1.0e-10, reltol = 1.0e-10)
+                pre = (callback = double((true, false)), save_everystep = false)
+                sol = SciMLBase.solve(prob, alg; kw..., pre...)
+                @test sol.t == [0.0, 0.5, 1.0]
+                @test abs(sol.u[2][1] - exp(-0.5)) < 1.0e-9
+                @test SciMLBase.solve!(SciMLBase.init(prob, alg; kw..., pre...)).t == sol.t
+
+                both = double((true, true))
+                at = SciMLBase.solve(prob, alg; kw..., callback = both, saveat = [0.0, 0.3, 0.6, 1.0])
+                @test at.t == [0.0, 0.3, 0.5, 0.5, 0.6, 1.0]
+                @test at.u[4] == 2 .* at.u[3]
+                @test count(==(0.5), SciMLBase.solve(prob, alg; kw..., callback = both).t) == 2
+                twice = SciMLBase.solve(
+                    prob, alg; kw..., callback = SciMLBase.CallbackSet(both, both),
+                    save_everystep = false,
+                )
+                @test first.(twice.u[2:5]) == [1, 2, 2, 4] .* twice.u[2][1]
+
+                ticks = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> true, integ -> nothing; save_positions = (true, false),
+                )
+                every = SciMLBase.solve(
+                    prob, alg; callback = ticks, save_everystep = false, dt = 0.25,
+                    adaptive = false,
+                )
+                @test every.t == [0.0, 0.25, 0.5, 0.75, 1.0]
+            end
+
             @testset "an affect! that declares no change is not written back" begin
                 touched = Ref(0)
                 quiet = SciMLBase.DiscreteCallback(

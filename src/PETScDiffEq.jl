@@ -2694,12 +2694,14 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     return true
 end
 
-function _apply_callbacks!(integ::PETScIntegrator)
+function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
     h = integ.h
     ctx = h.ctx
     for cb in integ.callbacks
         integ.finished && return nothing
         cb.condition(integ.u, integ.t, integ) || continue
+        cb.save_positions[1] && !saved && _record!(ctx, integ.tdir * integ.t, integ.u)
+        saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
         cb.affect!(integ)
@@ -2998,6 +3000,7 @@ function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near
     h = integ.h
     ctx = h.ctx
     tol = _near(integ.t)
+    n = length(ctx.ts)
     landed = false
     while ctx.saveat_idx <= length(ctx.saveat) &&
             ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + slack
@@ -3012,7 +3015,7 @@ function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near
     end
     endpoint && ctx.save_everystep && !landed &&
         _record_end!(ctx, integ.tdir * upto, integ.u)
-    return nothing
+    return length(ctx.ts) > n && _last_recorded(ctx, integ.tdir * upto)
 end
 
 # MATCHSTEP refuses a step leaving under 10 eps (1.2e-6 in Float32) before a stop.
@@ -3121,9 +3124,9 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     _end_step_here!(integ)
     fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing
-    fired || _save_step!(integ, integ.t, true)
+    saved = !fired && _save_step!(integ, integ.t, true)
     # Discrete callbacks run with the stop they landed on still at the head of the queue.
-    _apply_callbacks!(integ)
+    _apply_callbacks!(integ, saved)
     while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t)
         popfirst!(integ.tstops)
     end
