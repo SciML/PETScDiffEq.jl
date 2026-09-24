@@ -2124,6 +2124,12 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test_logs (:warn, r"floating point spacing") SciMLBase.solve!(integ)
             @test integ.sol.retcode == SciMLBase.ReturnCode.Unstable
             @test integ.sol.t == sol.t
+            plain = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                runaway, PETScDiffEq.TSRK("5dp"),
+            )
+            @test plain.retcode == SciMLBase.ReturnCode.Unstable
+            @test plain.t == sol.t
+            @test plain.u == sol.u
         end
 
         @testset "a step below dtmin ends the solve where it still holds" begin

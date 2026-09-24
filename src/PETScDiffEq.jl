@@ -1232,8 +1232,11 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
             ctx.fend = nothing
             ctx.pdirty = false
         end
-        ctx.end_s = t
-        _readvec!(ctx.end_u, ctx.petsclib, x)
+        # Steps below the spacing of t still change the state, so keep the first one at t.
+        if step == 0 || t != ctx.end_s
+            ctx.end_s = t
+            _readvec!(ctx.end_u, ctx.petsclib, x)
+        end
 
     catch e
         ctx.err = e
