@@ -1,6 +1,9 @@
 using MPI, PETScDiffEq, SciMLBase, Test
 using PETScDiffEq: PETSc
 using SciMLBase: ODEProblem, ODEFunction, DAEProblem, DiscreteCallback, ReturnCode, init, solve
+using SciMLBase: ContinuousCallback, VectorContinuousCallback, CallbackSet, terminate!, step!,
+    solve!, reinit!, set_u!, get_du, add_tstop!, add_saveat!, savevalues!,
+    change_t_via_interpolation!, set_proposed_dt!
 
 MPI.Init()
 const comm = MPI.COMM_WORLD
@@ -91,6 +94,38 @@ function heat_throwing(when)
         return nothing
     end
 end
+
+const FIXED = (; dt = 1.0e-3, adaptive = false)
+algorithm_pairs() = (
+    (TSRK("5dp"; comm), TSRK("5dp")),
+    (TSGeneric("ssp"; explicit = true, comm), TSGeneric("ssp"; explicit = true)),
+)
+
+parallel(alg) = alg.comm != MPI.COMM_SELF
+heat_problem(idx, alg) =
+    ODEProblem(parallel(alg) ? heat! : heat_serial!, heat0(idx), (0.0, 0.1))
+local_row(idx, g) = findfirst(==(g), idx)
+first_block(idx) = [g <= counts[1] ? 0.5 : 1.0 for g in idx]
+
+function against_serial(run, alg, serial_alg)
+    got = run(rows, alg)
+    return got, rank == 0 ? run(1:N, serial_alg) : got
+end
+
+function matches_serial(sol, ref; exact_t = true)
+    n = length(sol.t)
+    MPI.Allreduce(n, min, comm) == MPI.Allreduce(n, max, comm) || return false
+    same = same_everywhere(sol.t)
+    us = gathered(sol, counts)
+    rank == 0 || return same
+    length(sol.t) == length(ref.t) || return false
+    times = exact_t ? sol.t == ref.t : maximum(abs, sol.t - ref.t) <= ROUNDOFF
+    return same && times && sol.retcode == ref.retcode && maxdiff(us, ref.u) <= ROUNDOFF
+end
+
+halve_at(s) = DiscreteCallback((u, t, i) -> t == s, i -> (i.u .*= 0.5))
+crossing_last_row(idx, level) =
+    (u, t, i) -> (j = local_row(idx, N); j === nothing ? 1.0 : u[j] - level)
 
 @testset "MPI, $nranks ranks" begin
     tol = (abstol = 1.0e-10, reltol = 1.0e-10)
@@ -232,6 +267,200 @@ end
         @test sol.retcode == ReturnCode.Success
     end
 
+    @testset "discrete callbacks" begin
+        for (alg, serial_alg) in algorithm_pairs()
+            sol, ref = against_serial(alg, serial_alg) do idx, a
+                solve(heat_problem(idx, a), a; callback = halve_at(0.05), tstops = [0.05], FIXED...)
+            end
+            @test matches_serial(sol, ref)
+
+            fired = Ref(0)
+            sol, ref = against_serial(alg, serial_alg) do idx, a
+                n = Ref(0)
+                cb = DiscreteCallback(
+                    (u, t, i) -> N in idx && t >= 0.05 && n[] == 0, i -> (n[] += 1; i.u .*= 0.5),
+                )
+                s = solve(heat_problem(idx, a), a; callback = cb, tstops = [0.05], FIXED...)
+                parallel(a) && (fired[] = n[])
+                s
+            end
+            @test fired[] == 1
+            @test matches_serial(sol, ref)
+
+            sol, ref = against_serial(alg, serial_alg) do idx, a
+                function nudge!(i)
+                    j = local_row(idx, N)
+                    j === nothing ? SciMLBase.derivative_discontinuity!(i, false) : (i.u[j] += 0.1)
+                    return nothing
+                end
+                cb = DiscreteCallback((u, t, i) -> t == 0.05, nudge!)
+                solve(heat_problem(idx, a), a; callback = cb, tstops = [0.05], FIXED...)
+            end
+            @test matches_serial(sol, ref)
+        end
+    end
+
+    @testset "continuous callbacks" begin
+        for (alg, serial_alg) in algorithm_pairs()
+            for interp_points in (10, 1)
+                fired = Ref(0)
+                sol, ref = against_serial(alg, serial_alg) do idx, a
+                    n = Ref(0)
+                    affect!(i) = (n[] += 1; i.u .*= 2)
+                    cb = ContinuousCallback(crossing_last_row(idx, 0.15), affect!; interp_points)
+                    s = solve(heat_problem(idx, a), a; callback = cb, FIXED...)
+                    parallel(a) && (fired[] = n[])
+                    s
+                end
+                @test fired[] == 2
+                @test matches_serial(sol, ref; exact_t = false)
+            end
+
+            sol, ref = against_serial(alg, serial_alg) do idx, a
+                total(u) = parallel(a) ? MPI.Allreduce(sum(u), +, comm) : sum(u)
+                cb = ContinuousCallback((u, t, i) -> total(u) - 8.0, terminate!)
+                solve(heat_problem(idx, a), a; callback = cb, FIXED...)
+            end
+            @test sol.retcode == ReturnCode.Terminated
+            @test matches_serial(sol, ref; exact_t = false)
+
+            got, ref = against_serial(alg, serial_alg) do idx, a
+                events = Tuple{Float64, Vector{Int}}[]
+                function conditions(out, u, t, i)
+                    j, k = local_row(idx, N), local_row(idx, 1)
+                    out[1] = j === nothing ? 1.0 : u[j] - 0.25
+                    out[2] = k === nothing ? 1.0 : u[k] - 0.1
+                    return nothing
+                end
+                affect!(i, mask) = push!(events, (i.t, findall(!iszero, mask)))
+                cb = VectorContinuousCallback(conditions, affect!, 2)
+                (; sol = solve(heat_problem(idx, a), a; callback = cb, FIXED...), events)
+            end
+            @test same_everywhere(got.events)
+            @test last.(got.events) == last.(ref.events) == [[1], [2]]
+            @test maximum(abs, first.(got.events) - first.(ref.events)) <= ROUNDOFF
+            @test matches_serial(got.sol, ref.sol; exact_t = false)
+        end
+    end
+
+    @testset "saveat and terminate! with callbacks" begin
+        for (alg, serial_alg) in algorithm_pairs()
+            sol, ref = against_serial(alg, serial_alg) do idx, a
+                stop = DiscreteCallback((u, t, i) -> t >= 0.08, terminate!)
+                cbs = CallbackSet(halve_at(0.05), stop)
+                solve(heat_problem(idx, a), a; callback = cbs, tstops = [0.05], saveat = 0.01, FIXED...)
+            end
+            @test sol.retcode == ReturnCode.Terminated
+            @test issubset(0.0:0.01:0.08, sol.t)
+            @test matches_serial(sol, ref)
+
+            sol, ref = against_serial(alg, serial_alg) do idx, a
+                cb = ContinuousCallback(crossing_last_row(idx, 0.15), i -> (i.u .*= 2))
+                solve(heat_problem(idx, a), a; callback = cb, saveat = 0.01, FIXED...)
+            end
+            @test matches_serial(sol, ref; exact_t = false)
+        end
+    end
+
+    @testset "callback initialize and finalize" begin
+        for (alg, serial_alg) in algorithm_pairs()
+            finalized = Ref(0)
+            sol, ref = against_serial(alg, serial_alg) do idx, a
+                cb = DiscreteCallback(
+                    (u, t, i) -> false, i -> nothing;
+                    initialize = (c, u, t, i) -> (i.u ./= first_block(idx)),
+                    finalize = (c, u, t, i) -> parallel(a) && (finalized[] += 1),
+                )
+                solve(heat_problem(idx, a), a; callback = cb, FIXED...)
+            end
+            @test finalized[] == 1
+            @test matches_serial(sol, ref)
+        end
+    end
+
+    @testset "the integrator interface" begin
+        for (alg, serial_alg) in algorithm_pairs()
+            got, ref = against_serial(alg, serial_alg) do idx, a
+                integ = init(heat_problem(idx, a), a; FIXED...)
+                add_tstop!(integ, 0.0425)
+                add_saveat!(integ, 0.0333)
+                mids, dus = Vector{Float64}[], Vector{Float64}[]
+                while !SciMLBase.done(integ)
+                    step!(integ)
+                    push!(mids, integ((integ.tprev + integ.t) / 2))
+                    push!(dus, get_du(integ))
+                    k = length(mids)
+                    k == 20 && set_u!(integ, 0.5 .* integ.u)
+                    k == 30 && set_u!(integ, first_block(idx) .* integ.u)
+                    k == 40 && (integ.u .*= first_block(idx))
+                    k == 50 && savevalues!(integ, true)
+                    k == 60 && change_t_via_interpolation!(integ, (integ.tprev + integ.t) / 2)
+                end
+                first_sol = integ.sol
+                reinit!(integ, 2 .* heat0(idx))
+                (; first_sol, mids, dus, sol = solve!(integ))
+            end
+            @test 0.0425 in got.first_sol.t && 0.0333 in got.first_sol.t
+            @test matches_serial(got.first_sol, ref.first_sol)
+            @test matches_serial(got.sol, ref.sol)
+            mids = [gathered(u, counts) for u in got.mids]
+            dus = [gathered(du, counts) for du in got.dus]
+            if rank == 0
+                @test length(mids) == length(ref.mids)
+                @test maxdiff(mids, ref.mids) <= ROUNDOFF
+                @test maxdiff(dus, ref.dus) <= ROUNDOFF / dx^2
+            end
+        end
+
+        integ = init(heat_problem(rows, TSRK("5dp"; comm)), TSRK("5dp"; comm))
+        step!(integ)
+        set_proposed_dt!(integ, rank == 0 ? 1.0e-5 : 1.0e-4)
+        step!(integ)
+        @test same_everywhere(integ.t)
+        @test abs(integ.dt - 1.0e-5) <= ROUNDOFF
+        terminate!(integ)
+        @test integ.sol.retcode == ReturnCode.Terminated
+        @test same_everywhere(integ.sol.t)
+    end
+
+    @testset "a callback throwing on one rank raises on every rank" begin
+        prob = heat_problem(rows, TSRK("5dp"; comm))
+        late(t) = rank == thrower && t > 0.02
+        for cb in (
+                DiscreteCallback((u, t, i) -> late(t) ? error("condition threw") : false, i -> nothing),
+                DiscreteCallback((u, t, i) -> t > 0.02, i -> rank == thrower && error("affect threw")),
+                ContinuousCallback((u, t, i) -> late(t) ? error("condition threw") : 1.0, i -> nothing),
+                ContinuousCallback(
+                    crossing_last_row(rows, 0.15), i -> rank == thrower && error("affect threw"),
+                ),
+                DiscreteCallback(
+                    (u, t, i) -> false, i -> nothing;
+                    initialize = (c, u, t, i) -> rank == thrower && error("initialize threw"),
+                ),
+                DiscreteCallback(
+                    (u, t, i) -> false, i -> nothing;
+                    finalize = (c, u, t, i) -> rank == thrower && error("finalize threw"),
+                ),
+            )
+            @test raised(caught(() -> solve(prob, TSRK("5dp"; comm); callback = cb, FIXED...)), "threw")
+        end
+
+        armed = Ref(false)
+        f!(du, u, p, t) = (heat!(du, u, p, t); armed[] && rank == thrower && error("f threw"); nothing)
+        integ = init(
+            ODEProblem(f!, heat0(rows), (0.0, 0.1)), TSGeneric("ssp"; explicit = true, comm);
+            save_everystep = false, FIXED...,
+        )
+        step!(integ)
+        armed[] = true
+        @test raised(caught(() -> integ((integ.tprev + integ.t) / 2)), "f threw")
+        @test raised(caught(() -> get_du(integ)), "f threw")
+        armed[] = false
+        step!(integ)
+        @test !anywhere(any(isnan, integ((integ.tprev + integ.t) / 2)))
+        terminate!(integ)
+    end
+
     @testset "refusals" begin
         prob = decay_problem(rows)
         for alg in (
@@ -255,9 +484,6 @@ end
             () -> solve(ODEProblem(mass, decay0(rows), (0.0, 1.0), rows), TSRK("5dp"; comm)),
             "mass matrix",
         )
-        cb = DiscreteCallback((u, t, i) -> false, i -> nothing)
-        @test refused(() -> solve(prob, TSRK("5dp"; comm); callback = cb), "callbacks")
-        @test refused(() -> init(prob, TSRK("5dp"; comm); dt = 0.1), "integrator interface")
         @test refused(
             () -> PETScDiffEq._discrete_adjoint(
                 prob, TSRK("4"; comm), PETScAdjoint(); t = [1.0],
@@ -274,6 +500,10 @@ end
         @test rank == thrower ? e isa ArgumentError && occursin("abstol", e.msg) : remote(e)
         e = caught(() -> solve(prob, TSRK("5dp"; comm); save_idxs = [rank == thrower ? n + 1 : 1]))
         @test rank == thrower ? e isa ArgumentError && occursin("save_idxs", e.msg) : remote(e)
+        integ = init(prob, TSRK("5dp"; comm))
+        e = caught(() -> integ.opts.abstol = bad)
+        @test rank == thrower ? e isa ArgumentError && occursin("abstol", e.msg) : remote(e)
+        terminate!(integ)
     end
 
     @testset "every handle is freed" begin
