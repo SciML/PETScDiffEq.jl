@@ -2351,6 +2351,20 @@ end
 SciMLBase.derivative_discontinuity!(integ::PETScIntegrator, bool::Bool) =
     _locked(() -> _discontinuity_unlocked(integ, bool))
 
+function _set_p_unlocked(integ::PETScIntegrator, v)
+    setfield!(integ, :p, convert(fieldtype(typeof(integ), :p), v))
+    h = integ.h
+    h.ctx.p = integ.p
+    h.ctx.pdirty = true
+    # An FSAL method reuses its last stage's slope, taken with the old p, unless restarted.
+    h.destroyed || LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    return v
+end
+
+Base.setproperty!(integ::PETScIntegrator, name::Symbol, v) = name === :p ?
+    _locked(() -> _set_p_unlocked(integ, v)) :
+    setfield!(integ, name, convert(fieldtype(typeof(integ), name), v))
+
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
 function _proposed_dt_unlocked(integ::PETScIntegrator)
     integ.finished && return abs(integ.dt)
@@ -2921,6 +2935,7 @@ function _reinit_unlocked(
     old = integ.h
     prob = SciMLBase.remake(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
+        p = integ.p,
     )
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)

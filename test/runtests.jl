@@ -5306,6 +5306,23 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "a replaced integ.p is the one solved with" begin
+        scaled!(du, u, p, t) = (du[1] = -p * u[1]; nothing)
+        prob = SciMLBase.ODEProblem(scaled!, [1.0], (0.0, 1.0), 1.0)
+        tight = (abstol = 1.0e-10, reltol = 1.0e-10)
+        for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"))
+            cb = SciMLBase.DiscreteCallback((u, t, integ) -> t == 0.5, integ -> (integ.p = 2.0))
+            sol = SciMLBase.solve(prob, alg; tight..., callback = cb, tstops = [0.5])
+            @test abs(sol.u[end][1] - exp(-1.5)) < 2.0e-10
+            integ = SciMLBase.init(prob, alg; tight..., tstops = [0.5])
+            SciMLBase.step!(integ, 0.5, true)
+            integ.p = 2.0
+            @test abs(SciMLBase.solve!(integ).u[end][1] - exp(-1.5)) < 2.0e-10
+            SciMLBase.reinit!(integ)
+            @test abs(SciMLBase.solve!(integ).u[end][1] - exp(-2.0)) < 2.0e-10
+        end
+    end
+
     @testset "Only methods with an error estimate adapt" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         steps(alg, rt) = SciMLBase.solve(
