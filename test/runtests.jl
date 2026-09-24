@@ -1726,7 +1726,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "PETSc types this package cannot drive are refused" begin
-        for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk", "pseudo")
+        for t in ("alpha2", "basicsymplectic", "discgrad", "eimex", "mimex", "mprk", "pseudo")
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t; explicit = true)
         end
@@ -1736,15 +1736,16 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test PETScDiffEq.TSGeneric(t; explicit = true).ts_type == t
         end
 
-        for t in ("alpha", "beuler", "bdf", "cn", "dirk", "glle", "rosw", "theta")
+        for t in ("alpha", "beuler", "bdf", "cn", "dirk", "glle", "irk", "rosw", "theta")
             @test PETScDiffEq.TSGeneric(t).ts_type == t
         end
+        @test_throws "`irk` is an implicit PETSc type" PETScDiffEq.TSGeneric("irk"; explicit = true)
     end
 
     @testset "the same types are refused when an option selects them" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         solve_at(alg; kw...) = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, kw...)
-        for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk", "pseudo"), alg in (
+        for t in ("alpha2", "basicsymplectic", "discgrad", "eimex", "mimex", "mprk", "pseudo"), alg in (
                     PETScDiffEq.TSImplicit("beuler", ["-ts_type", t]),
                     PETScDiffEq.TSRK("4", ["-ts_type=$t"]),
                     PETScDiffEq.TSGeneric("glee", ["-TS_TYPE", t]; explicit = true),
@@ -1760,6 +1761,12 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test_throws "`$t` is an explicit PETSc type" SciMLBase.init(
                 prob, alg; dt = 0.1, adaptive = false,
             )
+        end
+        for alg in (
+                PETScDiffEq.TSRK("4", ["-ts_type", "irk"]),
+                PETScDiffEq.TSGeneric("euler", ["-ts_type=irk"]; explicit = true),
+            )
+            @test_throws "`irk` is an implicit PETSc type" solve_at(alg)
         end
         sol = solve_at(PETScDiffEq.TSRK("4", ["-ts_type", "glee"]))
         @test sol.retcode == SciMLBase.ReturnCode.Success

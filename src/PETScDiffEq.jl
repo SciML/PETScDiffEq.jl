@@ -356,9 +356,9 @@ Whether the named type adapts is not known here, so no tolerance warning is
 issued for it. Only `"euler"` and `"alpha"` have been run through this
 package's own convergence tests.
 
-`"alpha2"`, `"discgrad"`, `"eimex"`, `"mimex"` and `"mprk"` are refused: each is
-driven through a PETSc setup call this package does not make, and without it they
-crash or integrate to zero rather than saying anything.
+`"alpha2"`, `"basicsymplectic"`, `"discgrad"`, `"eimex"`, `"mimex"` and `"mprk"` are
+refused: each is driven through a PETSc setup call this package does not make, and
+without it they crash or integrate to zero rather than saying anything.
 """
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
@@ -369,6 +369,7 @@ end
 
 const _NEEDS_OTHER_SETUP = Dict(
     "alpha2" => "is for second-order systems and needs TSSetI2Function",
+    "basicsymplectic" => "needs TSRHSSplitSetIS to declare its position and momentum parts",
     "discgrad" => "needs TSDiscGradSetFormulation",
     "eimex" => "needs its own right-hand-side split, and integrates to zero without one",
     "mimex" => "needs TSRHSSplit to declare its slow and fast parts",
@@ -391,6 +392,9 @@ function TSGeneric(
     )
     !explicit && t in _EXPLICIT_ONLY && throw(
         ArgumentError("`$t` is an explicit PETSc type, so it needs `explicit = true`"),
+    )
+    explicit && t == "irk" && throw(
+        ArgumentError("`irk` is an implicit PETSc type, so it cannot take `explicit = true`"),
     )
     return TSGeneric(
         t, explicit, String[String(o) for o in petsc_options], _check_autodiff(autodiff),
@@ -2086,6 +2090,12 @@ function _setup(
                 ArgumentError(
                     "`$chosen` is an explicit PETSc type, so it needs " *
                         "`TSGeneric(\"$chosen\"; explicit = true)` rather than an option",
+                ),
+            )
+            !_uses_ifunction(alg) && chosen == "irk" && throw(
+                ArgumentError(
+                    "`irk` is an implicit PETSc type, so it needs `TSIRK` or " *
+                        "`TSGeneric(\"irk\")` rather than an option on an explicit algorithm",
                 ),
             )
             running = _running_name(petsclib, ts)
