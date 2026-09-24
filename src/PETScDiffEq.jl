@@ -598,8 +598,7 @@ function _throw_if_threw!(ctx::TSContext)
     return nothing
 end
 
-# On a distributed comm a rank whose `f` throws must keep making the calls the other ranks
-# make, so it keeps the error, returns NaN and carries on until the ranks next agree.
+# A rank whose `f` throws keeps making the collective calls, returning NaN until the ranks agree.
 function _call_f!(ctx::TSContext, du, u, t)
     ctx.comm === nothing && return ctx.f!(du, u, ctx.p, t)
     try
