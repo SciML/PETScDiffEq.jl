@@ -266,7 +266,8 @@ size.
 
 ## MPI
 
-`TSRK` and `TSGeneric(ts_type; explicit = true)` take a `comm` keyword. With a communicator
+`TSRK`, `TSRosW`, `TSImplicit`, `TSIRK`, `TSDAE`, `TSARKIMEX` and
+`TSGeneric(ts_type; explicit = true)` take a `comm` keyword. With a communicator
 other than the default `MPI.COMM_SELF` the solve runs distributed over it: every rank of
 `comm` calls `solve` with the same arguments, and `u0` is the block of the state that rank
 owns, the blocks following each other in rank order. Each rank's `sol.u` holds its own rows,
@@ -309,9 +310,10 @@ started PETSc on every rank.
 `saveat`, `tstops`, `d_discontinuities`, a fixed `dt` and dense output work as in a serial
 solve. Vector `abstol` and `reltol`, `save_idxs` and `p` are per rank.
 `unstable_check` and `isoutofdomain` are asked on each rank's rows, and `true` on any rank
-counts on all of them. When `f` or one of those checks throws on some ranks, those ranks go
-on with NaN until the end of the step, and then every rank throws, so an `f` that throws has to
-do so after its own communication.
+counts on all of them. When `f`, `jac` or one of those checks throws on some ranks, those
+ranks go on with NaN until the ranks next agree, at the end of the step or when its nonlinear
+solve fails, and then every rank throws, so an `f` that throws has to do so after its own
+communication.
 
 Callbacks and the integrator interface run distributed too, as long as every rank makes the
 same calls with the same arguments in the same order: `init`, `step!`, `solve!`, `reinit!`,
@@ -331,15 +333,52 @@ collective as well: an affect that calls `terminate!` has to call it on every ra
 affect, `initialize` or `finalize` that throws on some ranks makes every rank throw, as `f`
 does, so an affect that throws has to do so after its own communication.
 
-A distributed solve refuses, with an `ArgumentError`, the implicit algorithms, `TSMPRK`, a
-`jac`, a mass matrix and `PETScAdjoint`. Solving from several threads at once, as
-`EnsembleThreads` does, is not refused, but nothing then keeps the ranks' solves in the same
-order, which they need.
+The implicit algorithms build their Jacobian as a distributed PETSc matrix whose pattern
+comes from the problem's `jac_prototype`, which then holds this rank's rows only: it is
+`length(u0)` by the length of the whole state, with global column indices. A `jac` fills
+those rows, and is collective like `f`. For the heat equation above:
+
+```julia
+using SparseArrays
+
+N = 8nranks
+rows = 8rank .+ (1:8)
+near(i) = max(1, i - 1):min(N, i + 1)
+proto = sparse(
+    [k for (k, i) in enumerate(rows) for _ in near(i)], [j for i in rows for j in near(i)],
+    1.0, 8, N,
+)
+function heat_jac!(J, u, p, t)
+    for (k, i) in enumerate(rows), j in near(i)
+        J[k, j] = (i == j ? -2 : 1) / dx^2
+    end
+end
+
+f = ODEFunction(heat!; jac = heat_jac!, jac_prototype = proto)
+sol = solve(ODEProblem(f, sinpi.(x), (0.0, 0.1)), TSImplicit("bdf"; comm))
+```
+
+Without a `jac`, `autodiff` defaults to `AutoFiniteDiff()` on such a `comm`: PETSc colours the
+prototype's pattern and differences `f`, calling it the same number of times on every rank.
+ForwardDiff and the other `autodiff` backends are refused there, since the number of times
+they call `f` differs between ranks. So are a `jac` or colouring without a sparse prototype,
+a mass matrix other than a `Diagonal` of this rank's entries, and `TSIRK` without a `jac`.
+`TSIRK` also needs each rank to hold PETSc's own share of the state, split evenly with the
+first ranks taking one row more, since PETSc lays out its stage vector that way.
+
+PETSc solves the linear systems of a distributed solve with GMRES and block Jacobi, one
+ILU(0) block on each rank, to a relative tolerance of 1e-5, so such a solve agrees with a
+serial one to that accuracy rather than to round-off. Options such as `-ksp_rtol` or
+`-sub_pc_type` in `petsc_options` change that solver.
+
+A distributed solve refuses, with an `ArgumentError`, `TSMPRK`, an implicit `TSGeneric` and
+`PETScAdjoint`. Solving from several threads at once, as `EnsembleThreads` does, is not
+refused, but nothing then keeps the ranks' solves in the same order, which they need.
 
 ## Limitations
 
-Only the explicit methods run distributed so far, as described under MPI; every other solve
-runs on `MPI.COMM_SELF`. PETSc TS is built for large distributed problems, and reaching it
+Only the algorithms named under MPI run distributed so far; every other solve runs on
+`MPI.COMM_SELF`. PETSc TS is built for large distributed problems, and reaching it
 from the SciML interface is what this package is for; use OrdinaryDiffEq.jl for serial
 problems where it applies.
 
