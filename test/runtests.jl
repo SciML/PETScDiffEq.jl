@@ -2693,6 +2693,23 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test_throws ArgumentError SciMLBase.solve(
                 prob, alg; dt = 1.0e-4, abstol = [1.0e-6, -1.0],
             )
+
+            integ = SciMLBase.init(prob, alg; dt = 1.0e-4)
+            held() = (
+                t = PETScDiffEq.LibPETSc.TSGetTolerances(integ.h.petsclib, integ.h.ts);
+                (t[1], t[2].ptr, t[3], t[4].ptr)
+            )
+            @test_throws ArgumentError integ.opts.abstol = [1.0e-8]
+            @test_throws ArgumentError integ.opts.reltol = [1.0e-6, -1.0]
+            @test (integ.opts.abstol, integ.opts.reltol) == (1.0e-6, 1.0e-3)
+            @test held() == (1.0e-6, C_NULL, 1.0e-3, C_NULL)
+            SciMLBase.step!(integ)
+            @test !integ.finished
+            @test integ.t > 0
+            integ.opts.abstol = [1.0e-8, 1.0e-8]
+            @test held()[2] != C_NULL
+            SciMLBase.step!(integ)
+            @test !integ.finished
         end
 
         @testset "a non-adaptive method still warns" begin

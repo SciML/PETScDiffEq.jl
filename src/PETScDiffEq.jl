@@ -2244,7 +2244,7 @@ end
 
 function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {H, R}
     h = getfield(o, :h)
-    name in (:abstol, :reltol) && _check_real_tol(v, name)
+    name in (:abstol, :reltol) && _check_tol(v, length(h.u0), name)
     setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : v)
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib
