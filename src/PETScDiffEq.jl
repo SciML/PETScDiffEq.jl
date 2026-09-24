@@ -1228,6 +1228,8 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
             ctx.fend = nothing
             ctx.pdirty = false
         end
+        ctx.end_s = t
+        _readvec!(ctx.end_u, ctx.petsclib, x)
 
     catch e
         ctx.err = e
@@ -2214,10 +2216,12 @@ function _solve_unlocked(
         end
         ctx.err === nothing || throw(ctx.err)
         h.stopped == 0 || _warn_failed_step(alg, h.stopped)
-        # PETSc sets the solve time only when TSSolve returns normally.
-        tend = h.stopped == 0 ? LibPETSc.TSGetSolveTime(pl, h.ts) : LibPETSc.TSGetTime(pl, h.ts)
+        # PETSc sets the solve time only when TSSolve returns normally, and a step that
+        # raises leaves its rejected trial in the solution vector.
+        tend, uend = h.stopped == 0 ?
+            (LibPETSc.TSGetSolveTime(pl, h.ts), _readvec!(similar(h.u0), pl, h.u)) :
+            (ctx.end_s, copy(ctx.end_u))
         st = _read_stats(h)
-        uend = _readvec!(similar(h.u0), pl, h.u)
     finally
         _destroy!(h)
     end

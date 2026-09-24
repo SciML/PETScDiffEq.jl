@@ -2092,6 +2092,25 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test allunique(over.t)
         end
 
+        @testset "a step that raises leaves the last accepted state at the end" begin
+            breaks = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
+            )
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            for kw in ((;), (; save_everystep = false))
+                plain = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                    breaks, PETScDiffEq.TSRK("5dp"); kw...,
+                )
+                stepped = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                    breaks, PETScDiffEq.TSRK("5dp"); callback = never, kw...,
+                )
+                @test plain.retcode == SciMLBase.ReturnCode.Unstable
+                @test all(isfinite, plain.u[end])
+                @test plain.t == stepped.t
+                @test plain.u == stepped.u
+            end
+        end
+
         @testset "a step below dtmin ends the solve where it still holds" begin
             fast!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
             quick = SciMLBase.ODEProblem(fast!, [1.0], (0.0, 1.0))
