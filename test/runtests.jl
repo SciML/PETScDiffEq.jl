@@ -5002,6 +5002,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test integ.sol.stats.nf > 0
             saved, exactly = SciMLBase.savevalues!(integ)
             @test (saved, exactly) == (false, false)
+            SciMLBase.change_t_via_interpolation!(integ, (integ.tprev + integ.t) / 2)
+            @test integ.dt == integ.t - integ.tprev
+            @test integ(integ.t - integ.dt) == integ.uprev
 
             never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
             capped = SciMLBase.solve(

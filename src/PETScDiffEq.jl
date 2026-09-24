@@ -2430,6 +2430,7 @@ function _change_t_unlocked(
     t = oftype(integ.t, t)
     copyto!(integ.u, _state_at(integ, t))
     integ.t = t
+    integ.dt = integ.t - integ.tprev
     _end_step_here!(integ)
     PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), integ.h.u; read = false, write = true,
