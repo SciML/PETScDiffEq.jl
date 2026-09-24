@@ -505,6 +505,8 @@ mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
     ts::Vector{R}
     us::Vector{Vector{U}}
     dus::Vector{Vector{U}}
+    user_ts::Union{Nothing, Vector{R}}
+    user_dus::Union{Nothing, Vector{Vector{U}}}
     saveat::Vector{R}
     saveat_idx::Int
     save_everystep::Bool
@@ -544,9 +546,11 @@ function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     full = Vector{S}(x)
     idxs = ctx.save_idxs
     push!(ctx.ts, R(t))
+    ctx.user_ts === nothing || push!(ctx.user_ts, _user_t(ctx.tdir, R(t)))
     if ctx.dense
         du === nothing && (du = _derivative(ctx, R(t), full))
         push!(ctx.dus, _select(du, idxs))
+        ctx.user_dus === nothing || push!(ctx.user_dus, -ctx.dus[end])
     end
     push!(ctx.us, _select(full, idxs))
     return du
@@ -1926,7 +1930,7 @@ function _setup(
         similar(u0), similar(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0,
         idx0,
         row_cols0, row_src, row_buf, J0,
-        R[], Vector{U}[], Vector{U}[],
+        R[], Vector{U}[], Vector{U}[], nothing, nothing,
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
         PETScCompat.PetscVec(petsclib, n),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
@@ -2876,7 +2880,6 @@ function _initial_save!(h::TSHandles)
     return nothing
 end
 
-# A forward solve shares ctx's arrays, which keeps a running integrator's `sol` current.
 _user_time(h::TSHandles) = h.tdir > 0 ? (h.ctx.ts, h.ctx.dus) :
     (_user_t.(h.tdir, h.ctx.ts), [-d for d in h.ctx.dus])
 
@@ -2884,6 +2887,8 @@ _nf(h::TSHandles) = h.ctx.nf + (h.ad_calls === nothing ? 0 : h.ad_calls[])
 
 function _initial_solution(prob, alg, h::TSHandles)
     ts, dus = _user_time(h)
+    # The running `sol` shares these arrays, and `_record!` extends a reversed span's copies.
+    h.tdir > 0 || ((h.ctx.user_ts, h.ctx.user_dus) = (ts, dus))
     return SciMLBase.build_solution(
         prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
         dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = SciMLBase.DEStats(0),

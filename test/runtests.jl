@@ -5578,6 +5578,24 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test abs(integ.u[1] - exp(1.0)) < 1.0e-5
         end
 
+        @testset "the running solution keeps up with each step" begin
+            fwd = SciMLBase.ODEProblem(grow!, [1.0], (-1.0, 0.0))
+            for dense in (true, false)
+                b = SciMLBase.init(back, PETScDiffEq.TSRK("5dp"); dense = dense, tight...)
+                f = SciMLBase.init(fwd, PETScDiffEq.TSRK("5dp"); dense = dense, tight...)
+                for _ in 1:3
+                    SciMLBase.step!(b)
+                    SciMLBase.step!(f)
+                end
+                @test length(b.sol.t) == length(b.sol.u) == 4
+                @test b.sol.t[end] == b.t
+                @test b.sol(b.t) == b.u
+                @test b.sol.t == -f.sol.t
+                tm = (b.tprev + b.t) / 2
+                @test b.sol(tm) == f.sol(-tm)
+            end
+        end
+
         @testset "callbacks" begin
             hits = Float64[]
             preset = PresetTimeCallback([0.25, 0.75], integ -> push!(hits, integ.t))
