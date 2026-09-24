@@ -2735,6 +2735,23 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test_throws ArgumentError SciMLBase.solve(
                 prob, alg; dt = 1.0e-4, abstol = [1.0e-6, -1.0],
             )
+
+            integ = SciMLBase.init(prob, alg; dt = 1.0e-4)
+            held() = (
+                t = PETScDiffEq.LibPETSc.TSGetTolerances(integ.h.petsclib, integ.h.ts);
+                (t[1], t[2].ptr, t[3], t[4].ptr)
+            )
+            @test_throws ArgumentError integ.opts.abstol = [1.0e-8]
+            @test_throws ArgumentError integ.opts.reltol = [1.0e-6, -1.0]
+            @test (integ.opts.abstol, integ.opts.reltol) == (1.0e-6, 1.0e-3)
+            @test held() == (1.0e-6, C_NULL, 1.0e-3, C_NULL)
+            SciMLBase.step!(integ)
+            @test !integ.finished
+            @test integ.t > 0
+            integ.opts.abstol = [1.0e-8, 1.0e-8]
+            @test held()[2] != C_NULL
+            SciMLBase.step!(integ)
+            @test !integ.finished
         end
 
         @testset "a non-adaptive method still warns" begin
@@ -4801,6 +4818,19 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test sol.stats.nf > 0
         @test sol.stats.naccept == 10
         @test sol.stats.nreject == 0
+
+        for span in ((0.0, 1.0), (1.0, 0.0))
+            reads = Int[]
+            cb = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> true, integ -> push!(reads, integ.sol.stats.naccept);
+                save_positions = (false, false),
+            )
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, [1.0], span), PETScDiffEq.TSRK("5dp");
+                callback = cb, abstol = 1.0e-8, reltol = 1.0e-8,
+            )
+            @test reads == 1:sol.stats.naccept
+        end
     end
 
     @testset "Unsupported keywords warn rather than being dropped" begin
@@ -5048,6 +5078,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test integ.sol.stats.nf > 0
             saved, exactly = SciMLBase.savevalues!(integ)
             @test (saved, exactly) == (false, false)
+            SciMLBase.change_t_via_interpolation!(integ, (integ.tprev + integ.t) / 2)
+            @test integ.dt == integ.t - integ.tprev
+            @test integ(integ.t - integ.dt) == integ.uprev
 
             never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
             capped = SciMLBase.solve(
@@ -5639,6 +5672,24 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test 0.45 in integ.sol.t
             @test integ.t == 0.0
             @test abs(integ.u[1] - exp(1.0)) < 1.0e-5
+        end
+
+        @testset "the running solution keeps up with each step" begin
+            fwd = SciMLBase.ODEProblem(grow!, [1.0], (-1.0, 0.0))
+            for dense in (true, false)
+                b = SciMLBase.init(back, PETScDiffEq.TSRK("5dp"); dense = dense, tight...)
+                f = SciMLBase.init(fwd, PETScDiffEq.TSRK("5dp"); dense = dense, tight...)
+                for _ in 1:3
+                    SciMLBase.step!(b)
+                    SciMLBase.step!(f)
+                end
+                @test length(b.sol.t) == length(b.sol.u) == 4
+                @test b.sol.t[end] == b.t
+                @test b.sol(b.t) == b.u
+                @test b.sol.t == -f.sol.t
+                tm = (b.tprev + b.t) / 2
+                @test b.sol(tm) == f.sol(-tm)
+            end
         end
 
         @testset "callbacks" begin
