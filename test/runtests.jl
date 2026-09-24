@@ -759,10 +759,14 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 sol = @test_logs min_level = Logging.Warn SciMLBase.solve(tiny, beuler; dt = 0.01f0)
                 @test sol.u[end][1] ≈ 1.0f-22 / 1.01f0^100 rtol = 1.0e-5
             end
-            @test_logs min_level = Logging.Warn SciMLBase.solve(
-                SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f5)),
-                PETScDiffEq.TSImplicit("bdf"),
-            )
+            # Decaying into the underflow range warns only if the solve fails there.
+            logs, decayed = Test.collect_test_logs(min_level = Logging.Warn) do
+                SciMLBase.solve(
+                    SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f5)),
+                    PETScDiffEq.TSImplicit("bdf"),
+                )
+            end
+            @test isempty(logs) == (decayed.retcode == SciMLBase.ReturnCode.Success)
             @test_logs min_level = Logging.Warn SciMLBase.solve(
                 SciMLBase.remake(tiny; u0 = Float32[1.0f-15]), beuler; dt = 0.01f0,
             )
