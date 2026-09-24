@@ -1194,6 +1194,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         SciMLBase.step!(integ)
         @test tried ≈ [0.1, 0.02]
         @test integ.t ≈ 0.02
+        @test integ.sol.stats.nreject == 1
         @test !integ.finished
         every_other = Ref(0)
         alternate = (u, p, t) -> (every_other[] += 1; isodd(every_other[]))
@@ -2142,6 +2143,41 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test all(isfinite, plain.u[end])
                 @test plain.t == stepped.t
                 @test plain.u == stepped.u
+            end
+        end
+
+        @testset "a NaN trial step is taken again smaller, as OrdinaryDiffEq takes it" begin
+            breaks = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
+            )
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRK("3bs")),
+                    kw in ((;), (; saveat = 0.05))
+                plain = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                    breaks, alg; kw...,
+                )
+                stepped = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                    breaks, alg; callback = never, kw...,
+                )
+                @test plain.retcode == SciMLBase.ReturnCode.Unstable
+                @test 0.5 - plain.t[end] < 1.0e-12
+                @test maximum(abs(u[1] - exp(-t)) for (t, u) in zip(plain.t, plain.u)) < 2.0e-4
+                @test plain.stats.nreject > 10
+                @test plain.t == stepped.t
+                @test plain.u == stepped.u
+                @test stepped.retcode == plain.retcode
+                @test (stepped.stats.naccept, stepped.stats.nreject, stepped.stats.nf) ==
+                    (plain.stats.naccept, plain.stats.nreject, plain.stats.nf)
+            end
+            for run in (
+                    () -> SciMLBase.solve(breaks, PETScDiffEq.TSRK("5dp"); dtmin = 0.01),
+                    () -> SciMLBase.solve(
+                        breaks, PETScDiffEq.TSRK("5dp"); dtmin = 0.01, callback = never,
+                    ),
+                )
+                floored = @test_logs (:warn, r"floating point exception") run()
+                @test floored.retcode == SciMLBase.ReturnCode.DtLessThanMin
+                @test 0.45 < floored.t[end] < 0.5
             end
         end
 

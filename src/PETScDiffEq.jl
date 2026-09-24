@@ -545,6 +545,9 @@ mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
     nf2::Int
     njacs::Int
     err::Union{Nothing, Any}
+    retry_fp::Bool
+    workvec::Ptr{Cvoid}
+    nreject::Int
 end
 
 function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
@@ -692,6 +695,76 @@ function _warn_failed_step(alg, code)
         "the LU factorization of its Newton matrix hit a zero pivot"
     @warn "`$(_warn_name(alg))` ends here because $why"
     return nothing
+end
+
+function _ts_dm(pl, ts)
+    dm = Ref{Ptr{Cvoid}}(C_NULL)
+    code = ccall(
+        _symbol(pl, :TSGetDM), LibPETSc.PetscErrorCode, (LibPETSc.CTS, Ptr{Ptr{Cvoid}}), ts, dm,
+    )
+    code == 0 || throw(LibPETSc.PetscError(code))
+    return dm[]
+end
+
+# TSAdapt raises PETSC_ERR_FP with its DM work vector still out, which pins the DM and fails
+# its next DMClearGlobalVectors. Holding the vector the DM hands out first lets it go back.
+function _hold_work_vec!(ctx, ts)
+    pl = ctx.petsclib
+    dm, v = _ts_dm(pl, ts), Ref{Ptr{Cvoid}}(C_NULL)
+    code = ccall(
+        _symbol(pl, :DMGetGlobalVector), LibPETSc.PetscErrorCode,
+        (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}), dm, v,
+    )
+    code == 0 || throw(LibPETSc.PetscError(code))
+    ccall(_symbol(pl, :PetscObjectReference), LibPETSc.PetscErrorCode, (Ptr{Cvoid},), v[])
+    ctx.workvec = v[]
+    ccall(
+        _symbol(pl, :DMRestoreGlobalVector), LibPETSc.PetscErrorCode,
+        (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}), dm, v,
+    )
+    return nothing
+end
+
+function _return_work_vec!(ctx, ts)
+    ctx.workvec == C_NULL && return false
+    pl = ctx.petsclib
+    dm, owner = _ts_dm(pl, ts), Ref{Ptr{Cvoid}}(C_NULL)
+    ccall(
+        _symbol(pl, :VecGetDM), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}),
+        ctx.workvec, owner,
+    )
+    owner[] == dm || return false
+    return ccall(
+        _symbol(pl, :DMRestoreGlobalVector), LibPETSc.PetscErrorCode,
+        (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}), dm, Ref(ctx.workvec),
+    ) == 0
+end
+
+function _release_work_vec!(ctx)
+    ctx.workvec == C_NULL && return nothing
+    ccall(
+        _symbol(ctx.petsclib, :VecDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+        Ref(ctx.workvec),
+    )
+    ctx.workvec = C_NULL
+    return nothing
+end
+
+function _retry_step(h, s, taken, floor, forced, failed)
+    ctx = h.ctx
+    ctx.nreject += 1
+    smaller = taken / 5
+    if forced && smaller < floor
+        failed && taken <= floor || return min(floor, taken), true
+        ctx.unstable_hit = true
+        return nothing, false
+    end
+    below_floor = ctx.dtmin > 0 && smaller < ctx.dtmin
+    if below_floor || smaller < 100 * eps(max(abs(s), abs(h.t0), abs(h.tf)))
+        below_floor ? (ctx.dt_too_small = true) : (ctx.unstable_hit = true)
+        return nothing, false
+    end
+    return smaller, false
 end
 
 function _pivot_raises(pl, ts)
@@ -1222,6 +1295,7 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     try
+        ctx.retry_fp && ctx.workvec == C_NULL && _hold_work_vec!(ctx, ts_ptr)
         ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
         tol = _near(t)
         landed = false
@@ -1609,6 +1683,8 @@ function _destroy!(h::TSHandles)
     end
     h.ctx.work.ptr == C_NULL || PETScCompat.destroy!(h.ctx.work)
     h.u === nothing || PETScCompat.destroy!(h.u)
+    h.ts === nothing || _return_work_vec!(h.ctx, h.ts)
+    _release_work_vec!(h.ctx)
     h.ts === nothing || LibPETSc.TSDestroy(h.petsclib, h.ts)
     return nothing
 end
@@ -1976,7 +2052,8 @@ function _setup(
         R(NaN), similar(u0), false,
         _floor(R, dtmin, force_dtmin, adaptive && _adapts(alg) !== false), false,
         unstable_check, false, tdir, isoutofdomain,
-        0, 0, 0, nothing,
+        0, 0, 0, nothing, adaptive && _adapts(alg) !== false && !_uses_ifunction(alg), C_NULL,
+        0,
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing, ad_calls, nothing,
@@ -2151,7 +2228,7 @@ function _read_stats(h::TSHandles)
     return (
         reason = LibPETSc.TSGetConvergedReason(pl, ts),
         nsteps = Int(LibPETSc.TSGetStepNumber(pl, ts)),
-        nreject = Int(LibPETSc.TSGetStepRejections(pl, ts)),
+        nreject = Int(LibPETSc.TSGetStepRejections(pl, ts)) + h.ctx.nreject,
         nnonliniter = Int(LibPETSc.TSGetSNESIterations(pl, ts)),
         nnonlinfail = Int(LibPETSc.TSGetSNESFailures(pl, ts)),
     )
@@ -2251,30 +2328,55 @@ function _solve_unlocked(
     end
     h = _setup(prob, alg; kwargs...)
     ctx, pl = h.ctx, h.petsclib
+    floor = abs(oftype(h.t0, something(get(kwargs, :dtmin, nothing), 0.0)))
+    forced = get(kwargs, :force_dtmin, false) === true
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
+        raised = false
         GC.@preserve ctx begin
-            try
-                _quiet_errors(h) do
-                    LibPETSc.TSSolve(pl, h.ts, h.u)
+            while true
+                raised = false
+                _release_work_vec!(ctx)
+                try
+                    _quiet_errors(h) do
+                        LibPETSc.TSSolve(pl, h.ts, h.u)
+                    end
+                catch e
+                    ctx.err === nothing && !_failed_step(e, h) && rethrow()
+                    h.stopped = e.code
+                    raised = true
                 end
-            catch e
-                ctx.err === nothing && !_failed_step(e, h) && rethrow()
-                h.stopped = e.code
+                raised && ctx.err === nothing && _retry_solve!(h, alg, floor, forced) || break
             end
         end
         ctx.err === nothing || throw(ctx.err)
         h.stopped == 0 || _warn_failed_step(alg, h.stopped)
         # PETSc sets the solve time only when TSSolve returns normally, and a step that
         # raises leaves its rejected trial in the solution vector.
-        tend, uend = h.stopped == 0 ?
-            (LibPETSc.TSGetSolveTime(pl, h.ts), _readvec!(similar(h.u0), pl, h.u)) :
-            (ctx.end_s, copy(ctx.end_u))
+        tend, uend = raised ? (ctx.end_s, copy(ctx.end_u)) :
+            (LibPETSc.TSGetSolveTime(pl, h.ts), _readvec!(similar(h.u0), pl, h.u))
         st = _read_stats(h)
     finally
         _destroy!(h)
     end
     return _assemble(prob, alg, h, tend, uend, st)
+end
+
+function _retry_solve!(h, alg, floor, forced)
+    ctx, pl = h.ctx, h.petsclib
+    h.stopped == PETSC_ERR_FP && _return_work_vec!(ctx, h.ts) || return false
+    h.stopped = 0
+    dt, _ = _retry_step(h, ctx.end_s, LibPETSc.TSGetTimeStep(pl, h.ts), floor, forced, true)
+    dt === nothing && (_warn_failed_step(alg, PETSC_ERR_FP); return false)
+    # TSSolve zeroes its counters when it starts on step 0.
+    LibPETSc.TSGetStepNumber(pl, h.ts) == 0 &&
+        (ctx.nreject += Int(LibPETSc.TSGetStepRejections(pl, h.ts)))
+    PETScCompat.with_local_array!(ua -> copyto!(ua, ctx.end_u), h.u; read = false, write = true)
+    # The monitor sees this time again and takes `fend` as the slope there.
+    ctx.hermite && (ctx.fend = ctx.fstart)
+    LibPETSc.TSSetTimeStep(pl, h.ts, dt)
+    LibPETSc.TSRestartStep(pl, h.ts)
+    return true
 end
 
 SciMLBase.__solve(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
@@ -2839,12 +2941,11 @@ end
 SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
     _locked(() -> _init_unlocked(prob, alg; kwargs...))
 
-function _reject_out_of_domain!(integ::PETScIntegrator, before)
+function _reject_step!(integ::PETScIntegrator, before, taken)
     h = integ.h
     ctx, pl = h.ctx, h.petsclib
+    failed, h.stopped = h.stopped != 0, 0
     nstep, integ.dt, integ.dtcache, ctx.pdirty, outer = before
-    taken = abs(integ.t - integ.tprev)
-    smaller = taken / 5
     integ.t = integ.tprev
     copyto!(integ.u, integ.uprev)
     PETScCompat.with_local_array!(
@@ -2853,28 +2954,27 @@ function _reject_out_of_domain!(integ::PETScIntegrator, before)
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
     floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
-    if get(integ.kwargs, :force_dtmin, false) === true && smaller < floor
-        LibPETSc.TSSetTimeStep(pl, h.ts, min(floor, taken))
-        LibPETSc.TSRestartStep(pl, h.ts)
-        domain, ctx.domain = ctx.domain, nothing
-        try
-            return _step_unlocked(integ, outer)
-        finally
-            ctx.domain = domain
+    forced = get(integ.kwargs, :force_dtmin, false) === true
+    dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, failed)
+    if dt === nothing
+        failed && _warn_failed_step(integ.alg, PETSC_ERR_FP)
+        if outer !== nothing
+            integ.tprev = outer[1]
+            copyto!(integ.uprev, outer[2])
         end
-    end
-    below_floor = ctx.dtmin > 0 && smaller < ctx.dtmin
-    if below_floor || smaller < 100 * eps(max(abs(integ.t), abs(h.t0), abs(h.tf)))
-        below_floor ? (ctx.dt_too_small = true) : (ctx.unstable_hit = true)
-        integ.tprev = outer[1]
-        copyto!(integ.uprev, outer[2])
         ctx.fstart = nothing
         _finish!(integ)
         return nothing
     end
-    LibPETSc.TSSetTimeStep(pl, h.ts, smaller)
+    LibPETSc.TSSetTimeStep(pl, h.ts, dt)
     LibPETSc.TSRestartStep(pl, h.ts)
-    return _step_unlocked(integ, outer)
+    at_floor || return _step_unlocked(integ, outer)
+    domain, ctx.domain = ctx.domain, nothing
+    try
+        return _step_unlocked(integ, outer)
+    finally
+        ctx.domain = domain
+    end
 end
 
 # PETSc needs dt_max strictly above dt_min.
@@ -3153,6 +3253,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
     end
     h.stopped = 0
+    ctx.retry_fp && ctx.workvec == C_NULL && _hold_work_vec!(ctx, h.ts)
     GC.@preserve ctx begin
         try
             _quiet_errors(h) do
@@ -3167,6 +3268,9 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         err = ctx.err
         _finish!(integ)
         throw(err)
+    end
+    if h.stopped == PETSC_ERR_FP && SciMLBase.isadaptive(integ) && _return_work_vec!(ctx, h.ts)
+        return _reject_step!(integ, before, LibPETSc.TSGetTimeStep(pl, h.ts))
     end
     h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped)
     integ.t = _user_t(integ.tdir, LibPETSc.TSGetTime(pl, h.ts))
@@ -3195,7 +3299,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     _readvec!(integ.u, pl, h.u)
     if ctx.domain !== nothing && SciMLBase.isadaptive(integ) &&
             ctx.domain(integ.u, ctx.p, integ.t)
-        return _reject_out_of_domain!(integ, before)
+        return _reject_step!(integ, before, abs(integ.t - integ.tprev))
     end
     _end_step_here!(integ)
     _live_stats!(integ)
