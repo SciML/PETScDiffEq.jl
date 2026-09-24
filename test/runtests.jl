@@ -2092,6 +2092,40 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test allunique(over.t)
         end
 
+        @testset "a step that raises leaves the last accepted state at the end" begin
+            breaks = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
+            )
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            for kw in ((;), (; save_everystep = false))
+                plain = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                    breaks, PETScDiffEq.TSRK("5dp"); kw...,
+                )
+                stepped = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                    breaks, PETScDiffEq.TSRK("5dp"); callback = never, kw...,
+                )
+                @test plain.retcode == SciMLBase.ReturnCode.Unstable
+                @test all(isfinite, plain.u[end])
+                @test plain.t == stepped.t
+                @test plain.u == stepped.u
+            end
+        end
+
+        @testset "a step too small to move t is Unstable through the integrator" begin
+            square!(du, u, p, t) = (du[1] = u[1]^2; nothing)
+            runaway = SciMLBase.ODEProblem(square!, [1.0], (0.0, 2.0))
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            sol = @test_logs (:warn, r"floating point spacing") SciMLBase.solve(
+                runaway, PETScDiffEq.TSRK("5dp"); callback = never,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Unstable
+            @test all(isfinite, sol.u[end])
+            integ = SciMLBase.init(runaway, PETScDiffEq.TSRK("5dp"))
+            @test_logs (:warn, r"floating point spacing") SciMLBase.solve!(integ)
+            @test integ.sol.retcode == SciMLBase.ReturnCode.Unstable
+            @test integ.sol.t == sol.t
+        end
+
         @testset "a step below dtmin ends the solve where it still holds" begin
             fast!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
             quick = SciMLBase.ODEProblem(fast!, [1.0], (0.0, 1.0))
@@ -3150,6 +3184,22 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             none = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = cb)
             @test quiet == hits
             @test !(hits[1] in none.t)
+        end
+
+        @testset "a saveat on the root is not saved twice" begin
+            double(sp) = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> t - 0.5, integ -> (integ.u .*= 2; nothing);
+                save_positions = sp,
+            )
+            kw = (saveat = [0.5], abstol = 1.0e-10, reltol = 1.0e-10)
+            for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRK("3bs"))
+                both = SciMLBase.solve(prob, alg; kw..., callback = double((true, true)))
+                @test both.t == [0.5, 0.5]
+                @test both.u[2] == 2 .* both.u[1]
+                pre = SciMLBase.solve(prob, alg; kw..., callback = double((true, false)))
+                @test pre.t == [0.5]
+                @test abs(pre.u[1][1] - exp(-0.5)) < 1.0e-8
+            end
         end
 
         @testset "dense output across the event" begin
@@ -4670,6 +4720,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     SciMLBase.step!(integ)
                 end
                 @test_throws ArgumentError SciMLBase.add_saveat!(integ, 0.25)
+                @test_throws ArgumentError SciMLBase.add_saveat!(integ, prevfloat(integ.t))
                 here = integ.t
                 SciMLBase.add_saveat!(integ, here)
                 @test here in SciMLBase.solve!(integ).t
@@ -5269,6 +5320,40 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, callback = cbs)
                 @test fired[]
                 @test abs(sol.u[end][1] - expected(1.0)) < 1.0e-6
+            end
+
+            @testset "save_positions[1] saves the state before affect!" begin
+                double(sp) = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t == 0.5, integ -> (integ.u .*= 2; nothing);
+                    save_positions = sp,
+                )
+                alg = PETScDiffEq.TSRK("5dp")
+                kw = (tstops = [0.5], abstol = 1.0e-10, reltol = 1.0e-10)
+                pre = (callback = double((true, false)), save_everystep = false)
+                sol = SciMLBase.solve(prob, alg; kw..., pre...)
+                @test sol.t == [0.0, 0.5, 1.0]
+                @test abs(sol.u[2][1] - exp(-0.5)) < 1.0e-9
+                @test SciMLBase.solve!(SciMLBase.init(prob, alg; kw..., pre...)).t == sol.t
+
+                both = double((true, true))
+                at = SciMLBase.solve(prob, alg; kw..., callback = both, saveat = [0.0, 0.3, 0.6, 1.0])
+                @test at.t == [0.0, 0.3, 0.5, 0.5, 0.6, 1.0]
+                @test at.u[4] == 2 .* at.u[3]
+                @test count(==(0.5), SciMLBase.solve(prob, alg; kw..., callback = both).t) == 2
+                twice = SciMLBase.solve(
+                    prob, alg; kw..., callback = SciMLBase.CallbackSet(both, both),
+                    save_everystep = false,
+                )
+                @test first.(twice.u[2:5]) == [1, 2, 2, 4] .* twice.u[2][1]
+
+                ticks = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> true, integ -> nothing; save_positions = (true, false),
+                )
+                every = SciMLBase.solve(
+                    prob, alg; callback = ticks, save_everystep = false, dt = 0.25,
+                    adaptive = false,
+                )
+                @test every.t == [0.0, 0.25, 0.5, 0.75, 1.0]
             end
 
             @testset "an affect! that declares no change is not written back" begin
