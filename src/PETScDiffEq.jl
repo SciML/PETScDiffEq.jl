@@ -2898,7 +2898,7 @@ end
 
 function _live_stats!(integ::PETScIntegrator)
     stats = integ.sol.stats
-    stats === nothing && return nothing
+    stats isa SciMLBase.DEStats || return nothing
     ctx, st = integ.h.ctx, _read_stats(integ.h)
     stats.nf, stats.nf2, stats.njacs = _nf(integ.h), ctx.nf2, ctx.njacs
     stats.nnonliniter, stats.nnonlinconvfail = st.nnonliniter, st.nnonlinfail
