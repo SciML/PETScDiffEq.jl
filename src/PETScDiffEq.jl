@@ -1839,8 +1839,8 @@ function _setup(
         elseif has_mass
             max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
         else
-            est_abstol = something(abstol, reltol === nothing ? 1.0e-4 : 1.0e-6)
-            est_reltol = something(reltol, abstol === nothing ? 1.0e-4 : 1.0e-3)
+            est_abstol = something(abstol, 1.0e-6)
+            est_reltol = something(reltol, 1.0e-3)
             user_dtmax = dtmax === nothing || isinf(dtmax) ? R(Inf) : abs(R(dtmax))
             first_stop = minimum(
                 (abs(R(s) - user_t0) for s in tstops if tdir * (R(s) - user_t0) > 0);

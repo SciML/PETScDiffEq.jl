@@ -2981,7 +2981,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     (u, t, integ) -> u[1] - h, integ -> push!(ups, integ.t),
                     integ -> push!(downs, integ.t); rootfind = rootfind,
                 )
-                SciMLBase.solve(toss, PETScDiffEq.TSRK("5dp"); callback = cb)
+                SciMLBase.solve(
+                    toss, PETScDiffEq.TSRK("5dp"); callback = cb, abstol = 1.0e-4, reltol = 1.0e-4,
+                )
                 @test length(ups) == 1 && abs(ups[1] - (apex - half)) < 1.0e-9
                 @test length(downs) == 1 && abs(downs[1] - (apex + half)) < 1.0e-9
 
@@ -5705,7 +5707,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), rk,
                     (; loose..., dtmax = 1.0e-3), 0.001,
                 ),
-                (SciMLBase.ODEProblem(lv!, [1.0, 1.0], (0.0, 10.0)), rk, NamedTuple(), 0.056237800849029955),
+                (SciMLBase.ODEProblem(lv!, [1.0, 1.0], (0.0, 10.0)), rk, NamedTuple(), 0.0776084743154256),
                 (lv, rk, (abstol = 1.0e-9,), 0.08421578155635664),
                 (lv, rk, (reltol = 1.0e-7,), 0.021785462059001403),
                 (lv, rosw, loose, 0.016189521278835287),
@@ -5753,6 +5755,15 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 ),
             )
             @test isapprox(SciMLBase.init(prob, alg; kw...).dt, expected; rtol = 1.0e-12)
+        end
+        osc = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = u[2]; du[2] = -u[1]; nothing), [0.0, 1.0], (0.0, 10.0),
+        )
+        for alg in (rk, PETScDiffEq.TSRK("3bs"), rosw)
+            @test SciMLBase.init(osc, alg).dt == SciMLBase.init(osc, alg; loose...).dt
+            default, explicit = SciMLBase.solve(osc, alg), SciMLBase.solve(osc, alg; loose...)
+            @test default.t == explicit.t
+            @test default.u == explicit.u
         end
     end
 
