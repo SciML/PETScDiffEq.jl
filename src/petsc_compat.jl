@@ -8,6 +8,9 @@ const V05 = pkgversion(PETSc) >= v"0.5.0-"
 
 @static if V05
     const with_local_array! = PETSc.with_local_array!
+    const destroy! = PETSc.destroy!
+    const isinitialized = PETSc.isinitialized
+    const isfinalized = PETSc.isfinalized
     const PetscVec = PETSc.PetscVec
     const PetscMat = PETSc.PetscMat
     const PetscOptions = PETSc.PetscOptions
@@ -24,6 +27,9 @@ else
     end
 
     const with_local_array! = PETSc.withlocalarray!
+    const destroy! = PETSc.destroy
+    const isinitialized = PETSc.initialized
+    const isfinalized = PETSc.finalized
     PetscVec(pl, x) = PETSc.VecSeq(pl, x)
     PetscMat(pl, A::Matrix) = PETSc.MatSeqDense(pl, A)
     PetscMat(pl, m::Integer, n::Integer, nnz::Integer) = PETSc.MatSeqAIJ(pl, m, n, nnz)

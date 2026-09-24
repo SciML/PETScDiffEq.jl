@@ -1541,15 +1541,15 @@ function _destroy!(h::TSHandles)
     h.destroyed = true
     h.ts === nothing || delete!(POST_STEP_CTX, h.ts.ptr)
     # After PETSc or MPI has finalized, freeing anything aborts.
-    (PETSc.finalized(h.petsclib) || MPI.Finalized()) && return nothing
-    h.opts === nothing || PETSc.destroy(h.opts)
-    h.jac_mat === nothing || PETSc.destroy(h.jac_mat)
-    h.fd_mat === nothing || PETSc.destroy(h.fd_mat)
+    (PETScCompat.isfinalized(h.petsclib) || MPI.Finalized()) && return nothing
+    h.opts === nothing || PETScCompat.destroy!(h.opts)
+    h.jac_mat === nothing || PETScCompat.destroy!(h.jac_mat)
+    h.fd_mat === nothing || PETScCompat.destroy!(h.fd_mat)
     for v in h.tolvecs
-        v.ptr == C_NULL || PETSc.destroy(v)
+        v.ptr == C_NULL || PETScCompat.destroy!(v)
     end
-    h.ctx.work.ptr == C_NULL || PETSc.destroy(h.ctx.work)
-    h.u === nothing || PETSc.destroy(h.u)
+    h.ctx.work.ptr == C_NULL || PETScCompat.destroy!(h.ctx.work)
+    h.u === nothing || PETScCompat.destroy!(h.u)
     h.ts === nothing || LibPETSc.TSDestroy(h.petsclib, h.ts)
     return nothing
 end
@@ -1782,7 +1782,7 @@ function _setup(
 
     petsclib = _petsclib(S)
     _check_inttype(petsclib)
-    PETSc.initialized(petsclib) || PETSc.initialize(petsclib)
+    PETScCompat.isinitialized(petsclib) || PETSc.initialize(petsclib)
     _arm_exit_cleanup!(petsclib)
 
     iip = SciMLBase.isinplace(prob)
@@ -2122,7 +2122,7 @@ function _setup(
             )
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
             if chosen == "irk" && has_jac && !uses_sparse_jac
-                PETSc.destroy(h.jac_mat)
+                PETScCompat.destroy!(h.jac_mat)
                 h.jac_mat = PETScCompat.PetscMat(petsclib, n, n, n)
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.ijacobian, ctxptr,

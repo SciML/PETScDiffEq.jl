@@ -542,9 +542,9 @@ function _throw_callback_error(ctx, adj)
 end
 
 function _destroy_adjoint!(adj::AdjointContext)
-    (PETSc.finalized(adj.petsclib) || MPI.Finalized()) && return nothing
+    (PETScCompat.isfinalized(adj.petsclib) || MPI.Finalized()) && return nothing
     for obj in (adj.jac_mat, adj.pmat, adj.lam, adj.mu)
-        obj === nothing || PETSc.destroy(obj)
+        obj === nothing || PETScCompat.destroy!(obj)
     end
     return nothing
 end
