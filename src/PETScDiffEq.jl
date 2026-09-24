@@ -175,7 +175,8 @@ Needs a Jacobian, from the `ODEFunction`'s `jac` or from `autodiff`, and refuses
 `AutoFiniteDiff()` rather than letting PETSc fail, since it solves all stages as
 one coupled system whose matrix it cannot build from finite differences. That coupled matrix is a Kronecker product with the
 Jacobian, which has no LU factorisation, so this algorithm defaults to
-`-pc_type pbjacobi`; your own `petsc_options` are parsed afterwards and win.
+`-pc_type pbjacobi` unless your own `petsc_options` set a `-pc_type`. So does `"irk"`
+picked by [`TSGeneric`](@ref) or by `-ts_type`.
 
 A wrong Jacobian is not caught here. Where the other implicit families fail to
 converge, this one reports success and returns a wrong answer, so check a
@@ -355,9 +356,9 @@ Whether the named type adapts is not known here, so no tolerance warning is
 issued for it. Only `"euler"` and `"alpha"` have been run through this
 package's own convergence tests.
 
-`"alpha2"`, `"discgrad"`, `"eimex"`, `"mimex"` and `"mprk"` are refused: each is
-driven through a PETSc setup call this package does not make, and without it they
-crash or integrate to zero rather than saying anything.
+`"alpha2"`, `"basicsymplectic"`, `"discgrad"`, `"eimex"`, `"mimex"` and `"mprk"` are
+refused: each is driven through a PETSc setup call this package does not make, and
+without it they crash or integrate to zero rather than saying anything.
 """
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
@@ -368,6 +369,7 @@ end
 
 const _NEEDS_OTHER_SETUP = Dict(
     "alpha2" => "is for second-order systems and needs TSSetI2Function",
+    "basicsymplectic" => "needs TSRHSSplitSetIS to declare its position and momentum parts",
     "discgrad" => "needs TSDiscGradSetFormulation",
     "eimex" => "needs its own right-hand-side split, and integrates to zero without one",
     "mimex" => "needs TSRHSSplit to declare its slow and fast parts",
@@ -390,6 +392,9 @@ function TSGeneric(
     )
     !explicit && t in _EXPLICIT_ONLY && throw(
         ArgumentError("`$t` is an explicit PETSc type, so it needs `explicit = true`"),
+    )
+    explicit && t == "irk" && throw(
+        ArgumentError("`irk` is an implicit PETSc type, so it cannot take `explicit = true`"),
     )
     return TSGeneric(
         t, explicit, String[String(o) for o in petsc_options], _check_autodiff(autodiff),
@@ -711,6 +716,29 @@ function _pivot_raises(pl, ts)
         (LibPETSc.CSNES, Ptr{LibPETSc.PetscBool}), snes[], snes_raises,
     )
     return raises[] == LibPETSc.PETSC_TRUE || snes_raises[] == LibPETSc.PETSC_TRUE
+end
+
+function _set_pc_type!(pl, ts, type)
+    lib = Libdl.dlopen(pl.petsc_library)
+    snes, ksp = Ref{LibPETSc.CSNES}(C_NULL), Ref{LibPETSc.CKSP}(C_NULL)
+    pc = Ref{Ptr{Cvoid}}(C_NULL)
+    ccall(
+        Libdl.dlsym(lib, :TSGetSNES), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
+    )
+    ccall(
+        Libdl.dlsym(lib, :SNESGetKSP), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}), snes[], ksp,
+    )
+    ccall(
+        Libdl.dlsym(lib, :KSPGetPC), LibPETSc.PetscErrorCode,
+        (LibPETSc.CKSP, Ptr{Ptr{Cvoid}}), ksp[], pc,
+    )
+    code = ccall(
+        Libdl.dlsym(lib, :PCSetType), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Cstring), pc[], type,
+    )
+    code == 0 || throw(LibPETSc.PetscError(code))
+    return nothing
 end
 
 function _colour_jacobian!(pl, ts, mat)
@@ -1394,6 +1422,75 @@ function _running_name(petsclib, ts)
     return type
 end
 
+function _refuse_method(name, has_mass, has_jac, is_split)
+    if name == "irk" && has_mass
+        throw(
+            ArgumentError(
+                "PETScDiffEq does not support a mass matrix with TSIRK; PETSc's " *
+                    "coupled-stage matrix assumes dF/du_dot = I, and the answer drifts " *
+                    "further from the true one as dt shrinks rather than failing",
+            ),
+        )
+    end
+    if name == "irk" && !has_jac
+        throw(
+            ArgumentError(
+                "TSIRK needs a Jacobian; give the ODEFunction a `jac` or leave `autodiff` " *
+                    "at a backend other than `AutoFiniteDiff()`, since PETSc builds its " *
+                    "coupled-stage matrix from one and has no finite-difference fallback for it",
+            ),
+        )
+    end
+    sub = last(split(name))
+    if startswith(name, "rosw ") && sub in _ROSW_NO_STEP
+        throw(
+            ArgumentError(
+                "TSRosW(\"$sub\") cannot be used: without a `jac` PETSc stops " *
+                    "and asks for one, and with one it does not restore its Jacobian lag " *
+                    "after the explicit last stage, so an adaptive solve fails within its " *
+                    "first two steps and a fixed-step solve diverges; use another TSRosW type",
+            ),
+        )
+    end
+    if name == "rosw assp3p3s1c" && has_mass
+        throw(
+            ArgumentError(
+                "TSRosW(\"assp3p3s1c\") cannot take a mass matrix; PETSc leaves the mass " *
+                    "matrix out of its explicit first stage, so the solve reports success " *
+                    "with an error that does not shrink with dt",
+            ),
+        )
+    end
+    if name == "rosw assp3p3s1c" && !has_jac
+        throw(
+            ArgumentError(
+                "TSRosW(\"assp3p3s1c\") needs a Jacobian; give the ODEFunction a `jac` " *
+                    "or leave `autodiff` at a backend other than `AutoFiniteDiff()`, since " *
+                    "PETSc asks for one at the start of every step and has no " *
+                    "finite-difference fallback there",
+            ),
+        )
+    end
+    if name == "arkimex ars122" && !is_split
+        throw(
+            ArgumentError(
+                "TSARKIMEX(\"ars122\") needs a SplitODEProblem; it has an explicit first " *
+                    "stage and is not stiffly accurate, so PETSc cannot evaluate its " *
+                    "first-stage slope when the whole problem is implicit",
+            ),
+        )
+    end
+    if name == "arkimex bpr3" && is_split
+        throw(
+            ArgumentError(
+                "TSARKIMEX(\"bpr3\") converges at first order on a SplitODEProblem; solve " *
+                    "a plain ODEProblem with it, or use another TSARKIMEX type",
+            ),
+        )
+    end
+    return nothing
+end
+
 _set_subtype!(petsclib, ts, alg::TSRK) =
     PETScCompat.TSRKSetType(petsclib, ts, alg.subtype)
 _set_subtype!(petsclib, ts, alg::TSRosW) =
@@ -1425,8 +1522,6 @@ _set_subtype!(petsclib, ts, ::TSMPRK) = nothing
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 _default_options(::AnyPETScTS) = String[]
-# PETSc's default LU cannot factor IRK's Kronecker-product stage matrix.
-_default_options(::TSIRK) = ["-pc_type", "pbjacobi"]
 # Without -ts_use_splitrhsfunction PETSc never calls the per-part functions.
 _default_options(alg::TSMPRK) =
     ["-ts_mprk_type", alg.subtype, "-ts_use_splitrhsfunction", "true"]
@@ -1698,15 +1793,6 @@ function _setup(
             ),
         )
     end
-    if has_mass && alg isa TSIRK
-        throw(
-            ArgumentError(
-                "PETScDiffEq does not support a mass matrix with TSIRK; PETSc's " *
-                    "coupled-stage matrix assumes dF/du_dot = I, and the answer drifts " *
-                    "further from the true one as dt shrinks rather than failing",
-            ),
-        )
-    end
     if has_mass && is_split
         throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
     end
@@ -1760,61 +1846,7 @@ function _setup(
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
     builds_jac = _uses_ifunction(alg) && prob.f.jac === nothing && !_petsc_differences(alg)
     has_jac = _uses_ifunction(alg) && (prob.f.jac !== nothing || builds_jac)
-    if alg isa TSIRK && !has_jac
-        throw(
-            ArgumentError(
-                "TSIRK needs a Jacobian; give the ODEFunction a `jac` or leave `autodiff` " *
-                    "at a backend other than `AutoFiniteDiff()`, since PETSc builds its " *
-                    "coupled-stage matrix from one and has no finite-difference fallback for it",
-            ),
-        )
-    end
-    if alg isa TSRosW && alg.subtype in _ROSW_NO_STEP
-        throw(
-            ArgumentError(
-                "TSRosW(\"$(alg.subtype)\") cannot be used: without a `jac` PETSc stops " *
-                    "and asks for one, and with one it does not restore its Jacobian lag " *
-                    "after the explicit last stage, so an adaptive solve fails within its " *
-                    "first two steps and a fixed-step solve diverges; use another TSRosW type",
-            ),
-        )
-    end
-    if alg isa TSRosW && alg.subtype == "assp3p3s1c" && has_mass
-        throw(
-            ArgumentError(
-                "TSRosW(\"assp3p3s1c\") cannot take a mass matrix; PETSc leaves the mass " *
-                    "matrix out of its explicit first stage, so the solve reports success " *
-                    "with an error that does not shrink with dt",
-            ),
-        )
-    end
-    if alg isa TSRosW && alg.subtype == "assp3p3s1c" && !has_jac
-        throw(
-            ArgumentError(
-                "TSRosW(\"assp3p3s1c\") needs a Jacobian; give the ODEFunction a `jac` " *
-                    "or leave `autodiff` at a backend other than `AutoFiniteDiff()`, since " *
-                    "PETSc asks for one at the start of every step and has no " *
-                    "finite-difference fallback there",
-            ),
-        )
-    end
-    if alg isa TSARKIMEX && alg.subtype == "ars122" && !is_split
-        throw(
-            ArgumentError(
-                "TSARKIMEX(\"ars122\") needs a SplitODEProblem; it has an explicit first " *
-                    "stage and is not stiffly accurate, so PETSc cannot evaluate its " *
-                    "first-stage slope when the whole problem is implicit",
-            ),
-        )
-    end
-    if alg isa TSARKIMEX && alg.subtype == "bpr3" && is_split
-        throw(
-            ArgumentError(
-                "TSARKIMEX(\"bpr3\") converges at first order on a SplitODEProblem; solve " *
-                    "a plain ODEProblem with it, or use another TSARKIMEX type",
-            ),
-        )
-    end
+    _refuse_method(_warn_name(alg), has_mass, has_jac, is_split)
     ad_calls = builds_jac ? Ref(0) : nothing
     jac_fn = if !has_jac
         nothing
@@ -1845,8 +1877,8 @@ function _setup(
         elseif has_mass
             max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
         else
-            est_abstol = something(abstol, reltol === nothing ? 1.0e-4 : 1.0e-6)
-            est_reltol = something(reltol, abstol === nothing ? 1.0e-4 : 1.0e-3)
+            est_abstol = something(abstol, 1.0e-6)
+            est_reltol = something(reltol, 1.0e-3)
             user_dtmax = dtmax === nothing || isinf(dtmax) ? R(Inf) : abs(R(dtmax))
             first_stop = minimum(
                 (abs(R(s) - user_t0) for s in tstops if tdir * (R(s) - user_t0) > 0);
@@ -2053,7 +2085,7 @@ function _setup(
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
             end
-            # An option can change the type, so recheck the constructor's refusals.
+            # An option can change the type or subtype, so recheck the refusals.
             chosen = LibPETSc.TSGetType(petsclib, ts)
             !(alg isa TSMPRK) && haskey(_NEEDS_OTHER_SETUP, chosen) && throw(
                 ArgumentError(
@@ -2066,6 +2098,14 @@ function _setup(
                         "`TSGeneric(\"$chosen\"; explicit = true)` rather than an option",
                 ),
             )
+            !_uses_ifunction(alg) && chosen == "irk" && throw(
+                ArgumentError(
+                    "`irk` is an implicit PETSc type, so it needs `TSIRK` or " *
+                        "`TSGeneric(\"irk\")` rather than an option on an explicit algorithm",
+                ),
+            )
+            running = _running_name(petsclib, ts)
+            _refuse_method(running, has_mass, has_jac, is_split)
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
             if chosen == "irk" && has_jac && !uses_sparse_jac
                 PETScCompat.destroy!(h.jac_mat)
@@ -2074,6 +2114,9 @@ function _setup(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.ijacobian, ctxptr,
                 )
             end
+            # PETSc's default LU cannot factor IRK's Kronecker-product stage matrix.
+            chosen == "irk" && !any(o -> _names_option(o, "pc_type"), effective_options) &&
+                _set_pc_type!(petsclib, ts, "pbjacobi")
             # Only valid once TSSetFromOptions has reached the linear solve.
             h.pivot_raises = _pivot_raises(petsclib, ts) ||
                 _option_flag(effective_options, "ts_error_if_step_fails")
@@ -2087,7 +2130,6 @@ function _setup(
                     ),
                 )
             end
-            running = _running_name(petsclib, ts)
             if running != ctx.alg_name
                 ctx.hermite = !has_mass && !is_dae
                 ctx.interpolates = nothing
@@ -2351,6 +2393,20 @@ end
 
 SciMLBase.derivative_discontinuity!(integ::PETScIntegrator, bool::Bool) =
     _locked(() -> _discontinuity_unlocked(integ, bool))
+
+function _set_p_unlocked(integ::PETScIntegrator, v)
+    setfield!(integ, :p, convert(fieldtype(typeof(integ), :p), v))
+    h = integ.h
+    h.ctx.p = integ.p
+    h.ctx.pdirty = true
+    # An FSAL method reuses its last stage's slope, taken with the old p, unless restarted.
+    h.destroyed || LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    return v
+end
+
+Base.setproperty!(integ::PETScIntegrator, name::Symbol, v) = name === :p ?
+    _locked(() -> _set_p_unlocked(integ, v)) :
+    setfield!(integ, name, convert(fieldtype(typeof(integ), name), v))
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
 function _proposed_dt_unlocked(integ::PETScIntegrator)
@@ -2926,6 +2982,7 @@ function _reinit_unlocked(
     old = integ.h
     prob = SciMLBase.remake(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
+        p = integ.p,
     )
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
