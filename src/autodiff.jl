@@ -1,6 +1,3 @@
-# A problem without a `jac` gets one from `autodiff`, in the form a user's `jac` takes, so
-# it runs through the same path. `AutoFiniteDiff()` leaves the Jacobian to PETSc instead.
-
 _check_autodiff(ad::ADTypes.AbstractADType) = ad
 _check_autodiff(ad) = throw(
     ArgumentError(
@@ -12,16 +9,14 @@ _check_autodiff(ad) = throw(
 _autodiff(alg::Union{TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX, TSGeneric}) = alg.autodiff
 _autodiff(::Union{TSRK, TSMPRK}) = nothing
 
-# Whether PETSc differences the step's equations itself rather than being handed a Jacobian.
+# `AutoFiniteDiff()` means PETSc differences the Jacobian itself, not FiniteDiff.jl.
 function _petsc_differences(alg)
     ad = _autodiff(alg)
     return ad !== nothing && ADTypes.dense_ad(ad) isa AutoFiniteDiff
 end
 
-# The Jacobian is written into a matrix with the prototype's pattern, so a sparse
-# prototype is the pattern to colour, as OrdinaryDiffEq uses it, whatever detector the
-# backend brings; only its colouring is kept. Without one the matrix is dense, and a
-# sparse backend that has no way to find a pattern is used dense.
+# J is stored in the prototype's pattern, so that pattern overrides the backend's detector.
+# With no prototype J is dense, and a sparse backend with no detector runs dense.
 function _with_pattern(backend, proto)
     if proto isa SparseArrays.AbstractSparseMatrix
         coloring = backend isa ADTypes.AutoSparse ? ADTypes.coloring_algorithm(backend) :
@@ -40,8 +35,6 @@ function _with_pattern(backend, proto)
     return backend
 end
 
-# Counts the evaluations a Jacobian makes, which the statistics include, as
-# OrdinaryDiffEq's do.
 struct Counted{F}
     f::F
     n::Base.RefValue{Int}
@@ -79,8 +72,7 @@ function _ad_jacobian(backend, f!, jac_prototype, u0, p, t, calls, advice)
     return ADJacobian(g!, b, prep, du, advice)
 end
 
-# `gamma * dG/du' + dG/du` is the derivative of `v -> G(du + gamma * (v - u), v)` at
-# `v = u`, so one Jacobian of that is the whole matrix PETSc wants.
+# gamma * dG/du' + dG/du is the Jacobian of v -> G(du + gamma * (v - u), v) at v = u.
 function _shifted_residual!(r, v, g!, du, u, gamma, p, t, w)
     @. w = du + gamma * (v - u)
     g!(r, w, v, p, t)
@@ -126,11 +118,8 @@ function _ad_dae_jacobian(backend, g!, jac_prototype, u0, p, t, calls, advice)
     return ADDAEJacobian(h!, b, prep, r, w, advice)
 end
 
-# ForwardDiff takes no complex input, so for a complex state the function is differentiated
-# as a real map: from the state's real part, its imaginary part held fixed, to the real and
-# imaginary parts of its value. For a holomorphic function that derivative, `[A; C]`, is
-# the complex Jacobian `A + iC`, and a sparse prototype's pattern stacked on itself is the
-# pattern to colour.
+# ForwardDiff takes no complex input, so differentiate x -> [real(f); imag(f)] at
+# complex(x, y). For holomorphic f that gives [A; C], and the complex Jacobian is A + iC.
 function _split_parts!(out, z)
     n = length(z)
     @views out[1:n] .= real.(z)
@@ -160,10 +149,7 @@ function _stacked_pattern(R, proto)
     return vcat(P, P)
 end
 
-# The backend for the real map, whose Jacobian has two rows for each of the state's. A
-# pattern for the state, from the prototype or from a backend that knows one, is stacked
-# on itself. Any other detector would have to find the real map's pattern itself, so its
-# backend is used dense.
+# A known pattern is stacked for the 2n-row real map. Other detectors run dense.
 function _complex_backend(R, backend, jac_prototype)
     jac_prototype isa SparseArrays.AbstractSparseMatrix &&
         return _with_pattern(backend, _stacked_pattern(R, jac_prototype))
@@ -175,8 +161,7 @@ function _complex_backend(R, backend, jac_prototype)
     )
 end
 
-# The real Jacobian of a sparse prototype is stored column by column as the prototype's
-# rows and then the same rows shifted by n, so each column of `J` reads two runs of it.
+# Each column of Jr holds J's rows, then the same rows shifted by n.
 function _assemble_complex!(J::SparseMatrixCSC, Jr::SparseMatrixCSC)
     for j in axes(J, 2)
         r, k = nzrange(J, j), first(nzrange(Jr, j))
@@ -302,24 +287,17 @@ function _ad_dae_jacobian(
         DI.Constant(zero(u0)), DI.Constant(copy(u0)), DI.Constant(one(t)), DI.Constant(p),
         DI.Constant(t),
     )
-    # With no derivative given and a unit shift, the residual's Jacobian in its state is
-    # the derivative of `z -> G(z - v, z)` at `z = v`.
+    # The shifted residual at du = 0, gamma = 1, u = v.
     v = _off(u0)
     _check_holomorphic(z -> (r = similar(z); h!(r, z .- v, z, p, t); r), v, b, advice)
     return ADComplexDAEJacobian(h!, b, prep, x, y, out, Jr, similar(u0), advice)
 end
 
-# A point near `u0` and a direction from it that no simple symmetry of the problem lines up
-# with, so that a state such as zero, where a non-holomorphic term's derivative can vanish,
-# does not hide it.
+# Off u0 and uneven, so a symmetric state like zero can't hide a `conj` or `abs`.
 _direction(R, n) = [one(R) + R(k) / n for k in 1:n]
 _off(u0) = (R = real(eltype(u0)); u0 .+ complex(R(0.01), R(0.02)) .* (1 .+ abs.(u0)) .* _direction(R, length(u0)))
 
-# PETSc's complex Newton iteration needs a holomorphic function, whose derivative along the
-# imaginary part is `i` times the one along the real part that the Jacobian is built from.
-# One such pair is compared at a point near the start, each taken dense, since a prototype
-# that leaves out an entry the function has changes a coloured Jacobian but not whether the
-# function is holomorphic. A function that is not finite there is not judged.
+# Dense on purpose: a prototype missing an entry would skew a coloured check.
 function _check_holomorphic(h, v, backend, advice)
     n = length(v)
     n == 0 && return nothing
@@ -348,7 +326,6 @@ function _check_holomorphic(h, v, backend, advice)
     )
 end
 
-# The adjoint's parameter Jacobian, `df/dp`, in the form a user's `paramjac` takes.
 struct ADParamJacobian{F, B, P}
     f!::F
     backend::B
@@ -376,7 +353,7 @@ function (j::ADParamJacobian)(pJ, u, p, t)
     return nothing
 end
 
-# A chunk size picked for the state can exceed the number of parameters.
+# A chunk size picked for the state can exceed length(p).
 _param_backend(b, np) = b
 _param_backend(b::AutoForwardDiff{C}, np) where {C} =
     C === nothing || C <= np ? b : AutoForwardDiff(; tag = b.tag)
@@ -390,8 +367,7 @@ function _ad_paramjacobian(backend, f!, u0, p, t, advice)
     return ADParamJacobian(f!, b, prep, du, advice)
 end
 
-# A function written for Float64 alone fails on the first dual number it is handed, as an
-# argument it has no method for, a type assertion, or a conversion.
+# Float64-only code fails on duals as a MethodError, TypeError or conversion error.
 _has_dual(x) = _is_dual(x) || (x isa Type && _is_dual_type(x)) ||
     (x isa AbstractArray && _is_dual_type(eltype(x)))
 _is_dual(x) = x isa Union{ForwardDiff.Dual, Complex{<:ForwardDiff.Dual}}
@@ -408,13 +384,10 @@ _dual_error(e, backend, advice) = ArgumentError(
         first(split(sprint(showerror, e), '\n')) * ". " * advice,
 )
 
-# A derivative that is infinite where the function is not, such as that of `sqrt` or
-# `norm` at zero, would reach PETSc's Newton matrix as NaN. Where the function is not
-# finite either, the step fails as it would with any Jacobian. The dual pass's own value
-# can be NaN where the function is not, so the function is evaluated again to tell.
 _stored_values(J::SparseArrays.AbstractSparseMatrix) = SparseArrays.nonzeros(J)
 _stored_values(J) = J
 
+# f is evaluated again since the dual pass's value can be NaN where f is finite.
 function _check_finite(value, J, t, advice)
     all(isfinite, _stored_values(J)) && return nothing
     all(isfinite, value()) || return nothing
@@ -427,7 +400,6 @@ function _check_finite(value, J, t, advice)
     )
 end
 
-# What each Jacobian's caller can do instead when differentiating fails.
 const _ODE_ADVICE = "Give the ODEFunction a `jac`, or pass " *
     "`autodiff = PETScDiffEq.AutoFiniteDiff()` to the algorithm to have PETSc difference it"
 const _DAE_ADVICE = "Give the DAEFunction a `jac`, or pass " *
