@@ -648,6 +648,22 @@ function _checked_everywhere(f, comm)
     return value
 end
 
+function _checked_anywhere(f, comm)
+    comm === nothing && return f()
+    value, err = false, nothing
+    try
+        value = f()::Bool
+    catch e
+        err = e
+    end
+    threw, value = MPI.Allreduce([err !== nothing, value], |, comm)
+    threw && throw(something(err, _remote_error()))
+    return value
+end
+
+_smallest(::Nothing, x) = x
+_smallest(comm::MPI.Comm, x) = MPI.Allreduce(x, min, comm)
+
 function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     full = Vector{S}(x)
     idxs = ctx.save_idxs
@@ -1038,8 +1054,9 @@ function _petsc_interpolate!(ctx, ts, s)
     finally
         ccall(Libdl.dlsym(lib, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ())
     end
-    written = PETScCompat.with_local_array!(
-        w -> any(!isnan, w), ctx.work; read = true, write = false,
+    written = _anywhere(
+        ctx.comm,
+        PETScCompat.with_local_array!(w -> any(!isnan, w), ctx.work; read = true, write = false),
     )
     ctx.interpolates = written
     return written ? ctx.work : nothing
@@ -2548,19 +2565,20 @@ function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
-    _distributed(alg) && !_no_callback(callback) && throw(
-        ArgumentError("PETScDiffEq does not support callbacks $_NOT_SELF yet"),
-    )
     # MPRK misses tf, Float32 landing refuses short steps, and isoutofdomain retries steps.
     if !_no_callback(callback) || !isempty(tstops) || !isempty(d_discontinuities) ||
             alg isa TSMPRK || get(kwargs, :isoutofdomain, nothing) !== nothing ||
             first(_eltypes(prob)) === Float32
-        return _solve_integrator_unlocked(
-            _init_unlocked(
-                prob, alg; callback = callback, tstops = tstops,
-                d_discontinuities = d_discontinuities, kwargs...,
-            ),
+        integ = _init_unlocked(
+            prob, alg; callback = callback, tstops = tstops,
+            d_discontinuities = d_discontinuities, kwargs...,
         )
+        try
+            return _solve_integrator_unlocked(integ)
+        catch
+            _destroy!(integ.h)
+            rethrow()
+        end
     end
     h = _setup(prob, alg; kwargs...)
     ctx, pl = h.ctx, h.petsclib
@@ -2631,7 +2649,8 @@ end
 
 function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {H, R}
     h = getfield(o, :h)
-    name in (:abstol, :reltol) && _check_tol(v, length(h.u0), name)
+    name in (:abstol, :reltol) &&
+        _checked_everywhere(() -> _check_tol(v, length(h.u0), name), h.ctx.comm)
     setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : v)
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib
@@ -2758,8 +2777,9 @@ end
 
 SciMLBase.get_proposed_dt(integ::PETScIntegrator) = _locked(() -> _proposed_dt_unlocked(integ))
 function _set_proposed_dt_unlocked(integ::PETScIntegrator, dt)
-    integ.finished ||
-        LibPETSc.TSSetTimeStep(integ.h.petsclib, integ.h.ts, abs(oftype(integ.t, dt)))
+    integ.finished || LibPETSc.TSSetTimeStep(
+        integ.h.petsclib, integ.h.ts, _smallest(integ.h.ctx.comm, abs(oftype(integ.t, dt))),
+    )
     return nothing
 end
 
@@ -2776,15 +2796,29 @@ _make_opts(h::TSHandles{<:Any, <:Any, R}, kwargs) where {R} = PETScIntegratorOpt
 SciMLBase.isadaptive(integ::PETScIntegrator) =
     getfield(integ.opts, :adaptive) && _adapts(integ.alg) !== false
 
-(integ::PETScIntegrator)(t::Number) = copy(_state_at(integ, t))
-(integ::PETScIntegrator)(t::Number, ::Type{Val{0}}) = copy(_state_at(integ, t))
-(integ::PETScIntegrator)(out::AbstractArray, t) = copyto!(out, _state_at(integ, t))
+(integ::PETScIntegrator)(t::Number) = copy(_checked_state(integ, t))
+(integ::PETScIntegrator)(t::Number, ::Type{Val{0}}) = copy(_checked_state(integ, t))
+(integ::PETScIntegrator)(out::AbstractArray, t) = copyto!(out, _checked_state(integ, t))
 (integ::PETScIntegrator)(out::AbstractArray, t, ::Type{Val{0}}) =
-    copyto!(out, _state_at(integ, t))
+    copyto!(out, _checked_state(integ, t))
 
-SciMLBase.get_du(integ::PETScIntegrator) = integ.tdir .* _derivative(integ.h.ctx, integ.tdir * integ.t, integ.u)
+function _raise_threw!(integ::PETScIntegrator)
+    ctx = integ.h.ctx
+    (ctx.comm === nothing || !_threw!(ctx)) && return nothing
+    # The cached slopes may hold the NaN that stood in for `f`.
+    err, ctx.err, ctx.fstart, ctx.fend = ctx.err, nothing, nothing, nothing
+    throw(err)
+end
+
+function _checked_du(integ::PETScIntegrator)
+    du = integ.tdir .* _derivative(integ.h.ctx, integ.tdir * integ.t, integ.u)
+    _raise_threw!(integ)
+    return du
+end
+
+SciMLBase.get_du(integ::PETScIntegrator) = _checked_du(integ)
 function SciMLBase.get_du!(out, integ::PETScIntegrator)
-    copyto!(out, integ.tdir .* _derivative(integ.h.ctx, integ.tdir * integ.t, integ.u))
+    copyto!(out, _checked_du(integ))
     return out
 end
 SciMLBase.get_tmp_cache(integ::PETScIntegrator) = (integ.tmp1, integ.tmp2)
@@ -2839,6 +2873,7 @@ function _change_t_unlocked(
     )
     LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * t)
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
+    _raise_threw!(integ)
     return nothing
 end
 
@@ -2856,6 +2891,7 @@ function _savevalues_unlocked(integ::PETScIntegrator, force_save = false)
         _record!(ctx, s, integ.u)
     end
     saved = length(ctx.ts) > n
+    _raise_threw!(integ)
     return (saved, saved && ctx.ts[end] == s)
 end
 
@@ -2889,6 +2925,12 @@ end
 
 _state_at(integ::PETScIntegrator, t) =
     _locked(() -> _state_at_unlocked(integ, oftype(integ.t, t)))
+
+function _checked_state(integ::PETScIntegrator, t)
+    u = _state_at(integ, t)
+    _raise_threw!(integ)
+    return u
+end
 
 # `s` is PETSc's time. Returns `integ.ucache`, which the next call overwrites.
 function _interpolate!(integ::PETScIntegrator, s)
@@ -3028,6 +3070,28 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
     return nothing
 end
 
+function _agreed_event(integ::PETScIntegrator, cb, k::Int)
+    comm = integ.h.ctx.comm
+    comm === nothing && return _find_event(integ, cb, k)
+    m = _ncond(cb)
+    found = err = nothing
+    try
+        found = _find_event(integ, cb, k)
+    catch e
+        err = e
+    end
+    mine = zeros(m + 3)
+    mine[1] = err !== nothing
+    found === nothing || (mine[2] = 1; mine[3] = found[1]; mine[4:end] .= found[2])
+    seen = reshape(MPI.Allgather(mine, comm), m + 3, :)
+    any(!iszero, view(seen, 1, :)) && throw(something(err, _remote_error()))
+    hits = findall(!iszero, view(seen, 2, :))
+    isempty(hits) && return nothing
+    j = hits[argmin([integ.tdir * seen[3, i] for i in hits])]
+    crossing = cb isa SciMLBase.VectorContinuousCallback ? Int8.(seen[4:end, j]) : seen[4, j]
+    return (oftype(integ.t, seen[3, j]), crossing)
+end
+
 _mark_fired!(ev, ::SciMLBase.ContinuousCallback, _, t) = (ev[1] = t; nothing)
 function _mark_fired!(ev, ::SciMLBase.VectorContinuousCallback, mask, t)
     for i in eachindex(mask)
@@ -3075,16 +3139,18 @@ end
 
 function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     isempty(integ.continuous) && return false
+    ctx = integ.h.ctx
+    # A rank's own root search must not call `f`, which is collective.
+    ctx.comm === nothing || _pin_step!(integ)
     best, best_cb, best_crossing, best_k = nothing, nothing, nothing, 0
     for (k, cb) in enumerate(integ.continuous)
-        found = _find_event(integ, cb, k)
+        found = _agreed_event(integ, cb, k)
         found === nothing && continue
         if best === nothing || integ.tdir * found[1] < integ.tdir * best
             best, best_cb, best_crossing, best_k = found[1], cb, found[2], k
         end
     end
     best === nothing && return false
-    ctx = integ.h.ctx
     saved = _save_step!(integ, best, false; slack = zero(best))
     _rollback!(integ, best, dt, true)
     residual = integ.event_residual[best_k]
@@ -3093,7 +3159,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     best_cb.save_positions[1] && !saved && _record!(ctx, integ.tdir * integ.t, integ.u)
     integ.derivative_discontinuity = true
     _pin_step!(integ)
-    _fire!(integ, best_cb, best_crossing)
+    _checked_everywhere(() -> _fire!(integ, best_cb, best_crossing), ctx.comm)
     integ.finished && return true
     _rollback!(integ, integ.t, dt, false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
@@ -3106,14 +3172,14 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
     ctx = h.ctx
     for cb in integ.callbacks
         integ.finished && return nothing
-        cb.condition(integ.u, integ.t, integ) || continue
+        _checked_anywhere(() -> cb.condition(integ.u, integ.t, integ), ctx.comm) || continue
         cb.save_positions[1] && !saved && _record!(ctx, integ.tdir * integ.t, integ.u)
         saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
-        cb.affect!(integ)
+        _checked_everywhere(() -> cb.affect!(integ), ctx.comm)
         integ.finished && return nothing
-        if integ.derivative_discontinuity
+        if _anywhere(ctx.comm, integ.derivative_discontinuity)
             PETScCompat.with_local_array!(
                 ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
             )
@@ -3129,11 +3195,13 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     h = integ.h
     cbs = (integ.callbacks..., integ.continuous...)
     before = copy(integ.u)
-    for cb in cbs
-        cb.initialize(cb, integ.u, integ.t, integ)
+    _checked_everywhere(h.ctx.comm) do
+        for cb in cbs
+            cb.initialize(cb, integ.u, integ.t, integ)
+        end
     end
     integ.derivative_discontinuity = false
-    integ.u == before && return nothing
+    _everywhere(h.ctx.comm, integ.u == before) && return nothing
     copyto!(integ.uprev, integ.u)
     PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
@@ -3170,21 +3238,18 @@ function _init_unlocked(
         stops, tstops, d_discontinuities, d_discontinuities, dt0,
         _initial_solution(prob, alg, h), false, false,
     )
-    _initialize_callbacks!(integ, true)
+    try
+        _initialize_callbacks!(integ, true)
+    catch
+        _destroy!(h)
+        rethrow()
+    end
     _past_discontinuity!(integ)
     return integ
 end
 
-function SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...)
-    _distributed(alg) && throw(
-        ArgumentError(
-            "PETScDiffEq does not support the integrator interface $_NOT_SELF yet, since " *
-                "`integrator(t)`, `get_du` and the other calls that can evaluate `f` must then " *
-                "be made on every rank; use `solve`",
-        ),
-    )
-    return _locked(() -> _init_unlocked(prob, alg; kwargs...))
-end
+SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
+    _locked(() -> _init_unlocked(prob, alg; kwargs...))
 
 function _reject_step!(integ::PETScIntegrator, before, taken)
     h = integ.h
@@ -3227,7 +3292,8 @@ _above(hi, lo) = hi > lo ? hi : nextfloat(lo)
 
 function _take_written_state!(integ::PETScIntegrator)
     h = integ.h
-    _readvec!(integ.ucache, h.petsclib, h.u) == integ.u && return nothing
+    _everywhere(h.ctx.comm, _readvec!(integ.ucache, h.petsclib, h.u) == integ.u) &&
+        return nothing
     PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
     )
@@ -3389,8 +3455,10 @@ end
 function _finish!(integ::PETScIntegrator, retcode = nothing)
     integ.finished && return nothing
     h = integ.h
-    for cb in (integ.callbacks..., integ.continuous...)
-        cb.finalize(cb, integ.u, integ.t, integ)
+    _checked_everywhere(h.ctx.comm) do
+        for cb in (integ.callbacks..., integ.continuous...)
+            cb.finalize(cb, integ.u, integ.t, integ)
+        end
     end
     st = _read_stats(h)
     sol = _assemble(integ.prob, integ.alg, h, integ.tdir * integ.t, copy(integ.u), st)
@@ -3481,8 +3549,9 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     )
     copyto!(integ.uprev, integ.u)
     integ.tprev = integ.t
-    unmoved = integ.tdir * integ.t == ctx.end_s && integ.u == ctx.end_u
-    ctx.fstart = unmoved && !ctx.pdirty ? ctx.fend : nothing
+    reuse = ctx.hermite && integ.tdir * integ.t == ctx.end_s &&
+        _everywhere(ctx.comm, integ.u == ctx.end_u && !ctx.pdirty)
+    ctx.fstart = reuse ? ctx.fend : nothing
     ctx.pdirty = false
     tol = _near(h.tf)
     while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t)
