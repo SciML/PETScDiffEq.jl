@@ -1383,7 +1383,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     @testset "the loaded PETSc has the index width the wrappers assume" begin
         lib = PETScDiffEq.PETSc.getlib(PetscScalar = Float64)
         @test PETScDiffEq._check_inttype(lib) === nothing
-        # Index vectors are typed at precompile time, so a width mismatch corrupts silently.
         @test PETScDiffEq.PETSc.inttype(lib) === PETScDiffEq.LibPETSc.PetscInt
     end
 
@@ -1770,14 +1769,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
     end
 
     @testset "PETSc types this package cannot drive are refused" begin
-        # These need PETSc setup calls this package never makes. Without them alpha2,
-        # discgrad and mimex abort, and eimex integrates to zero and reports success.
         for t in ("alpha2", "discgrad", "eimex", "mimex", "mprk", "pseudo")
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t; explicit = true)
         end
 
-        # Given an implicit residual these integrate nothing, and glee still reports success.
         for t in ("euler", "glee", "rk", "ssp")
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
             @test PETScDiffEq.TSGeneric(t; explicit = true).ts_type == t
@@ -4132,7 +4128,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "an asymmetric Jacobian is not transposed" begin
-            # PETSc takes the dense block row-major. Only an asymmetric J catches a transpose.
             asym!(du, u, p, t) = (du[1] = -u[1] + 3.0 * u[2]; du[2] = -2.0 * u[2]; nothing)
             function asym_jac!(J, u, p, t)
                 J[1, 1] = -1.0
@@ -5086,7 +5081,6 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             integ.opts.abstol = 1.0e-9
             @test held(integ) == (1.0e-9, 1.0e-5)
 
-            # integ.dt is the step just taken. The next one is get_proposed_dt.
             SciMLBase.step!(integ)
             SciMLBase.step!(integ)
             @test integ.dt == integ.t - integ.tprev

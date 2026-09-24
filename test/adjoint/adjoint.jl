@@ -46,7 +46,6 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
         )
         @test via == direct
         @test via[2] isa LinearAlgebra.Adjoint
-        # Cost times are the Float32 times `solve` saved.
         single = remake(prob; u0 = Float32.(U0), tspan = (0.0f0, 1.0f0), p = Float32.(P0))
         sol32 = solve(single, TSRK("4"); dt = 0.01f0, adaptive = false, saveat = 0.1f0)
         via32 = adjoint_sensitivities(

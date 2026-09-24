@@ -16,7 +16,6 @@ function _petsc_differences(alg)
 end
 
 # J is stored in the prototype's pattern, so that pattern overrides the backend's detector.
-# With no prototype J is dense, and a sparse backend with no detector runs dense.
 function _with_pattern(backend, proto)
     if proto isa SparseArrays.AbstractSparseMatrix
         coloring = backend isa ADTypes.AutoSparse ? ADTypes.coloring_algorithm(backend) :
@@ -149,7 +148,6 @@ function _stacked_pattern(R, proto)
     return vcat(P, P)
 end
 
-# A known pattern is stacked for the 2n-row real map. Other detectors run dense.
 function _complex_backend(R, backend, jac_prototype)
     jac_prototype isa SparseArrays.AbstractSparseMatrix &&
         return _with_pattern(backend, _stacked_pattern(R, jac_prototype))

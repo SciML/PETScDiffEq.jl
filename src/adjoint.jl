@@ -91,7 +91,6 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     order::Vector{Int}
     next::Int
     s_prev::Float64
-    # Time type the original `solve` ran in, so its saved Float32 times still match.
     clock::DataType
     cost_at_step::Dict{Int, Vector{Int}}
     u_at_step::Dict{Int, Vector{Float64}}

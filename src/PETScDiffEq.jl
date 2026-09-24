@@ -366,8 +366,7 @@ struct TSGeneric <: PETScTSAlgorithm
     autodiff::ADTypes.AbstractADType
 end
 
-# Without these setup calls `alpha2`, `discgrad` and `mimex` crash the process and
-# `eimex` integrates to zero and reports success.
+# Without these setup calls PETSc crashes, or integrates to zero and reports success.
 const _NEEDS_OTHER_SETUP = Dict(
     "alpha2" => "is for second-order systems and needs TSSetI2Function",
     "discgrad" => "needs TSDiscGradSetFormulation",
@@ -1234,8 +1233,7 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
                 _record_end!(ctx, want, _readvec!(ctx.u, ctx.petsclib, x))
                 landed = true
             elseif ctx.hermite
-                # -ts_exact_final_time interpolate steps past tf and reports tf in a
-                # later call of its own.
+                # -ts_exact_final_time interpolate steps past tf and reports tf later.
                 tmax = LibPETSc.TSGetMaxTime(ctx.petsclib, ts)
                 want >= tmax - tol && t > tmax + tol && break
                 u1 = _readvec!(ctx.u, ctx.petsclib, x)
@@ -1362,8 +1360,7 @@ function __init__()
     return nothing
 end
 
-# PETSc.jl's `TSRHSSplitSetRHSFunction` wrapper has no room for a context, so the
-# symbol is called directly.
+# PETSc.jl's `TSRHSSplitSetRHSFunction` wrapper takes no context, so ccall it.
 function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr)
     n = LibPETSc.PetscInt(length(idxs))
     is = LibPETSc.ISCreateGeneral(
@@ -1493,7 +1490,7 @@ mutable struct TSHandles{CTX, L, R, S}
     save_end::Bool
     pivot_raises::Bool
     stopped::Int
-    # `matches`: the integrator, not PETSc, lands steps on stops. `fixed`: fixed steps.
+    # `matches`: the integrator, not PETSc, lands steps on stops.
     matches::Bool
     fixed::Bool
     tolvecs::Vector{Any}
@@ -1652,8 +1649,7 @@ _loaded_builds() = Type[
         (_SINGLE_BUILDS || real(PETSc.scalartype(pl)) !== Float32)
 ]
 
-# Single precision runs in a single build only with a Float32 span. Otherwise it runs
-# in the double build and only the saved states stay single.
+# A single build needs a Float32 span too. Otherwise it runs double and saves single.
 function _eltypes(prob, builds = _loaded_builds())
     E, tE = eltype(prob.u0), eltype(prob.tspan)
     single = E === Float32 || E === ComplexF32
@@ -2178,6 +2174,7 @@ const _NORM_FLOOR = sqrt(floatmin(Float32))
 _tiny(u) = 0 < maximum(abs, u; init = 0.0f0) < _NORM_FLOOR
 
 _underflows(::TSHandles{<:Any, <:Any, Float64}, alg, uend, retcode) = false
+# Decaying below the floor is harmless, so warn only if u0 was there or the solve failed.
 _underflows(h::TSHandles{<:Any, <:Any, Float32}, alg, uend, retcode) =
     _uses_ifunction(alg) && _tiny(uend) &&
     (_tiny(h.u0) || retcode != SciMLBase.ReturnCode.Success)
