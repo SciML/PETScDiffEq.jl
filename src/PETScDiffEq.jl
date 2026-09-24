@@ -1260,6 +1260,8 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
             ctx.fend = nothing
             ctx.pdirty = false
         end
+        ctx.end_s = t
+        _readvec!(ctx.end_u, ctx.petsclib, x)
 
     catch e
         ctx.err = e
@@ -2260,10 +2262,12 @@ function _solve_unlocked(
         end
         ctx.err === nothing || throw(ctx.err)
         h.stopped == 0 || _warn_failed_step(alg, h.stopped)
-        # PETSc sets the solve time only when TSSolve returns normally.
-        tend = h.stopped == 0 ? LibPETSc.TSGetSolveTime(pl, h.ts) : LibPETSc.TSGetTime(pl, h.ts)
+        # PETSc sets the solve time only when TSSolve returns normally, and a step that
+        # raises leaves its rejected trial in the solution vector.
+        tend, uend = h.stopped == 0 ?
+            (LibPETSc.TSGetSolveTime(pl, h.ts), _readvec!(similar(h.u0), pl, h.u)) :
+            (ctx.end_s, copy(ctx.end_u))
         st = _read_stats(h)
-        uend = _readvec!(similar(h.u0), pl, h.u)
     finally
         _destroy!(h)
     end
@@ -2471,7 +2475,7 @@ function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
     t = oftype(integ.t, t)
     ctx = integ.h.ctx
     s = integ.tdir * t
-    s < integ.tdir * integ.t - _near(integ.t) &&
+    s < integ.tdir * integ.t &&
         throw(ArgumentError("cannot add a saveat at $t, behind the current time $(integ.t)"))
     i = searchsortedfirst(ctx.saveat, s)
     (i <= length(ctx.saveat) && ctx.saveat[i] == s) || insert!(ctx.saveat, i, s)
@@ -2739,12 +2743,12 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     end
     best === nothing && return false
     ctx = integ.h.ctx
-    _save_step!(integ, best, false; slack = zero(best))
+    saved = _save_step!(integ, best, false; slack = zero(best))
     _rollback!(integ, best, dt, true)
     residual = integ.event_residual[best_k]
     best_cb.rootfind === SciMLBase.NoRootFind ? fill!(residual, 0.0) :
         _fill_conditions!(residual, integ, best_cb, integ.t)
-    best_cb.save_positions[1] && _record!(ctx, integ.tdir * integ.t, integ.u)
+    best_cb.save_positions[1] && !saved && _record!(ctx, integ.tdir * integ.t, integ.u)
     integ.derivative_discontinuity = true
     _pin_step!(integ)
     _fire!(integ, best_cb, best_crossing)
@@ -2755,12 +2759,14 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     return true
 end
 
-function _apply_callbacks!(integ::PETScIntegrator)
+function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
     h = integ.h
     ctx = h.ctx
     for cb in integ.callbacks
         integ.finished && return nothing
         cb.condition(integ.u, integ.t, integ) || continue
+        cb.save_positions[1] && !saved && _record!(ctx, integ.tdir * integ.t, integ.u)
+        saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
         cb.affect!(integ)
@@ -3061,6 +3067,7 @@ function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near
     h = integ.h
     ctx = h.ctx
     tol = _near(integ.t)
+    n = length(ctx.ts)
     landed = false
     while ctx.saveat_idx <= length(ctx.saveat) &&
             ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + slack
@@ -3075,7 +3082,7 @@ function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near
     end
     endpoint && ctx.save_everystep && !landed &&
         _record_end!(ctx, integ.tdir * upto, integ.u)
-    return nothing
+    return length(ctx.ts) > n && _last_recorded(ctx, integ.tdir * upto)
 end
 
 # MATCHSTEP refuses a step leaving under 10 eps (1.2e-6 in Float32) before a stop.
@@ -3161,6 +3168,12 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped)
     integ.t = _user_t(integ.tdir, LibPETSc.TSGetTime(pl, h.ts))
     if integ.tdir * integ.t <= integ.tdir * integ.tprev
+        if h.stopped == 0 && SciMLBase.isadaptive(integ) &&
+                Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
+            ctx.unstable_hit = true
+            @warn "`$(_warn_name(integ.alg))` ends here because its step fell below the " *
+                "floating point spacing at t = $(integ.t)"
+        end
         _finish!(integ)
         return nothing
     end
@@ -3185,9 +3198,9 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     _live_stats!(integ)
     fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing
-    fired || _save_step!(integ, integ.t, true)
+    saved = !fired && _save_step!(integ, integ.t, true)
     # Discrete callbacks run with the stop they landed on still at the head of the queue.
-    _apply_callbacks!(integ)
+    _apply_callbacks!(integ, saved)
     while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t)
         popfirst!(integ.tstops)
     end
