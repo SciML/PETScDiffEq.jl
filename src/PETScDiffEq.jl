@@ -1394,8 +1394,11 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
             ctx.fend = nothing
             ctx.pdirty = false
         end
-        ctx.end_s = t
-        _readvec!(ctx.end_u, ctx.petsclib, x)
+        # Steps below the spacing of t still change the state, so keep the first one at t.
+        if step == 0 || t != ctx.end_s
+            ctx.end_s = t
+            _readvec!(ctx.end_u, ctx.petsclib, x)
+        end
 
     catch e
         ctx.err = e
@@ -1556,13 +1559,21 @@ function _running_name(petsclib, ts)
     return type
 end
 
-function _refuse_method(name, has_mass, has_jac, is_split)
+function _refuse_method(name, has_mass, has_jac, is_split, is_dae)
     if name == "irk" && has_mass
         throw(
             ArgumentError(
                 "PETScDiffEq does not support a mass matrix with TSIRK; PETSc's " *
                     "coupled-stage matrix assumes dF/du_dot = I, and the answer drifts " *
                     "further from the true one as dt shrinks rather than failing",
+            ),
+        )
+    end
+    if name == "irk" && is_dae
+        throw(
+            ArgumentError(
+                "PETScDiffEq does not support a DAEProblem with TSIRK, whose " *
+                    "stage matrix in PETSc assumes dG/du' = I",
             ),
         )
     end
@@ -2028,7 +2039,7 @@ function _setup(
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
     builds_jac = _uses_ifunction(alg) && prob.f.jac === nothing && !_petsc_differences(alg)
     has_jac = _uses_ifunction(alg) && (prob.f.jac !== nothing || builds_jac)
-    _refuse_method(_warn_name(alg), has_mass, has_jac, is_split)
+    _refuse_method(_warn_name(alg), has_mass, has_jac, is_split, is_dae)
     ad_calls = builds_jac ? Ref(0) : nothing
     jac_fn = if !has_jac
         nothing
@@ -2305,7 +2316,7 @@ function _setup(
                 ),
             )
             running = _running_name(petsclib, ts)
-            _refuse_method(running, has_mass, has_jac, is_split)
+            _refuse_method(running, has_mass, has_jac, is_split, is_dae)
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
             if chosen == "irk" && has_jac && !uses_sparse_jac
                 PETScCompat.destroy!(h.jac_mat)
@@ -2620,7 +2631,8 @@ function _set_p_unlocked(integ::PETScIntegrator, v)
     h.ctx.p = integ.p
     h.ctx.pdirty = true
     # An FSAL method reuses its last stage's slope, taken with the old p, unless restarted.
-    h.destroyed || LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    # BDF keeps only past states, which stay valid, and a restart drops it to first order.
+    h.destroyed || h.ctx.alg_name == "bdf" || LibPETSc.TSRestartStep(h.petsclib, h.ts)
     return v
 end
 
@@ -3188,7 +3200,7 @@ end
 
 function _live_stats!(integ::PETScIntegrator)
     stats = integ.sol.stats
-    stats === nothing && return nothing
+    stats isa SciMLBase.DEStats || return nothing
     ctx, st = integ.h.ctx, _read_stats(integ.h)
     stats.nf, stats.nf2, stats.njacs = _nf(integ.h), ctx.nf2, ctx.njacs
     stats.nnonliniter, stats.nnonlinconvfail = st.nnonliniter, st.nnonlinfail

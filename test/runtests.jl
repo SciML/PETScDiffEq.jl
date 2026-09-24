@@ -1786,6 +1786,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         split = SciMLBase.SplitODEProblem(decay!, decay!, [1.0], (0.0, 1.0))
+        halved!(r, du, u, p, t) = (r[1] = 2du[1] + u[1]; nothing)
+        dae = SciMLBase.DAEProblem(halved!, [-0.5], [1.0], (0.0, 1.0))
         pb = ["-pc_type", "pbjacobi"]
         for (pr, alg, msg) in (
                 (mass, PETScDiffEq.TSImplicit("beuler", ["-ts_type", "irk", pb...]), "a mass matrix with TSIRK"),
@@ -1795,6 +1797,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 (prob, PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "ark3"]), "cannot be used"),
                 (prob, PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "ars122"]), "needs a SplitODEProblem"),
                 (split, PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "bpr3"]), "converges at first order"),
+                (dae, PETScDiffEq.TSDAE("irk", pb), "a DAEProblem with TSIRK"),
+                (dae, PETScDiffEq.TSDAE("beuler", ["-ts_type", "irk", pb...]), "a DAEProblem with TSIRK"),
             )
             @test_throws msg SciMLBase.solve(pr, alg; dt = 0.01, adaptive = false)
             @test_throws msg SciMLBase.init(pr, alg; dt = 0.01, adaptive = false)
@@ -2159,6 +2163,12 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test_logs (:warn, r"floating point spacing") SciMLBase.solve!(integ)
             @test integ.sol.retcode == SciMLBase.ReturnCode.Unstable
             @test integ.sol.t == sol.t
+            plain = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                runaway, PETScDiffEq.TSRK("5dp"),
+            )
+            @test plain.retcode == SciMLBase.ReturnCode.Unstable
+            @test plain.t == sol.t
+            @test plain.u == sol.u
         end
 
         @testset "a step below dtmin ends the solve where it still holds" begin
@@ -2784,13 +2794,11 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test_throws ArgumentError integ.opts.reltol = [1.0e-6, -1.0]
             @test (integ.opts.abstol, integ.opts.reltol) == (1.0e-6, 1.0e-3)
             @test held() == (1.0e-6, C_NULL, 1.0e-3, C_NULL)
-            SciMLBase.step!(integ)
-            @test !integ.finished
-            @test integ.t > 0
             integ.opts.abstol = [1.0e-8, 1.0e-8]
             @test held()[2] != C_NULL
             SciMLBase.step!(integ)
             @test !integ.finished
+            @test integ.t > 0
         end
 
         @testset "a non-adaptive method still warns" begin
@@ -5463,6 +5471,13 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.reinit!(integ)
             @test abs(SciMLBase.solve!(integ).u[end][1] - exp(-2.0)) < 2.0e-10
         end
+        bdf = PETScDiffEq.TSImplicit("bdf")
+        integ = SciMLBase.init(prob, bdf; dt = 0.01, adaptive = false)
+        while integ.t < 1.0
+            integ.p = 1.0
+            SciMLBase.step!(integ)
+        end
+        @test integ.u == SciMLBase.solve(prob, bdf; dt = 0.01, adaptive = false).u[end]
     end
 
     @testset "Only methods with an error estimate adapt" begin
