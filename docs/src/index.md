@@ -264,11 +264,66 @@ jacobian_errors(f!, jac!, paramjac!, [1.0, 0.5], [0.7, 0.3, 0.4, 0.2], 0.3)
 Both errors should be near round-off, around 1e-10 here; a wrong entry shows up at its own
 size.
 
+## MPI
+
+`TSRK` and `TSGeneric(ts_type; explicit = true)` take a `comm` keyword. With a communicator
+other than the default `MPI.COMM_SELF` the solve runs distributed over it: every rank of
+`comm` calls `solve` with the same arguments, and `u0` is the block of the state that rank
+owns, the blocks following each other in rank order. Each rank's `sol.u` holds its own rows,
+and `sol.t` is the same on every rank.
+
+`f(du, u, p, t)` sees only its rank's rows, so it fetches what it needs from the other ranks
+itself, and it has to be collective: the package calls it the same number of times, in the
+same order, on every rank. A 1-D heat equation with eight rows on each rank:
+
+```julia
+using MPI, PETScDiffEq, SciMLBase
+
+MPI.Init()
+comm = MPI.COMM_WORLD
+rank, nranks = MPI.Comm_rank(comm), MPI.Comm_size(comm)
+dx = 1 / (8nranks + 1)
+x = (8rank .+ (1:8)) .* dx
+
+function heat!(du, u, p, t)
+    left = rank == 0 ? MPI.PROC_NULL : rank - 1
+    right = rank == nranks - 1 ? MPI.PROC_NULL : rank + 1
+    gl, gr = zeros(1), zeros(1)
+    MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
+    MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
+    for i in eachindex(u)
+        l = i == 1 ? gl[1] : u[i - 1]
+        r = i == length(u) ? gr[1] : u[i + 1]
+        du[i] = (l - 2u[i] + r) / dx^2
+    end
+end
+
+sol = solve(ODEProblem(heat!, sinpi.(x), (0.0, 0.1)), TSRK("5dp"; comm))
+```
+
+Run it with the `mpiexec` MPI.jl provides, `MPI.mpiexec()`, as in `mpiexec -n 4 julia heat.jl`.
+PETSc starts up collectively over `MPI.COMM_WORLD`, so under `mpiexec` a rank that solves on
+its own, on `MPI.COMM_SELF` too, hangs unless an earlier solve or `PETSc.initialize` has
+started PETSc on every rank.
+
+`saveat`, `tstops`, `d_discontinuities`, a fixed `dt` and dense output work as in a serial
+solve. Vector `abstol` and `reltol`, `save_idxs` and `p` are per rank.
+`unstable_check` and `isoutofdomain` are asked on each rank's rows, and `true` on any rank
+counts on all of them. When `f` or one of those checks throws on some ranks, those ranks go
+on with NaN until the end of the step, and then every rank throws, so an `f` that throws has to
+do so after its own communication.
+
+A distributed solve refuses, with an `ArgumentError`, the implicit algorithms, `TSMPRK`, a
+`jac`, a mass matrix, callbacks, `init` and the rest of the integrator interface, and
+`PETScAdjoint`. Solving from several threads at once, as `EnsembleThreads` does, is not
+refused, but nothing then keeps the ranks' solves in the same order, which they need.
+
 ## Limitations
 
-Every solve runs on `MPI.COMM_SELF`, so this package is serial. PETSc TS is built for
-large distributed problems, and reaching it from the SciML interface is what this package
-is for; use OrdinaryDiffEq.jl for serial problems where it applies.
+Only the explicit methods run distributed so far, as described under MPI; every other solve
+runs on `MPI.COMM_SELF`. PETSc TS is built for large distributed problems, and reaching it
+from the SciML interface is what this package is for; use OrdinaryDiffEq.jl for serial
+problems where it applies.
 
 On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.

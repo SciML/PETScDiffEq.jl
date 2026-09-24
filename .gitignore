@@ -7,3 +7,4 @@ Manifest.toml
 .DS_Store
 test/qa/Manifest.toml
 test/adjoint/Manifest.toml
+test/mpi/Manifest.toml
