@@ -2181,6 +2181,28 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
         end
 
+        @testset "a fixed-step solve stops at its first state that is not finite" begin
+            breaks = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
+            )
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            for (alg, kw) in (
+                    (PETScDiffEq.TSRK("4"), (; dt = 0.01)),
+                    (PETScDiffEq.TSRK("5dp"), (; dt = 0.01, adaptive = false)),
+                    (PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"]), (; dt = 0.01)),
+                )
+                plain = SciMLBase.solve(breaks, alg; kw...)
+                stepped = SciMLBase.solve(breaks, alg; callback = never, kw...)
+                @test plain.retcode == SciMLBase.ReturnCode.Unstable
+                @test plain.t[end] < 0.51
+                @test !all(isfinite, plain.u[end])
+                @test all(u -> all(isfinite, u), plain.u[1:(end - 1)])
+                @test plain.t == stepped.t
+                @test isequal(plain.u, stepped.u)
+                @test plain.stats.naccept == stepped.stats.naccept
+            end
+        end
+
         @testset "a step too small to move t is Unstable through the integrator" begin
             square!(du, u, p, t) = (du[1] = u[1]^2; nothing)
             runaway = SciMLBase.ODEProblem(square!, [1.0], (0.0, 2.0))

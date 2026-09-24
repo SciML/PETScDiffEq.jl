@@ -548,6 +548,7 @@ mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
     retry_fp::Bool
     workvec::Ptr{Cvoid}
     nreject::Int
+    halt_nonfinite::Bool
 end
 
 function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
@@ -586,15 +587,17 @@ function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
         if ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
             ctx.dt_too_small = stop = true
         end
-        if !stop && ctx.unstable !== nothing
+        if !stop && (ctx.unstable !== nothing || ctx.halt_nonfinite)
             x = Ref{LibPETSc.CVec}(C_NULL)
             ccall(
                 _symbol(pl, :TSGetSolution), LibPETSc.PetscErrorCode,
                 (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x,
             )
             u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
-            ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s)) &&
+            ctx.unstable !== nothing &&
+                ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s)) &&
                 (ctx.unstable_hit = stop = true)
+            ctx.halt_nonfinite && !all(isfinite, u) && (stop = true)
         end
         stop && LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_CONVERGED_USER)
     catch e
@@ -2053,7 +2056,7 @@ function _setup(
         _floor(R, dtmin, force_dtmin, adaptive && _adapts(alg) !== false), false,
         unstable_check, false, tdir, isoutofdomain,
         0, 0, 0, nothing, adaptive && _adapts(alg) !== false && !_uses_ifunction(alg), C_NULL,
-        0,
+        0, false,
     )
     h = TSHandles(
         ctx, petsclib, nothing, nothing, nothing, nothing, ad_calls, nothing,
@@ -2332,6 +2335,10 @@ function _solve_unlocked(
     forced = get(kwargs, :force_dtmin, false) === true
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
+        if LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
+            ctx.halt_nonfinite = true
+            _set_post_step!(pl, h.ts, ctx)
+        end
         raised = false
         GC.@preserve ctx begin
             while true
