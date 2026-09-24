@@ -1766,6 +1766,29 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test abs(sol.u[end][1] - exp(-1)) < 1.0e-3
     end
 
+    @testset "subtype refusals hold when an option selects the subtype" begin
+        pair_jac!(J, u, p, t) = (J .= 0.0; J[1, 1] = -1.0; J[2, 2] = -1.0; nothing)
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; jac = pair_jac!, mass_matrix = Diagonal([2.0, 1.0])),
+            [1.0, 1.0], (0.0, 1.0),
+        )
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        split = SciMLBase.SplitODEProblem(decay!, decay!, [1.0], (0.0, 1.0))
+        pb = ["-pc_type", "pbjacobi"]
+        for (pr, alg, msg) in (
+                (mass, PETScDiffEq.TSImplicit("beuler", ["-ts_type", "irk", pb...]), "a mass matrix with TSIRK"),
+                (mass, PETScDiffEq.TSGeneric("beuler", ["-ts_type", "irk", pb...]), "a mass matrix with TSIRK"),
+                (mass, PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "assp3p3s1c"]), "cannot take a mass matrix"),
+                (mass, PETScDiffEq.TSGeneric("rosw", ["-ts_rosw_type", "assp3p3s1c"]), "cannot take a mass matrix"),
+                (prob, PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "ark3"]), "cannot be used"),
+                (prob, PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "ars122"]), "needs a SplitODEProblem"),
+                (split, PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "bpr3"]), "converges at first order"),
+            )
+            @test_throws msg SciMLBase.solve(pr, alg; dt = 0.01, adaptive = false)
+            @test_throws msg SciMLBase.init(pr, alg; dt = 0.01, adaptive = false)
+        end
+    end
+
     @testset "a solve that never uses the Jacobian is called out" begin
         prob = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),
@@ -4717,7 +4740,9 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test matches_petsc(mass, PETScDiffEq.TSImplicit(st))
             end
             refuses_between_steps(PETScDiffEq.TSGeneric("rosw", ["-ts_rosw_type", "rodas3"]))
-            refuses_between_steps(PETScDiffEq.TSGeneric("irk", ["-pc_type", "pbjacobi"]))
+            @test_throws "a mass matrix with TSIRK" SciMLBase.solve(
+                mass, PETScDiffEq.TSGeneric("irk", ["-pc_type", "pbjacobi"]); fixed...,
+            )
             @test matches_petsc(mass, PETScDiffEq.TSGeneric("rosw"))
             refuses_between_steps(PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "rodas3"]))
             @test matches_petsc(mass, PETScDiffEq.TSRosW("rodas3", ["-ts_rosw_type", "ra34pw2"]))

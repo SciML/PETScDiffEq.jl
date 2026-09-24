@@ -1388,6 +1388,75 @@ function _running_name(petsclib, ts)
     return type
 end
 
+function _refuse_method(name, has_mass, has_jac, is_split)
+    if name == "irk" && has_mass
+        throw(
+            ArgumentError(
+                "PETScDiffEq does not support a mass matrix with TSIRK; PETSc's " *
+                    "coupled-stage matrix assumes dF/du_dot = I, and the answer drifts " *
+                    "further from the true one as dt shrinks rather than failing",
+            ),
+        )
+    end
+    if name == "irk" && !has_jac
+        throw(
+            ArgumentError(
+                "TSIRK needs a Jacobian; give the ODEFunction a `jac` or leave `autodiff` " *
+                    "at a backend other than `AutoFiniteDiff()`, since PETSc builds its " *
+                    "coupled-stage matrix from one and has no finite-difference fallback for it",
+            ),
+        )
+    end
+    sub = last(split(name))
+    if startswith(name, "rosw ") && sub in _ROSW_NO_STEP
+        throw(
+            ArgumentError(
+                "TSRosW(\"$sub\") cannot be used: without a `jac` PETSc stops " *
+                    "and asks for one, and with one it does not restore its Jacobian lag " *
+                    "after the explicit last stage, so an adaptive solve fails within its " *
+                    "first two steps and a fixed-step solve diverges; use another TSRosW type",
+            ),
+        )
+    end
+    if name == "rosw assp3p3s1c" && has_mass
+        throw(
+            ArgumentError(
+                "TSRosW(\"assp3p3s1c\") cannot take a mass matrix; PETSc leaves the mass " *
+                    "matrix out of its explicit first stage, so the solve reports success " *
+                    "with an error that does not shrink with dt",
+            ),
+        )
+    end
+    if name == "rosw assp3p3s1c" && !has_jac
+        throw(
+            ArgumentError(
+                "TSRosW(\"assp3p3s1c\") needs a Jacobian; give the ODEFunction a `jac` " *
+                    "or leave `autodiff` at a backend other than `AutoFiniteDiff()`, since " *
+                    "PETSc asks for one at the start of every step and has no " *
+                    "finite-difference fallback there",
+            ),
+        )
+    end
+    if name == "arkimex ars122" && !is_split
+        throw(
+            ArgumentError(
+                "TSARKIMEX(\"ars122\") needs a SplitODEProblem; it has an explicit first " *
+                    "stage and is not stiffly accurate, so PETSc cannot evaluate its " *
+                    "first-stage slope when the whole problem is implicit",
+            ),
+        )
+    end
+    if name == "arkimex bpr3" && is_split
+        throw(
+            ArgumentError(
+                "TSARKIMEX(\"bpr3\") converges at first order on a SplitODEProblem; solve " *
+                    "a plain ODEProblem with it, or use another TSARKIMEX type",
+            ),
+        )
+    end
+    return nothing
+end
+
 _set_subtype!(petsclib, ts, alg::TSRK) =
     PETScCompat.TSRKSetType(petsclib, ts, alg.subtype)
 _set_subtype!(petsclib, ts, alg::TSRosW) =
@@ -1692,15 +1761,6 @@ function _setup(
             ),
         )
     end
-    if has_mass && alg isa TSIRK
-        throw(
-            ArgumentError(
-                "PETScDiffEq does not support a mass matrix with TSIRK; PETSc's " *
-                    "coupled-stage matrix assumes dF/du_dot = I, and the answer drifts " *
-                    "further from the true one as dt shrinks rather than failing",
-            ),
-        )
-    end
     if has_mass && is_split
         throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
     end
@@ -1754,61 +1814,7 @@ function _setup(
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
     builds_jac = _uses_ifunction(alg) && prob.f.jac === nothing && !_petsc_differences(alg)
     has_jac = _uses_ifunction(alg) && (prob.f.jac !== nothing || builds_jac)
-    if alg isa TSIRK && !has_jac
-        throw(
-            ArgumentError(
-                "TSIRK needs a Jacobian; give the ODEFunction a `jac` or leave `autodiff` " *
-                    "at a backend other than `AutoFiniteDiff()`, since PETSc builds its " *
-                    "coupled-stage matrix from one and has no finite-difference fallback for it",
-            ),
-        )
-    end
-    if alg isa TSRosW && alg.subtype in _ROSW_NO_STEP
-        throw(
-            ArgumentError(
-                "TSRosW(\"$(alg.subtype)\") cannot be used: without a `jac` PETSc stops " *
-                    "and asks for one, and with one it does not restore its Jacobian lag " *
-                    "after the explicit last stage, so an adaptive solve fails within its " *
-                    "first two steps and a fixed-step solve diverges; use another TSRosW type",
-            ),
-        )
-    end
-    if alg isa TSRosW && alg.subtype == "assp3p3s1c" && has_mass
-        throw(
-            ArgumentError(
-                "TSRosW(\"assp3p3s1c\") cannot take a mass matrix; PETSc leaves the mass " *
-                    "matrix out of its explicit first stage, so the solve reports success " *
-                    "with an error that does not shrink with dt",
-            ),
-        )
-    end
-    if alg isa TSRosW && alg.subtype == "assp3p3s1c" && !has_jac
-        throw(
-            ArgumentError(
-                "TSRosW(\"assp3p3s1c\") needs a Jacobian; give the ODEFunction a `jac` " *
-                    "or leave `autodiff` at a backend other than `AutoFiniteDiff()`, since " *
-                    "PETSc asks for one at the start of every step and has no " *
-                    "finite-difference fallback there",
-            ),
-        )
-    end
-    if alg isa TSARKIMEX && alg.subtype == "ars122" && !is_split
-        throw(
-            ArgumentError(
-                "TSARKIMEX(\"ars122\") needs a SplitODEProblem; it has an explicit first " *
-                    "stage and is not stiffly accurate, so PETSc cannot evaluate its " *
-                    "first-stage slope when the whole problem is implicit",
-            ),
-        )
-    end
-    if alg isa TSARKIMEX && alg.subtype == "bpr3" && is_split
-        throw(
-            ArgumentError(
-                "TSARKIMEX(\"bpr3\") converges at first order on a SplitODEProblem; solve " *
-                    "a plain ODEProblem with it, or use another TSARKIMEX type",
-            ),
-        )
-    end
+    _refuse_method(_warn_name(alg), has_mass, has_jac, is_split)
     ad_calls = builds_jac ? Ref(0) : nothing
     jac_fn = if !has_jac
         nothing
@@ -2047,7 +2053,7 @@ function _setup(
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
             end
-            # An option can change the type, so recheck the constructor's refusals.
+            # An option can change the type or subtype, so recheck the refusals.
             chosen = LibPETSc.TSGetType(petsclib, ts)
             !(alg isa TSMPRK) && haskey(_NEEDS_OTHER_SETUP, chosen) && throw(
                 ArgumentError(
@@ -2060,6 +2066,8 @@ function _setup(
                         "`TSGeneric(\"$chosen\"; explicit = true)` rather than an option",
                 ),
             )
+            running = _running_name(petsclib, ts)
+            _refuse_method(running, has_mass, has_jac, is_split)
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
             if chosen == "irk" && has_jac && !uses_sparse_jac
                 PETScCompat.destroy!(h.jac_mat)
@@ -2081,7 +2089,6 @@ function _setup(
                     ),
                 )
             end
-            running = _running_name(petsclib, ts)
             if running != ctx.alg_name
                 ctx.hermite = !has_mass && !is_dae
                 ctx.interpolates = nothing
