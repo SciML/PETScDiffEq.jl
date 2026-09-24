@@ -1435,9 +1435,8 @@ function _refuse_method(name, has_mass, has_jac, is_split, is_dae)
     if name == "irk" && is_dae
         throw(
             ArgumentError(
-                "PETScDiffEq does not support a DAEProblem with TSIRK; PETSc's " *
-                    "coupled-stage matrix assumes dG/du' = I, and the answer drifts " *
-                    "further from the true one as dt shrinks rather than failing",
+                "PETScDiffEq does not support a DAEProblem with TSIRK, whose " *
+                    "stage matrix in PETSc assumes dG/du' = I",
             ),
         )
     end
