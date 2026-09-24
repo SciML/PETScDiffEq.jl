@@ -234,10 +234,28 @@ counts on all of them. When `f` or one of those checks throws on some ranks, tho
 on with NaN until the end of the step, and then every rank throws, so an `f` that throws has to
 do so after its own communication.
 
+Callbacks and the integrator interface run distributed too, as long as every rank makes the
+same calls with the same arguments in the same order: `init`, `step!`, `solve!`, `reinit!`,
+`terminate!`, `set_u!`, `add_tstop!`, `add_saveat!`, `savevalues!`,
+`change_t_via_interpolation!`, `set_proposed_dt!`, `integrator(t)` and `get_du` are all
+collective, and the last two can call `f`. `integrator.u` holds the rank's own rows, and so
+does the state given to `set_u!` or `reinit!`. `set_proposed_dt!` takes the smallest step any
+rank proposes.
+
+A callback's condition should give the same value on every rank, which usually means it
+reduces over the ranks itself, for instance with `MPI.Allreduce`. The package reduces the
+conditions as well, so ranks whose conditions disagree still stay together: a
+`DiscreteCallback` fires when its condition is `true` on any rank, and a `ContinuousCallback`
+or `VectorContinuousCallback` fires at the earliest event any rank finds, with that rank's
+crossing. The affect then runs on every rank whatever its own condition gave, so it has to be
+collective as well: an affect that calls `terminate!` has to call it on every rank. A condition,
+affect, `initialize` or `finalize` that throws on some ranks makes every rank throw, as `f`
+does, so an affect that throws has to do so after its own communication.
+
 A distributed solve refuses, with an `ArgumentError`, the implicit algorithms, `TSMPRK`, a
-`jac`, a mass matrix, callbacks, `init` and the rest of the integrator interface, and
-`PETScAdjoint`. Solving from several threads at once, as `EnsembleThreads` does, is not
-refused, but nothing then keeps the ranks' solves in the same order, which they need.
+`jac`, a mass matrix and `PETScAdjoint`. Solving from several threads at once, as
+`EnsembleThreads` does, is not refused, but nothing then keeps the ranks' solves in the same
+order, which they need.
 
 ## Limitations
 
