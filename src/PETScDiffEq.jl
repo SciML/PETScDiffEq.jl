@@ -1595,7 +1595,7 @@ function _tolvec(h::TSHandles{<:Any, <:Any, R, S}, petsclib, tol, n, name) where
     # It has to be in the build's scalar type. PETSc reads the real part.
     buf = Vector{S}(collect(tol))
     push!(h.tolbufs, buf)
-    v = PETSc.VecSeq(petsclib, buf)
+    v = PETScCompat.PetscVec(petsclib, buf)
     push!(h.tolvecs, v)
     return v
 end
@@ -1983,7 +1983,7 @@ function _setup(
         row_cols0, row_src, row_buf, J0,
         R[], Vector{U}[], Vector{U}[],
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
-        PETSc.VecSeq(petsclib, n),
+        PETScCompat.PetscVec(petsclib, n),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
         R(NaN), similar(u0), t0, copy(u0), nothing, nothing, false,
         slow_idxs, medium_idxs, fast_idxs,
@@ -2007,7 +2007,7 @@ function _setup(
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
         _set_subtype!(petsclib, ts, alg)
 
-        h.u = PETSc.VecSeq(petsclib, n)
+        h.u = PETScCompat.PetscVec(petsclib, n)
         u = h.u
         PETSc.withlocalarray!(u; read = false, write = true) do ua
             copyto!(ua, u0)
@@ -2035,19 +2035,22 @@ function _setup(
             end
             if has_jac && uses_sparse_jac
                 pattern = _jacobian_pattern(J0, n, M)
-                h.jac_mat = PETSc.MatSeqAIJWithArrays(petsclib, MPI.COMM_SELF, pattern)
+                h.jac_mat = PETScCompat.PetscMat(
+                    petsclib, MPI.COMM_SELF, pattern; with_arrays = true,
+                )
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.sparse_ijacobian, ctxptr,
                 )
             elseif has_jac
                 # A dense matrix gets LAPACK's pivoting LU, as PETSc's own does.
-                h.jac_mat = PETSc.MatSeqDense(petsclib, zeros(S, n, n))
+                h.jac_mat = PETScCompat.PetscMat(petsclib, zeros(S, n, n))
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.ijacobian, ctxptr,
                 )
             elseif _uses_ifunction(alg) && prob.f.jac_prototype isa SparseArrays.AbstractSparseMatrix
-                h.fd_mat = PETSc.MatSeqAIJWithArrays(
-                    petsclib, MPI.COMM_SELF, _fd_pattern(prob.f.jac_prototype, M, n),
+                h.fd_mat = PETScCompat.PetscMat(
+                    petsclib, MPI.COMM_SELF, _fd_pattern(prob.f.jac_prototype, M, n);
+                    with_arrays = true,
                 )
                 _colour_jacobian!(petsclib, ts, h.fd_mat)
             end
@@ -2094,7 +2097,7 @@ function _setup(
             append!(effective_options, extra_options)
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
-                h.opts = PETSc.Options(petsclib; parsed...)
+                h.opts = PETScCompat.PetscOptions(petsclib; parsed...)
                 push!(h.opts)
                 try
                     LibPETSc.TSSetFromOptions(petsclib, ts)
@@ -2120,7 +2123,7 @@ function _setup(
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
             if chosen == "irk" && has_jac && !uses_sparse_jac
                 PETSc.destroy(h.jac_mat)
-                h.jac_mat = PETSc.MatSeqAIJ(petsclib, n, n, n)
+                h.jac_mat = PETScCompat.PetscMat(petsclib, n, n, n)
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.ijacobian, ctxptr,
                 )
