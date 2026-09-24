@@ -83,11 +83,14 @@ the step after each starts one ULP past it, so the right-hand side there sees th
 when written as `if t > t_d`. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
 step that leaves the domain is taken again at a fifth of its size, as OrdinaryDiffEq takes it;
 one that cannot be made small enough ends the solve with `Unstable`, or `DtLessThanMin` at
-`dtmin`.
+`dtmin`. An explicit adaptive step whose error estimate is NaN or infinite, as when the
+right-hand side returns NaN or the state overflows, is taken again smaller the same way, and
+both kinds of retry count in `stats.nreject`. An implicit method's Newton solve fails on a NaN
+instead, which ends the solve with `ConvergenceFailure`.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
-state stops being finite, PETSc hits an overflow, an adaptive step is too small to move
-`t`, or `unstable_check(dt, u, p, t)`
+state stops being finite, a step overflows or turns NaN at every size tried, with a warning,
+an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
 returns true, which is asked before each step with the step about to be taken, as
 OrdinaryDiffEq asks it, `ConvergenceFailure` when a nonlinear
 solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are taken, and
