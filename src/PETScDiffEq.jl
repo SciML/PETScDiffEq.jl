@@ -3125,6 +3125,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         return _reject_out_of_domain!(integ, before)
     end
     _end_step_here!(integ)
+    _live_stats!(integ)
     fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing
     fired || _save_step!(integ, integ.t, true)

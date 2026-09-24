@@ -4772,6 +4772,19 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @test sol.stats.nf > 0
         @test sol.stats.naccept == 10
         @test sol.stats.nreject == 0
+
+        for span in ((0.0, 1.0), (1.0, 0.0))
+            reads = Int[]
+            cb = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> true, integ -> push!(reads, integ.sol.stats.naccept);
+                save_positions = (false, false),
+            )
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, [1.0], span), PETScDiffEq.TSRK("5dp");
+                callback = cb, abstol = 1.0e-8, reltol = 1.0e-8,
+            )
+            @test reads == 1:sol.stats.naccept
+        end
     end
 
     @testset "Unsupported keywords warn rather than being dropped" begin
