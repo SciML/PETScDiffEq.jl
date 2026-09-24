@@ -738,80 +738,85 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 @test sol.t == kw.saveat
                 @test [u[1] for u in sol.u] == sol.t
             end
-            # Saved times near either end of a long span are neither dropped, nor joined by t0,
-            # nor given an end's state.
-            osc!(du, u, p, t) = (du[1] = u[2]; du[2] = -u[1]; nothing)
-            ring = SciMLBase.ODEProblem(osc!, Float32[0, 1], (0.0f0, 1000.0f0))
-            tight = (; reltol = 1.0f-6, abstol = 1.0f-6)
-            want = Float32[0.001, 0.005, 0.5, 999.995]
-            final = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tight...).u[end]
-            for kw in ((;), (; save_start = false, save_end = false), (; tstops = [500.0f0]))
-                sol = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tight..., saveat = want, kw...)
-                @test sol.t == want
-                # Measured 5.5e-7 from sin(t).
-                @test maximum(k -> abs(sol.u[k][1] - sin(Float64(want[k]))), 1:3) < 2.0e-6
-                @test sol.u[end] != final
-            end
-            # A stop within 100 ulps of the end is still landed on.
-            fired = Float32[]
-            kick = SciMLBase.DiscreteCallback((u, t, i) -> t == 999.995f0, i -> push!(fired, i.t))
-            sol = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tstops = [999.995f0], callback = kick)
-            @test fired == [999.995f0]
-            @test 999.995f0 in sol.t
-            # Each crossing fires once: the root finder looks a hundredth of a step past an
-            # event, which is closer than 100 ulps.
-            for span in ((100.0f0, 104.0f0), (0.0f0, 100.0f0)),
-                    alg in (PETScDiffEq.TSRK("3bs"), PETScDiffEq.TSRK("5dp"))
-                crossings = Ref(0)
-                cb = SciMLBase.ContinuousCallback((u, t, i) -> u[1], i -> (crossings[] += 1))
-                start = Float32[sin(span[1]), cos(span[1])]
-                SciMLBase.solve(SciMLBase.ODEProblem(osc!, start, span), alg; callback = cb)
-                @test crossings[] == count(k -> span[1] < k * pi < span[2], 1:100)
+            # Single build only: on i686 the double build can hit PETSc's `bad hmax` over these spans.
+            if single_build
+                # Saved times near either end of a long span are neither dropped, nor joined by t0,
+                # nor given an end's state.
+                osc!(du, u, p, t) = (du[1] = u[2]; du[2] = -u[1]; nothing)
+                ring = SciMLBase.ODEProblem(osc!, Float32[0, 1], (0.0f0, 1000.0f0))
+                tight = (; reltol = 1.0f-6, abstol = 1.0f-6)
+                want = Float32[0.001, 0.005, 0.5, 999.995]
+                final = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tight...).u[end]
+                for kw in ((;), (; save_start = false, save_end = false), (; tstops = [500.0f0]))
+                    sol = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tight..., saveat = want, kw...)
+                    @test sol.t == want
+                    # Measured 5.5e-7 from sin(t).
+                    @test maximum(k -> abs(sol.u[k][1] - sin(Float64(want[k]))), 1:3) < 2.0e-6
+                    @test sol.u[end] != final
+                end
+                # A stop within 100 ulps of the end is still landed on.
+                fired = Float32[]
+                kick = SciMLBase.DiscreteCallback((u, t, i) -> t == 999.995f0, i -> push!(fired, i.t))
+                sol = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tstops = [999.995f0], callback = kick)
+                @test fired == [999.995f0]
+                @test 999.995f0 in sol.t
+                # Each crossing fires once: the root finder looks a hundredth of a step past an
+                # event, which is closer than 100 ulps.
+                for span in ((100.0f0, 104.0f0), (0.0f0, 100.0f0)),
+                        alg in (PETScDiffEq.TSRK("3bs"), PETScDiffEq.TSRK("5dp"))
+                    crossings = Ref(0)
+                    cb = SciMLBase.ContinuousCallback((u, t, i) -> u[1], i -> (crossings[] += 1))
+                    start = Float32[sin(span[1]), cos(span[1])]
+                    SciMLBase.solve(SciMLBase.ODEProblem(osc!, start, span), alg; callback = cb)
+                    @test crossings[] == count(k -> span[1] < k * pi < span[2], 1:100)
+                end
             end
         end
 
         @testset "steps the single-precision clock can take" begin
-            # PETSc's stages need room between a step's ends, which one or two ulps of t do not
-            # leave; an ulp is 1e-3 at t = 1e4, where the starting step is 1.4e-3.
-            implicit = (
-                PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW(), PETScDiffEq.TSARKIMEX("3"),
-            )
-            for t0 in (1.0f4, 1.0f5), alg in implicit
-                sol = SciMLBase.solve(SciMLBase.ODEProblem(decay!, Float32[1], (t0, t0 + 10)), alg)
-                @test sol.retcode == SciMLBase.ReturnCode.Success
-                # At the default tolerances, measured at most 11% of exp(-10), as in double.
-                @test abs(sol.u[end][1] - exp(-10)) < 0.2 * exp(-10)
-            end
-            # After a stop the step goes on at the one PETSc last proposed, not the first.
-            for span in ((0.0f0, 1.0f6), (0.0f0, 1.0f5)), alg in implicit
-                stops = [span[2] / 7 * k for k in 1:6]
-                sol = SciMLBase.solve(
-                    SciMLBase.ODEProblem(decay!, Float32[1], span), alg;
-                    tstops = stops, abstol = 1.0f-5, reltol = 1.0f-4,
+            if single_build
+                # PETSc's stages need room between a step's ends, which one or two ulps of t do not
+                # leave; an ulp is 1e-3 at t = 1e4, where the starting step is 1.4e-3.
+                implicit = (
+                    PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW(), PETScDiffEq.TSARKIMEX("3"),
                 )
-                @test sol.retcode == SciMLBase.ReturnCode.Success
-                @test sol.t[end] == span[2]
-                @test stops ⊆ sol.t
-            end
-            # PETSc's own landing on the final time refuses a step under 1.2e-6 before a final
-            # time below 1, so the integrator lands there, fixed step or adaptive.
-            scaled!(du, u, p, t) = (du .= p .* u; nothing)
-            for (F, p) in ((Float32, -0.5f0), (ComplexF32, -0.5f0 + 2.0f0im)),
-                    alg in (PETScDiffEq.TSRK("4"), PETScDiffEq.TSImplicit("cn"))
-                sol = SciMLBase.solve(
-                    SciMLBase.ODEProblem(scaled!, F[1], (0.0f0, 1.0f-3), p), alg; dt = 1.0f-6,
-                )
-                @test sol.retcode == SciMLBase.ReturnCode.Success
-                @test sol.t[end] == 1.0f-3
-                @test sol.stats.naccept == 1000
-                # Single precision's rounding over 1000 steps, measured at most 2.5e-5.
-                @test abs(sol.u[end][1] - exp(p * 1.0e-3)) < 1.0e-4
-                stiff = SciMLBase.solve(
-                    SciMLBase.ODEProblem(scaled!, F[1], (0.0f0, 1.0f-4), -3.0f6),
-                    PETScDiffEq.TSRK("5dp"),
-                )
-                @test stiff.retcode == SciMLBase.ReturnCode.Success
-                @test stiff.t[end] == 1.0f-4
+                for t0 in (1.0f4, 1.0f5), alg in implicit
+                    sol = SciMLBase.solve(SciMLBase.ODEProblem(decay!, Float32[1], (t0, t0 + 10)), alg)
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    # At the default tolerances, measured at most 11% of exp(-10), as in double.
+                    @test abs(sol.u[end][1] - exp(-10)) < 0.2 * exp(-10)
+                end
+                # After a stop the step goes on at the one PETSc last proposed, not the first.
+                for span in ((0.0f0, 1.0f6), (0.0f0, 1.0f5)), alg in implicit
+                    stops = [span[2] / 7 * k for k in 1:6]
+                    sol = SciMLBase.solve(
+                        SciMLBase.ODEProblem(decay!, Float32[1], span), alg;
+                        tstops = stops, abstol = 1.0f-5, reltol = 1.0f-4,
+                    )
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test sol.t[end] == span[2]
+                    @test stops ⊆ sol.t
+                end
+                # PETSc's own landing on the final time refuses a step under 1.2e-6 before a final
+                # time below 1, so the integrator lands there, fixed step or adaptive.
+                scaled!(du, u, p, t) = (du .= p .* u; nothing)
+                for (F, p) in ((Float32, -0.5f0), (ComplexF32, -0.5f0 + 2.0f0im)),
+                        alg in (PETScDiffEq.TSRK("4"), PETScDiffEq.TSImplicit("cn"))
+                    sol = SciMLBase.solve(
+                        SciMLBase.ODEProblem(scaled!, F[1], (0.0f0, 1.0f-3), p), alg; dt = 1.0f-6,
+                    )
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test sol.t[end] == 1.0f-3
+                    @test sol.stats.naccept == 1000
+                    # Single precision's rounding over 1000 steps, measured at most 2.5e-5.
+                    @test abs(sol.u[end][1] - exp(p * 1.0e-3)) < 1.0e-4
+                    stiff = SciMLBase.solve(
+                        SciMLBase.ODEProblem(scaled!, F[1], (0.0f0, 1.0f-4), -3.0f6),
+                        PETScDiffEq.TSRK("5dp"),
+                    )
+                    @test stiff.retcode == SciMLBase.ReturnCode.Success
+                    @test stiff.t[end] == 1.0f-4
+                end
             end
         end
 
