@@ -2561,6 +2561,7 @@ _state_at(integ::PETScIntegrator, t) =
 
 # `s` is PETSc's time. Returns `integ.ucache`, which the next call overwrites.
 function _interpolate!(integ::PETScIntegrator, s)
+    s = oftype(integ.t, s)
     h = integ.h
     ctx = h.ctx
     if !ctx.hermite
@@ -2730,6 +2731,7 @@ end
 
 # TSRestartStep makes a multistep method drop history across the event.
 function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
+    t, dt = oftype(integ.t, t), oftype(integ.t, dt)
     h = integ.h
     pl = h.petsclib
     if interpolate && t != integ.t
