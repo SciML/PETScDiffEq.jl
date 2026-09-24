@@ -15,6 +15,8 @@ using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, ro
     sparse
 using SparseMatrixColorings: SparseMatrixColorings
 
+include("petsc_compat.jl")
+
 export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSDAE, TSMPRK, TSGeneric,
     PETScIntegrator, PETScAdjoint
 
@@ -1404,11 +1406,6 @@ function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothi
     return sparse(all_rows, all_cols, ones(length(all_rows)), n, n)
 end
 
-function _cstr(f::F, s::AbstractString) where {F}
-    str = String(s)
-    return GC.@preserve str f(Base.unsafe_convert(Ptr{Cchar}, str))
-end
-
 _ts_type(::TSRK) = "rk"
 _ts_type(::TSRosW) = "rosw"
 _ts_type(alg::TSImplicit) = alg.subtype
@@ -1431,9 +1428,9 @@ function _running_name(petsclib, ts)
 end
 
 _set_subtype!(petsclib, ts, alg::TSRK) =
-    _cstr(p -> LibPETSc.TSRKSetType(petsclib, ts, p), alg.subtype)
+    PETScCompat.TSRKSetType(petsclib, ts, alg.subtype)
 _set_subtype!(petsclib, ts, alg::TSRosW) =
-    _cstr(p -> LibPETSc.TSRosWSetType(petsclib, ts, p), alg.subtype)
+    PETScCompat.TSRosWSetType(petsclib, ts, alg.subtype)
 function _set_subtype!(petsclib, ts, alg::TSImplicit)
     if alg.subtype == "theta" && alg.theta !== nothing
         LibPETSc.TSThetaSetTheta(petsclib, ts, petsclib.PetscReal(alg.theta))
@@ -1446,11 +1443,11 @@ end
 function _set_subtype!(petsclib, ts, alg::TSIRK)
     LibPETSc.TSIRKSetNumStages(petsclib, ts, LibPETSc.PetscInt(alg.nstages))
     # Set the type after the stage count: PETSc builds the tableau from it.
-    _cstr(p -> LibPETSc.TSIRKSetType(petsclib, ts, p), "gauss")
+    PETScCompat.TSIRKSetType(petsclib, ts, "gauss")
     return nothing
 end
 _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
-    _cstr(p -> LibPETSc.TSARKIMEXSetType(petsclib, ts, p), alg.subtype)
+    PETScCompat.TSARKIMEXSetType(petsclib, ts, alg.subtype)
 function _set_subtype!(petsclib, ts, alg::TSDAE)
     if alg.order !== nothing
         LibPETSc.TSBDFSetOrder(petsclib, ts, LibPETSc.PetscInt(alg.order))
