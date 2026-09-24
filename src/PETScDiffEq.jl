@@ -3105,6 +3105,12 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped)
     integ.t = _user_t(integ.tdir, LibPETSc.TSGetTime(pl, h.ts))
     if integ.tdir * integ.t <= integ.tdir * integ.tprev
+        if h.stopped == 0 && SciMLBase.isadaptive(integ) &&
+                Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
+            ctx.unstable_hit = true
+            @warn "`$(_warn_name(integ.alg))` ends here because its step fell below the " *
+                "floating point spacing at t = $(integ.t)"
+        end
         _finish!(integ)
         return nothing
     end

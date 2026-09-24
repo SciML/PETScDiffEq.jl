@@ -2111,6 +2111,21 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
         end
 
+        @testset "a step too small to move t is Unstable through the integrator" begin
+            square!(du, u, p, t) = (du[1] = u[1]^2; nothing)
+            runaway = SciMLBase.ODEProblem(square!, [1.0], (0.0, 2.0))
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            sol = @test_logs (:warn, r"floating point spacing") SciMLBase.solve(
+                runaway, PETScDiffEq.TSRK("5dp"); callback = never,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Unstable
+            @test all(isfinite, sol.u[end])
+            integ = SciMLBase.init(runaway, PETScDiffEq.TSRK("5dp"))
+            @test_logs (:warn, r"floating point spacing") SciMLBase.solve!(integ)
+            @test integ.sol.retcode == SciMLBase.ReturnCode.Unstable
+            @test integ.sol.t == sol.t
+        end
+
         @testset "a step below dtmin ends the solve where it still holds" begin
             fast!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
             quick = SciMLBase.ODEProblem(fast!, [1.0], (0.0, 1.0))
