@@ -4669,6 +4669,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     SciMLBase.step!(integ)
                 end
                 @test_throws ArgumentError SciMLBase.add_saveat!(integ, 0.25)
+                @test_throws ArgumentError SciMLBase.add_saveat!(integ, prevfloat(integ.t))
                 here = integ.t
                 SciMLBase.add_saveat!(integ, here)
                 @test here in SciMLBase.solve!(integ).t
