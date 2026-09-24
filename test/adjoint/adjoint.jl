@@ -68,9 +68,9 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
         )
         reference = vcat(gdu0, vec(gdp))
         for (alg, bound, lo, hi) in (
-                (TSRK("4"), 1.0e-10, 13.0, 19.0), # measured 1.7e-11, ratio 16.07
-                (TSImplicit("beuler", EXACT), 1.0e-2, 1.9, 2.1), # measured 2.7e-3, ratio 2.001
-                (TSImplicit("cn", EXACT), 2.0e-5, 3.8, 4.2), # measured 3.5e-6, ratio 4.000
+                (TSRK("4"), 1.0e-10, 13.0, 19.0),
+                (TSImplicit("beuler", EXACT), 1.0e-2, 1.9, 2.1),
+                (TSImplicit("cn", EXACT), 2.0e-5, 3.8, 4.2),
             )
             gaps = map((0.01, 0.005)) do dt
                 sol = solve(prob, alg; dt, adaptive = false, saveat = TS)
@@ -114,7 +114,6 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
     end
 
     @testset "no method mentioning PETScAdjoint is ambiguous" begin
-        # The extension's methods live in its own module, so check it too.
         ext = Base.get_extension(PETScDiffEq, :PETScDiffEqSciMLSensitivityExt)
         ambiguous = Test.detect_ambiguities(PETScDiffEq, ext, SciMLSensitivity, SciMLBase)
         mine = filter(pair -> any(m -> occursin("PETScAdjoint", string(m.sig)), pair), ambiguous)
