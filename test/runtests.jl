@@ -5466,6 +5466,13 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             SciMLBase.reinit!(integ)
             @test abs(SciMLBase.solve!(integ).u[end][1] - exp(-2.0)) < 2.0e-10
         end
+        bdf = PETScDiffEq.TSImplicit("bdf")
+        integ = SciMLBase.init(prob, bdf; dt = 0.01, adaptive = false)
+        while integ.t < 1.0
+            integ.p = 1.0
+            SciMLBase.step!(integ)
+        end
+        @test integ.u == SciMLBase.solve(prob, bdf; dt = 0.01, adaptive = false).u[end]
     end
 
     @testset "Only methods with an error estimate adapt" begin

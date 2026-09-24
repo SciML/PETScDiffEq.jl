@@ -2409,7 +2409,8 @@ function _set_p_unlocked(integ::PETScIntegrator, v)
     h.ctx.p = integ.p
     h.ctx.pdirty = true
     # An FSAL method reuses its last stage's slope, taken with the old p, unless restarted.
-    h.destroyed || LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    # BDF keeps only past states, which stay valid, and a restart drops it to first order.
+    h.destroyed || h.ctx.alg_name == "bdf" || LibPETSc.TSRestartStep(h.petsclib, h.ts)
     return v
 end
 
