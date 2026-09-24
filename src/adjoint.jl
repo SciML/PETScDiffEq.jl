@@ -530,9 +530,9 @@ function _throw_callback_error(ctx, adj)
 end
 
 function _destroy_adjoint!(adj::AdjointContext)
-    (PETSc.finalized(adj.petsclib) || MPI.Finalized()) && return nothing
+    (PETScCompat.isfinalized(adj.petsclib) || MPI.Finalized()) && return nothing
     for obj in (adj.jac_mat, adj.pmat, adj.lam, adj.mu)
-        obj === nothing || PETSc.destroy(obj)
+        obj === nothing || PETScCompat.destroy!(obj)
     end
     return nothing
 end
@@ -597,8 +597,10 @@ function _discrete_adjoint_unlocked(
         GC.@preserve ctx adj begin
             if !implicit
                 adj.jac_mat = J isa SparseMatrixCSC ?
-                    PETSc.MatSeqAIJWithArrays(pl, MPI.COMM_SELF, _jacobian_pattern(J, n)) :
-                    PETSc.MatSeqDense(pl, J)
+                    PETScCompat.PetscMat(
+                        pl, MPI.COMM_SELF, _jacobian_pattern(J, n); with_arrays = true,
+                    ) :
+                    PETScCompat.PetscMat(pl, J)
                 code = ccall(
                     _symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
                     (LibPETSc.CTS, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
@@ -607,7 +609,7 @@ function _discrete_adjoint_unlocked(
                 _check_code(code, "TSSetRHSJacobian")
             end
             if np > 0
-                adj.pmat = PETSc.MatSeqDense(pl, adj.pJ)
+                adj.pmat = PETScCompat.PetscMat(pl, adj.pJ)
                 name = implicit ? :TSSetIJacobianP : :TSSetRHSJacobianP
                 code = ccall(
                     _symbol(pl, name), LibPETSc.PetscErrorCode,
@@ -616,10 +618,10 @@ function _discrete_adjoint_unlocked(
                     implicit ? ADJ_IJACOBIANP_PTR[] : ADJ_RHSJACOBIANP_PTR[], adjptr,
                 )
                 _check_code(code, String(name))
-                adj.mu = PETSc.VecSeq(pl, adj.mu_buf)
+                adj.mu = PETScCompat.PetscVec(pl, adj.mu_buf)
                 push!(adj.muarr, adj.mu.ptr)
             end
-            adj.lam = PETSc.VecSeq(pl, adj.lam_buf)
+            adj.lam = PETScCompat.PetscVec(pl, adj.lam_buf)
             push!(adj.lamarr, adj.lam.ptr)
             LibPETSc.TSMonitorSet(pl, ts, ADJ_RECORD_PTR[], adjptr)
             code = ccall(

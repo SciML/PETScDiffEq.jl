@@ -15,6 +15,8 @@ using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, ro
     sparse
 using SparseMatrixColorings: SparseMatrixColorings
 
+include("petsc_compat.jl")
+
 export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSDAE, TSMPRK, TSGeneric,
     PETScIntegrator, PETScAdjoint
 
@@ -779,7 +781,7 @@ function _petsc_interpolate!(ctx, ts, s)
     ctx.interpolates === true && (LibPETSc.TSInterpolate(pl, ts, s, ctx.work); return ctx.work)
     # PETSc prints a traceback before refusing, so ask with printing off. Some types
     # register an interpolant that writes nothing, so prefill NaN to catch that.
-    PETSc.withlocalarray!(w -> fill!(w, NaN), ctx.work; read = false, write = true)
+    PETScCompat.with_local_array!(w -> fill!(w, NaN), ctx.work; read = false, write = true)
     lib = Libdl.dlopen(pl.petsc_library)
     ccall(
         Libdl.dlsym(lib, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
@@ -794,7 +796,7 @@ function _petsc_interpolate!(ctx, ts, s)
     finally
         ccall(Libdl.dlsym(lib, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ())
     end
-    written = PETSc.withlocalarray!(
+    written = PETScCompat.with_local_array!(
         w -> any(!isnan, w), ctx.work; read = true, write = false,
     )
     ctx.interpolates = written
@@ -1366,11 +1368,6 @@ function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothi
     return sparse(all_rows, all_cols, ones(length(all_rows)), n, n)
 end
 
-function _cstr(f::F, s::AbstractString) where {F}
-    str = String(s)
-    return GC.@preserve str f(Base.unsafe_convert(Ptr{Cchar}, str))
-end
-
 _ts_type(::TSRK) = "rk"
 _ts_type(::TSRosW) = "rosw"
 _ts_type(alg::TSImplicit) = alg.subtype
@@ -1392,9 +1389,9 @@ function _running_name(petsclib, ts)
 end
 
 _set_subtype!(petsclib, ts, alg::TSRK) =
-    _cstr(p -> LibPETSc.TSRKSetType(petsclib, ts, p), alg.subtype)
+    PETScCompat.TSRKSetType(petsclib, ts, alg.subtype)
 _set_subtype!(petsclib, ts, alg::TSRosW) =
-    _cstr(p -> LibPETSc.TSRosWSetType(petsclib, ts, p), alg.subtype)
+    PETScCompat.TSRosWSetType(petsclib, ts, alg.subtype)
 function _set_subtype!(petsclib, ts, alg::TSImplicit)
     if alg.subtype == "theta" && alg.theta !== nothing
         LibPETSc.TSThetaSetTheta(petsclib, ts, petsclib.PetscReal(alg.theta))
@@ -1407,11 +1404,11 @@ end
 function _set_subtype!(petsclib, ts, alg::TSIRK)
     LibPETSc.TSIRKSetNumStages(petsclib, ts, LibPETSc.PetscInt(alg.nstages))
     # Set the type after the stage count: PETSc builds the tableau from it.
-    _cstr(p -> LibPETSc.TSIRKSetType(petsclib, ts, p), "gauss")
+    PETScCompat.TSIRKSetType(petsclib, ts, "gauss")
     return nothing
 end
 _set_subtype!(petsclib, ts, alg::TSARKIMEX) =
-    _cstr(p -> LibPETSc.TSARKIMEXSetType(petsclib, ts, p), alg.subtype)
+    PETScCompat.TSARKIMEXSetType(petsclib, ts, alg.subtype)
 function _set_subtype!(petsclib, ts, alg::TSDAE)
     if alg.order !== nothing
         LibPETSc.TSBDFSetOrder(petsclib, ts, LibPETSc.PetscInt(alg.order))
@@ -1499,15 +1496,15 @@ function _destroy!(h::TSHandles)
     h.destroyed && return nothing
     h.destroyed = true
     h.ts === nothing || delete!(POST_STEP_CTX, h.ts.ptr)
-    (PETSc.finalized(h.petsclib) || MPI.Finalized()) && return nothing
-    h.opts === nothing || PETSc.destroy(h.opts)
-    h.jac_mat === nothing || PETSc.destroy(h.jac_mat)
-    h.fd_mat === nothing || PETSc.destroy(h.fd_mat)
+    (PETScCompat.isfinalized(h.petsclib) || MPI.Finalized()) && return nothing
+    h.opts === nothing || PETScCompat.destroy!(h.opts)
+    h.jac_mat === nothing || PETScCompat.destroy!(h.jac_mat)
+    h.fd_mat === nothing || PETScCompat.destroy!(h.fd_mat)
     for v in h.tolvecs
-        v.ptr == C_NULL || PETSc.destroy(v)
+        v.ptr == C_NULL || PETScCompat.destroy!(v)
     end
-    h.ctx.work.ptr == C_NULL || PETSc.destroy(h.ctx.work)
-    h.u === nothing || PETSc.destroy(h.u)
+    h.ctx.work.ptr == C_NULL || PETScCompat.destroy!(h.ctx.work)
+    h.u === nothing || PETScCompat.destroy!(h.u)
     h.ts === nothing || LibPETSc.TSDestroy(h.petsclib, h.ts)
     return nothing
 end
@@ -1550,7 +1547,7 @@ function _tolvec(h::TSHandles{<:Any, <:Any, R, S}, petsclib, tol, n, name) where
     # PETSc borrows `buf` and reads it every step, so the handle keeps it alive.
     buf = Vector{S}(collect(tol))
     push!(h.tolbufs, buf)
-    v = PETSc.VecSeq(petsclib, buf)
+    v = PETScCompat.PetscVec(petsclib, buf)
     push!(h.tolvecs, v)
     return v
 end
@@ -1734,7 +1731,7 @@ function _setup(
 
     petsclib = _petsclib(S)
     _check_inttype(petsclib)
-    PETSc.initialized(petsclib) || PETSc.initialize(petsclib)
+    PETScCompat.isinitialized(petsclib) || PETSc.initialize(petsclib)
     _arm_exit_cleanup!(petsclib)
 
     iip = SciMLBase.isinplace(prob)
@@ -1931,7 +1928,7 @@ function _setup(
         row_cols0, row_src, row_buf, J0,
         R[], Vector{U}[], Vector{U}[],
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
-        PETSc.VecSeq(petsclib, n),
+        PETScCompat.PetscVec(petsclib, n),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
         R(NaN), similar(u0), t0, copy(u0), nothing, nothing, false,
         slow_idxs, medium_idxs, fast_idxs,
@@ -1955,9 +1952,9 @@ function _setup(
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
         _set_subtype!(petsclib, ts, alg)
 
-        h.u = PETSc.VecSeq(petsclib, n)
+        h.u = PETScCompat.PetscVec(petsclib, n)
         u = h.u
-        PETSc.withlocalarray!(u; read = false, write = true) do ua
+        PETScCompat.with_local_array!(u; read = false, write = true) do ua
             copyto!(ua, u0)
         end
         LibPETSc.TSSetSolution(petsclib, ts, u)
@@ -1982,18 +1979,21 @@ function _setup(
             end
             if has_jac && uses_sparse_jac
                 pattern = _jacobian_pattern(J0, n, M)
-                h.jac_mat = PETSc.MatSeqAIJWithArrays(petsclib, MPI.COMM_SELF, pattern)
+                h.jac_mat = PETScCompat.PetscMat(
+                    petsclib, MPI.COMM_SELF, pattern; with_arrays = true,
+                )
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.sparse_ijacobian, ctxptr,
                 )
             elseif has_jac
-                h.jac_mat = PETSc.MatSeqDense(petsclib, zeros(S, n, n))
+                h.jac_mat = PETScCompat.PetscMat(petsclib, zeros(S, n, n))
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.ijacobian, ctxptr,
                 )
             elseif _uses_ifunction(alg) && prob.f.jac_prototype isa SparseArrays.AbstractSparseMatrix
-                h.fd_mat = PETSc.MatSeqAIJWithArrays(
-                    petsclib, MPI.COMM_SELF, _fd_pattern(prob.f.jac_prototype, M, n),
+                h.fd_mat = PETScCompat.PetscMat(
+                    petsclib, MPI.COMM_SELF, _fd_pattern(prob.f.jac_prototype, M, n);
+                    with_arrays = true,
                 )
                 _colour_jacobian!(petsclib, ts, h.fd_mat)
             end
@@ -2037,7 +2037,7 @@ function _setup(
             append!(effective_options, extra_options)
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
-                h.opts = PETSc.Options(petsclib; parsed...)
+                h.opts = PETScCompat.PetscOptions(petsclib; parsed...)
                 push!(h.opts)
                 try
                     LibPETSc.TSSetFromOptions(petsclib, ts)
@@ -2062,8 +2062,8 @@ function _setup(
             )
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
             if chosen == "irk" && has_jac && !uses_sparse_jac
-                PETSc.destroy(h.jac_mat)
-                h.jac_mat = PETSc.MatSeqAIJ(petsclib, n, n, n)
+                PETScCompat.destroy!(h.jac_mat)
+                h.jac_mat = PETScCompat.PetscMat(petsclib, n, n, n)
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.ijacobian, ctxptr,
                 )
@@ -2389,7 +2389,7 @@ DiffEqBase.get_tstops_max(integ::PETScIntegrator) = last(integ.tstops)
 function _set_u_unlocked(integ::PETScIntegrator, u)
     copyto!(integ.u, u)
     integ.finished && return nothing
-    PETSc.withlocalarray!(
+    PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), integ.h.u; read = false, write = true,
     )
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
@@ -2427,7 +2427,7 @@ function _change_t_unlocked(
     copyto!(integ.u, _state_at(integ, t))
     integ.t = t
     _end_step_here!(integ)
-    PETSc.withlocalarray!(
+    PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), integ.h.u; read = false, write = true,
     )
     LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * t)
@@ -2485,6 +2485,7 @@ _state_at(integ::PETScIntegrator, t) =
 
 # `s` is PETSc's time. Returns `integ.ucache`, which the next call overwrites.
 function _interpolate!(integ::PETScIntegrator, s)
+    s = oftype(integ.t, s)
     h = integ.h
     ctx = h.ctx
     if !ctx.hermite
@@ -2645,6 +2646,7 @@ function _fire!(integ::PETScIntegrator, cb::SciMLBase.VectorContinuousCallback, 
 end
 
 function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
+    t, dt = oftype(integ.t, t), oftype(integ.t, dt)
     h = integ.h
     pl = h.petsclib
     if interpolate && t != integ.t
@@ -2654,7 +2656,9 @@ function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
     end
     integ.t = t
     h.ctx.pdirty = true
-    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    PETScCompat.with_local_array!(
+        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+    )
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * t)
     LibPETSc.TSSetTimeStep(pl, h.ts, integ.tdir * dt)
     LibPETSc.TSRestartStep(pl, h.ts)
@@ -2701,7 +2705,9 @@ function _apply_callbacks!(integ::PETScIntegrator)
         cb.affect!(integ)
         integ.finished && return nothing
         if integ.derivative_discontinuity
-            PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+            PETScCompat.with_local_array!(
+                ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+            )
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
             ctx.pdirty = true
         end
@@ -2720,7 +2726,9 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     integ.derivative_discontinuity = false
     integ.u == before && return nothing
     copyto!(integ.uprev, integ.u)
-    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    PETScCompat.with_local_array!(
+        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+    )
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
     initialize_save && any(cb -> cb.save_positions[2], cbs) &&
         _record!(h.ctx, h.tdir * integ.t, integ.u)
@@ -2769,7 +2777,9 @@ function _reject_out_of_domain!(integ::PETScIntegrator, before)
     smaller = taken / 5
     integ.t = integ.tprev
     copyto!(integ.u, integ.uprev)
-    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    PETScCompat.with_local_array!(
+        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+    )
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
     floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
@@ -2803,7 +2813,9 @@ _above(hi, lo) = hi > lo ? hi : nextfloat(lo)
 function _take_written_state!(integ::PETScIntegrator)
     h = integ.h
     _readvec!(integ.ucache, h.petsclib, h.u) == integ.u && return nothing
-    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    PETScCompat.with_local_array!(
+        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+    )
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
     h.ctx.pdirty = true
     return nothing
