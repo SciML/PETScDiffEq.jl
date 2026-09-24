@@ -1422,12 +1422,21 @@ function _running_name(petsclib, ts)
     return type
 end
 
-function _refuse_method(name, has_mass, has_jac, is_split)
+function _refuse_method(name, has_mass, has_jac, is_split, is_dae)
     if name == "irk" && has_mass
         throw(
             ArgumentError(
                 "PETScDiffEq does not support a mass matrix with TSIRK; PETSc's " *
                     "coupled-stage matrix assumes dF/du_dot = I, and the answer drifts " *
+                    "further from the true one as dt shrinks rather than failing",
+            ),
+        )
+    end
+    if name == "irk" && is_dae
+        throw(
+            ArgumentError(
+                "PETScDiffEq does not support a DAEProblem with TSIRK; PETSc's " *
+                    "coupled-stage matrix assumes dG/du' = I, and the answer drifts " *
                     "further from the true one as dt shrinks rather than failing",
             ),
         )
@@ -1846,7 +1855,7 @@ function _setup(
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
     builds_jac = _uses_ifunction(alg) && prob.f.jac === nothing && !_petsc_differences(alg)
     has_jac = _uses_ifunction(alg) && (prob.f.jac !== nothing || builds_jac)
-    _refuse_method(_warn_name(alg), has_mass, has_jac, is_split)
+    _refuse_method(_warn_name(alg), has_mass, has_jac, is_split, is_dae)
     ad_calls = builds_jac ? Ref(0) : nothing
     jac_fn = if !has_jac
         nothing
@@ -2105,7 +2114,7 @@ function _setup(
                 ),
             )
             running = _running_name(petsclib, ts)
-            _refuse_method(running, has_mass, has_jac, is_split)
+            _refuse_method(running, has_mass, has_jac, is_split, is_dae)
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
             if chosen == "irk" && has_jac && !uses_sparse_jac
                 PETScCompat.destroy!(h.jac_mat)

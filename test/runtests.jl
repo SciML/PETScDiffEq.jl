@@ -1785,6 +1785,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         split = SciMLBase.SplitODEProblem(decay!, decay!, [1.0], (0.0, 1.0))
+        halved!(r, du, u, p, t) = (r[1] = 2du[1] + u[1]; nothing)
+        dae = SciMLBase.DAEProblem(halved!, [-0.5], [1.0], (0.0, 1.0))
         pb = ["-pc_type", "pbjacobi"]
         for (pr, alg, msg) in (
                 (mass, PETScDiffEq.TSImplicit("beuler", ["-ts_type", "irk", pb...]), "a mass matrix with TSIRK"),
@@ -1794,6 +1796,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 (prob, PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "ark3"]), "cannot be used"),
                 (prob, PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "ars122"]), "needs a SplitODEProblem"),
                 (split, PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "bpr3"]), "converges at first order"),
+                (dae, PETScDiffEq.TSDAE("irk", pb), "a DAEProblem with TSIRK"),
+                (dae, PETScDiffEq.TSDAE("beuler", ["-ts_type", "irk", pb...]), "a DAEProblem with TSIRK"),
             )
             @test_throws msg SciMLBase.solve(pr, alg; dt = 0.01, adaptive = false)
             @test_throws msg SciMLBase.init(pr, alg; dt = 0.01, adaptive = false)
