@@ -5,6 +5,7 @@ using Logging
 using SparseArrays
 using DiffEqCallbacks
 using DiffEqCallbacks: PresetTimeCallback
+using MPI
 using Test
 
 decay!(du, u, p, t) = (
@@ -6587,6 +6588,32 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     ),
                 )
                 @test_throws "ArgumentError: $message" call()
+            end
+        end
+    end
+
+    @testset "MPI" begin
+        if Sys.WORD_SIZE == 64 && !Sys.iswindows()
+            dir = joinpath(@__DIR__, "mpi")
+            julia = Base.julia_cmd()
+            root = dirname(@__DIR__)
+            # Pkg.test leaves the stdlib out of the load path.
+            setup = "push!(LOAD_PATH, \"@stdlib\"); using Pkg; " *
+                "Pkg.develop(path = $(repr(root))); Pkg.instantiate()"
+            run(`$julia --project=$dir -e $setup`)
+            for script in ("explicit.jl", "exit.jl"), np in (1, 2, 3)
+                cmd = `$(MPI.mpiexec()) -n $np $julia --project=$dir $(joinpath(dir, script))`
+                proc = run(pipeline(cmd; stdout, stderr); wait = false)
+                # A rank left waiting in a collective hangs rather than fails, and a rank
+                # killed there can hang again in its exit hooks.
+                timer = Timer(900) do _
+                    kill(proc)
+                    sleep(30)
+                    process_running(proc) && kill(proc, Base.SIGKILL)
+                end
+                wait(proc)
+                close(timer)
+                @test success(proc)
             end
         end
     end
