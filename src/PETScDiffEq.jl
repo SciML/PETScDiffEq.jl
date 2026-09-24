@@ -812,7 +812,7 @@ function _petsc_interpolate!(ctx, ts, s)
     ctx.interpolates === true && (LibPETSc.TSInterpolate(pl, ts, s, ctx.work); return ctx.work)
     # PETSc prints a traceback before refusing, so ask with printing off. Some types
     # register an interpolant that writes nothing, so prefill NaN to catch that.
-    PETSc.withlocalarray!(w -> fill!(w, NaN), ctx.work; read = false, write = true)
+    PETScCompat.with_local_array!(w -> fill!(w, NaN), ctx.work; read = false, write = true)
     lib = Libdl.dlopen(pl.petsc_library)
     ccall(
         Libdl.dlsym(lib, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
@@ -827,7 +827,7 @@ function _petsc_interpolate!(ctx, ts, s)
     finally
         ccall(Libdl.dlsym(lib, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ())
     end
-    written = PETSc.withlocalarray!(
+    written = PETScCompat.with_local_array!(
         w -> any(!isnan, w), ctx.work; read = true, write = false,
     )
     ctx.interpolates = written
@@ -2009,7 +2009,7 @@ function _setup(
 
         h.u = PETScCompat.PetscVec(petsclib, n)
         u = h.u
-        PETSc.withlocalarray!(u; read = false, write = true) do ua
+        PETScCompat.with_local_array!(u; read = false, write = true) do ua
             copyto!(ua, u0)
         end
         LibPETSc.TSSetSolution(petsclib, ts, u)
@@ -2463,7 +2463,7 @@ DiffEqBase.get_tstops_max(integ::PETScIntegrator) = last(integ.tstops)
 function _set_u_unlocked(integ::PETScIntegrator, u)
     copyto!(integ.u, u)
     integ.finished && return nothing
-    PETSc.withlocalarray!(
+    PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), integ.h.u; read = false, write = true,
     )
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
@@ -2501,7 +2501,7 @@ function _change_t_unlocked(
     copyto!(integ.u, _state_at(integ, t))
     integ.t = t
     _end_step_here!(integ)
-    PETSc.withlocalarray!(
+    PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), integ.h.u; read = false, write = true,
     )
     LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * t)
@@ -2740,7 +2740,9 @@ function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
     integ.t = t
     # An affect! may change `p`, which only the next step's start derivative sees.
     h.ctx.pdirty = true
-    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    PETScCompat.with_local_array!(
+        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+    )
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * t)
     LibPETSc.TSSetTimeStep(pl, h.ts, integ.tdir * dt)
     LibPETSc.TSRestartStep(pl, h.ts)
@@ -2790,7 +2792,9 @@ function _apply_callbacks!(integ::PETScIntegrator)
         cb.affect!(integ)
         integ.finished && return nothing
         if integ.derivative_discontinuity
-            PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+            PETScCompat.with_local_array!(
+                ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+            )
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
             ctx.pdirty = true
         end
@@ -2810,7 +2814,9 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     integ.derivative_discontinuity = false
     integ.u == before && return nothing
     copyto!(integ.uprev, integ.u)
-    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    PETScCompat.with_local_array!(
+        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+    )
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
     initialize_save && any(cb -> cb.save_positions[2], cbs) &&
         _record!(h.ctx, h.tdir * integ.t, integ.u)
@@ -2861,7 +2867,9 @@ function _reject_out_of_domain!(integ::PETScIntegrator, before)
     smaller = taken / 5
     integ.t = integ.tprev
     copyto!(integ.u, integ.uprev)
-    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    PETScCompat.with_local_array!(
+        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+    )
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
     floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
@@ -2895,7 +2903,9 @@ _above(hi, lo) = hi > lo ? hi : nextfloat(lo)
 function _take_written_state!(integ::PETScIntegrator)
     h = integ.h
     _readvec!(integ.ucache, h.petsclib, h.u) == integ.u && return nothing
-    PETSc.withlocalarray!(ua -> copyto!(ua, integ.u), h.u; read = false, write = true)
+    PETScCompat.with_local_array!(
+        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+    )
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
     h.ctx.pdirty = true
     return nothing

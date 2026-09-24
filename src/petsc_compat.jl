@@ -7,6 +7,7 @@ using PETSc.LibPETSc: LibPETSc
 const V05 = pkgversion(PETSc) >= v"0.5.0-"
 
 @static if V05
+    const with_local_array! = PETSc.with_local_array!
     const PetscVec = PETSc.PetscVec
     const PetscMat = PETSc.PetscMat
     const PetscOptions = PETSc.PetscOptions
@@ -22,6 +23,7 @@ else
         ) || error("PETSc.jl $(pkgversion(PETSc)) lacks the 0.4 API this branch uses")
     end
 
+    const with_local_array! = PETSc.withlocalarray!
     PetscVec(pl, x) = PETSc.VecSeq(pl, x)
     PetscMat(pl, A::Matrix) = PETSc.MatSeqDense(pl, A)
     PetscMat(pl, m::Integer, n::Integer, nnz::Integer) = PETSc.MatSeqAIJ(pl, m, n, nnz)
