@@ -2379,7 +2379,6 @@ function _retry_solve!(h, alg, floor, forced)
     LibPETSc.TSGetStepNumber(pl, h.ts) == 0 &&
         (ctx.nreject += Int(LibPETSc.TSGetStepRejections(pl, h.ts)))
     PETScCompat.with_local_array!(ua -> copyto!(ua, ctx.end_u), h.u; read = false, write = true)
-    # The monitor sees this time again and takes `fend` as the slope there.
     ctx.hermite && (ctx.fend = ctx.fstart)
     LibPETSc.TSSetTimeStep(pl, h.ts, dt)
     LibPETSc.TSRestartStep(pl, h.ts)
