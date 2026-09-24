@@ -3135,6 +3135,22 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test !(hits[1] in none.t)
         end
 
+        @testset "a saveat on the root is not saved twice" begin
+            double(sp) = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> t - 0.5, integ -> (integ.u .*= 2; nothing);
+                save_positions = sp,
+            )
+            kw = (saveat = [0.5], abstol = 1.0e-10, reltol = 1.0e-10)
+            for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRK("3bs"))
+                both = SciMLBase.solve(prob, alg; kw..., callback = double((true, true)))
+                @test both.t == [0.5, 0.5]
+                @test both.u[2] == 2 .* both.u[1]
+                pre = SciMLBase.solve(prob, alg; kw..., callback = double((true, false)))
+                @test pre.t == [0.5]
+                @test abs(pre.u[1][1] - exp(-0.5)) < 1.0e-8
+            end
+        end
+
         @testset "dense output across the event" begin
             hits = Float64[]
             sol = SciMLBase.solve(

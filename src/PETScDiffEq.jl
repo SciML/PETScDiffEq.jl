@@ -2678,12 +2678,12 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     end
     best === nothing && return false
     ctx = integ.h.ctx
-    _save_step!(integ, best, false; slack = zero(best))
+    saved = _save_step!(integ, best, false; slack = zero(best))
     _rollback!(integ, best, dt, true)
     residual = integ.event_residual[best_k]
     best_cb.rootfind === SciMLBase.NoRootFind ? fill!(residual, 0.0) :
         _fill_conditions!(residual, integ, best_cb, integ.t)
-    best_cb.save_positions[1] && _record!(ctx, integ.tdir * integ.t, integ.u)
+    best_cb.save_positions[1] && !saved && _record!(ctx, integ.tdir * integ.t, integ.u)
     integ.derivative_discontinuity = true
     _pin_step!(integ)
     _fire!(integ, best_cb, best_crossing)
