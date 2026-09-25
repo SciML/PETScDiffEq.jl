@@ -361,7 +361,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         script = """
         using PETScDiffEq, SciMLBase
         P = PETScDiffEq
-        all(isempty, (P.CALLBACKS, P.PETSC_SYMBOLS, P.EXIT_CLEANUP_ARMED, P.LIVE_HANDLES)) &&
+        all(isempty, (P.CALLBACKS, P.PETSC_SYMBOLS, P.EXIT_CLEANUP_ARMED, P.POST_STEP_CTX)) &&
+            all(isempty, (P.PARALLEL_HANDLES, P.LIVE_HANDLES.ht)) &&
             !any(P.PETScCompat.isinitialized, P.PETSc.petsclibs) && !P.MPI.Initialized() ||
             exit(2)
         f!(du, u, p, t) = (du[1] = -u[1]; nothing)
