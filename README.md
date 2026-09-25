@@ -99,7 +99,8 @@ state stops being finite, a step overflows, turns NaN or fails its Newton or lin
 every size tried, with a warning, an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
 returns true, which is asked before each step with the step about to be taken, as
 OrdinaryDiffEq asks it, `ConvergenceFailure` when a fixed-step nonlinear
-solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are taken, and
+solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are accepted, where
+OrdinaryDiffEq counts rejected and failed attempts too, and
 `Failure` for a zero pivot in a fixed-step solve, with a warning, or another step PETSc cannot
 take. Where
 `petsc_options` asks PETSc to raise, with `-ksp_error_if_not_converged`,
