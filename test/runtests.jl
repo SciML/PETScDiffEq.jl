@@ -2305,9 +2305,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             bdf = PETScDiffEq.TSImplicit("bdf", ["-ts_max_snes_failures", "2"])
             @test SciMLBase.solve(breaks, bdf; dt = 0.1, dtmin = 0.1).retcode ==
-                SciMLBase.ReturnCode.ConvergenceFailure
+                SciMLBase.ReturnCode.DtLessThanMin
             @test SciMLBase.solve!(SciMLBase.init(breaks, bdf; dt = 0.1, dtmin = 0.1)).retcode ==
-                SciMLBase.ReturnCode.ConvergenceFailure
+                SciMLBase.ReturnCode.DtLessThanMin
 
             forced = SciMLBase.solve(
                 quick, PETScDiffEq.TSRK("5dp"); kw..., force_dtmin = true,
@@ -2336,6 +2336,199 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.ODEProblem(boom!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK("5dp");
             dt = 0.1,
         )
+    end
+
+    @testset "a failed implicit step is taken again smaller" begin
+        never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+        counts(sol) = (sol.stats.naccept, sol.stats.nreject, sol.stats.nnonlinconvfail)
+        same(a, b) = a.t == b.t && a.u == b.u && a.retcode == b.retcode && counts(a) == counts(b)
+        breaks = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
+        )
+        dae_breaks = SciMLBase.DAEProblem(
+            (r, du, u, p, t) -> (r[1] = t > 0.5 ? NaN : du[1] + u[1]; nothing), [-1.0], [1.0],
+            (0.0, 1.0),
+        )
+        adaptive = (
+            (breaks, PETScDiffEq.TSImplicit("bdf")), (breaks, PETScDiffEq.TSRosW()),
+            (breaks, PETScDiffEq.TSARKIMEX()), (dae_breaks, PETScDiffEq.TSDAE("bdf")),
+        )
+
+        @testset "a right-hand side that turns NaN" begin
+            failed = (:warn, r"nonlinear solve failed at every step size")
+            for (prob, alg) in adaptive
+                plain = @test_logs failed SciMLBase.solve(prob, alg)
+                stepped = @test_logs failed SciMLBase.solve(prob, alg; callback = never)
+                @test plain.retcode == SciMLBase.ReturnCode.Unstable
+                @test 0.5 - plain.t[end] < 1.0e-12
+                @test maximum(abs(u[1] - exp(-t)) for (t, u) in zip(plain.t, plain.u)) < 2.0e-3
+                @test plain.stats.nnonlinconvfail > 10
+                @test same(plain, stepped)
+            end
+            for (prob, alg) in adaptive[1:3]
+                floored = @test_logs failed SciMLBase.solve(prob, alg; dtmin = 0.01)
+                @test floored.retcode == SciMLBase.ReturnCode.DtLessThanMin
+                @test 0.45 < floored.t[end] < 0.5
+                @test same(
+                    floored,
+                    @test_logs failed SciMLBase.solve(prob, alg; dtmin = 0.01, callback = never)
+                )
+                forced = @test_logs failed SciMLBase.solve(
+                    prob, alg; dtmin = 0.01, force_dtmin = true,
+                )
+                @test forced.retcode == SciMLBase.ReturnCode.Unstable
+                @test 0.45 < forced.t[end] < 0.5
+                @test minimum(diff(forced.t)) > 0.9 * 0.01
+            end
+            nan = (du, u, p, t) -> (du[1] = NaN; nothing)
+            for (_, alg) in adaptive[1:3]
+                fails = map(((0.0, 1.0), (1.0, 2.0))) do span
+                    sol = @test_logs failed SciMLBase.solve(
+                        SciMLBase.ODEProblem(nan, [1.0], span), alg,
+                    )
+                    return sol.stats.nnonlinconvfail
+                end
+                @test fails[1] == fails[2]
+            end
+        end
+
+        @testset "a Rosenbrock method whose first stage is explicit" begin
+            positive = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = u[1] < 0 ? NaN : -1000 * u[1]; nothing), [1.0],
+                (0.0, 1.0),
+            )
+            sol = SciMLBase.solve(positive, PETScDiffEq.TSRosW("assp3p3s1c"); dt = 1.0)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.stats.nnonlinconvfail > 0
+            @test maximum(abs(u[1] - exp(-1000t)) for (t, u) in zip(sol.t, sol.u)) < 1.0e-3
+        end
+
+        @testset "a Newton solve that diverges at the first step" begin
+            square = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = u[1]^2; nothing), [1.0], (0.0, 0.9),
+            )
+            dae_square = SciMLBase.DAEProblem(
+                (r, du, u, p, t) -> (r[1] = du[1] - u[1]^2; nothing), [1.0], [1.0], (0.0, 0.9),
+            )
+            kw = (; dt = 0.5, abstol = 1.0e-10, reltol = 1.0e-8)
+            for (prob, alg) in (
+                    (square, PETScDiffEq.TSImplicit("bdf")), (square, PETScDiffEq.TSARKIMEX()),
+                    (dae_square, PETScDiffEq.TSDAE("bdf")),
+                )
+                sol = SciMLBase.solve(prob, alg; kw...)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.stats.nnonlinconvfail >= 1
+                @test abs(sol.u[end][1] - 10) < 1.0e-3
+                @test same(sol, SciMLBase.solve(prob, alg; callback = never, kw...))
+            end
+        end
+
+        @testset "a Newton matrix that is singular at the first step" begin
+            linear(λ) = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = λ * u[1]; nothing), [1.0], (0.0, 2.0),
+            )
+            for (λ, alg) in (
+                    (1 / 0.435866521508459, PETScDiffEq.TSRosW()),
+                    (2.0, PETScDiffEq.TSImplicit("bdf")),
+                    (4055673282236 / 1767732205903, PETScDiffEq.TSARKIMEX()),
+                )
+                sol = SciMLBase.solve(linear(λ), alg; dt = 1.0)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.stats.nnonlinconvfail >= 1
+                @test abs(sol.u[end][1] / exp(2λ) - 1) < 0.05
+                @test same(sol, SciMLBase.solve(linear(λ), alg; dt = 1.0, callback = never))
+            end
+        end
+
+        @testset "an algebraic equation whose Jacobian vanishes" begin
+            cusp = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (du[1] = 1.0; du[2] = u[2]^3 - (u[1] - 0.5); nothing);
+                    mass_matrix = Diagonal([1.0, 0.0]),
+                ), [0.0, -cbrt(0.5)], (0.0, 1.0),
+            )
+            for alg in (PETScDiffEq.TSRosW(), PETScDiffEq.TSImplicit("bdf"))
+                plain, stepped = Logging.with_logger(Logging.NullLogger()) do
+                    SciMLBase.solve(cusp, alg; dt = 0.1),
+                        SciMLBase.solve(cusp, alg; dt = 0.1, callback = never)
+                end
+                @test same(plain, stepped)
+                @test maximum(u -> abs(u[2] - cbrt(u[1] - 0.5)), plain.u) < 1.0e-3
+                if plain.retcode == SciMLBase.ReturnCode.Success
+                    @test plain.t[end] == 1.0
+                else
+                    @test plain.retcode == SciMLBase.ReturnCode.Unstable
+                    @test 0.5 - plain.t[end] < 1.0e-8
+                    @test_logs (:warn, r"ends here") SciMLBase.solve(cusp, alg; dt = 0.1)
+                end
+            end
+        end
+
+        @testset "an error estimate that overflows" begin
+            decay = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+            kw = (;
+                dt = 1.0, abstol = 1.0e-160, reltol = 1.0e-160, dtmin = 0.01, force_dtmin = true,
+            )
+            for alg in (PETScDiffEq.TSRosW(), PETScDiffEq.TSARKIMEX())
+                sol = @test_logs SciMLBase.solve(decay, alg; kw...)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.stats.nreject >= 2
+                @test maximum(abs(u[1] - exp(-t)) for (t, u) in zip(sol.t, sol.u)) < 1.0e-7
+                @test same(sol, SciMLBase.solve(decay, alg; callback = never, kw...))
+            end
+            bdf = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0e-4)),
+                PETScDiffEq.TSImplicit("bdf"); abstol = 1.0e-200, reltol = 1.0e-200,
+            )
+            @test bdf.retcode == SciMLBase.ReturnCode.Unstable
+            @test bdf.t[end] > 0
+        end
+
+        @testset "a fixed-step solve ends at its first failed Newton or linear solve" begin
+            kw = (; dt = 0.1, adaptive = false)
+            for alg in (
+                    PETScDiffEq.TSIRK(), PETScDiffEq.TSImplicit("beuler"),
+                    PETScDiffEq.TSImplicit("theta", 0.7), PETScDiffEq.TSImplicit("bdf"),
+                    PETScDiffEq.TSRosW(),
+                )
+                plain = SciMLBase.solve(breaks, alg; kw...)
+                @test plain.retcode == SciMLBase.ReturnCode.ConvergenceFailure
+                @test plain.t[end] == 0.5
+                @test counts(plain) == (5, 0, 1)
+                @test all(u -> all(isfinite, u), plain.u)
+                @test same(plain, SciMLBase.solve(breaks, alg; callback = never, kw...))
+            end
+        end
+
+        # PETSc's step check fails the t = 300 span on 32-bit x86 (#79).
+        Sys.WORD_SIZE == 64 && @testset "a successful solve makes no work vector at each stage" begin
+            pl = PETScDiffEq.PETSc.getlib(; PetscScalar = Float64)
+            PETScDiffEq.PETSc.initialize(pl)
+            function last_id()
+                v = PETScDiffEq._state_vec(pl, nothing, 1)
+                id = Ref{Int64}(0)
+                ccall(
+                    PETScDiffEq._symbol(pl, :PetscObjectGetId), Cint, (Ptr{Cvoid}, Ptr{Int64}),
+                    v.ptr, id,
+                )
+                PETScDiffEq.PETScCompat.destroy!(v)
+                return id[]
+            end
+            vdp!(du, u, p, t) = (du[1] = u[2]; du[2] = 100 * (1 - u[1]^2) * u[2] - u[1]; nothing)
+            function made(tf, alg)
+                before = last_id()
+                sol = SciMLBase.solve(SciMLBase.ODEProblem(vdp!, [2.0, 0.0], (0.0, tf)), alg)
+                return last_id() - before, sol.stats.naccept + sol.stats.nreject
+            end
+            for (alg, per_step) in (
+                    (PETScDiffEq.TSImplicit("bdf"), 1), (PETScDiffEq.TSRosW(), 2),
+                    (PETScDiffEq.TSARKIMEX(), 2),
+                )
+                (a, n), (b, m) = made(1.0, alg), made(300.0, alg)
+                @test m - n > 100
+                @test b - a < per_step * (m - n)
+            end
+        end
     end
 
     @testset "the standard DiffEqCallbacks work" begin
@@ -2556,7 +2749,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     SciMLBase.ODEFunction(decay!; jac = decay_wrong_jac!), [1.0], (0.0, 1.0),
                 ), PETScDiffEq.TSIRK(); dt = 0.1, adaptive = false,
             )
-            @test wrong.retcode == SciMLBase.ReturnCode.Success
+            @test wrong.retcode == SciMLBase.ReturnCode.ConvergenceFailure
             @test abs(wrong.u[end][1] - exp(-1)) > 1.0e-3
             right = SciMLBase.solve(prob, PETScDiffEq.TSIRK(); dt = 0.1, adaptive = false)
             @test abs(right.u[end][1] - exp(-1)) < 1.0e-10
