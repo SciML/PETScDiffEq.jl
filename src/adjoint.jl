@@ -546,6 +546,8 @@ function _discrete_adjoint_unlocked(
     )
     _distributed(alg) &&
         throw(ArgumentError("PETScAdjoint does not support a solve $_NOT_SELF yet"))
+    alg.dm === nothing ||
+        throw(ArgumentError("PETScAdjoint does not support a solve $_WITH_DM yet"))
     solve_kwargs = _adjoint_solve_kwargs(prob, kwargs)
     has_p = _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete)
     p = prob.p
