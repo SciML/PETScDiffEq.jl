@@ -139,7 +139,9 @@ wrong in its first digit, so keep them for a right-hand side ForwardDiff cannot 
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`
 and `terminate!`. After a step the running solution's retcode is `Success`, as
 OrdinaryDiffEq's is. `check_error` gives `Success` while the integrator can go on and the
-retcode it stopped with after that, and `check_error!` and `postamble!` work as SciMLBase
+retcode it stopped with after that. In a callback's `finalize` it gives the retcode passed to
+`terminate!`, and `Success` for a solve that ended any other way, where OrdinaryDiffEq's
+also gives `MaxIters` or `Unstable`. `check_error!` and `postamble!` work as SciMLBase
 defines them, `postamble!` finishing the integrator where it is. Unlike OrdinaryDiffEq's,
 a finished integrator cannot step again. `auto_dt_reset!` takes the step `init` would take
 from the current state, and `reinit!` does the same with `reset_dt = true`, or keeps

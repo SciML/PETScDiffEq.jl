@@ -5604,6 +5604,20 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 SciMLBase.step!(integ)
                 SciMLBase.terminate!(integ)
                 @test SciMLBase.check_error(integ) == RC.Terminated
+
+                seen = RC.T[]
+                watch = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> false, integ -> nothing;
+                    finalize = (c, u, t, integ) -> push!(seen, SciMLBase.check_error(integ)),
+                )
+                stop = SciMLBase.DiscreteCallback((u, t, integ) -> t > 0.5, SciMLBase.terminate!)
+                SciMLBase.solve(
+                    lv, PETScDiffEq.TSRK("5dp"); callback = SciMLBase.CallbackSet(stop, watch),
+                )
+                integ = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"); callback = watch)
+                SciMLBase.step!(integ)
+                SciMLBase.terminate!(integ, RC.Failure)
+                @test seen == [RC.Terminated, RC.Failure]
             end
 
             @testset "last_step_failed is a fixed step whose Newton solve failed" begin
