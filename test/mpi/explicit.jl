@@ -543,8 +543,19 @@ crossing_last_row(idx, level) =
             )
             @test refused(() -> solve(prob, alg; dt = 0.1), what)
         end
-        e = caught(() -> solve(prob, TSMPRK([rank == thrower ? n + 1 : 1]; comm); dt = 0.1))
-        @test rank == thrower ? e isa ArgumentError && occursin("names index", e.msg) : remote(e)
+        for (slow, medium, sub, what) in (
+                ([n + 1], Int[], "p2", "names index"),
+                ([0], Int[], "p2", "indices start at 1"),
+                ([1, 1], Int[], "p2", "repeats an index"),
+                ([1], [1], "2a23", "share an index"),
+                ([1], [2], "p2", "takes only two splits"),
+            )
+            e = caught() do
+                mine = rank == thrower ? (slow, medium) : ([1], Int[])
+                solve(prob, TSMPRK(mine..., sub; comm); dt = 0.1)
+            end
+            @test rank == thrower ? e isa ArgumentError && occursin(what, e.msg) : remote(e)
+        end
         jac = ODEFunction(decay!; jac = (J, u, p, t) -> nothing)
         @test refused(
             () -> solve(ODEProblem(jac, decay0(rows), (0.0, 1.0), rows), TSRK("5dp"; comm)),

@@ -309,6 +309,26 @@ TSARKIMEX(
 const _MPRK_TWO_WAY = ("2a22", "2a32", "p2", "p3")
 const _MPRK_THREE_WAY = ("2a23", "2a33")
 
+function _check_mprk(slow, medium, subtype, distributed)
+    for (name, v) in (("slow", slow), ("medium", medium))
+        all(i -> i >= 1, v) || throw(ArgumentError("`$name` indices start at 1"))
+        length(unique(v)) == length(v) || throw(ArgumentError("`$name` repeats an index"))
+    end
+    isempty(intersect(slow, medium)) ||
+        throw(ArgumentError("`slow` and `medium` share an index"))
+    three = !isempty(medium) || distributed && subtype in _MPRK_THREE_WAY
+    subtype in (three ? _MPRK_THREE_WAY : _MPRK_TWO_WAY) || throw(
+        ArgumentError(
+            !three ?
+                "`$subtype` needs a `medium` split as well; without one use " *
+                join(map(t -> "\"$t\"", _MPRK_TWO_WAY), ", ") :
+                "`$subtype` takes only two splits, so leave `medium` out; with " *
+                "one use " * join(map(t -> "\"$t\"", _MPRK_THREE_WAY), " or "),
+        ),
+    )
+    return nothing
+end
+
 """
     TSMPRK(slow, subtype = "p2", petsc_options = String[]; comm = MPI.COMM_SELF)
     TSMPRK(slow, medium, subtype = "2a23", petsc_options = String[]; comm = MPI.COMM_SELF)
@@ -346,25 +366,10 @@ struct TSMPRK <: PETScTSAlgorithm
             slow::Vector{Int}, medium::Vector{Int}, subtype::String,
             petsc_options::Vector{String}, comm::MPI.Comm,
         )
-        isempty(slow) && comm == MPI.COMM_SELF &&
-            throw(ArgumentError("`slow` needs at least one index"))
-        for (name, v) in (("slow", slow), ("medium", medium))
-            all(i -> i >= 1, v) || throw(ArgumentError("`$name` indices start at 1"))
-            length(unique(v)) == length(v) ||
-                throw(ArgumentError("`$name` repeats an index"))
+        if comm == MPI.COMM_SELF
+            isempty(slow) && throw(ArgumentError("`slow` needs at least one index"))
+            _check_mprk(slow, medium, subtype, false)
         end
-        isempty(intersect(slow, medium)) ||
-            throw(ArgumentError("`slow` and `medium` share an index"))
-        three = !isempty(medium) || comm != MPI.COMM_SELF && subtype in _MPRK_THREE_WAY
-        subtype in (three ? _MPRK_THREE_WAY : _MPRK_TWO_WAY) || throw(
-            ArgumentError(
-                !three ?
-                    "`$subtype` needs a `medium` split as well; without one use " *
-                    join(map(t -> "\"$t\"", _MPRK_TWO_WAY), ", ") :
-                    "`$subtype` takes only two splits, so leave `medium` out; with " *
-                    "one use " * join(map(t -> "\"$t\"", _MPRK_THREE_WAY), " or "),
-            ),
-        )
         return new(sort(slow), sort(medium), subtype, petsc_options, comm)
     end
 end
@@ -2052,6 +2057,7 @@ const SupportedProblem = Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractD
 function _mprk_splits(alg::TSMPRK, n, comm)
     named = vcat(alg.slow, alg.medium)
     _checked_everywhere(comm) do
+        comm === nothing || _check_mprk(alg.slow, alg.medium, alg.subtype, true)
         all(<=(n), named) || throw(
             ArgumentError("`slow` or `medium` names index $(maximum(named)), but the state has $n"),
         )
