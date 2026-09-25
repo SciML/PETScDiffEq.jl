@@ -523,6 +523,15 @@ crossing_last_row(idx, level) =
         @test raised(caught(() -> solve(prob, mprk(rows, "p2", comm); dt = 1.0e-4)), "f threw")
     end
 
+    @testset "a Threads.@threads loop on one thread" begin
+        sols = Vector{Any}(undef, 2)
+        Threads.@threads for i in 1:2
+            sols[i] = solve(decay_problem(rows), TSRK("5dp"; comm))
+        end
+        ref = solve(decay_problem(rows), TSRK("5dp"; comm))
+        @test all(s -> s.retcode == ReturnCode.Success && s.u == ref.u, sols)
+    end
+
     @testset "refusals" begin
         prob = decay_problem(rows)
         n = length(rows)
