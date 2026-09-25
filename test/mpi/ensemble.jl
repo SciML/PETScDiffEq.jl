@@ -67,10 +67,33 @@ end
     end
     e = caught(() -> solve(ensemble(heat!, rows), TSRK("5dp"; comm), EnsembleThreads(); FIXED...))
     @test e !== nothing && occursin("EnsembleSerial", sprint(showerror, e))
-    looped() = Threads.@threads for i in 1:2
+    heat_solve() =
         solve(ODEProblem(heat!, heat0(rows), (0.0, 0.01)), TSRK("5dp"; comm); dt = 1.0e-3)
+    looped() = Threads.@threads for i in 1:2
+        heat_solve()
     end
     e = caught(looped)
     @test e !== nothing && occursin("Threads.@threads", sprint(showerror, e))
+    function one_rank()
+        rank == 0 || return heat_solve()
+        Threads.@threads for i in 1:1
+            heat_solve()
+        end
+    end
+    e = caught(one_rank)
+    @test e !== nothing && occursin("Threads.@threads", sprint(showerror, e))
+
+    started, release = Threads.Atomic{Int}(0), Base.Event()
+    elsewhere = Threads.@spawn Threads.@threads for i in 1:2
+        Threads.atomic_add!(started, 1)
+        wait(release)
+    end
+    while started[] == 0
+        yield()
+    end
+    e = caught(heat_solve)
+    notify(release)
+    wait(elsewhere)
+    @test e === nothing
     @test isempty(PETScDiffEq.PARALLEL_HANDLES)
 end
