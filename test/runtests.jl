@@ -6659,7 +6659,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             setup = "push!(LOAD_PATH, \"@stdlib\"); using Pkg; " *
                 "Pkg.develop(path = $(repr(root))); Pkg.instantiate()"
             run(`$julia --project=$dir -e $setup`)
-            for script in ("explicit.jl", "exit.jl"), np in (1, 2, 3)
+            for script in ("explicit.jl", "implicit.jl", "exit.jl"), np in (1, 2, 3)
                 cmd = `$(MPI.mpiexec()) -n $np $julia --project=$dir $(joinpath(dir, script))`
                 proc = run(pipeline(cmd; stdout, stderr); wait = false)
                 # A rank left waiting in a collective hangs rather than fails, and a rank
