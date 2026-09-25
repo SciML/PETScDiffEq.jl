@@ -60,7 +60,14 @@ function damped_oscillator_jac!(J, u, p, t)
 end
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
-@testset "PETScDiffEq.jl" begin
+# As one block these testsets take Julia 1.12 about an hour to compile, so each stands alone.
+macro each_toplevel(block)
+    return esc(Expr(:toplevel, block.args...))
+end
+
+const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
+Test.push_testset(ALL_TESTS)
+@each_toplevel begin
     @testset "TSRK convergence order" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         exact = exp(-1.0)
@@ -6676,3 +6683,5 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 end
+Test.pop_testset()
+Test.finish(ALL_TESTS)
