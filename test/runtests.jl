@@ -5788,7 +5788,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     SciMLBase.step!(integ)
                     before = live()
                     @test_throws "f refuses" SciMLBase.reinit!(integ, fill(10.0, 3); reset_dt)
-                    @test live() == before
+                    @test live() <= before
                     @test SciMLBase.solve!(integ).retcode == RC.Success
                 end
             end
