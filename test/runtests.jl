@@ -2380,6 +2380,16 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test 0.45 < forced.t[end] < 0.5
                 @test minimum(diff(forced.t)) > 0.9 * 0.01
             end
+            nan = (du, u, p, t) -> (du[1] = NaN; nothing)
+            for (_, alg) in adaptive[1:3]
+                fails = map(((0.0, 1.0), (1.0, 2.0))) do span
+                    sol = @test_logs failed SciMLBase.solve(
+                        SciMLBase.ODEProblem(nan, [1.0], span), alg,
+                    )
+                    return sol.stats.nnonlinconvfail
+                end
+                @test fails[1] == fails[2]
+            end
         end
 
         @testset "a Rosenbrock method whose first stage is explicit" begin
