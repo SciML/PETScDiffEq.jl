@@ -4804,6 +4804,7 @@ end
 function _finish!(integ::PETScIntegrator, retcode = nothing)
     integ.finished && return nothing
     h = integ.h
+    retcode === nothing || (integ.sol = SciMLBase.solution_new_retcode(integ.sol, retcode))
     _checked_everywhere(h.ctx.comm) do
         for cb in (integ.callbacks..., integ.continuous...)
             cb.finalize(cb, integ.u, integ.t, integ)
