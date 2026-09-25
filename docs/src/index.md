@@ -20,6 +20,10 @@ using PETScDiffEq, Preferences
 set_preferences!(PETScDiffEq, "precompile_workload" => false; force = true)
 ```
 
+Precompiling under `mpiexec` or `srun` skips these solves, and later sessions reuse that
+build until the package or one of its dependencies changes, so load the package once
+without the launcher before the first parallel run.
+
 ## Common API Usage
 
 This library adds the common interface to PETSc's TS solvers, documented in the
