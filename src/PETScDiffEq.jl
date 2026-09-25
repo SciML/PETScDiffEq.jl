@@ -4730,8 +4730,7 @@ function _reinit_unlocked(
     end
     old = integ.h
     reset_dt === true && _check_estimable(integ.alg)
-    dt = reset_dt === false ?
-        (integ.finished ? integ.dtcache : _proposed_dt_unlocked(integ)) : nothing
+    dt = reset_dt === false ? _proposed_dt_unlocked(integ) : nothing
     prob = SciMLBase.remake(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
         p = integ.p,

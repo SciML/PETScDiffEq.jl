@@ -6126,9 +6126,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 SciMLBase.reinit!(integ)
                 @test integ.dt == 0.5
                 SciMLBase.solve!(integ)
-                ended = integ.dtcache
+                ended = SciMLBase.get_proposed_dt(integ)
                 SciMLBase.reinit!(integ; reset_dt = false)
-                @test integ.dt == ended
+                @test SciMLBase.get_proposed_dt(integ) == integ.dt == ended
+                SciMLBase.step!(integ)
+                @test integ.t == ended
                 @test SciMLBase.solve!(integ).retcode == RC.Success
 
                 integ = SciMLBase.init(
