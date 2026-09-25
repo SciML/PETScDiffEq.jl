@@ -718,20 +718,23 @@ end
 
 # PETSc's `dt_min` clamps and takes the step whatever its error, so check the floor here.
 function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
-    ctx = POST_STEP_CTX[ts_ptr]::TSContext
+    ctx, ts = POST_STEP_CTX[ts_ptr]::Tuple
     ctx.comm === nothing || return _post_step_collective!(ctx, ts_ptr)
+    return _post_step_serial!(ctx, ts)
+end
+
+function _post_step_serial!(ctx, ts)
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
     try
         pl = ctx.petsclib
-        ts = LibPETSc.TS(ts_ptr, pl)
-        Int(LibPETSc.TSGetConvergedReason(pl, ts)) < 0 && return LibPETSc.PetscErrorCode(0)
+        reason = Int(LibPETSc.TSGetConvergedReason(pl, ts))
+        reason < 0 && return LibPETSc.PetscErrorCode(0)
         s = LibPETSc.TSGetTime(pl, ts)
         smax = LibPETSc.TSGetMaxTime(pl, ts)
         s >= smax - _near(smax) && return LibPETSc.PetscErrorCode(0)
         hnext = LibPETSc.TSGetTimeStep(pl, ts)
         stop = false
-        if ctx.halt_stalled && Int(LibPETSc.TSGetConvergedReason(pl, ts)) == 0 &&
-                s <= LibPETSc.TSGetPrevTime(pl, ts)
+        if ctx.halt_stalled && reason == 0 && s <= LibPETSc.TSGetPrevTime(pl, ts)
             ctx.stalled = stop = true
         elseif ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
             ctx.dt_too_small = stop = true
@@ -740,7 +743,7 @@ function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
             x = Ref{LibPETSc.CVec}(C_NULL)
             ccall(
                 _symbol(pl, :TSGetSolution), LibPETSc.PetscErrorCode,
-                (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x,
+                (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts, x,
             )
             u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
             ctx.unstable !== nothing &&
@@ -798,7 +801,7 @@ const POST_STEP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 const POST_STEP_CTX = Dict{LibPETSc.CTS, Any}()
 
 function _set_post_step!(pl, ts, ctx)
-    POST_STEP_CTX[ts.ptr] = ctx
+    POST_STEP_CTX[ts.ptr] = (ctx, ts)
     ccall(
         _symbol(pl, :TSSetPostStep), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Ptr{Cvoid}), ts, POST_STEP_PTR[],
