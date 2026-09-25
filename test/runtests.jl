@@ -2108,6 +2108,15 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test_throws SciMLBase.CheckInitFailureError checks(
                 mass(bad), alg; abstol = [1.0e-6, 1.0e-6, 0.1],
             )
+            zero_entry = [1.0e-6, 0.0, 1.0e-6]
+            @test checks(mass(good), alg; abstol = zero_entry)
+            sol = SciMLBase.solve(
+                mass(good), alg; abstol = zero_entry, initializealg = shampine, maxiters = 1,
+            )
+            @test sol.u[1] == good
+            @test_throws SciMLBase.CheckInitFailureError checks(
+                mass(bad), alg; abstol = [1.0, 1.0, 0.0],
+            )
         end
 
         # PETSc's absolute-eps step check fails these Robertson spans on 32-bit x86.
