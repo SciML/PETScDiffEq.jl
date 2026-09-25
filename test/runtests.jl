@@ -4581,6 +4581,25 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test SciMLBase.solve!(integ).t == [0.0, 1.0]
         end
 
+        @testset "integ.opts.save_on pauses saving part-way" begin
+            pause = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> t > 0.25, integ -> (integ.opts.save_on = false);
+                save_positions = (false, false),
+            )
+            @test SciMLBase.solve(prob, alg; dt = 0.1, callback = pause).t ≈
+                [0.0, 0.1, 0.2, 0.3, 1.0]
+            integ = SciMLBase.init(prob, alg; dt = 0.1, saveat = [0.05, 0.15, 0.55, 0.65])
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            integ.opts.save_on = false
+            for _ in 1:4
+                SciMLBase.step!(integ)
+            end
+            @test SciMLBase.savevalues!(integ, true) == (false, false)
+            integ.opts.save_on = true
+            @test SciMLBase.solve!(integ).t == [0.05, 0.15, 0.65]
+        end
+
         @testset "save_start and save_end" begin
             nostart = SciMLBase.solve(
                 prob, alg; dt = 0.1, saveat = [0.0, 0.3, 1.0], save_start = false,
