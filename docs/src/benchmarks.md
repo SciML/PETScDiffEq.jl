@@ -8,8 +8,9 @@ measures them. Lower and further left is better.
 
 The error is the mean absolute error at the final time. Each reference was checked against a
 second solver, and the two agree at the final time to within 5e-10 on every
-problem ([`reference.csv`](assets/workprecision/reference.csv)), far below the errors
-plotted.
+problem ([`reference.csv`](assets/workprecision/reference.csv)). That is below every error
+plotted: more than 180 times below on three problems, and 5.6 times below on HIRES, where the
+two differ by 5.9e-12 and the smallest error plotted is 3.3e-11.
 
 Solid lines with circles are PETScDiffEq with PETSc's default linear solver, GMRES
 preconditioned with ILU(0). Dotted lines with triangles are PETScDiffEq with a direct LU
@@ -39,7 +40,7 @@ problems, and slower than the same method in OrdinaryDiffEq wherever the coeffic
 |:--- | ---:| ---:|
 | Lotka-Volterra, 2 states | 32 | 29 (`TSRK("5dp")`, `DP5`) |
 | HIRES, 8 states | 21 | 16 (`TSRosW("ra34pw2")`, `ROS34PW2`) |
-| Robertson DAE, 3 states | at least 51 | 26 (`TSRosW("ra34pw2")`, `ROS34PW2`) |
+| Robertson DAE, 3 states | at least 50 | 26 (`TSRosW("ra34pw2")`, `ROS34PW2`) |
 | Brusselator, 1000 states | 7.1 | 1.8 (`TSRosW("ra34pw2")` with LU, `ROS34PW2`) |
 
 The gap narrows as the problem grows because much of PETScDiffEq's cost does not grow with
@@ -244,6 +245,8 @@ julia --project=benchmark/workprecision benchmark/workprecision/profile.jl
 ```
 
 The first run writes the CSV files and plots into `docs/src/assets/workprecision`.
-Passing `report` instead redraws the plots from those CSV files and prints the tables on
-this page. `profile.jl` prints PETSc's `-log_view` with one stage per method, each covering
-its five timed solves, the source of the PETSc log figures above.
+Passing `report` instead redraws the plots from those CSV files and prints the four
+time-to-error tables, from which the summary is taken. The overhead table is `overhead.csv`,
+and the HIRES Newton and Jacobian counts are in `hires.csv`. `profile.jl` prints PETSc's
+`-log_view` with one stage per method, each covering its five timed solves, the source of the
+PETSc log figures and of the Brusselator table with lagged Jacobians.
