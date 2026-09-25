@@ -4378,7 +4378,6 @@ end
 
 function _reinit_unlocked(
         integ::PETScIntegrator, u0 = integ.prob.u0;
-        # A new TS always starts with fresh caches, so `reinit_cache` changes nothing.
         reset_dt = nothing, reinit_cache = true,
         t0 = integ.prob.tspan[1], tf = integ.prob.tspan[2],
         erase_sol = true, saveat = nothing, tstops = integ.tstops_cache,
