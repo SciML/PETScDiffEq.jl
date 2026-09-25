@@ -5725,6 +5725,20 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test integ.sol.retcode == RC.Success
             end
 
+            @testset "a reinit! whose f throws frees the TS it made" begin
+                live() = count(h -> !h.destroyed, keys(PETScDiffEq.LIVE_HANDLES))
+                refuses!(du, u, p, t) = (any(>(5.0), u) && error("f refuses"); du .= -u; nothing)
+                refusing = SciMLBase.ODEProblem(refuses!, ones(3), (0.0, 1.0))
+                for (reset_dt, dense) in ((nothing, true), (true, false))
+                    integ = SciMLBase.init(refusing, PETScDiffEq.TSRK("5dp"); dt = 0.1, dense)
+                    SciMLBase.step!(integ)
+                    before = live()
+                    @test_throws "f refuses" SciMLBase.reinit!(integ, fill(10.0, 3); reset_dt)
+                    @test live() == before
+                    @test SciMLBase.solve!(integ).retcode == RC.Success
+                end
+            end
+
             @testset "set_abstol! and set_reltol! hold for the steps after" begin
                 integ = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"); dt = 0.01)
                 SciMLBase.set_abstol!(integ, 1.0e-10)
