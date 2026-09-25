@@ -4781,7 +4781,7 @@ function _reinit_unlocked(
     integ.tstops = _tstops(vcat(tstops, d_discontinuities), h)
     integ.d_discontinuities = d_discontinuities
     integ.finished = false
-    dt === nothing || _use_dt!(integ, dt)
+    dt === nothing || _use_dt!(integ, dt, reset_dt === true)
     for ev in integ.event_t
         fill!(ev, NaN)
     end
@@ -5069,10 +5069,12 @@ function _estimate_dt(h::TSHandles{<:Any, <:Any, R}, alg, opts, u, s, stops) whe
     return dt
 end
 
-function _use_dt!(integ::PETScIntegrator, dt)
+function _use_dt!(integ::PETScIntegrator, dt, estimated = false)
     dt = abs(oftype(integ.t, dt))
+    integ.dt = integ.tdir * dt
+    estimated && !SciMLBase.isadaptive(integ) && return nothing
     LibPETSc.TSSetTimeStep(integ.h.petsclib, integ.h.ts, dt)
-    integ.dt = integ.dtcache = integ.tdir * dt
+    integ.dtcache = integ.dt
     return nothing
 end
 
@@ -5081,6 +5083,7 @@ function _auto_dt_unlocked(integ::PETScIntegrator)
     h = integ.h
     _use_dt!(
         integ, _estimate_dt(h, integ.alg, integ.opts, integ.u, integ.tdir * integ.t, integ.tstops),
+        true,
     )
     _live_stats!(integ)
     return nothing
