@@ -84,8 +84,11 @@ The options available in `solve` are documented
 This package supports `dt`, `adaptive`, `dtmin`, `force_dtmin`, `dtmax`, `reltol` and
 `abstol` (either may be a vector of per-component tolerances), `saveat`, `save_everystep`,
 `save_start`, `save_end`, `save_on`, `save_idxs`, `dense`, `callback`, `tstops`,
-`d_discontinuities`, `unstable_check` and `isoutofdomain`. Keywords it cannot
-honour emit a warning rather than being silently dropped.
+`d_discontinuities`, `unstable_check`, `isoutofdomain`, `timeseries_errors`,
+`dense_errors` and `verbose`. The warning a solve that ends early gives is logged at the
+`instability` level of a `DEVerbosity`, so `verbose = DEVerbosity(SciMLLogging.None())`
+silences it, as do `SciMLLogging.None()` and `false`. Keywords it cannot honour emit a
+warning rather than being silently dropped.
 
 Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
 only when it names them or `save_start` or `save_end` asks, and `save_everystep = true`
@@ -98,18 +101,26 @@ the step after each starts one ULP past it, so the right-hand side there sees th
 when written as `if t > t_d`. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
 step that leaves the domain is taken again at a fifth of its size, as OrdinaryDiffEq takes it;
 one that cannot be made small enough ends the solve with `Unstable`, or `DtLessThanMin` at
-`dtmin`. An explicit adaptive step whose error estimate is NaN or infinite, as when the
-right-hand side returns NaN or the state overflows, is taken again smaller the same way, and
-both kinds of retry count in `stats.nreject`. An implicit method's Newton solve fails on a NaN
-instead, which ends the solve with `ConvergenceFailure`.
+`dtmin`. An adaptive step whose error estimate is NaN or infinite, as when an explicit
+method's right-hand side returns NaN or the state overflows, is taken again smaller the same
+way, and both kinds of retry count in `stats.nreject`. An adaptive implicit step whose Newton
+or linear solve fails, as when its right-hand side returns NaN, or whose Newton matrix has a
+zero pivot, is taken again at PETSc's `-ts_adapt_scale_solve_failed` share of its size, a
+quarter by default, as many times as it takes, and counts in `stats.nnonlinconvfail` rather
+than `stats.nreject`. OrdinaryDiffEq counts a failed Newton solve the same way, but counts a
+zero pivot, and a Rosenbrock step that turns NaN, in `stats.nreject`. A fixed-step solve ends
+at its first failed Newton or linear solve with `ConvergenceFailure`, as OrdinaryDiffEq's
+Newton-based methods do with `adaptive = false`.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
-state stops being finite, a step overflows or turns NaN at every size tried, with a warning,
-an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
+state stops being finite, a step overflows, turns NaN or fails its Newton or linear solve at
+every size tried, with a warning, an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
 returns true, which is asked before each step with the step about to be taken, as
-OrdinaryDiffEq asks it, `ConvergenceFailure` when a nonlinear
-solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are taken, and
-`Failure` for a zero pivot, with a warning, or another step PETSc cannot take. Where
+OrdinaryDiffEq asks it, `ConvergenceFailure` when a fixed-step nonlinear
+solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are accepted, where
+OrdinaryDiffEq counts rejected and failed attempts too, and
+`Failure` for a zero pivot in a fixed-step solve, with a warning, or another step PETSc cannot
+take. Where
 `petsc_options` asks PETSc to raise, with `-ksp_error_if_not_converged`,
 `-snes_error_if_not_converged` or `-ts_error_if_step_fails`, it raises instead.
 
@@ -272,8 +283,7 @@ what it needs, what it refuses and how to check `jac` and `paramjac`.
 
 ## MPI
 
-`TSRK`, `TSRosW`, `TSImplicit`, `TSIRK`, `TSDAE`, `TSARKIMEX` and
-`TSGeneric(ts_type; explicit = true)` take a `comm` keyword. With a communicator
+Every algorithm takes a `comm` keyword. With a communicator
 other than the default `MPI.COMM_SELF` the solve runs distributed over it: every rank of
 `comm` calls `solve` with the same arguments, and `u0` is the block of the state that rank
 owns, the blocks following each other in rank order. Each rank's `sol.u` holds its own rows,
@@ -316,10 +326,12 @@ started PETSc on every rank.
 `saveat`, `tstops`, `d_discontinuities`, a fixed `dt` and dense output work as in a serial
 solve. Vector `abstol` and `reltol`, `save_idxs` and `p` are per rank.
 `unstable_check` and `isoutofdomain` are asked on each rank's rows, and `true` on any rank
-counts on all of them. When `f`, `jac` or one of those checks throws on some ranks, those
-ranks go on with NaN until the ranks next agree, at the end of the step or when its nonlinear
-solve fails, and then every rank throws, so an `f` that throws has to do so after its own
-communication.
+counts on all of them. A step that turns NaN or overflows on any rank's rows is taken again
+smaller on every rank, and a fixed-step solve stops at the first state that is not finite on
+some rank, as in a serial solve. When `f`, `jac` or one of those checks throws on some ranks,
+those ranks go on with NaN until the ranks next agree, at the end of the step or when its
+nonlinear solve fails, and then every rank throws rather than retrying the step, so an `f`
+that throws has to do so after its own communication.
 
 Callbacks and the integrator interface run distributed too, as long as every rank makes the
 same calls with the same arguments in the same order: `init`, `step!`, `solve!`, `reinit!`,
@@ -377,6 +389,13 @@ PETSc solves the linear systems of a distributed solve with GMRES and block Jaco
 ILU(0) block on each rank, to a relative tolerance of 1e-5, so such a solve agrees with a
 serial one to that accuracy rather than to round-off. Options such as `-ksp_rtol` or
 `-sub_pc_type` in `petsc_options` change that solver.
+
+`TSMPRK`'s `slow` and `medium` index the rank's own rows, and either may be empty on some
+ranks as long as some rank names a slow row and, for `"2a23"` and `"2a33"`, a medium one. An
+implicit `TSGeneric` runs distributed for `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`,
+`"arkimex"`, `"irk"`, `"alpha"` and `"dirk"`, as `TSImplicit` does. Other implicit types are
+refused: `"glle"`'s step control follows the round-off of the distributed linear solve, so it
+takes other steps than a serial solve and ends with another error, larger or smaller.
 
 `PETScAdjoint` runs distributed too, for `TSRK`, `TSImplicit("beuler")` and
 `TSImplicit("cn")`. It needs the problem's `jac`, filling this rank's rows of a sparse
@@ -445,23 +464,28 @@ and `du` owned. Everything else the package calls, such as a callback, `unstable
 DM itself stays free for further solves. A DMDA on `MPI.COMM_SELF`, or on a single rank, gives
 a serial solve. Only a DMDA is taken so far.
 
-A distributed solve refuses, with an `ArgumentError`, `TSMPRK` and an implicit `TSGeneric`, and
-one with a `dm` refuses `PETScAdjoint` as well. Solving from several threads at once, as
-`EnsembleThreads` does, is not refused, but nothing then keeps the ranks' solves in the same
-order, which they need.
+A solve with a `dm` refuses `TSMPRK`, an implicit `TSGeneric` and `PETScAdjoint` with an
+`ArgumentError`. A distributed solve, with a `dm` or without, is refused inside
+`Threads.@threads` on more than one thread, as `EnsembleThreads` runs its trajectories:
+nothing there keeps the ranks' solves in the same order, and ranks taking them in different
+orders run different solves as one and can return wrong results without an error.
+Distributed solves running at once from `Threads.@spawn` tasks are not refused, so the caller
+has to keep them in the same order on every rank. An ensemble of distributed solves runs with
+`EnsembleSerial()`.
 
 ## Limitations
 
-Only the algorithms named under MPI run distributed so far, and not on a
-`DynamicalODEProblem` or `SecondOrderODEProblem`; every other solve runs on `MPI.COMM_SELF`. PETSc TS is built for large distributed problems, and reaching it
-from the SciML interface is what this package is for; use OrdinaryDiffEq.jl for serial
-problems where it applies.
+A `DynamicalODEProblem` or `SecondOrderODEProblem` does not run distributed yet, whatever the
+algorithm, so `TSBasicSymplectic` and `TSAlpha2` run on `MPI.COMM_SELF` only. PETSc TS is
+built for large distributed problems, and reaching it from the SciML interface is what this
+package is for; use OrdinaryDiffEq.jl for serial problems where it applies.
 
 On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.
 
 Solves from several threads, such as an `EnsembleThreads` ensemble, are safe but run one
-at a time: PETSc's options and MPI are shared by the whole process.
+at a time: PETSc's options and MPI are shared by the whole process. Distributed ones are not,
+as the MPI section says.
 
 Finish or terminate every integrator you start. One dropped part way is released by a
 finalizer, and if that finalizer runs at process exit, after MPI has shut down, PETSc's
