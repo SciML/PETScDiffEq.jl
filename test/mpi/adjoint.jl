@@ -253,6 +253,9 @@ const METHODS = (
         wrong = rank == thrower ? [heat_proto(rows); spzeros(1, N)] : heat_proto(rows)
         e = caught(() -> gradient(heat_with(jac_prototype = wrong), rk, times, rows))
         @test rank == thrower ? e isa ArgumentError && occursin("must be", e.msg) : remote(e)
+        not_bool = rank == thrower ? nothing : false
+        e = caught(() -> gradient(heat_with(), rk, times, rows; no_start = not_bool))
+        @test rank == thrower ? e isa MethodError : remote(e)
         for (alg, what) in (
                 (TSImplicit("bdf"; comm), "PETSc has no adjoint for TSImplicit(\"bdf\")"),
                 (TSRosW(; comm), "PETSc has no adjoint for TSRosW"),
