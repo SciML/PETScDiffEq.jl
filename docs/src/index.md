@@ -68,12 +68,14 @@ way, and both kinds of retry count in `stats.nreject`. An adaptive implicit step
 or linear solve fails, as when its right-hand side returns NaN, or whose Newton matrix has a
 zero pivot, is taken again at PETSc's `-ts_adapt_scale_solve_failed` share of its size, a
 quarter by default, as many times as it takes, and counts in `stats.nnonlinconvfail` rather
-than `stats.nreject`, as in OrdinaryDiffEq. A fixed-step solve ends at its first failed Newton solve with
-`ConvergenceFailure`, as OrdinaryDiffEq's does with `adaptive = false`.
+than `stats.nreject`. OrdinaryDiffEq counts a failed Newton solve the same way, but counts a
+zero pivot, and a Rosenbrock step that turns NaN, in `stats.nreject`. A fixed-step solve ends
+at its first failed Newton or linear solve with `ConvergenceFailure`, as OrdinaryDiffEq's
+Newton-based methods do with `adaptive = false`.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
-state stops being finite, a step overflows, turns NaN or fails its Newton solve at every size
-tried, with a warning, an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
+state stops being finite, a step overflows, turns NaN or fails its Newton or linear solve at
+every size tried, with a warning, an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
 returns true, which is asked before each step with the step about to be taken, as
 OrdinaryDiffEq asks it, `ConvergenceFailure` when a fixed-step nonlinear
 solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are taken, and

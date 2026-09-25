@@ -2301,7 +2301,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         )
     end
 
-    @testset "a failed implicit step is taken again smaller, as OrdinaryDiffEq takes it" begin
+    @testset "a failed implicit step is taken again smaller" begin
         never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
         counts(sol) = (sol.stats.naccept, sol.stats.nreject, sol.stats.nnonlinconvfail)
         same(a, b) = a.t == b.t && a.u == b.u && a.retcode == b.retcode && counts(a) == counts(b)
@@ -2447,7 +2447,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test bdf.t[end] > 0
         end
 
-        @testset "a fixed-step solve ends at its first failed Newton solve" begin
+        @testset "a fixed-step solve ends at its first failed Newton or linear solve" begin
             kw = (; dt = 0.1, adaptive = false)
             for alg in (
                     PETScDiffEq.TSIRK(), PETScDiffEq.TSImplicit("beuler"),
