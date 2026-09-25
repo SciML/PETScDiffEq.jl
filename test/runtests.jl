@@ -2482,6 +2482,35 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test same(plain, SciMLBase.solve(breaks, alg; callback = never, kw...))
             end
         end
+
+        @testset "a successful solve makes no work vector at each stage" begin
+            pl = PETScDiffEq.PETSc.getlib(; PetscScalar = Float64)
+            PETScDiffEq.PETSc.initialize(pl)
+            function last_id()
+                v = PETScDiffEq._state_vec(pl, nothing, 1)
+                id = Ref{Int64}(0)
+                ccall(
+                    PETScDiffEq._symbol(pl, :PetscObjectGetId), Cint, (Ptr{Cvoid}, Ptr{Int64}),
+                    v.ptr, id,
+                )
+                PETScDiffEq.PETScCompat.destroy!(v)
+                return id[]
+            end
+            vdp!(du, u, p, t) = (du[1] = u[2]; du[2] = 100 * (1 - u[1]^2) * u[2] - u[1]; nothing)
+            function made(tf, alg)
+                before = last_id()
+                sol = SciMLBase.solve(SciMLBase.ODEProblem(vdp!, [2.0, 0.0], (0.0, tf)), alg)
+                return last_id() - before, sol.stats.naccept + sol.stats.nreject
+            end
+            for (alg, per_step) in (
+                    (PETScDiffEq.TSImplicit("bdf"), 1), (PETScDiffEq.TSRosW(), 2),
+                    (PETScDiffEq.TSARKIMEX(), 2),
+                )
+                (a, n), (b, m) = made(1.0, alg), made(300.0, alg)
+                @test m - n > 100
+                @test b - a < per_step * (m - n)
+            end
+        end
     end
 
     @testset "the standard DiffEqCallbacks work" begin
