@@ -6981,9 +6981,12 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     osc!, (du, v, u, p, t) -> (du .= v; nothing); mass_matrix = Diagonal([2.0, 1.0]),
                 ), [0.0], [1.0], (0.0, 1.0),
             )
-            @test_throws "does not take a mass matrix" SciMLBase.solve(
-                mass, PETScDiffEq.TSAlpha2(); dt = 0.1,
-            )
+            for alg in (
+                    PETScDiffEq.TSAlpha2(), PETScDiffEq.TSBasicSymplectic(), PETScDiffEq.TSRK(),
+                    PETScDiffEq.TSRosW(),
+                )
+                @test_throws "does not take a mass matrix" SciMLBase.solve(mass, alg; dt = 0.1)
+            end
             sparse_proto = SciMLBase.SecondOrderODEProblem(
                 SciMLBase.DynamicalODEFunction{true}(
                     osc!, (du, v, u, p, t) -> (du .= v; nothing); jac_prototype = sparse(ones(2, 2)),

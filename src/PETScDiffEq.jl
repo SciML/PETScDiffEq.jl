@@ -2631,17 +2631,6 @@ function _setup(
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     mass_matrix = is_dae ? nothing : prob.f.mass_matrix
     has_mass = !(mass_matrix === nothing || mass_matrix == LinearAlgebra.I)
-    if has_mass && !_uses_ifunction(alg)
-        throw(
-            ArgumentError(
-                "PETScDiffEq cannot apply a mass matrix with an explicit algorithm; " *
-                    "use an implicit one such as TSImplicit or TSRosW",
-            ),
-        )
-    end
-    if has_mass && is_split
-        throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
-    end
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
     if dyn
         _check_dynamical(prob, alg, has_mass)
@@ -2652,6 +2641,17 @@ function _setup(
                     (alg isa TSAlpha2 ? "" : "DynamicalODEProblem or a ") * "SecondOrderODEProblem",
             ),
         )
+    end
+    if has_mass && !_uses_ifunction(alg)
+        throw(
+            ArgumentError(
+                "PETScDiffEq cannot apply a mass matrix with an explicit algorithm; " *
+                    "use an implicit one such as TSImplicit or TSRosW",
+            ),
+        )
+    end
+    if has_mass && is_split
+        throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
     end
     comm = _distributed(alg) ? alg.comm : nothing
     N = comm === nothing ? length(prob.u0) : MPI.Allreduce(length(prob.u0), +, comm)
