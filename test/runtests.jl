@@ -2285,6 +2285,26 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
         end
 
+        @testset "a solve that ends early keeps its last step as the one just taken" begin
+            breaks = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
+            )
+            runaway = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = u[1]^2; nothing), [1.0], (0.0, 2.0),
+            )
+            for (pr, alg) in (
+                    (breaks, PETScDiffEq.TSRK("5dp")), (breaks, PETScDiffEq.TSRosW()),
+                    (breaks, PETScDiffEq.TSImplicit("bdf")), (runaway, PETScDiffEq.TSRK("5dp")),
+                )
+                integ = SciMLBase.init(pr, alg; verbose = false)
+                SciMLBase.solve!(integ)
+                @test integ.sol.retcode != SciMLBase.ReturnCode.Success
+                @test integ.sol.t[(end - 1):end] == [integ.tprev, integ.t]
+                @test integ.sol.u[end - 1] == integ.uprev
+                @test integ.t - integ.tprev == integ.dt
+            end
+        end
+
         @testset "a step below dtmin ends the solve where it still holds" begin
             fast!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
             quick = SciMLBase.ODEProblem(fast!, [1.0], (0.0, 1.0))

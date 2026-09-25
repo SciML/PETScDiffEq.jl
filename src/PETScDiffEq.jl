@@ -3457,13 +3457,22 @@ end
 SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
     _locked(() -> _init_unlocked(prob, alg; kwargs...))
 
+function _restore_prev!(integ::PETScIntegrator, outer)
+    outer === nothing && return nothing
+    integ.tprev = outer[1]
+    copyto!(integ.uprev, outer[2])
+    return nothing
+end
+
 function _reject_step!(integ::PETScIntegrator, before, taken)
     h = integ.h
     ctx, pl = h.ctx, h.petsclib
     failed, h.stopped = h.stopped != 0, 0
     nstep, integ.dt, integ.dtcache, ctx.pdirty, outer = before
-    integ.t = integ.tprev
-    copyto!(integ.u, integ.uprev)
+    if !failed
+        integ.t = integ.tprev
+        copyto!(integ.u, integ.uprev)
+    end
     PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
     )
@@ -3474,10 +3483,7 @@ function _reject_step!(integ::PETScIntegrator, before, taken)
     dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, failed)
     if dt === nothing
         failed && _warn_failed_step(integ.alg, PETSC_ERR_FP, integ.kwargs)
-        if outer !== nothing
-            integ.tprev = outer[1]
-            copyto!(integ.uprev, outer[2])
-        end
+        _restore_prev!(integ, outer)
         ctx.fstart = nothing
         _finish!(integ)
         return nothing
@@ -3755,8 +3761,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty,
         outer === nothing && ctx.domain !== nothing ? (integ.tprev, copy(integ.uprev)) : outer,
     )
-    copyto!(integ.uprev, integ.u)
-    integ.tprev = integ.t
+    start = integ.t
     reuse = ctx.hermite && integ.tdir * integ.t == ctx.end_s &&
         _everywhere(ctx.comm, integ.u == ctx.end_u && !ctx.pdirty)
     ctx.fstart = reuse ? ctx.fend : nothing
@@ -3791,16 +3796,19 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     end
     h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped, integ.kwargs)
     integ.t = _user_t(integ.tdir, LibPETSc.TSGetTime(pl, h.ts))
-    if integ.tdir * integ.t <= integ.tdir * integ.tprev
+    if integ.tdir * integ.t <= integ.tdir * start
         if h.stopped == 0 && SciMLBase.isadaptive(integ) &&
                 Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
             ctx.unstable_hit = true
             _verbose(integ.kwargs) && @warn "`$(_warn_name(integ.alg))` ends here because " *
                 "its step fell below the floating point spacing at t = $(integ.t)"
         end
+        _restore_prev!(integ, before[5])
         _finish!(integ)
         return nothing
     end
+    copyto!(integ.uprev, integ.u)
+    integ.tprev = start
     if stop === nothing
         h.matches || (integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts))
         if integ.tdir * integ.t != h.tf && integ.tdir * integ.t >= h.tf - tol
