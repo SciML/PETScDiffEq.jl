@@ -3916,8 +3916,9 @@ function _retry_solve!(h, alg, floor, forced, verbose)
     return true
 end
 
-SciMLBase.__solve(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
-    _locked(() -> _solve_unlocked(prob, alg; kwargs...))
+SciMLBase.__solve(
+    prob::SupportedProblem, alg::AnyPETScTS, timeseries = (), ts = (), ks = (); kwargs...,
+) = _locked(() -> _solve_unlocked(prob, alg; kwargs...))
 
 mutable struct PETScIntegratorOpts{H, R}
     h::H
