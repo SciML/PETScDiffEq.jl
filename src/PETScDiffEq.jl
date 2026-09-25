@@ -2803,6 +2803,9 @@ end
 
 const _NOT_SELF = "on a communicator other than MPI.COMM_SELF"
 
+# Set while `Threads.@threads` runs, even on one thread.
+_in_threads_loop() = ccall(:jl_in_threaded_region, Cint, ()) != 0
+
 function _check_irk_layout(n, N, comm)
     nranks = MPI.Comm_size(comm)
     share = N ÷ nranks + (MPI.Comm_rank(comm) < N % nranks)
@@ -3151,6 +3154,13 @@ function _setup(
     end
     comm = _distributed(alg) ? alg.comm : nothing
     dm = _alg_dm(alg)
+    comm !== nothing && _in_threads_loop() && throw(
+        ArgumentError(
+            "PETScDiffEq cannot solve $_NOT_SELF inside `Threads.@threads`, as " *
+                "`EnsembleThreads` runs its trajectories: the ranks would take them in " *
+                "different orders and wait on each other forever; use `EnsembleSerial()`",
+        ),
+    )
     N = comm === nothing ? length(prob.u0) : MPI.Allreduce(length(prob.u0), +, comm)
     if dm !== nothing
         _checked_everywhere(() -> _refuse_dm(prob, alg, is_dae), comm)
