@@ -431,6 +431,11 @@ function _adjoint_solve_kwargs(prob, kwargs)
 end
 
 function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, comm)
+    prob.f isa SciMLBase.DynamicalODEFunction && throw(
+        ArgumentError(
+            "PETScAdjoint does not support a DynamicalODEProblem or SecondOrderODEProblem",
+        ),
+    )
     (prob isa SciMLBase.AbstractODEProblem && !(prob.f isa SciMLBase.SplitFunction)) ||
         throw(
         ArgumentError(
