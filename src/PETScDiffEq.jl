@@ -2070,8 +2070,8 @@ end
 
 const _NOT_SELF = "on a communicator other than MPI.COMM_SELF"
 
-# Set while `Threads.@threads` runs, even on one thread.
-_in_threads_loop() = ccall(:jl_in_threaded_region, Cint, ()) != 0
+_in_threads_loop() =
+    current_task() !== Base.roottask && ccall(:jl_in_threaded_region, Cint, ()) != 0
 
 function _check_irk_layout(n, N, comm)
     nranks = MPI.Comm_size(comm)
@@ -2274,14 +2274,16 @@ function _setup(
         throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
     end
     comm = _distributed(alg) ? alg.comm : nothing
-    comm !== nothing && _in_threads_loop() && throw(
+    N, looped = comm === nothing ? (length(prob.u0), 0) :
+        MPI.Allreduce([length(prob.u0), Int(_in_threads_loop())], +, comm)
+    looped > 0 && throw(
         ArgumentError(
-            "PETScDiffEq cannot solve $_NOT_SELF inside `Threads.@threads`, as " *
-                "`EnsembleThreads` runs its trajectories: the ranks would take them in " *
-                "different orders and wait on each other forever; use `EnsembleSerial()`",
+            "PETScDiffEq cannot solve $_NOT_SELF when a rank calls it inside " *
+                "`Threads.@threads`, as `EnsembleThreads` runs its trajectories: the ranks " *
+                "would take them in different orders and wait on each other forever; use " *
+                "`EnsembleSerial()`",
         ),
     )
-    N = comm === nothing ? length(prob.u0) : MPI.Allreduce(length(prob.u0), +, comm)
     comm === nothing || _checked_everywhere(comm) do
         _refuse_distributed(prob, alg, is_dae, N)
     end
