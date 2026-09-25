@@ -2794,8 +2794,9 @@ function _solve_unlocked(
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
         if ctx.comm === nothing
-            fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
-            ctx.halt_nonfinite, ctx.halt_stalled = fixed, !fixed
+            ctx.halt_nonfinite =
+                LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
+            ctx.halt_stalled = true
             _set_post_step!(pl, h.ts, ctx)
         end
         raised, failure = false, nothing
@@ -3813,8 +3814,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped, integ.kwargs)
     integ.t = _user_t(integ.tdir, LibPETSc.TSGetTime(pl, h.ts))
     if integ.tdir * integ.t <= integ.tdir * start
-        if h.stopped == 0 && SciMLBase.isadaptive(integ) &&
-                Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
+        if h.stopped == 0 && Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
             _stalled!(h, integ.alg, integ.t, integ.kwargs)
         end
         _restore_prev!(integ, before[5])

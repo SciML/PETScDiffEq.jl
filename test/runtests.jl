@@ -2281,6 +2281,28 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
         end
 
+        @testset "a fixed-step solve stops at a step too small to move t" begin
+            late = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 2.0))
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            for (alg, kw) in (
+                    (PETScDiffEq.TSRK("4"), (; dt = 1.0e-17)),
+                    (PETScDiffEq.TSRK("5dp"), (; dt = 1.0e-17, adaptive = false)),
+                    (PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"]), (; dt = 1.0e-17)),
+                )
+                plain = @test_logs (:warn, r"floating point spacing") SciMLBase.solve(
+                    late, alg; kw...,
+                )
+                stepped = @test_logs (:warn, r"floating point spacing") SciMLBase.solve(
+                    late, alg; callback = never, kw...,
+                )
+                for sol in (plain, stepped)
+                    @test sol.retcode == SciMLBase.ReturnCode.Unstable
+                    @test sol.t == [1.0]
+                    @test (sol.stats.naccept, sol.stats.nreject) == (0, 1)
+                end
+            end
+        end
+
         @testset "verbose = false silences the warning for a solve that ends early" begin
             breaks = SciMLBase.ODEProblem(
                 (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
