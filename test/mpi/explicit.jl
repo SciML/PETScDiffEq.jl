@@ -513,6 +513,15 @@ crossing_last_row(idx, level) =
         step!(integ)
         @test !anywhere(any(isnan, integ((integ.tprev + integ.t) / 2)))
         terminate!(integ)
+
+        integ = init(
+            ODEProblem(f!, heat0(rows), (0.0, 0.1)), TSRK("5dp"; comm); dense = false, FIXED...,
+        )
+        step!(integ)
+        armed[] = true
+        @test raised(caught(() -> reinit!(integ; reset_dt = true)), "f threw")
+        armed[] = false
+        terminate!(integ)
     end
 
     @testset "TSMPRK with its splits spread over the ranks" begin

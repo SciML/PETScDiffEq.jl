@@ -4738,27 +4738,32 @@ function _reinit_unlocked(
     )
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
-    LibPETSc.TSSetUp(h.petsclib, h.ts)
-    _match_steps_here!(h)
-    if !erase_sol
-        append!(h.ctx.ts, old.ctx.ts)
-        append!(h.ctx.us, old.ctx.us)
-        if h.ctx.dense
-            if old.ctx.dense
-                append!(h.ctx.dus, old.ctx.dus)
-            else
-                for (t, u) in zip(old.ctx.ts, old.ctx.us)
-                    push!(h.ctx.dus, _kept(h.ctx, _derivative(h.ctx, t, u)))
+    try
+        LibPETSc.TSSetUp(h.petsclib, h.ts)
+        _match_steps_here!(h)
+        if !erase_sol
+            append!(h.ctx.ts, old.ctx.ts)
+            append!(h.ctx.us, old.ctx.us)
+            if h.ctx.dense
+                if old.ctx.dense
+                    append!(h.ctx.dus, old.ctx.dus)
+                else
+                    for (t, u) in zip(old.ctx.ts, old.ctx.us)
+                        push!(h.ctx.dus, _kept(h.ctx, _derivative(h.ctx, t, u)))
+                    end
                 end
             end
         end
-    end
-    initialize_save && _initial_save!(h)
-    if reset_dt === true
-        dt = _estimate_dt(
-            h, integ.alg, _make_opts(h, integ.kwargs), h.u0, h.t0,
-            _tstops(vcat(tstops, d_discontinuities), h),
-        )
+        initialize_save && _initial_save!(h)
+        if reset_dt === true
+            dt = _estimate_dt(
+                h, integ.alg, _make_opts(h, integ.kwargs), h.u0, h.t0,
+                _tstops(vcat(tstops, d_discontinuities), h),
+            )
+        end
+    catch
+        _destroy!(h)
+        rethrow()
     end
     _destroy!(old)
     integ.h = h
