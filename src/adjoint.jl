@@ -610,15 +610,16 @@ function _discrete_adjoint_unlocked(
         kwargs...,
     )
     comm = _distributed(alg) ? alg.comm : nothing
-    solve_kwargs, has_p = _checked_everywhere(comm) do
+    solve_kwargs, has_p, skip_start = _checked_everywhere(comm) do
         given = _adjoint_solve_kwargs(prob, kwargs)
-        given, _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, comm)
+        checked = _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, comm)
+        given, checked, Bool(no_start)
     end
     p = prob.p
     np = has_p ? length(p) : 0
     cost_t = collect(Float64, t)
     comm === nothing ||
-        _check_agreement(comm, (cost_t, Bool(no_start), np, dgdp_discrete === nothing))
+        _check_agreement(comm, (cost_t, skip_start, np, dgdp_discrete === nothing))
 
     h = _setup(
         prob, alg; solve_kwargs...,
@@ -663,7 +664,7 @@ function _discrete_adjoint_unlocked(
                 _ad_paramjacobian(backend, f_ad, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE) :
                 _as_inplace_jac(prob.f.paramjac, iip),
             zeros(n, np),
-            implicit ? -h.tdir : h.tdir, dgdu_discrete, Bool(no_start),
+            implicit ? -h.tdir : h.tdir, dgdu_discrete, skip_start,
             cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
@@ -820,7 +821,7 @@ function _discrete_adjoint_unlocked(
         mine = comm === nothing ? dp : zeros(np)
         _checked_everywhere(comm) do
             for (step, ks) in adj.cost_at_step, k in ks
-                no_start && k == 1 && continue
+                skip_start && k == 1 && continue
                 fill!(gp, 0.0)
                 dgdp_discrete(gp, copy(adj.u_at_step[step]), p, cost_t[k], k)
                 mine .+= gp
