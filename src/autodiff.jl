@@ -10,8 +10,9 @@ _default_autodiff(comm, dm) =
     dm === nothing && something(comm, MPI.COMM_SELF) == MPI.COMM_SELF ? AutoForwardDiff() :
     AutoFiniteDiff()
 
-_autodiff(alg::Union{TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX, TSGeneric}) = alg.autodiff
-_autodiff(::Union{TSRK, TSMPRK}) = nothing
+_autodiff(alg::Union{TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX, TSGeneric, TSAlpha2}) =
+    alg.autodiff
+_autodiff(::Union{TSRK, TSMPRK, TSBasicSymplectic}) = nothing
 
 function _petsc_differences(alg)
     ad = _autodiff(alg)

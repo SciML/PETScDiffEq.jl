@@ -16,6 +16,18 @@ using Pkg
 Pkg.add("PETScDiffEq")
 ```
 
+Precompiling the package runs a few small solves through PETSc, so that the first `solve`
+of a session compiles much less. To precompile without them:
+
+```julia
+using PETScDiffEq, Preferences
+set_preferences!(PETScDiffEq, "precompile_workload" => false; force = true)
+```
+
+Precompiling under `mpiexec` or `srun` skips these solves, and later sessions reuse that
+build until the package or one of its dependencies changes, so load the package once
+without the launcher before the first parallel run.
+
 ## Common API Usage
 
 This library adds the common interface to PETSc's TS solvers.
@@ -54,6 +66,9 @@ estimate. `TSGeneric` needs it too, since which of its types adapt is not known 
 - `TSIRK(nstages)`, Gauss-Legendre implicit Runge-Kutta of order `2 * nstages`
 - `TSARKIMEX(subtype)`, additive Runge-Kutta IMEX, for a `SplitODEProblem`
 - `TSDAE(subtype)`, the same implicit methods applied to a `DAEProblem`
+- `TSBasicSymplectic(subtype)`, symplectic splitting methods for a `DynamicalODEProblem` or
+  `SecondOrderODEProblem`
+- `TSAlpha2()`, generalized-alpha for a `SecondOrderODEProblem`
 - `TSGeneric(ts_type)`, a pass-through to any other PETSc `TSType` by name
 
 Each has a docstring covering its subtypes, whether it adapts and what it requires, so
@@ -105,8 +120,8 @@ output uses for everything else, `TSGeneric` and a type `petsc_options` changes 
 With a mass matrix or a `DAEProblem` only PETSc's is available, and a type that has none
 raises an `ArgumentError` when such a state is needed.
 
-`ODEProblem`, `SplitODEProblem` and `DAEProblem` are supported, in place or out of
-place, along with
+`ODEProblem`, `SplitODEProblem`, `DAEProblem`, `DynamicalODEProblem` and
+`SecondOrderODEProblem` are supported, in place or out of place, along with
 `ODEFunction`'s `jac`, `jac_prototype` and `mass_matrix`. Supply a `jac_prototype` for
 anything sparse: without one the Jacobian is dense and forces a dense factorization.
 
@@ -123,6 +138,58 @@ wrong in its first digit, so keep them for a right-hand side ForwardDiff cannot 
 `DiscreteCallback`, `ContinuousCallback`, `VectorContinuousCallback` and `CallbackSet`
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`
 and `terminate!`.
+
+## Second-order and partitioned problems
+
+A `SecondOrderODEProblem`, `u'' = f(u', u, p, t)`, and a `DynamicalODEProblem`, whose state is
+a velocity `v` and a position `u` with `v' = f1(v, u, p, t)` and `u' = f2(v, u, p, t)`, have
+two PETSc integrators of their own. Every other serial algorithm solves them as the
+first-order system `[v; u]' = [f1; f2]`, as OrdinaryDiffEq's general methods do.
+
+`TSBasicSymplectic` steps the velocity and the position in turn with `f1` and `f2`, so, as for
+OrdinaryDiffEq's symplectic methods, `f1` must not depend on `v` nor `f2` on `u`. Its
+subtypes `"sieuler"`, `"velverlet"`, `"3"` and `"4"` are of order 1 to 4 and step at a fixed
+`dt`, and their energy error stays bounded over long times where a non-symplectic method's
+grows:
+
+```julia
+using PETScDiffEq, SciMLBase
+
+pendulum!(ddu, du, u, p, t) = (ddu .= -sin.(u); nothing)
+prob = SecondOrderODEProblem(pendulum!, [0.0], [2.0], (0.0, 1000.0))
+sol = solve(prob, TSBasicSymplectic("4"); dt = 0.1)
+energy(s) = s.x[1][1]^2 / 2 - cos(s.x[2][1])
+maximum(abs(energy(s) - energy(sol.u[1])) for s in sol.u)  # 6.4e-6, as large at t = 1000 as at t = 500
+```
+
+`f1` is given the time of the positions it is evaluated at, so a force that depends on `t`
+keeps each method's order; PETSc's own time for that update runs ahead of the positions.
+`"velverlet"` then gives OrdinaryDiffEq's `VelocityVerlet` answer to round-off.
+
+`TSAlpha2` is PETSc's implicit generalized-alpha method of order 2, for stiff second-order
+systems such as structural dynamics. `radius`, from 0 to 1, is its spectral radius at an
+infinite step: below 1 it damps the frequencies the step cannot resolve, which radius 1, the
+default, carries on undamped. It adapts on PETSc's error estimate with scalar `abstol` and
+`reltol`, or steps at `dt` with `adaptive = false`. Its Jacobian, from a `jac` or from
+`autodiff` as for the other implicit families, is that of the first-order system, `2n` by
+`2n`; it takes no sparse `jac_prototype` yet.
+
+```julia
+K, C = [1.0e6 0.0; 0.0 1.0], [200.0 0.0; 0.0 0.02]
+spring!(ddu, du, u, p, t) = (ddu .= -K * u .- C * du; nothing)
+prob = SecondOrderODEProblem(spring!, [0.0, 0.0], [1.0, 1.0], (0.0, 5.0))
+sol = solve(prob, TSAlpha2(; radius = 0.5); dt = 0.1, adaptive = false)
+```
+
+The states come back as OrdinaryDiffEq returns them: `sol.u[i]`, `sol(t)`, `integrator.u` and
+`get_du(integrator)` are `ArrayPartition(v, u)`, so `sol.u[i].x[2]` is the position, while
+`save_idxs` indexes the flat `[v; u]` and saves plain vectors. Between steps `sol(t)` is the
+cubic Hermite interpolant of the velocity and the position, which is also what OrdinaryDiffEq
+gives for `VelocityVerlet`. `stats.nf` counts evaluations of `f1`, or of the whole system,
+and `stats.nf2` those of `f2` alone.
+
+These problems run on `MPI.COMM_SELF` only, take no mass matrix and no `PETScAdjoint`, and
+`TSAlpha2` does not integrate backward in time.
 
 ## Number types
 
@@ -292,6 +359,20 @@ ILU(0) block on each rank, to a relative tolerance of 1e-5, so such a solve agre
 serial one to that accuracy rather than to round-off. Options such as `-ksp_rtol` or
 `-sub_pc_type` in `petsc_options` change that solver.
 
+`PETScAdjoint` runs distributed too, for `TSRK`, `TSImplicit("beuler")` and
+`TSImplicit("cn")`. It needs the problem's `jac`, filling this rank's rows of a sparse
+prototype as above, and when there are parameters a `paramjac` filling this rank's rows,
+since automatic differentiation would call `f` a different number of times on each rank; both
+are collective like `f`. An explicit method takes such a `jac` in its own solve too, and
+ignores it there. `dgdu_discrete` gets this rank's rows of the state and writes their
+gradient, and `dgdp_discrete` gives this rank's share of the cost's direct derivative with
+respect to `p`, which the ranks add up. `du0` comes back as this rank's rows and `dp` as the
+whole gradient, the same on every rank. The cost times, `no_start`, the length of `p` and
+whether `dgdp_discrete` is given have to agree across the ranks. A `jac`, `paramjac`, cost
+function or `f` that throws on some ranks makes every rank throw, as in a solve. The
+transposed linear solves of `TSImplicit` use the solver above;
+`["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
+
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
 which every algorithm that takes `comm` takes as well. The solve then runs on the DM's
 communicator, which `comm` may name too but not contradict, and `u0` is the block of the grid
@@ -345,14 +426,15 @@ and `du` owned. Everything else the package calls, such as a callback, `unstable
 DM itself stays free for further solves. A DMDA on `MPI.COMM_SELF`, or on a single rank, gives
 a serial solve. Only a DMDA is taken so far.
 
-A distributed solve or one with a `dm` refuses, with an `ArgumentError`, `TSMPRK`, an
-implicit `TSGeneric` and `PETScAdjoint`. Solving from several threads at once, as `EnsembleThreads` does, is not
-refused, but nothing then keeps the ranks' solves in the same order, which they need.
+A distributed solve refuses, with an `ArgumentError`, `TSMPRK` and an implicit `TSGeneric`, and
+one with a `dm` refuses `PETScAdjoint` as well. Solving from several threads at once, as
+`EnsembleThreads` does, is not refused, but nothing then keeps the ranks' solves in the same
+order, which they need.
 
 ## Limitations
 
-Only the algorithms named under MPI run distributed so far; every other solve runs on
-`MPI.COMM_SELF`. PETSc TS is built for large distributed problems, and reaching it
+Only the algorithms named under MPI run distributed so far, and not on a
+`DynamicalODEProblem` or `SecondOrderODEProblem`; every other solve runs on `MPI.COMM_SELF`. PETSc TS is built for large distributed problems, and reaching it
 from the SciML interface is what this package is for; use OrdinaryDiffEq.jl for serial
 problems where it applies.
 
