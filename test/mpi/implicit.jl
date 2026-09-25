@@ -289,6 +289,26 @@ const METHODS = (
         )
     end
 
+    @testset "a rank whose own mass block is the identity" begin
+        algebraic = rank > 0
+        function pair!(du, u, p, t)
+            du[1] = -u[1]
+            du[2] = algebraic ? u[2] - u[1] : -u[2]
+            return nothing
+        end
+        proto = sparse([1, 2, 2], 2rank .+ [1, 1, 2], ones(3), 2, 2nranks)
+        M = Diagonal([1.0, algebraic ? 0.0 : 1.0])
+        pair(y0) = ODEProblem(
+            ODEFunction(pair!; jac_prototype = proto, mass_matrix = M), [1.0, y0], (0.0, 1.0),
+        )
+        bdf = TSImplicit("bdf"; comm)
+        sol = solve(pair(1.0), bdf; dt = 1.0e-3, TOL...)
+        @test sol.retcode == ReturnCode.Success
+        @test maximum(abs, sol.u[end] .- exp(-1)) <= 3.0e-6
+        off = caught(() -> solve(pair(2.0), bdf; dt = 1.0e-3, TOL...))
+        @test nranks == 1 ? off === nothing : off isa SciMLBase.CheckInitFailureError
+    end
+
     @testset "SplitODEProblem with an explicit f2" begin
         decay!(du, u, p, t) = (du .= -u; nothing)
         split(idx, f; jac) = SplitODEProblem(heat_function(f, idx; jac), decay!, heat0(idx), SPAN)

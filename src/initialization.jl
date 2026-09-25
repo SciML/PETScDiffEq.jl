@@ -32,8 +32,11 @@ function _initialize!(
     mass = is_dae ? nothing : prob.f.mass_matrix
     eqs = vars = nothing
     if !is_dae
-        (mass === nothing || mass == LinearAlgebra.I) && return true
-        eqs, vars = _zero_rows(mass), _zero_cols(mass)
+        plain = mass === nothing || mass == LinearAlgebra.I
+        comm === nothing && plain && return true
+        # A rank whose own block is the identity still joins the collectives below.
+        eqs = plain ? falses(length(u0)) : _zero_rows(mass)
+        vars = plain ? falses(length(u0)) : _zero_cols(mass)
         _anywhere(comm, any(eqs)) && _anywhere(comm, any(vars)) || return true
     end
     init isa _INIT_ALGS || throw(
