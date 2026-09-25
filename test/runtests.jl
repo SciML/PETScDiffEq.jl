@@ -2253,6 +2253,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test sol.u[1][1:4] == u0[1:4]
                 @test isapprox(sol.u[1][5], exact; rtol = 1.0e-14)
             end
+            function pendulum_residual!(r, du, u, p, t)
+                pendulum!(r, u, p, t)
+                r[1:4] .-= du[1:4]
+                return nothing
+            end
+            prob = SciMLBase.DAEProblem(
+                pendulum_residual!, zeros(5), u0, (0.0, 1.0);
+                differential_vars = [true, true, true, true, false],
+            )
+            fd = PETScDiffEq.AutoFiniteDiff()
+            for alg in (PETScDiffEq.TSDAE(), PETScDiffEq.TSDAE(; autodiff = fd))
+                sol = SciMLBase.solve(prob, alg; initializealg = brown, tol...)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.u[1][1:4] == u0[1:4]
+                @test isapprox(sol.u[1][5], exact; rtol = 1.0e-14)
+            end
         end
 
         Sys.WORD_SIZE == 64 && @testset "ShampineCollocationInit takes OrdinaryDiffEq's backward Euler step" begin
@@ -2268,6 +2284,51 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             @test sol.retcode == SciMLBase.ReturnCode.Success
             @test all(isapprox.(sol.u[1], dfbdf; rtol = 1.0e-10))
+            function step_residual(u, h)
+                r = zeros(3)
+                rober_residual!(r, (u .- bad) ./ h, u, nothing, 0.0)
+                return maximum(abs, r)
+            end
+            later = SciMLBase.remake(dae(bad, zeros(3)); tspan = (1.0, 100.0))
+            for (prob, alg, kw, h) in (
+                    (mass(bad), PETScDiffEq.TSImplicit("bdf"), (; dt = 1.0e-3), 2.0e-4),
+                    (
+                        mass(bad), PETScDiffEq.TSImplicit("bdf"),
+                        (; initializealg = DiffEqBase.ShampineCollocationInit(1.0e-2)), 1.0e-2,
+                    ),
+                    (later, PETScDiffEq.TSDAE(), (;), 1.0e-3),
+                )
+                sol = SciMLBase.solve(prob, alg; initializealg = shampine, kw..., tol...)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test step_residual(sol.u[1], h) <= 1.0e-12
+            end
+        end
+
+        @testset "sparse LU on an algebraic block with a zero diagonal" begin
+            function cell!(du, u, p, t)
+                du[1], du[2], du[3] = u[2] - u[3], u[1] - 2u[3], u[2] - u[1]
+                return nothing
+            end
+            rows, cols = [1, 1, 2, 2, 3, 3], [2, 3, 1, 3, 1, 2]
+            vals = [1.0, -1.0, 1.0, -2.0, -1.0, 1.0]
+            cell_jac!(J, u, p, t) = (foreach((i, j, v) -> J[i, j] = v, rows, cols, vals); nothing)
+            proto = sparse(rows, cols, ones(6), 3, 3)
+            h = 1.0e-3
+            ads = (PETScDiffEq.AutoForwardDiff(), PETScDiffEq.AutoFiniteDiff())
+            for jac in (nothing, cell_jac!), ad in ads
+                fn = SciMLBase.ODEFunction(
+                    cell!; jac, jac_prototype = proto, mass_matrix = Diagonal([0.0, 0.0, 1.0]),
+                )
+                prob = SciMLBase.ODEProblem(fn, [3.0, 1.0, 1.0], (0.0, 1.0))
+                for (init, start) in ((brown, [2.0, 1.0, 1.0]), (shampine, [2.0, 1.0, 1.0] / (1 + h)))
+                    sol = SciMLBase.solve(
+                        prob, PETScDiffEq.TSImplicit("bdf"; autodiff = ad); initializealg = init,
+                        tol...,
+                    )
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test isapprox(sol.u[1], start; rtol = 1.0e-15)
+                end
+            end
         end
 
         Sys.WORD_SIZE == 64 && @testset "every source of the Jacobian gives the same start" begin
@@ -2396,6 +2457,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             @test checks(
                 mass(good), PETScDiffEq.TSImplicit("bdf"); initializealg = SciMLBase.OverrideInit(),
+            )
+            skew = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (du .= u .- 1; nothing);
+                    mass_matrix = [1.0 1.0 0.0; 0.0 0.0 0.0; 0.0 0.0 0.0],
+                ), zeros(3), (0.0, 1.0),
+            )
+            @test_throws "2 zero rows and 1 zero columns" SciMLBase.solve(
+                skew, PETScDiffEq.TSImplicit("bdf"); initializealg = brown,
             )
         end
     end
