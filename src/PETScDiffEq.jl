@@ -603,6 +603,8 @@ mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
     nreject::Int
     halt_nonfinite::Bool
     coo::Union{Nothing, COOJacobian{S}}
+    halt_stalled::Bool
+    stalled::Bool
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -728,7 +730,10 @@ function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
         s >= smax - _near(smax) && return LibPETSc.PetscErrorCode(0)
         hnext = LibPETSc.TSGetTimeStep(pl, ts)
         stop = false
-        if ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
+        if ctx.halt_stalled && Int(LibPETSc.TSGetConvergedReason(pl, ts)) == 0 &&
+                s <= LibPETSc.TSGetPrevTime(pl, ts)
+            ctx.stalled = stop = true
+        elseif ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
             ctx.dt_too_small = stop = true
         end
         if !stop && (ctx.unstable !== nothing || ctx.halt_nonfinite)
@@ -2440,7 +2445,7 @@ function _setup(
         unstable_check, false, tdir, isoutofdomain,
         0, 0, 0, nothing, comm,
         comm === nothing && adaptive && _adapts(alg) !== false && !_uses_ifunction(alg),
-        C_NULL, 0, false, nothing,
+        C_NULL, 0, false, nothing, false, false,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -2788,9 +2793,9 @@ function _solve_unlocked(
     forced = get(kwargs, :force_dtmin, false) === true
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
-        if ctx.comm === nothing &&
-                LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
-            ctx.halt_nonfinite = true
+        if ctx.comm === nothing
+            fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
+            ctx.halt_nonfinite, ctx.halt_stalled = fixed, !fixed
             _set_post_step!(pl, h.ts, ctx)
         end
         raised, failure = false, nothing
@@ -2806,9 +2811,10 @@ function _solve_unlocked(
         _throw_if_threw!(ctx)
         failure === nothing || throw(failure)
         h.stopped == 0 || _warn_failed_step(alg, h.stopped, kwargs)
+        ctx.stalled && _stalled!(h, alg, _user_t(h.tdir, ctx.end_s), kwargs)
         # PETSc sets the solve time only when TSSolve returns normally, and a step that
         # raises leaves its rejected trial in the solution vector.
-        tend, uend = raised ? (ctx.end_s, copy(ctx.end_u)) :
+        tend, uend = raised || ctx.stalled ? (ctx.end_s, copy(ctx.end_u)) :
             (LibPETSc.TSGetSolveTime(pl, h.ts), _readvec!(similar(h.u0), pl, h.u))
         st = _read_stats(h)
     finally
@@ -2817,6 +2823,16 @@ function _solve_unlocked(
     sol = _assemble(prob, alg, h, tend, uend, st, kwargs)
     ctx.comm === nothing || _throw_if_threw!(ctx)
     return sol
+end
+
+function _stalled!(h, alg, t, kwargs)
+    pl, ctx = h.petsclib, h.ctx
+    LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.TSGetStepNumber(pl, h.ts) - 1)
+    ctx.nreject += 1
+    ctx.unstable_hit = true
+    _verbose(kwargs) && @warn "`$(_warn_name(alg))` ends here because its step fell below " *
+        "the floating point spacing at t = $t"
+    return nothing
 end
 
 function _retry_solve!(h, alg, floor, forced, kwargs)
@@ -3799,9 +3815,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     if integ.tdir * integ.t <= integ.tdir * start
         if h.stopped == 0 && SciMLBase.isadaptive(integ) &&
                 Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
-            ctx.unstable_hit = true
-            _verbose(integ.kwargs) && @warn "`$(_warn_name(integ.alg))` ends here because " *
-                "its step fell below the floating point spacing at t = $(integ.t)"
+            _stalled!(h, integ.alg, integ.t, integ.kwargs)
         end
         _restore_prev!(integ, before[5])
         _finish!(integ)

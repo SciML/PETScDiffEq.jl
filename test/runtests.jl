@@ -2163,7 +2163,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         @testset "an overflow is Unstable, not a raised error" begin
             square!(du, u, p, t) = (du[1] = u[1]^2; nothing)
             runaway = SciMLBase.ODEProblem(square!, [1.0], (0.0, 2.0))
-            over = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+            over = @test_logs (:warn, r"floating point spacing") SciMLBase.solve(
                 runaway, PETScDiffEq.TSRK("5dp");
                 dt = 0.01, abstol = 1.0e-10, reltol = 1.0e-10,
             )
@@ -2261,12 +2261,24 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test_logs (:warn, r"floating point spacing") SciMLBase.solve!(integ)
             @test integ.sol.retcode == SciMLBase.ReturnCode.Unstable
             @test integ.sol.t == sol.t
-            plain = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+            plain = @test_logs (:warn, r"floating point spacing") SciMLBase.solve(
                 runaway, PETScDiffEq.TSRK("5dp"),
             )
             @test plain.retcode == SciMLBase.ReturnCode.Unstable
             @test plain.t == sol.t
             @test plain.u == sol.u
+            for (alg, tol) in (
+                    (PETScDiffEq.TSRK("5dp"), 1.0e-6), (PETScDiffEq.TSRK("5dp"), 1.0e-10),
+                    (PETScDiffEq.TSRK("3bs"), 1.0e-6), (PETScDiffEq.TSRosW(), 1.0e-6),
+                )
+                kw = (; abstol = tol, reltol = tol, verbose = false)
+                plain = SciMLBase.solve(runaway, alg; kw...)
+                stepped = SciMLBase.solve(runaway, alg; callback = never, kw...)
+                @test plain.t == stepped.t
+                @test (plain.stats.naccept, plain.stats.nreject, plain.stats.nf) ==
+                    (stepped.stats.naccept, stepped.stats.nreject, stepped.stats.nf)
+                @test plain.stats.naccept == length(plain.t) - 1
+            end
         end
 
         @testset "verbose = false silences the warning for a solve that ends early" begin
