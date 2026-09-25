@@ -3,7 +3,8 @@ using LinearAlgebra: Diagonal
 using PETScDiffEq: PETSc, LibPETSc, PETScCompat, AutoForwardDiff, AutoFiniteDiff,
     reshape_local_array
 using SciMLBase: ODEProblem, ODEFunction, DAEProblem, DAEFunction, SplitODEProblem,
-    DiscreteCallback, ContinuousCallback, ReturnCode, init, solve, step!, get_du, terminate!
+    DiscreteCallback, ContinuousCallback, ReturnCode, init, solve, solve!, step!, get_du,
+    terminate!
 
 MPI.Init()
 const comm = MPI.COMM_WORLD
@@ -385,6 +386,23 @@ end
             ref = walk(comm_heat(), make(; comm))
             @test everywhere(got == ref)
         end
+    end
+
+    @testset "the caller can destroy the DM once the integrator has it" begin
+        function ghosted!(du, u, p, t)
+            for i in eachindex(du)
+                du[i] = (u[i] - 2u[i + 1] + u[i + 2]) / dx^2
+            end
+            return nothing
+        end
+        prob = ODEProblem(ghosted!, heat0(rows), SPAN)
+        fresh = line_da(comm; points_per_proc = (LibPETSc.PetscInt.(counts),))
+        integ = init(prob, explicit(; dm = fresh); FIXED...)
+        PETScCompat.destroy!(fresh)
+        got = solve!(integ)
+        ref = solve(prob, explicit(; dm = da); FIXED...)
+        @test got.t == ref.t
+        @test everywhere(got.u == ref.u)
     end
 
     @testset "a mass matrix, a SplitODEProblem and a DAEProblem" begin

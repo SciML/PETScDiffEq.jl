@@ -894,6 +894,13 @@ end
 
 _clone_dm(pl, dm) = LibPETSc.PetscDM(_dm_vec!(pl, :DMClone, dm.ptr)[], pl)
 
+function _referenced(pl, obj)
+    _check_code(
+        ccall(_symbol(pl, :PetscObjectReference), LibPETSc.PetscErrorCode, (Ptr{Cvoid},), obj),
+    )
+    return obj
+end
+
 function _scatter!(pl, dm, u, loc)
     glob = _dm_vec!(pl, :DMGetGlobalVector, dm)
     try
@@ -916,14 +923,14 @@ function _scatter!(pl, dm, u, loc)
     return nothing
 end
 
-struct Ghosted{F, L, D}
+struct Ghosted{F, L}
     f::F
     petsclib::L
-    dm::D
+    dm::Ptr{Cvoid}
 end
 
 function _ghosted(call, g::Ghosted, u)
-    pl, dm = g.petsclib, g.dm.ptr
+    pl, dm = g.petsclib, g.dm
     loc = _dm_vec!(pl, :DMGetLocalVector, dm)
     try
         _scatter!(pl, dm, u, loc[])
@@ -2364,7 +2371,7 @@ mutable struct TSHandles{CTX, L, R, S}
     tolbufs::Vector{Vector{S}}
     destroyed::Bool
     solution::Any
-    dm::Any
+    dms::Vector{Ptr{Cvoid}}
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -2425,12 +2432,14 @@ function _destroy!(h::TSHandles)
     h.ts === nothing || _return_work_vec!(h.ctx, h.ts)
     _release_work_vec!(h.ctx)
     h.ts === nothing || LibPETSc.TSDestroy(h.petsclib, h.ts)
-    h.dm === nothing || _check_code(
-        ccall(
-            _symbol(h.petsclib, :DMDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
-            Ref(h.dm.ptr),
-        ),
-    )
+    for dm in h.dms
+        _check_code(
+            ccall(
+                _symbol(h.petsclib, :DMDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+                Ref(dm),
+            ),
+        )
+    end
     return nothing
 end
 
@@ -2956,8 +2965,8 @@ function _setup(
     f1 = is_dae || dyn ? f1 : _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
     if dm !== nothing
-        f1 = Ghosted(f1, petsclib, dm)
-        f2 = f2 === nothing ? nothing : Ghosted(f2, petsclib, dm)
+        f1 = Ghosted(f1, petsclib, dm.ptr)
+        f2 = f2 === nothing ? nothing : Ghosted(f2, petsclib, dm.ptr)
     end
     builds_jac = _uses_ifunction(alg) && prob.f.jac === nothing && !_petsc_differences(alg)
     has_jac = _uses_ifunction(alg) && (prob.f.jac !== nothing || builds_jac)
@@ -3097,6 +3106,8 @@ function _setup(
     uvec = clone === nothing ? _state_vec(petsclib, comm, n) :
         LibPETSc.DMCreateGlobalVector(petsclib, clone)
     A = dyn && kept === nothing ? typeof(similar(prob.u0, U)) : Vector{U}
+    # f scatters through the caller's DM, so the handle holds a reference to it.
+    dms = clone === nothing ? Ptr{Cvoid}[] : [clone.ptr, _referenced(petsclib, dm.ptr)]
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
         similar(u0), copy(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0,
@@ -3119,7 +3130,7 @@ function _setup(
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0, false, false,
-        Any[], Vector{S}[], false, nothing, clone,
+        Any[], Vector{S}[], false, nothing, dms,
     )
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
