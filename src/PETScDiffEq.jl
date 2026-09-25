@@ -607,6 +607,7 @@ mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
     stuck::Union{Nothing, String}
     nfail::Int
     nits::Int
+    tbound::R
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -1111,7 +1112,7 @@ function _check_stage_body!(ctx, ts_ptr, t::R, y, accept) where {R}
             ctx.unstable_hit = true
         elseif ctx.dtmin > 0 && next < ctx.dtmin
             ctx.dt_too_small = true
-        elseif next < 100 * eps(abs(s))
+        elseif next < 100 * eps(max(abs(s), ctx.tbound))
             ctx.unstable_hit = true
         elseif next < h
             return LibPETSc.PetscErrorCode(0)
@@ -2638,7 +2639,7 @@ function _setup(
         comm === nothing && adaptive && _adapts(alg) !== false,
         C_NULL, 0, false, nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
-        nothing, 0, 0,
+        nothing, 0, 0, max(abs(t0), abs(tf)),
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
