@@ -374,10 +374,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             --trace-compile=$trace -e $script`
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
         @test count(l -> occursin("PETScDiffEq.", l), readlines(trace)) < 10
-        @test withenv(PETScDiffEq._under_mpi_launcher, "PMI_RANK" => "0")
     end
 
     @testset "precompile workload" begin
+        made = PETScDiffEq.HANDLES_MADE[]
+        withenv(PETScDiffEq._run_workload, "PMI_RANK" => "0")
+        @test PETScDiffEq.HANDLES_MADE[] == made
         @test PETScDiffEq._run_workload() === nothing
     end
 
