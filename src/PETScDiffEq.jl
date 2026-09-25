@@ -2063,13 +2063,14 @@ function _refuse_distributed(prob, alg, is_dae, N)
     )
     has_jac = prob.f.jac !== nothing
     if !_uses_ifunction(alg)
-        has_jac && throw(
+        has_jac || return nothing
+        prob.f.jac_prototype isa SparseMatrixCSC || throw(
             ArgumentError(
-                "PETScDiffEq does not take a `jac` for an explicit method $_NOT_SELF; " *
-                    "it never uses one, so leave it out",
+                "PETScDiffEq does not take a `jac` for an explicit method $_NOT_SELF without a " *
+                    "sparse `jac_prototype` holding this rank's rows, with global column " *
+                    "indices; the solve never uses it, and PETScAdjoint needs that prototype",
             ),
         )
-        return nothing
     end
     n = length(prob.u0)
     mass = is_dae ? nothing : prob.f.mass_matrix

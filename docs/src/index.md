@@ -371,9 +371,23 @@ ILU(0) block on each rank, to a relative tolerance of 1e-5, so such a solve agre
 serial one to that accuracy rather than to round-off. Options such as `-ksp_rtol` or
 `-sub_pc_type` in `petsc_options` change that solver.
 
-A distributed solve refuses, with an `ArgumentError`, `TSMPRK`, an implicit `TSGeneric` and
-`PETScAdjoint`. Solving from several threads at once, as `EnsembleThreads` does, is not
-refused, but nothing then keeps the ranks' solves in the same order, which they need.
+`PETScAdjoint` runs distributed too, for `TSRK`, `TSImplicit("beuler")` and
+`TSImplicit("cn")`. It needs the problem's `jac`, filling this rank's rows of a sparse
+prototype as above, and when there are parameters a `paramjac` filling this rank's rows,
+since automatic differentiation would call `f` a different number of times on each rank; both
+are collective like `f`. An explicit method takes such a `jac` in its own solve too, and
+ignores it there. `dgdu_discrete` gets this rank's rows of the state and writes their
+gradient, and `dgdp_discrete` gives this rank's share of the cost's direct derivative with
+respect to `p`, which the ranks add up. `du0` comes back as this rank's rows and `dp` as the
+whole gradient, the same on every rank. The cost times, `no_start`, the length of `p` and
+whether `dgdp_discrete` is given have to agree across the ranks. A `jac`, `paramjac`, cost
+function or `f` that throws on some ranks makes every rank throw, as in a solve. The
+transposed linear solves of `TSImplicit` use the solver above;
+`["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
+
+A distributed solve refuses, with an `ArgumentError`, `TSMPRK` and an implicit `TSGeneric`.
+Solving from several threads at once, as `EnsembleThreads` does, is not refused, but nothing
+then keeps the ranks' solves in the same order, which they need.
 
 ## Limitations
 
