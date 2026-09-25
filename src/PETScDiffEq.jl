@@ -1719,7 +1719,8 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     try
-        ctx.retry_fp && ctx.workvec == C_NULL && _hold_work_vec!(ctx, ts_ptr)
+        (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
+            _hold_work_vec!(ctx, ts_ptr)
         ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
         tol = _near(t)
         landed = false
@@ -3107,7 +3108,7 @@ end
 
 function _retry_solve!(h, alg, floor, forced)
     ctx, pl = h.ctx, h.petsclib
-    h.stopped == PETSC_ERR_FP && _return_work_vec!(ctx, h.ts) || return false
+    ctx.retry_fp && h.stopped == PETSC_ERR_FP && _return_work_vec!(ctx, h.ts) || return false
     h.stopped = 0
     dt, _ = _retry_step(h, ctx.end_s, LibPETSc.TSGetTimeStep(pl, h.ts), floor, forced, true)
     dt === nothing && (_warn_failed_step(alg, PETSC_ERR_FP); return false)
@@ -4056,7 +4057,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
     end
     h.stopped = 0
-    ctx.retry_fp && ctx.workvec == C_NULL && _hold_work_vec!(ctx, h.ts)
+    (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
+        _hold_work_vec!(ctx, h.ts)
     failure = _run!(h) do
         LibPETSc.TSStep(pl, h.ts)
     end
@@ -4066,7 +4068,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         throw(err)
     end
     failure === nothing || throw(failure)
-    if h.stopped == PETSC_ERR_FP && SciMLBase.isadaptive(integ) && _return_work_vec!(ctx, h.ts)
+    if ctx.retry_fp && h.stopped == PETSC_ERR_FP && SciMLBase.isadaptive(integ) &&
+            _return_work_vec!(ctx, h.ts)
         return _reject_step!(integ, before, LibPETSc.TSGetTimeStep(pl, h.ts))
     end
     h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped)
