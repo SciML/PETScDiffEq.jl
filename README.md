@@ -231,10 +231,12 @@ started PETSc on every rank.
 `saveat`, `tstops`, `d_discontinuities`, a fixed `dt` and dense output work as in a serial
 solve. Vector `abstol` and `reltol`, `save_idxs` and `p` are per rank.
 `unstable_check` and `isoutofdomain` are asked on each rank's rows, and `true` on any rank
-counts on all of them. When `f`, `jac` or one of those checks throws on some ranks, those
-ranks go on with NaN until the ranks next agree, at the end of the step or when its nonlinear
-solve fails, and then every rank throws, so an `f` that throws has to do so after its own
-communication.
+counts on all of them. A step that turns NaN or overflows on any rank's rows is taken again
+smaller on every rank, and a fixed-step solve stops at the first state that is not finite on
+some rank, as in a serial solve. When `f`, `jac` or one of those checks throws on some ranks,
+those ranks go on with NaN until the ranks next agree, at the end of the step or when its
+nonlinear solve fails, and then every rank throws rather than retrying the step, so an `f`
+that throws has to do so after its own communication.
 
 Callbacks and the integrator interface run distributed too, as long as every rank makes the
 same calls with the same arguments in the same order: `init`, `step!`, `solve!`, `reinit!`,

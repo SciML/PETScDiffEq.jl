@@ -756,29 +756,33 @@ function _post_step_collective!(ctx, ts_ptr)
     pl = ctx.petsclib
     try
         ts = LibPETSc.TS(ts_ptr, pl)
-        small = unstable = false
+        small = unstable = nonfinite = false
         s = LibPETSc.TSGetTime(pl, ts)
         smax = LibPETSc.TSGetMaxTime(pl, ts)
         if Int(LibPETSc.TSGetConvergedReason(pl, ts)) >= 0 && s < smax - _near(smax)
             hnext = LibPETSc.TSGetTimeStep(pl, ts)
             small = ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
-            if !small && ctx.unstable !== nothing
+            if !small && (ctx.unstable !== nothing || ctx.halt_nonfinite)
                 x = Ref{LibPETSc.CVec}(C_NULL)
                 ccall(
                     _symbol(pl, :TSGetSolution), LibPETSc.PetscErrorCode,
                     (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x,
                 )
                 u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
-                unstable = _asked(ctx) do
-                    ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s))
+                if ctx.unstable !== nothing
+                    unstable = _asked(ctx) do
+                        ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s))
+                    end
                 end
+                nonfinite = ctx.halt_nonfinite && !all(isfinite, u)
             end
         end
-        threw, unstable = MPI.Allreduce([ctx.err !== nothing, unstable], |, ctx.comm)
+        threw, unstable, nonfinite =
+            MPI.Allreduce([ctx.err !== nothing, unstable, nonfinite], |, ctx.comm)
         threw && ctx.err === nothing && (ctx.err = _remote_error())
         ctx.dt_too_small |= small
         ctx.unstable_hit |= unstable
-        (threw || small || unstable) &&
+        (threw || small || unstable || nonfinite) &&
             LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_CONVERGED_USER)
     catch e
         ctx.err = e
@@ -2434,7 +2438,7 @@ function _setup(
         _floor(R, dtmin, force_dtmin, adaptive && _adapts(alg) !== false), false,
         unstable_check, false, tdir, isoutofdomain,
         0, 0, 0, nothing, comm,
-        comm === nothing && adaptive && _adapts(alg) !== false && !_uses_ifunction(alg),
+        adaptive && _adapts(alg) !== false && !_uses_ifunction(alg),
         C_NULL, 0, false, nothing,
     )
     h = TSHandles(
@@ -2781,8 +2785,7 @@ function _solve_unlocked(
     forced = get(kwargs, :force_dtmin, false) === true
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
-        if ctx.comm === nothing &&
-                LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
+        if LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
             ctx.halt_nonfinite = true
             _set_post_step!(pl, h.ts, ctx)
         end
@@ -2793,8 +2796,7 @@ function _solve_unlocked(
                 LibPETSc.TSSolve(pl, h.ts, h.u)
             end
             raised = h.stopped != 0
-            raised && ctx.err === nothing && failure === nothing &&
-                _retry_solve!(h, alg, floor, forced) || break
+            raised && _retry_solve!(h, alg, floor, forced) || break
         end
         _throw_if_threw!(ctx)
         failure === nothing || throw(failure)
@@ -2814,7 +2816,7 @@ end
 
 function _retry_solve!(h, alg, floor, forced)
     ctx, pl = h.ctx, h.petsclib
-    h.stopped == PETSC_ERR_FP && _return_work_vec!(ctx, h.ts) || return false
+    h.stopped == PETSC_ERR_FP && !_threw!(ctx) && _return_work_vec!(ctx, h.ts) || return false
     h.stopped = 0
     dt, _ = _retry_step(h, ctx.end_s, LibPETSc.TSGetTimeStep(pl, h.ts), floor, forced, true)
     dt === nothing && (_warn_failed_step(alg, PETSC_ERR_FP); return false)
