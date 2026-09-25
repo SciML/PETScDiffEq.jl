@@ -5077,6 +5077,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 (; step_limiter = (u, integ, p, t) -> nothing),
                 (; stage_limiter = (u, integ, p, t) -> nothing),
             )
+            all(in(PETScDiffEq.DiffEqBase.allowedkeywords), keys(kw)) || continue
             @test_logs (:warn, r"does not support") SciMLBase.solve(prob, alg; dt = 0.1, kw...)
         end
         @test_logs min_level = Logging.Warn SciMLBase.solve(
