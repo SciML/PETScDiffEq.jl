@@ -6826,13 +6826,18 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test sol.retcode == SciMLBase.ReturnCode.Success
     end
 
-    @testset "solve takes the storage DiffEqDevTools passes, as OrdinaryDiffEq does" begin
+    @testset "solve accepts and ignores the storage DiffEqDevTools passes" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         ref = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"))
         sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"), ref.u, ref.t, ref.k)
         @test sol.retcode == SciMLBase.ReturnCode.Success
         @test sol.t == ref.t
         @test sol.u == ref.u
+        for arg in (0.1, [0.0, 0.5, 1.0])
+            @test_throws SciMLBase.NoDefaultAlgorithmError SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp"), arg,
+            )
+        end
         resid!(r, du, u, p, t) = (r[1] = du[1] + u[1]; nothing)
         dae = SciMLBase.DAEProblem(resid!, [-1.0], [1.0], (0.0, 1.0))
         ref = SciMLBase.solve(dae, PETScDiffEq.TSDAE("bdf"))
