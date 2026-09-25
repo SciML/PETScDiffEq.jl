@@ -3294,7 +3294,7 @@ function _setup(
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
     initialized = _initialize!(
         u0, prob, initializealg, f1, jac_fn, petsclib, comm, R(prob.tspan[1]),
-        R(prob.tspan[2]), something(abstol, 1.0e-6), dt, dtmax,
+        R(prob.tspan[2]), real.(something(abstol, 1.0e-6)), dt, dtmax,
     )
     ad_calls === nothing || (ad_calls[] = ad_before)
     if !dt_given

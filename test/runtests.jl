@@ -2210,6 +2210,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws SciMLBase.CheckInitFailureError checks(
                 mass(bad), alg; abstol = [1.0, 1.0, 0.0],
             )
+            @test checks(mass(good), alg; abstol = 1.0e-6 + 0im)
+            @test checks(
+                dae(good, [-0.04, 0.04, 0.0]), PETScDiffEq.TSDAE(); abstol = 1.0e-6 + 0im,
+            )
         end
 
         # PETSc's absolute-eps step check fails these Robertson spans on 32-bit x86.
@@ -2304,6 +2308,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             sol = SciMLBase.solve(
                 mass(complex.(bad)), PETScDiffEq.TSImplicit("bdf"); initializealg = shampine,
                 tol...,
+            )
+            @test sol.u[1] == real_start
+            sol = SciMLBase.solve(
+                mass(bad), PETScDiffEq.TSImplicit("bdf"); initializealg = shampine,
+                abstol = fill(1.0e-8 + 0im, 3), reltol = 1.0e-8,
             )
             @test sol.u[1] == real_start
         end
