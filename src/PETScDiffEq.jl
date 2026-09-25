@@ -2392,12 +2392,6 @@ function _check_dynamical(prob, alg, has_mass)
                 "SecondOrderODEProblem",
         ),
     )
-    any(f -> f isa SciMLOperators.AbstractSciMLOperator, (prob.f.f1, prob.f.f2)) && throw(
-        ArgumentError(
-            "PETScDiffEq does not support an operator-valued right-hand side; supply " *
-                "functions f1!(dv, v, u, p, t) and f2!(du, v, u, p, t)",
-        ),
-    )
     alg isa TSAlpha2 || return nothing
     prob.f.jac_prototype isa SparseArrays.AbstractSparseMatrix && throw(
         ArgumentError("TSAlpha2 takes no sparse `jac_prototype` yet; it builds a dense Jacobian"),

@@ -6933,6 +6933,18 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
         end
 
+        @testset "operator-valued parts" begin
+            A = SciMLOperators.MatrixOperator([-1.0 0.0; 0.0 -2.0])
+            B = SciMLOperators.MatrixOperator([1.0 0.0; 0.0 1.0])
+            prob = SciMLBase.DynamicalODEProblem(A, B, [1.0, 1.0], [1.0, 1.0], (0.0, 1.0))
+            exact = [exp.([-1.0, -2.0]); 1 .+ (1 .- exp.([-1.0, -2.0])) ./ [1.0, 2.0]]
+            for alg in (PETScDiffEq.TSRK(), PETScDiffEq.TSRosW())
+                sol = SciMLBase.solve(prob, alg; abstol = 1.0e-10, reltol = 1.0e-10)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test final_err(sol, exact) < 5.0e-10
+            end
+        end
+
         @testset "what these algorithms refuse" begin
             osc = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
             dyn = SciMLBase.DynamicalODEProblem(
