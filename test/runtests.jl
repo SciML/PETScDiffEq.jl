@@ -354,6 +354,26 @@ Test.push_testset(ALL_TESTS)
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
     end
 
+    @testset "a first solve runs precompiled code and loading starts nothing" begin
+        script = """
+        using PETScDiffEq, SciMLBase
+        P = PETScDiffEq
+        all(isempty, (P.CALLBACKS, P.PETSC_SYMBOLS, P.EXIT_CLEANUP_ARMED, P.LIVE_HANDLES)) &&
+            !any(P.PETScCompat.isinitialized, P.PETSc.petsclibs) && !P.MPI.Initialized() ||
+            exit(2)
+        f!(du, u, p, t) = (du[1] = -u[1]; nothing)
+        SciMLBase.solve(SciMLBase.ODEProblem(f!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK())
+        """
+        trace = tempname()
+        # Coverage turns off the native code in package images.
+        flags = `--code-coverage=none --track-allocation=none --pkgimages=yes`
+        cmd = `$(Base.julia_cmd()) $flags --project=$(Base.active_project())
+            --trace-compile=$trace -e $script`
+        @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
+        @test count(l -> occursin("PETScDiffEq.", l), readlines(trace)) < 10
+        @test withenv(PETScDiffEq._under_mpi_launcher, "PMI_RANK" => "0")
+    end
+
     @testset "several PETSc builds in one process" begin
         PETSc = PETScDiffEq.PETSc
         builds = [PETSc.getlib(; PetscScalar = S) for S in (Float64, Float32)]

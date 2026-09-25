@@ -3852,5 +3852,6 @@ SciMLBase.done(integ::PETScIntegrator) = integ.finished
 
 include("autodiff.jl")
 include("adjoint.jl")
+include("precompile.jl")
 
 end
