@@ -6681,6 +6681,12 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test all(o -> isapprox(o, p; atol = 0.1), orders(forced, alg, forced_exact(10.0)))
         end
 
+        @testset "a subtype picked by option keeps its order" begin
+            forced = SciMLBase.SecondOrderODEProblem(forced!, [0.0], [1.0], (0.0, 10.0))
+            alg = PETScDiffEq.TSBasicSymplectic("velverlet", ["-ts_basicsymplectic_type", "4"])
+            @test all(o -> isapprox(o, 4; atol = 0.1), orders(forced, alg, forced_exact(10.0)))
+        end
+
         @testset "velverlet is velocity Verlet with the force at the positions' time" begin
             a(u, t) = -sin(u) + 0.3cos(t)
             f!(ddu, du, u, p, t) = (ddu .= a.(u, t); nothing)
