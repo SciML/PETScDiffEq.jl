@@ -2221,8 +2221,10 @@ function _setup(
             @warn "PETScDiffEq does not support `$key` and is ignoring it"
         end
     end
-    get(kwargs, :progress, false) === true &&
-        @warn "PETScDiffEq does not support `progress` and is ignoring it"
+    for key in (:progress, :advance_to_tstop, :stop_at_next_tstop)
+        get(kwargs, key, false) === true &&
+            @warn "PETScDiffEq does not support `$key` and is ignoring it"
+    end
     prob.u0 isa AbstractVector{<:Union{Real, Complex}} || throw(
         ArgumentError("PETScDiffEq requires an AbstractVector u0 of real or complex numbers"),
     )
@@ -3475,7 +3477,7 @@ function _init_unlocked(
         _initial_solution(prob, alg, h), false, false,
     )
     try
-        _initialize_callbacks!(integ, true)
+        _initialize_callbacks!(integ, get(kwargs, :initialize_save, true))
     catch
         _destroy!(h)
         rethrow()
