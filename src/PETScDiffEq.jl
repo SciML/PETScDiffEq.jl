@@ -1169,6 +1169,27 @@ function _set_pc_type!(pl, ts, type)
     return nothing
 end
 
+# PETSc's DMDA colouring refuses a periodic axis whose size its colour count does not divide.
+function _dm_colours(pl, dm)
+    coloring = Ref{Ptr{Cvoid}}(C_NULL)
+    ccall(
+        _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
+        _symbol(pl, :PetscReturnErrorHandler), C_NULL,
+    )
+    code = ccall(
+        _symbol(pl, :DMCreateColoring), LibPETSc.PetscErrorCode,
+        (Ptr{Cvoid}, Cint, Ptr{Ptr{Cvoid}}), dm, Cint(LibPETSc.IS_COLORING_GLOBAL), coloring,
+    )
+    ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ())
+    code == 0 && _check_code(
+        ccall(
+            _symbol(pl, :ISColoringDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+            coloring,
+        ),
+    )
+    return code == 0
+end
+
 function _colour_jacobian!(pl, ts, mat)
     lib = Libdl.dlopen(pl.petsc_library)
     snes = Ref{LibPETSc.CSNES}(C_NULL)
@@ -2823,6 +2844,9 @@ function _setup(
                     _option(_above(abs(R(dtmax)), forced ? abs(R(dtmin)) : zero(R))),
                 ],
             )
+            clone !== nothing && _uses_ifunction(alg) &&
+                !_everywhere(comm, _dm_colours(petsclib, clone.ptr)) &&
+                append!(effective_options, ["-snes_fd_color_use_mat"])
             append!(effective_options, alg.petsc_options)
             append!(effective_options, extra_options)
             if !isempty(effective_options)
@@ -2996,9 +3020,9 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     )
 end
 
-# Block Jacobi reads its sub-solvers' options when it first sets them up, inside the solve.
+# Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
 function _with_options(f, h::TSHandles)
-    h.ctx.comm === nothing && return f()
+    h.ctx.comm === nothing && isempty(h.dms) && return f()
     push!(h.opts)
     try
         return f()
