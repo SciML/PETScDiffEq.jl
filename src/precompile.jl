@@ -69,4 +69,5 @@ end
     empty!(CALLBACKS)
     empty!(PETSC_SYMBOLS)
     empty!(EXIT_CLEANUP_ARMED)
+    empty!(LIVE_HANDLES)
 end
