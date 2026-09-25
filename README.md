@@ -137,8 +137,13 @@ OrdinaryDiffEq takes, which come from DiffEqBase:
   ones, and for a `DAEProblem` also for the derivatives of the differential ones, which
   needs `differential_vars`. Its own `abstol`, `1e-10` unless given, decides whether to
   solve.
-- `ShampineCollocationInit(initdt)` takes one backward Euler step of size `initdt`, or of
-  OrdinaryDiffEq's default size without one, and starts from where it lands.
+- `ShampineCollocationInit(initdt)` takes one backward Euler step and starts from where it
+  lands. The step is `initdt` as given. Without one it runs toward `tf`, and for an
+  `ODEProblem` it is OrdinaryDiffEq's: `dt / 5`, at most `dtmax`, when `dt` is given, and a
+  thousandth of the span otherwise. For a `DAEProblem` it is a tenth of `dtmax`, the span by
+  default, at `t0 = 0`, and the smaller of that and `|t0| / 1000` elsewhere. OrdinaryDiffEq
+  ignores `initdt` for a `DAEProblem`, and steps differently there when `t0` is negative or
+  the span runs backward.
 - `NoInit()` starts from `u0` as given.
 
 The two that solve use PETSc's SNES with the Jacobian the solve itself uses: the problem's

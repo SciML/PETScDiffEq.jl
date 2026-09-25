@@ -2178,7 +2178,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             end
         end
 
-        Sys.WORD_SIZE == 64 && @testset "ShampineCollocationInit takes OrdinaryDiffEq's backward Euler step" begin
+        Sys.WORD_SIZE == 64 && @testset "ShampineCollocationInit takes one backward Euler step" begin
             fbdf = [0.9961513330874654, 3.5651156852644935e-5, 0.0038130157556819193]
             for alg in with_mass
                 sol = SciMLBase.solve(mass(bad), alg; initializealg = shampine, tol...)
