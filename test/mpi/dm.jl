@@ -236,6 +236,18 @@ end
         @test everywhere(got.u == ref.u)
     end
 
+    @testset "ghost points past the edge of the grid read zero on every call" begin
+        function scribbling!(du, u, da, t)
+            heat_dm!(du, u, da, t)
+            u .= NaN
+            return nothing
+        end
+        got = solve(dm_heat(scribbling!), explicit(; dm = da, comm); FIXED...)
+        ref = solve(dm_heat(), explicit(; dm = da, comm); FIXED...)
+        @test got.t == ref.t
+        @test everywhere(got.u == ref.u)
+    end
+
     @testset "2-D heat, explicit and implicit" begin
         slab = uneven(NY)
         across = grid_da((nranks, 1), (LibPETSc.PetscInt.(uneven(NX)), nothing))
@@ -283,6 +295,12 @@ end
             @test got.t == ref.t
             @test got.u == ref.u
         end
+        back = (0.01, 0.0)
+        got = solve(ODEProblem(heat_dm!, heat0(1:N), back, solo), explicit(; dm = solo); TOL...)
+        ref = solve(ODEProblem(heat_serial!, heat0(1:N), back), explicit(); TOL...)
+        @test got.retcode == ReturnCode.Success
+        @test got.t == ref.t
+        @test got.u == ref.u
         nan_after(f) = (du, u, p, t) -> (f(du, u, p, t); t > 0.05 && fill!(du, NaN); nothing)
         got = @test_logs (:warn, r"floating point exception") solve(
             ODEProblem(nan_after(heat_dm!), heat0(1:N), SPAN, solo), explicit(; dm = solo),
