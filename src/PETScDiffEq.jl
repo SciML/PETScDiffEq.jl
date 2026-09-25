@@ -2673,7 +2673,7 @@ function _check_dm(petsclib, dm)
     dm isa LibPETSc.AbstractPetscDM{typeof(petsclib)} || throw(
         ArgumentError(
             "the `dm` belongs to PETSc's $(_build_name(PETSc.scalartype(_dm_lib(dm)))) " *
-                "build, but the state's element type runs this problem in its " *
+                "build, but `u0` and `tspan` together run this problem in its " *
                 "$(_build_name(PETSc.scalartype(petsclib))) one",
         ),
     )
