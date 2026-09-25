@@ -3919,6 +3919,11 @@ end
 SciMLBase.__solve(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
     _locked(() -> _solve_unlocked(prob, alg; kwargs...))
 
+SciMLBase.__solve(
+    prob::SupportedProblem, alg::AnyPETScTS, ::AbstractVector, ::AbstractVector, ks = nothing;
+    kwargs...,
+) = SciMLBase.__solve(prob, alg; kwargs...)
+
 mutable struct PETScIntegratorOpts{H, R}
     h::H
     adaptive::Bool
