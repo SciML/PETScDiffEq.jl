@@ -3926,6 +3926,7 @@ mutable struct PETScIntegratorOpts{H, R}
     dtmax::R
     verbose::Any
     force_dtmin::Bool
+    save_on::Bool
 end
 
 function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {H, R}
@@ -4075,6 +4076,7 @@ _make_opts(h::TSHandles{<:Any, <:Any, R}, kwargs) where {R} = PETScIntegratorOpt
     R(something(get(kwargs, :dtmin, nothing), 0.0)),
     R(something(get(kwargs, :dtmax, nothing), Inf)),
     get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
+    get(kwargs, :save_on, true) === true,
 )
 
 SciMLBase.isadaptive(integ::PETScIntegrator) =
@@ -4169,12 +4171,12 @@ SciMLBase.change_t_via_interpolation!(
 ) where {T} = _locked(() -> _change_t_unlocked(integ, t, modify_save_endpoint))
 
 function _save_here!(integ::PETScIntegrator)
-    get(integ.kwargs, :save_on, true) && _record!(integ.h.ctx, integ.tdir * integ.t, integ.u)
+    integ.opts.save_on && _record!(integ.h.ctx, integ.tdir * integ.t, integ.u)
     return nothing
 end
 
 function _savevalues_unlocked(integ::PETScIntegrator, force_save = false)
-    (integ.finished || !get(integ.kwargs, :save_on, true)) && return (false, false)
+    (integ.finished || !integ.opts.save_on) && return (false, false)
     ctx = integ.h.ctx
     n = length(ctx.ts)
     _save_step!(integ, integ.t, false)
@@ -4789,19 +4791,20 @@ function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near
     ctx = h.ctx
     tol = _near(integ.t)
     n = length(ctx.ts)
+    on = integ.opts.save_on
     landed = false
     while ctx.saveat_idx <= length(ctx.saveat) &&
             ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + slack
         want = ctx.saveat[ctx.saveat_idx]
-        if abs(want - integ.tdir * integ.t) <= tol
+        if on && abs(want - integ.tdir * integ.t) <= tol
             _record_end!(ctx, want, integ.u)
             landed = true
-        else
+        elseif on
             _record!(ctx, want, _interpolate!(integ, want))
         end
         ctx.saveat_idx += 1
     end
-    endpoint && ctx.save_everystep && !landed &&
+    endpoint && on && ctx.save_everystep && !landed &&
         _record_end!(ctx, integ.tdir * upto, integ.u)
     return length(ctx.ts) > n && _last_recorded(ctx, integ.tdir * upto)
 end
