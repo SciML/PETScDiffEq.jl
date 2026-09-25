@@ -1806,6 +1806,46 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 
+    @testset "a subtype an option replaces is not refused" begin
+        pair_jac!(J, u, p, t) = (J .= 0.0; J[1, 1] = -1.0; J[2, 2] = -1.0; nothing)
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; jac = pair_jac!, mass_matrix = Diagonal([2.0, 1.0])),
+            [1.0, 1.0], (0.0, 1.0),
+        )
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        split = SciMLBase.SplitODEProblem(decay!, decay!, [1.0], (0.0, 1.0))
+        fd = PETScDiffEq.AutoFiniteDiff()
+        ra34pw2 = ["-ts_rosw_type", "ra34pw2"]
+        for (pr, alg, runs) in (
+                (mass, PETScDiffEq.TSRosW("assp3p3s1c", ra34pw2), PETScDiffEq.TSRosW("ra34pw2")),
+                (
+                    prob, PETScDiffEq.TSRosW("assp3p3s1c", ra34pw2; autodiff = fd),
+                    PETScDiffEq.TSRosW("ra34pw2"; autodiff = fd),
+                ),
+                (prob, PETScDiffEq.TSRosW("ark3", ra34pw2), PETScDiffEq.TSRosW("ra34pw2")),
+                (
+                    prob, PETScDiffEq.TSARKIMEX("ars122", ["-ts_arkimex_type", "3"]),
+                    PETScDiffEq.TSARKIMEX("3"),
+                ),
+                (
+                    split, PETScDiffEq.TSARKIMEX("bpr3", ["-ts_arkimex_type", "3"]),
+                    PETScDiffEq.TSARKIMEX("3"),
+                ),
+                (mass, PETScDiffEq.TSIRK(2, ["-ts_type", "bdf"]), PETScDiffEq.TSImplicit("bdf")),
+                (
+                    prob, PETScDiffEq.TSIRK(2, ["-ts_type", "bdf"]; autodiff = fd),
+                    PETScDiffEq.TSImplicit("bdf"; autodiff = fd),
+                ),
+                (mass, PETScDiffEq.TSGeneric("irk", ["-ts_type", "bdf"]), PETScDiffEq.TSGeneric("bdf")),
+            )
+            sol = SciMLBase.solve(pr, alg; dt = 0.01)
+            ran = SciMLBase.solve(pr, runs; dt = 0.01)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.t == ran.t
+            @test sol.u == ran.u
+        end
+    end
+
     @testset "a solve that never uses the Jacobian is called out" begin
         prob = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(decay!; jac = decay_jac!), [1.0], (0.0, 1.0),
