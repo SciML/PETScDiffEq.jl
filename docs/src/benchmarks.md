@@ -183,11 +183,12 @@ back into Julia for every right-hand side, copying the state out of PETSc's vect
 derivative back in, and once more after the step to record it. At one state a step costs
 45 times what OrdinaryDiffEq's does, and at 10000 states 2.5 times.
 
-On the small stiff problems little of the time is in the user's functions. PETSc's log of
-`TSRosW("ra34pw2")` on HIRES, at `abstol = 1e-8` and `reltol = 1e-5`, puts 12% of the run in
-the Julia callbacks for ``f`` and the Jacobian, 0.9 µs a right-hand side call, and 38% in
-the 5500 linear solves of an 8 by 8 system, 4.7 µs each. Most of the rest is PETSc's
-stepping and nonlinear solver code around them.
+On the small stiff problems little of the time is in the user's functions. `profile.jl` runs
+`TSRosW("ra34pw2")` on HIRES at `abstol = 1e-8` and `reltol = 1e-5` five times with PETSc's
+`-log_view` on, which slows each solve from 8.7 ms to 13.4 ms. That log puts 12% of the time
+in the Julia callbacks for ``f`` and the Jacobian, and 38% in the linear solves of an 8 by 8
+system, 1100 of them per solve. Most of the rest is PETSc's stepping and nonlinear solver
+code around them.
 
 ### The Jacobian at every Newton iteration
 
@@ -244,5 +245,5 @@ julia --project=benchmark/workprecision benchmark/workprecision/profile.jl
 
 The first run writes the CSV files and plots into `docs/src/assets/workprecision`.
 Passing `report` instead redraws the plots from those CSV files and prints the tables on
-this page. `profile.jl` prints PETSc's `-log_view` with one stage per solve, the source of
-the PETSc log figures above.
+this page. `profile.jl` prints PETSc's `-log_view` with one stage per method, each covering
+its five timed solves, the source of the PETSc log figures above.
