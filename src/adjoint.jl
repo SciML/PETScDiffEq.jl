@@ -609,7 +609,7 @@ function _discrete_adjoint_unlocked(
         t = nothing, dgdu_discrete = nothing, dgdp_discrete = nothing, no_start = false,
         kwargs...,
     )
-    alg.dm === nothing ||
+    _alg_dm(alg) === nothing ||
         throw(ArgumentError("PETScAdjoint does not support a solve $_WITH_DM yet"))
     comm = _distributed(alg) ? alg.comm : nothing
     solve_kwargs, has_p, skip_start = _checked_everywhere(comm) do

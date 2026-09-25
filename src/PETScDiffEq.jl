@@ -735,6 +735,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
+_alg_dm(alg) = hasproperty(alg, :dm) ? alg.dm : nothing
 
 _everywhere(::Nothing, b::Bool) = b
 _everywhere(comm::MPI.Comm, b::Bool) = MPI.Allreduce(b, &, comm)
@@ -2912,7 +2913,7 @@ function _setup(
         throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
     end
     comm = _distributed(alg) ? alg.comm : nothing
-    dm = alg.dm
+    dm = _alg_dm(alg)
     N = comm === nothing ? length(prob.u0) : MPI.Allreduce(length(prob.u0), +, comm)
     if dm !== nothing
         _checked_everywhere(() -> _refuse_dm(prob, alg, is_dae), comm)
