@@ -6876,6 +6876,21 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test collect(integ.sol.u[end]) ≈ collect(twice.u[end]) rtol = 1.0e-14
         end
 
+        @testset "unstable_check gets the state: $(nameof(typeof(alg)))" for alg in (
+                PETScDiffEq.TSAlpha2(), PETScDiffEq.TSRK(), PETScDiffEq.TSBasicSymplectic(),
+            )
+            prob = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 2.0))
+            seen = []
+            sol = SciMLBase.solve(
+                prob, alg; dt = 0.01, adaptive = false,
+                unstable_check = (dt, u, p, t) -> (push!(seen, copy(u)); u.x[2][1] < 0.5),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Unstable
+            @test sol.t[end] ≈ 1.05
+            @test all(u -> u isa typeof(prob.u0), seen)
+            @test seen == sol.u[2:end]
+        end
+
         @testset "the other algorithms step the first-order form" begin
             prob = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
             jac!(J, x, p, t) = (@test hasproperty(x, :x); J .= [0 -1; 1 0]; nothing)

@@ -697,6 +697,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     halt_nonfinite::Bool
     coo::Union{Nothing, COOJacobian{S}}
     flat_vec::Any
+    partitioned_u::Any
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -836,6 +837,7 @@ function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
             )
             flat = ctx.flat_vec === nothing ? PETSc.VecPtr(pl, x[], false) : ctx.flat_vec
             u = _readvec!(ctx.u, pl, flat)
+            ctx.partitioned_u === nothing || (u = copyto!(ctx.partitioned_u, u))
             ctx.unstable !== nothing &&
                 ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s)) &&
                 (ctx.unstable_hit = stop = true)
@@ -2865,7 +2867,7 @@ function _setup(
         unstable_check, false, tdir, isoutofdomain,
         0, 0, 0, nothing, comm,
         comm === nothing && adaptive && _adapts(alg) !== false && !_uses_ifunction(alg),
-        C_NULL, 0, false, nothing, nothing,
+        C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
