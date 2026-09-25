@@ -96,6 +96,7 @@ function heat_throwing(when)
 end
 
 const FIXED = (; dt = 1.0e-3, adaptive = false)
+adaptive_step(kw) = !haskey(kw, :dt)
 algorithm_pairs() = (
     (TSRK("5dp"; comm), TSRK("5dp")),
     (TSGeneric("ssp"; explicit = true, comm), TSGeneric("ssp"; explicit = true)),
@@ -112,6 +113,8 @@ function against_serial(run, alg, serial_alg)
     return got, rank == 0 ? run(1:N, serial_alg) : got
 end
 
+nan_gap(a, b) = isnan.(a) == isnan.(b) ? maximum(abs, replace(a - b, NaN => 0.0)) : Inf
+
 function matches_serial(sol, ref; exact_t = true)
     n = length(sol.t)
     MPI.Allreduce(n, min, comm) == MPI.Allreduce(n, max, comm) || return false
@@ -120,7 +123,8 @@ function matches_serial(sol, ref; exact_t = true)
     rank == 0 || return same
     length(sol.t) == length(ref.t) || return false
     times = exact_t ? sol.t == ref.t : maximum(abs, sol.t - ref.t) <= ROUNDOFF
-    return same && times && sol.retcode == ref.retcode && maxdiff(us, ref.u) <= ROUNDOFF
+    gap = maximum(nan_gap.(us, ref.u))
+    return same && times && sol.retcode == ref.retcode && gap <= ROUNDOFF
 end
 
 halve_at(s) = DiscreteCallback((u, t, i) -> t == s, i -> (i.u .*= 0.5))
@@ -237,6 +241,41 @@ crossing_last_row(idx, level) =
             sol = solve(prob, TSRK("5dp"; comm); dt = 0.01, adaptive = false, kw...)
             @test sol.retcode == ReturnCode.Unstable
             @test same_everywhere(sol.t)
+        end
+    end
+
+    @testset "a NaN on one rank's rows is retried or stops as a serial solve does" begin
+        breaks!(du, u, idx, t) =
+            (du .= ifelse.((idx .== N) .& (t > 0.5), NaN, -rate.(idx) .* u); nothing)
+        exchanging!(du, u, idx, t) = (halo(u); breaks!(du, u, idx, t))
+        breaks(idx, a) =
+            ODEProblem(parallel(a) ? exchanging! : breaks!, decay0(idx), (0.0, 1.0), idx)
+        never = DiscreteCallback((u, t, i) -> false, i -> nothing)
+        warned(f) = (r = Test.collect_test_logs(f); (r[2], length(r[1])))
+        unstable, small = ReturnCode.Unstable, ReturnCode.DtLessThanMin
+        for (subtype, kw, retcode) in (
+                ("5dp", (;), unstable),
+                ("5dp", (; saveat = 0.05), unstable),
+                ("3bs", (; callback = never), unstable),
+                ("5dp", (; dtmin = 0.01), small),
+                ("5dp", (; dtmin = 0.01, callback = never), small),
+                ("5dp", FIXED, unstable),
+                ("4", (; dt = 0.01), unstable),
+                ("4", (; dt = 0.01, callback = never), unstable),
+            )
+            alg, serial_alg = TSRK(subtype; comm), TSRK(subtype)
+            (sol, warnings), (ref, _) = against_serial(alg, serial_alg) do idx, a
+                warned(() -> solve(breaks(idx, a), a; kw...))
+            end
+            @test sol.retcode == retcode
+            @test warnings == (adaptive_step(kw) ? 1 : 0)
+            @test matches_serial(sol, ref)
+            @test anywhere(!all(isfinite, sol.u[end])) == !adaptive_step(kw)
+            @test !anywhere(any(u -> !all(isfinite, u), sol.u[1:(end - 1)]))
+            @test same_everywhere((sol.stats.naccept, sol.stats.nreject))
+            rank == 0 && @test (sol.stats.naccept, sol.stats.nreject, sol.stats.nf) ==
+                (ref.stats.naccept, ref.stats.nreject, ref.stats.nf)
+            rank == 0 && adaptive_step(kw) && @test sol.stats.nreject > 5
         end
     end
 
