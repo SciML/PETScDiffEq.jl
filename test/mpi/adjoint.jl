@@ -243,6 +243,15 @@ const METHODS = (
                 "needs the ODEFunction's `paramjac`",
             )
         end
+        colouring = TSImplicit("beuler"; comm)
+        for (prob, what) in (
+                (heat_with(jac = nothing), "`jac`"), (heat_with(paramjac = nothing), "`paramjac`"),
+            )
+            @test refused(
+                () -> gradient(prob, colouring, times, rows),
+                "$what under `autodiff = AutoFiniteDiff()`",
+            )
+        end
         some = heat_with(paramjac = rank == thrower ? nothing : heat_paramjac(rows, halo))
         e = caught(() -> gradient(some, rk, times, rows))
         @test rank == thrower ? e isa ArgumentError && occursin("`paramjac`", e.msg) : remote(e)

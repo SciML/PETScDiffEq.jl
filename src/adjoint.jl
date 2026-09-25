@@ -466,18 +466,18 @@ function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_disc
                 "assumes a constant one and none of these methods has been verified with one",
         ),
     )
-    comm === nothing || prob.f.jac !== nothing || throw(
-        ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `jac` $_NOT_SELF, since automatic " *
-                "differentiation would call `f` a different number of times on each rank",
-        ),
-    )
     differences = _petsc_differences(alg)
     differences && prob.f.jac === nothing && throw(
         ArgumentError(
             "PETScAdjoint needs the ODEFunction's `jac` under `autodiff = AutoFiniteDiff()`: " *
                 "PETSc's adjoint step multiplies by the Jacobian it is given and has no " *
                 "other source for it",
+        ),
+    )
+    comm === nothing || prob.f.jac !== nothing || throw(
+        ArgumentError(
+            "PETScAdjoint needs the ODEFunction's `jac` $_NOT_SELF, since automatic " *
+                "differentiation would call `f` a different number of times on each rank",
         ),
     )
     p = prob.p
@@ -488,18 +488,18 @@ function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_disc
                 "`paramjac` fills a matrix with a column per entry of `p`; got $(typeof(p))",
         ),
     )
-    has_p && !isempty(p) && comm !== nothing && prob.f.paramjac === nothing && throw(
-        ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `paramjac` $_NOT_SELF when the problem has " *
-                "parameters, since automatic differentiation would call `f` a different " *
-                "number of times on each rank",
-        ),
-    )
     has_p && !isempty(p) && differences && prob.f.paramjac === nothing && throw(
         ArgumentError(
             "PETScAdjoint needs the ODEFunction's `paramjac` under " *
                 "`autodiff = AutoFiniteDiff()` when the problem has parameters: PETSc " *
                 "builds the parameter gradient from it",
+        ),
+    )
+    has_p && !isempty(p) && comm !== nothing && prob.f.paramjac === nothing && throw(
+        ArgumentError(
+            "PETScAdjoint needs the ODEFunction's `paramjac` $_NOT_SELF when the problem has " *
+                "parameters, since automatic differentiation would call `f` a different " *
+                "number of times on each rank",
         ),
     )
     !has_p && dgdp_discrete !== nothing && throw(
