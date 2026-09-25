@@ -118,17 +118,20 @@ OrdinaryDiffEq's is. `check_error` gives `Success` while the integrator can go o
 retcode it stopped with after that. In a callback's `finalize` it gives the retcode passed to
 `terminate!`, and `Success` for a solve that ended any other way, where OrdinaryDiffEq's
 also gives `MaxIters` or `Unstable`. `check_error!` and `postamble!` work as SciMLBase
-defines them, `postamble!` finishing the integrator where it is. Unlike OrdinaryDiffEq's,
-a finished integrator cannot step again. `auto_dt_reset!` takes the step `init` would take
-from the current state, and `reinit!` does the same with `reset_dt = true`, or keeps
-the proposed step with `reset_dt = false`. A fixed-step integrator goes on at its fixed size
-through both, as OrdinaryDiffEq's does, and only `dt` shows the estimate. `get_proposed_dt` is signed, negative on a
-reversed span, and `set_proposed_dt!` also takes another integrator whose proposed step it
-copies. `set_abstol!` and `set_reltol!` hold for the steps after.
-`change_t_via_interpolation!` with `Val{true}` drops what was saved past the new time, and
-saves the new end when `save_everystep` asks for every step. `resize!`, `deleteat!` and
-`addat!` raise an `ArgumentError`, since PETSc sizes its vectors and solvers when the
-integrator is made.
+defines them, `postamble!` finishing the integrator where it is. Like `terminate!`, it saves
+the point it stops at whenever the final time would be saved; under a `saveat` that does not
+name that point, OrdinaryDiffEq saves it only with `save_end = true` or when nothing is saved
+yet. Unlike OrdinaryDiffEq's, a finished integrator cannot step again. `auto_dt_reset!` takes
+the step `init` would take from the current state, and `reinit!` does the same with
+`reset_dt = true`, or keeps the proposed step with `reset_dt = false`. A fixed-step
+integrator goes on at its fixed size through both, as OrdinaryDiffEq's does, and only `dt`
+shows the estimate. `get_proposed_dt` is signed, negative on a reversed span, and
+`set_proposed_dt!` also takes another integrator whose proposed step it copies. `set_abstol!`
+and `set_reltol!` hold for the steps after, until `reinit!` goes back to the tolerances `init`
+was given, where OrdinaryDiffEq's `reinit!` keeps them. `change_t_via_interpolation!` with
+`Val{true}` drops what was saved past the new time, and saves the new end when
+`save_everystep` asks for every step. `resize!`, `deleteat!` and `addat!` raise an
+`ArgumentError`, since PETSc sizes its vectors and solvers when the integrator is made.
 
 ## Second-order and partitioned problems
 
@@ -398,8 +401,8 @@ Callbacks and the integrator interface run distributed too, as long as every ran
 same calls with the same arguments in the same order: `init`, `step!`, `solve!`, `reinit!`,
 `terminate!`, `set_u!`, `add_tstop!`, `add_saveat!`, `savevalues!`,
 `change_t_via_interpolation!`, `set_proposed_dt!`, `set_abstol!`, `set_reltol!`,
-`postamble!`, `auto_dt_reset!`, `integrator(t)` and `get_du` are all collective, and the
-last four can call `f`. `integrator.u` holds the rank's own rows, and so
+`postamble!`, `auto_dt_reset!`, `integrator(t)` and `get_du` are all collective.
+`integrator.u` holds the rank's own rows, and so
 does the state given to `set_u!` or `reinit!`. `set_proposed_dt!` takes the smallest step any
 rank proposes.
 
