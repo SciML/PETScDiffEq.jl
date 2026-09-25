@@ -449,9 +449,63 @@ function or `f` that throws on some ranks makes every rank throw, as in a solve.
 transposed linear solves of `TSImplicit` use the solver above;
 `["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
 
-A distributed solve refuses, with an `ArgumentError`, `TSMPRK` and an implicit `TSGeneric`.
-Solving from several threads at once, as `EnsembleThreads` does, is not refused, but nothing
-then keeps the ranks' solves in the same order, which they need.
+A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
+which every algorithm that takes `comm` takes as well. The solve then runs on the DM's
+communicator, which `comm` may name too but not contradict, and `u0` is the block of the grid
+this rank owns, in the DM's order. `f(du, u, p, t)` gets `u` ghosted: before every call to `f`,
+including the package's own calls for the first step size, dense output, callbacks, `get_du`
+and the Jacobian, the state is scattered into a local vector from `DMGetLocalVector` with
+`DMGlobalToLocalBegin` and `DMGlobalToLocalEnd`, so `u` also holds the neighbouring ranks'
+points within the stencil width. `du` is the owned block. `PETScDiffEq.reshape_local_array(x, dm)`
+views either one by grid point in global numbering, as `x[c, i]` on a 1-D grid and `x[c, i, j]`
+on a 2-D one, where `c` is the degree of freedom at the point. It is PETSc.jl's
+`reshape_local_array`, which PETSc.jl 0.4 calls `reshapelocalarray`. With `DM_BOUNDARY_GHOSTED`
+the ghost points past the edge of the grid read zero, so this heat equation is zero at both
+ends:
+
+```julia
+using MPI, PETScDiffEq, SciMLBase
+using PETScDiffEq: PETSc, LibPETSc
+
+MPI.Init()
+petsclib = PETSc.getlib(; PetscScalar = Float64)
+PETSc.initialize(petsclib)
+N = 64
+dx = 1 / (N + 1)
+da = PETSc.DMDA(petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), 1, 1)
+
+function heat!(du, u, da, t)
+    U = PETScDiffEq.reshape_local_array(u, da)
+    D = PETScDiffEq.reshape_local_array(du, da)
+    for i in axes(D, 2)
+        D[1, i] = (U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2
+    end
+end
+
+xs, _, _, xm = LibPETSc.DMDAGetCorners(petsclib, da)
+prob = ODEProblem(heat!, sinpi.((xs .+ (1:xm)) .* dx), (0.0, 0.1), da)
+sol = solve(prob, TSRK("5dp"; dm = da))
+sol_bdf = solve(prob, TSImplicit("bdf"; dm = da))
+```
+
+With a `dm` the implicit algorithms need no `jac_prototype`. Their Jacobian is the DM's own
+matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil and which PETSc fills
+by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()` and the
+other backends are refused; the stencil has to cover every point `f` reads. A `jac` is refused
+for now, and with it `TSIRK`, which needs one, as is a `jac_prototype`, since the DM gives the
+pattern. The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
+`TSARKIMEX` and `TSGeneric(ts_type; explicit = true)`, `saveat`, dense output, callbacks and
+the integrator interface, a `Diagonal` mass matrix, a `SplitODEProblem`, whose `f2` gets `u`
+ghosted as `f` does, and a `DAEProblem`, whose residual `f(r, du, u, p, t)` gets `u` ghosted
+and `du` owned. Everything else the package calls, such as a callback, `unstable_check` or
+`isoutofdomain`, sees the owned block. The TS works on a copy of the DM from `DMClone`, so the
+DM itself stays free for further solves. A DMDA on `MPI.COMM_SELF`, or on a single rank, gives
+a serial solve. Only a DMDA is taken so far.
+
+A distributed solve refuses, with an `ArgumentError`, `TSMPRK` and an implicit `TSGeneric`, and
+one with a `dm` refuses `PETScAdjoint` as well. Solving from several threads at once, as
+`EnsembleThreads` does, is not refused, but nothing then keeps the ranks' solves in the same
+order, which they need.
 
 ## Limitations
 
@@ -485,4 +539,5 @@ TSAlpha2
 TSGeneric
 PETScIntegrator
 PETScAdjoint
+PETScDiffEq.reshape_local_array
 ```
