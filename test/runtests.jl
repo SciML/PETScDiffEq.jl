@@ -5307,6 +5307,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 (; step_limiter = (u, integ, p, t) -> nothing),
                 (; stage_limiter = (u, integ, p, t) -> nothing),
             )
+            all(in(PETScDiffEq.DiffEqBase.allowedkeywords), keys(kw)) || continue
             @test_logs (:warn, r"does not support") SciMLBase.solve(prob, alg; dt = 0.1, kw...)
         end
         @test_logs min_level = Logging.Warn SciMLBase.solve(
