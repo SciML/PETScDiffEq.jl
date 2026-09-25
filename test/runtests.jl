@@ -2500,7 +2500,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
-        @testset "a successful solve makes no work vector at each stage" begin
+        # PETSc's step check fails the t = 300 span on 32-bit x86 (#79).
+        Sys.WORD_SIZE == 64 && @testset "a successful solve makes no work vector at each stage" begin
             pl = PETScDiffEq.PETSc.getlib(; PetscScalar = Float64)
             PETScDiffEq.PETSc.initialize(pl)
             function last_id()
