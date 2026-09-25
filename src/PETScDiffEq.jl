@@ -823,8 +823,6 @@ end
 _smallest(::Nothing, x) = x
 _smallest(comm::MPI.Comm, x) = MPI.Allreduce(x, min, comm)
 
-_check_code(code) = (code == 0 || throw(LibPETSc.PetscError(code)); nothing)
-
 _dm_lib(::LibPETSc.AbstractPetscDM{L}) where {L} = PETSc.getlib(L)
 
 function _dm_comm(dm)
