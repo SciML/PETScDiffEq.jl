@@ -1,6 +1,5 @@
-# Time to first solve. Run each measurement in a fresh process:
-#   julia --project=<env with PETScDiffEq, SciMLBase, SparseArrays> benchmark/ttfs.jl [case ...]
-# With no case it runs every case, each in its own process, and prints a table.
+# julia --project=<env with PETScDiffEq, SciMLBase, SparseArrays> benchmark/ttfs.jl [case]
+# With no case it times every case, each in a fresh process.
 const CASES = [
     "rk", "rk_p", "rk_oop", "rk_saveat", "rosw", "bdf", "bdf_sparse", "arkimex", "dae",
     "integ", "callback", "f32", "complex", "adjoint",
