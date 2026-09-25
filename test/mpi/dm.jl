@@ -586,6 +586,18 @@ end
         )
         e = caught(() -> solve(prob, explicit(; dm = da)))
         @test refused_on_thrower(e, "belongs to PETSc's")
+        da32 = PETSc.DMDA(
+            PETSc.getlib(; PetscScalar = Float32), comm, (GHOSTED,), (N,), 1, 1;
+            points_per_proc = (LibPETSc.PetscInt.(counts),),
+        )
+        @test refused(
+            () -> solve(
+                ODEProblem(heat_dm!, Float32.(heat0(rows)), SPAN, da32), explicit(; dm = da32),
+            ),
+            "Float32 real build, but `u0` and `tspan` together run this problem in its " *
+                "Float64 real one",
+        )
+        PETScCompat.destroy!(da32)
     end
 
     @testset "every handle is freed" begin
