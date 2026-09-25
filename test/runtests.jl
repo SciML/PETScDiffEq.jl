@@ -2428,16 +2428,20 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
 
         @testset "an error estimate that overflows" begin
-            decay = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0e-4))
-            kw = (; abstol = 1.0e-200, reltol = 1.0e-200)
+            decay = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+            kw = (;
+                dt = 1.0, abstol = 1.0e-160, reltol = 1.0e-160, dtmin = 0.01, force_dtmin = true,
+            )
             for alg in (PETScDiffEq.TSRosW(), PETScDiffEq.TSARKIMEX())
-                sol = SciMLBase.solve(decay, alg; kw...)
+                sol = @test_logs SciMLBase.solve(decay, alg; kw...)
                 @test sol.retcode == SciMLBase.ReturnCode.Success
-                @test sol.stats.nreject > 0
+                @test sol.stats.nreject >= 2
+                @test maximum(abs(u[1] - exp(-t)) for (t, u) in zip(sol.t, sol.u)) < 1.0e-7
                 @test same(sol, SciMLBase.solve(decay, alg; callback = never, kw...))
             end
             bdf = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
-                decay, PETScDiffEq.TSImplicit("bdf"); kw...,
+                SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0e-4)),
+                PETScDiffEq.TSImplicit("bdf"); abstol = 1.0e-200, reltol = 1.0e-200,
             )
             @test bdf.retcode == SciMLBase.ReturnCode.Unstable
             @test bdf.t[end] > 0
