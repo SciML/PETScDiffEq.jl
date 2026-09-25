@@ -377,6 +377,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test withenv(PETScDiffEq._under_mpi_launcher, "PMI_RANK" => "0")
     end
 
+    @testset "precompile workload" begin
+        @test PETScDiffEq._run_workload() === nothing
+    end
+
     @testset "several PETSc builds in one process" begin
         PETSc = PETScDiffEq.PETSc
         builds = [PETSc.getlib(; PetscScalar = S) for S in (Float64, Float32)]
