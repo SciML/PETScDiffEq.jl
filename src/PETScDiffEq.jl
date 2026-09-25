@@ -3816,7 +3816,7 @@ function _solve_unlocked(
         end
     end
     h = _setup(prob, alg; kwargs...)
-    h.init_failed && return _initial_failure(prob, alg, h)
+    h.init_failed && return _initial_failure(prob, alg, h, kwargs)
     ctx, pl = h.ctx, h.petsclib
     floor = abs(oftype(h.t0, something(get(kwargs, :dtmin, nothing), 0.0)))
     forced = get(kwargs, :force_dtmin, false) === true
@@ -3910,14 +3910,14 @@ function _stalled!(h, alg, t, verbose)
     return nothing
 end
 
-function _initial_failure(prob, alg, h)
+function _initial_failure(prob, alg, h, kwargs)
     h.save_start && isempty(h.ctx.ts) && _record!(h.ctx, h.t0, h.u0)
     st = try
         _read_stats(h)
     finally
         _destroy!(h)
     end
-    sol = _assemble(prob, alg, h, h.t0, copy(h.u0), st)
+    sol = _assemble(prob, alg, h, h.t0, copy(h.u0), st, kwargs)
     return SciMLBase.solution_new_retcode(sol, SciMLBase.ReturnCode.InitialFailure)
 end
 
@@ -4591,7 +4591,7 @@ function _init_unlocked(
         _initial_solution(prob, alg, h), false, false,
     )
     if h.init_failed
-        integ.sol = _initial_failure(prob, alg, h)
+        integ.sol = _initial_failure(prob, alg, h, kwargs)
         integ.finished = true
         return integ
     end
@@ -4821,7 +4821,7 @@ function _reinit_unlocked(
     integ.derivative_discontinuity = false
     integ.sol = _initial_solution(integ.prob, integ.alg, h)
     if h.init_failed
-        integ.sol = _initial_failure(integ.prob, integ.alg, h)
+        integ.sol = _initial_failure(integ.prob, integ.alg, h, integ.kwargs)
         integ.finished = true
         return nothing
     end
