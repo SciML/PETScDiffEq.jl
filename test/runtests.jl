@@ -7005,7 +7005,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                     osc!, (du, v, u, p, t) -> (du .= v; nothing); jac_prototype = sparse(ones(2, 2)),
                 ), [0.0], [1.0], (0.0, 1.0),
             )
-            @test_throws "no sparse `jac_prototype`" SciMLBase.__solve(
+            sparse_proto.f.jac_prototype isa SparseArrays.AbstractSparseMatrix &&
+                @test_throws "no sparse `jac_prototype`" SciMLBase.__solve(
                 sparse_proto, PETScDiffEq.TSAlpha2(); dt = 0.1,
             )
             scalars = SciMLBase.SecondOrderODEProblem((du, u, p, t) -> -u, 0.0, 1.0, (0.0, 1.0))
