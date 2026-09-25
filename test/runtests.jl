@@ -60,7 +60,7 @@ function damped_oscillator_jac!(J, u, p, t)
 end
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
-# As one block these testsets take Julia 1.12 about an hour to compile, so each stands alone.
+# Julia compiles a block as one thunk before running any of it, so each testset stands alone.
 macro each_toplevel(ts, block)
     stmts = block.args
     isdefined(Test, :push_testset) &&
