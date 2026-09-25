@@ -930,10 +930,10 @@ end
 # Each SNESSolve empties the DM's cache, dropping the held vector to our one reference.
 function _rehold_work_vec!(ctx, ts)
     if ctx.workvec != C_NULL
-        refs = Ref{LibPETSc.PetscInt}(0)
+        refs = Ref{PETSc.inttype(ctx.petsclib)}(0)
         ccall(
             _symbol(ctx.petsclib, :PetscObjectGetReference), LibPETSc.PetscErrorCode,
-            (Ptr{Cvoid}, Ptr{LibPETSc.PetscInt}), ctx.workvec, refs,
+            (Ptr{Cvoid}, Ptr{Cvoid}), ctx.workvec, refs,
         )
         refs[] > 1 && return nothing
         _release_work_vec!(ctx)
@@ -1020,18 +1020,34 @@ function _stale_failure!(pl, snes, y)
     return true
 end
 
-# TSStep_RosW lifts its Jacobian lag only after its last stage, so a failed stage leaves it frozen.
-function _unfreeze_jacobian!(pl, snes)
-    lag = Ref{LibPETSc.PetscInt}(0)
+function _jacobian_lag(pl, snes)
+    lag = Ref{PETSc.inttype(pl)}(0)
     ccall(
         _symbol(pl, :SNESGetLagJacobian), LibPETSc.PetscErrorCode,
-        (LibPETSc.CSNES, Ptr{LibPETSc.PetscInt}), snes, lag,
+        (LibPETSc.CSNES, Ptr{Cvoid}), snes, lag,
     )
-    lag[] < 0 && ccall(
+    return lag[]
+end
+
+# TSStep_RosW lifts its Jacobian lag only after its last stage, so a failed stage leaves it frozen.
+function _unfreeze_jacobian!(pl, snes)
+    _jacobian_lag(pl, snes) < 0 && ccall(
         _symbol(pl, :SNESSetLagJacobian), LibPETSc.PetscErrorCode,
         (LibPETSc.CSNES, LibPETSc.PetscInt), snes, LibPETSc.PetscInt(1),
     )
     return nothing
+end
+
+# TSAdaptChoose takes its DM work vector after the last stage, and BDF and theta take none.
+function _last_stage(ctx, pl, ts_ptr, y)
+    ctx.alg_name in ("bdf", "theta", "beuler", "cn") && return false
+    startswith(ctx.alg_name, "rosw") && return _jacobian_lag(pl, _snes(pl, ts_ptr)) >= 0
+    ns, stages = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{LibPETSc.CVec}}(C_NULL)
+    ccall(
+        _symbol(pl, :TSGetStages), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{Cvoid}, Ptr{Ptr{LibPETSc.CVec}}), ts_ptr, ns, stages,
+    )
+    return ns[] == 0 || unsafe_load(stages[], ns[]) == y
 end
 
 function _adapt_real(pl, ts_ptr, name, ::Type{R}) where {R}
@@ -1054,13 +1070,17 @@ end
 # TSAdaptCheckStage calls this before reading the SNES reason and skips its shrink once a
 # reason is set.
 function _check_stage!(
-        ts_ptr::LibPETSc.CTS, t::R, y::LibPETSc.CVec, accept::Ptr{Cvoid},
-    )::LibPETSc.PetscErrorCode where {R}
+        ts_ptr::LibPETSc.CTS, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
     ctx = POST_STEP_CTX[ts_ptr]::TSContext
+    return _check_stage_body!(ctx, ts_ptr, t, y, accept)
+end
+
+function _check_stage_body!(ctx, ts_ptr, t::R, y, accept) where {R}
     ctx.comm === nothing && ctx.err !== nothing && return LibPETSc.PetscErrorCode(0)
     try
         pl = ctx.petsclib
-        ctx.retry_fp && _rehold_work_vec!(ctx, ts_ptr)
+        ctx.retry_fp && _last_stage(ctx, pl, ts_ptr, y) && _rehold_work_vec!(ctx, ts_ptr)
         ts = LibPETSc.TS(ts_ptr, pl)
         h, s = LibPETSc.TSGetTimeStep(pl, ts), LibPETSc.TSGetTime(pl, ts)
         snes = _snes_failed(pl, ts_ptr)
