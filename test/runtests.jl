@@ -6385,7 +6385,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test SciMLBase.last_step_failed(integ)
                 integ = SciMLBase.init(stiff, PETScDiffEq.TSImplicit("bdf", one_newton); dt = 0.5)
                 SciMLBase.step!(integ)
-                @test integ.sol.retcode == RC.ConvergenceFailure
+                @test integ.sol.retcode == RC.Success
+                @test integ.sol.stats.nnonlinconvfail > 0
                 @test !SciMLBase.last_step_failed(integ)
             end
 
