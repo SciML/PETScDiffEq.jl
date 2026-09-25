@@ -1610,6 +1610,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.t[1] > 0.0
         end
 
+        @testset "initialize_save = false leaves an initialize callback's change unsaved" begin
+            doubled = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> false, integ -> nothing;
+                initialize = (c, u, t, integ) -> (integ.u .*= 2; nothing),
+            )
+            for (save, ts, us) in ((true, [0.0, 0.0], [[1.0], [2.0]]), (false, [0.0], [[1.0]]))
+                sol = SciMLBase.solve(
+                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = doubled,
+                    save_everystep = false, initialize_save = save,
+                )
+                @test sol.t[1:(end - 1)] == ts
+                @test sol.u[1:(end - 1)] == us
+                @test sol.t[end] == 1.0
+            end
+        end
+
         if isdefined(SciMLBase, :has_reinit)
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
             @test SciMLBase.has_reinit(integ)
@@ -5380,12 +5396,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 (; progress = true), (; failfactor = 4.0),
                 (; step_limiter = (u, integ, p, t) -> nothing),
                 (; stage_limiter = (u, integ, p, t) -> nothing),
+                (; advance_to_tstop = true), (; stop_at_next_tstop = true),
             )
             all(in(PETScDiffEq.DiffEqBase.allowedkeywords), keys(kw)) || continue
             @test_logs (:warn, r"does not support") SciMLBase.solve(prob, alg; dt = 0.1, kw...)
         end
         @test_logs min_level = Logging.Warn SciMLBase.solve(
             prob, alg; dt = 0.1, progress = false, progress_steps = 10,
+            advance_to_tstop = false, stop_at_next_tstop = false,
         )
     end
 
