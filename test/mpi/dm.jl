@@ -33,6 +33,28 @@ anywhere(b) = MPI.Allreduce(b, |, comm)
 everywhere(b) = MPI.Allreduce(b, &, comm)
 maxdiff(a, b) = maximum(maximum(abs, x - y) for (x, y) in zip(a, b))
 
+function refs(obj)
+    n = Ref{LibPETSc.PetscInt}(0)
+    PETScDiffEq._check_code(
+        ccall(
+            PETScDiffEq._symbol(pl, :PetscObjectGetReference), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{LibPETSc.PetscInt}), obj, n,
+        ),
+    )
+    return Int(n[])
+end
+held(dm) = PETScDiffEq._referenced(pl, dm)
+function released(dm)
+    n = refs(dm)
+    PETScDiffEq._check_code(
+        ccall(
+            PETScDiffEq._symbol(pl, :DMDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+            Ref(dm),
+        ),
+    )
+    return n == 1
+end
+
 function caught(f)
     try
         f()
@@ -206,10 +228,12 @@ end
         @test refused(() -> TSRK(; dm = 1), "takes a PETSc DM")
         nranks > 1 && @test refused(() -> TSRK(; dm = da, comm = MPI.COMM_SELF), "other ranks")
         integ = init(dm_heat(), TSImplicit("bdf"; dm = da); TOL...)
-        ts_dm = PETScDiffEq._ts_dm(pl, integ.h.ts)
+        ts_dm = held(PETScDiffEq._ts_dm(pl, integ.h.ts))
         @test ts_dm != da.ptr
         @test PETScDiffEq._dm_type(pl, LibPETSc.PetscDM(ts_dm, pl)) == "da"
         terminate!(integ)
+        @test everywhere(released(ts_dm))
+        @test everywhere(refs(da.ptr) == 1)
     end
 
     @testset "1-D heat, explicit and implicit" begin
@@ -426,16 +450,17 @@ end
         end
         decay!(du, u, p, t) = (du .= -u; nothing)
         got = solve(
-            SplitODEProblem(heat_dm!, decay_dm!, heat0(rows), SPAN, da), TSARKIMEX(; dm = da, comm);
+            SplitODEProblem(decay_dm!, heat_dm!, heat0(rows), SPAN, da), TSARKIMEX(; dm = da, comm);
             TOL...,
         )
-        f1 = ODEFunction(heat!; jac_prototype = heat_proto(rows))
-        ref = solve(SplitODEProblem(f1, decay!, heat0(rows), SPAN), TSARKIMEX(; comm); TOL...)
+        n = length(rows)
+        f1 = ODEFunction(decay!; jac_prototype = sparse(1:n, rows, ones(n), n, N))
+        ref = solve(SplitODEProblem(f1, heat!, heat0(rows), SPAN), TSARKIMEX(; comm); TOL...)
         @test got.retcode == ReturnCode.Success
         @test got.t == ref.t
         @test everywhere(got.u == ref.u)
         u = natural(got.u[end], da, N)
-        rank == 0 && @test maximum(abs, u - exp(-SPAN[2]) .* heat_exact(SPAN[2])) <= 4.0e-8
+        rank == 0 && @test maximum(abs, u - exp(-SPAN[2]) .* heat_exact(SPAN[2])) <= 5.0e-9
 
         residual(f) = (r, du, u, p, t) -> (f(r, u, p, t); r .= du .- r; nothing)
         du0 = zeros(length(rows))
@@ -464,6 +489,7 @@ end
         end
         @test solve(dm_heat(throwing(heat_dm!, t -> false)), implicit(; dm = da)).retcode ==
             ReturnCode.Success
+        @test everywhere(refs(da.ptr) == 1)
     end
 
     @testset "refusals" begin
