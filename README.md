@@ -299,10 +299,13 @@ implicit `TSGeneric` runs distributed for `"beuler"`, `"cn"`, `"theta"`, `"bdf"`
 `"arkimex"`, `"irk"`, `"alpha"` and `"dirk"`, as `TSImplicit` does. Other implicit types are
 refused: `"glle"`'s step control follows the round-off of the distributed linear solve, so it
 takes other steps than a serial solve and ends with another error, larger or smaller. A
-distributed solve also refuses `PETScAdjoint`, and a solve inside `Threads.@threads`, as
-`EnsembleThreads` runs its trajectories, with an `ArgumentError`: nothing there keeps the
-ranks' solves in the same order, and ranks taking them in different orders wait on each other
-forever. An ensemble of distributed solves runs with `EnsembleSerial()`.
+distributed solve also refuses `PETScAdjoint`, and a solve inside `Threads.@threads` on more
+than one thread, as `EnsembleThreads` runs its trajectories, with an `ArgumentError`: nothing
+there keeps the ranks' solves in the same order, and ranks taking them in different orders
+run different solves as one and can return wrong results without an error. Distributed solves
+running at once from `Threads.@spawn` tasks are not refused, so the caller has to keep them
+in the same order on every rank. An ensemble of distributed solves runs with
+`EnsembleSerial()`.
 
 ## Limitations
 
@@ -313,8 +316,8 @@ On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.
 
 Solves from several threads, such as an `EnsembleThreads` ensemble, are safe but run one
-at a time: PETSc's options and MPI are shared by the whole process. Distributed ones are
-refused there, as the MPI section says.
+at a time: PETSc's options and MPI are shared by the whole process. Distributed ones are not,
+as the MPI section says.
 
 Finish or terminate every integrator you start. One dropped part way is released by a
 finalizer, and if that finalizer runs at process exit, after MPI has shut down, PETSc's

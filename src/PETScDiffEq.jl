@@ -2280,7 +2280,7 @@ function _setup(
         ArgumentError(
             "PETScDiffEq cannot solve $_NOT_SELF when a rank calls it inside " *
                 "`Threads.@threads`, as `EnsembleThreads` runs its trajectories: the ranks " *
-                "would take them in different orders and wait on each other forever; use " *
+                "could take them in different orders and return wrong results; use " *
                 "`EnsembleSerial()`",
         ),
     )
