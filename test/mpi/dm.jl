@@ -360,6 +360,20 @@ end
         PETScCompat.destroy!(solo)
     end
 
+    @testset "an adaptive step that turns NaN on every rank leaves the TS's DM free" begin
+        nan_after(f) = (du, u, p, t) -> (f(du, u, p, t); t > 0.05 && fill!(du, NaN); nothing)
+        for (prob, alg) in (
+                (dm_heat(nan_after(heat_dm!)), explicit(; dm = da, comm)),
+                (comm_heat(nan_after(heat!)), explicit(; comm)),
+            )
+            integ = init(prob, alg)
+            ts_dm = held(PETScDiffEq._ts_dm(pl, integ.h.ts))
+            sol = @test_logs (:warn, r"floating point exception") solve!(integ)
+            @test sol.retcode == ReturnCode.Unstable
+            @test everywhere(released(ts_dm))
+        end
+    end
+
     @testset "saveat and dense output" begin
         rk3(; kw...) = TSRK("3bs"; kw...)
         for (make, kw) in ((explicit, FIXED), (implicit, TOL), (rk3, FIXED))
