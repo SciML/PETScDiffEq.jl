@@ -14,7 +14,6 @@ end
 
 const N = 23
 const thrower = nranks - 1
-const MEASURE = get(ENV, "PETSCDIFFEQ_MEASURE", "") == "1"
 
 const counts = let c = floor.(Int, N .* (1:nranks) ./ sum(1:nranks))
     c[end] += N - sum(c)
@@ -109,10 +108,7 @@ function against_serial(run, alg, serial_alg)
     return got, rank == 0 ? run(1:N, serial_alg) : got
 end
 
-report(what, x) = (MEASURE && rank == 0 && println("MEASURE $nranks $what $x"); x)
-
 const TYPES = (Float32, ComplexF64, ComplexF32)
-# Measured on 1 to 3 ranks: single precision can take other adaptive steps than the serial solve.
 const BOUNDS = Dict(
     Float32 => (serial = 5.0e-5, exact = 1.0e-4),
     ComplexF64 => (serial = 5.0e-8, exact = 1.0e-4),
@@ -142,9 +138,8 @@ const BOUNDS = Dict(
                 @test eltype(sol.t) === R && eltype(sol.u[end]) === S
                 u = gathered(sol.u[end])
                 if rank == 0
-                    what = "$S $(nameof(typeof(alg))) $jac"
-                    @test report("$what serial", maximum(abs, u - ref.u[end])) <= bound.serial
-                    @test report("$what exact", maximum(abs, u - heat_exact(S, 0.1))) <= bound.exact
+                    @test maximum(abs, u - ref.u[end]) <= bound.serial
+                    @test maximum(abs, u - heat_exact(S, 0.1)) <= bound.exact
                 end
             end
         end
@@ -165,9 +160,8 @@ const BOUNDS = Dict(
                 us = gathered(sol)
                 rank == 0 || continue
                 what == "vector tolerances" || @test sol.t == ref.t
-                @test report("$S $what", maximum(abs, us[end] - ref.u[end])) <= bound.serial
-                what == "vector tolerances" ||
-                    @test report("$S $what all", maxdiff(us, ref.u)) <= bound.serial
+                @test maximum(abs, us[end] - ref.u[end]) <= bound.serial
+                what == "vector tolerances" || @test maxdiff(us, ref.u) <= bound.serial
             end
         end
 
@@ -197,9 +191,9 @@ const BOUNDS = Dict(
             if rank == 0
                 @test got.fired == ref.fired > 0
                 @test length(got.sol.t) == length(ref.sol.t)
-                @test report("$S events t", maximum(abs, got.sol.t - ref.sol.t)) <= 4 * eps(R)
-                @test report("$S events u", maxdiff(us, ref.sol.u)) <= bound.serial
-                @test report("$S mids", maxdiff(mids, ref.mids)) <= bound.serial
+                @test maximum(abs, got.sol.t - ref.sol.t) <= 4 * eps(R)
+                @test maxdiff(us, ref.sol.u) <= bound.serial
+                @test maxdiff(mids, ref.mids) <= bound.serial
             end
         end
 
@@ -217,7 +211,7 @@ const BOUNDS = Dict(
             @test same_everywhere(sol.t)
             if rank == 0
                 @test length(sol.t) == length(ref.t)
-                @test report("$S nan t", maximum(abs, sol.t - ref.t)) <= 4 * eps(R)
+                @test maximum(abs, sol.t - ref.t) <= 4 * eps(R)
                 @test sol.stats.nreject == ref.stats.nreject
             end
         end
