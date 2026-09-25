@@ -142,9 +142,12 @@ end
 
 function time_at(points, target)
     isempty(points) && return NaN, true
-    all(p -> p[1] <= target, points) && return minimum(last, points), false
-    sorted = sort(points; rev = true)
-    for ((e1, t1), (e2, t2)) in zip(sorted, sorted[2:end])
+    front = Tuple{Float64, Float64}[]
+    for p in sort(points; by = last)
+        (isempty(front) || p[1] < front[end][1]) && push!(front, p)
+    end
+    front[1][1] <= target && return front[1][2], false
+    for ((e1, t1), (e2, t2)) in zip(front, front[2:end])
         e1 >= target >= e2 || continue
         w = log(e1 / target) / log(e1 / e2)
         return exp((1 - w) * log(t1) + w * log(t2)), true
