@@ -6,7 +6,9 @@ _check_autodiff(ad) = throw(
     ),
 )
 
-_default_autodiff(comm) = comm == MPI.COMM_SELF ? AutoForwardDiff() : AutoFiniteDiff()
+_default_autodiff(comm, dm) =
+    dm === nothing && something(comm, MPI.COMM_SELF) == MPI.COMM_SELF ? AutoForwardDiff() :
+    AutoFiniteDiff()
 
 _autodiff(alg::Union{TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX, TSGeneric, TSAlpha2}) =
     alg.autodiff
