@@ -2266,6 +2266,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test plain.u == sol.u
         end
 
+        @testset "verbose = false silences the warning for a solve that ends early" begin
+            breaks = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
+            )
+            runaway = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = u[1]^2; nothing), [1.0], (0.0, 2.0),
+            )
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            for pr in (breaks, runaway), kw in ((;), (; callback = never))
+                sol = @test_logs min_level = Logging.Warn SciMLBase.solve(
+                    pr, PETScDiffEq.TSRK("5dp"); verbose = false, kw...,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Unstable
+            end
+        end
+
         @testset "a step below dtmin ends the solve where it still holds" begin
             fast!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
             quick = SciMLBase.ODEProblem(fast!, [1.0], (0.0, 1.0))
@@ -4649,6 +4665,25 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test SciMLBase.solve!(integ).t ≈ [0.0, 0.25, 0.5, 0.6, 0.75, 1.0]
         end
 
+        @testset "save_on = false leaves callbacks and savevalues! nothing to save" begin
+            doubled = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> false, integ -> nothing;
+                initialize = (c, u, t, integ) -> (integ.u .*= 2; nothing),
+            )
+            for cb in (
+                    SciMLBase.DiscreteCallback((u, t, integ) -> t > 0.4, integ -> nothing),
+                    SciMLBase.ContinuousCallback((u, t, integ) -> t - 0.55, integ -> nothing),
+                    PresetTimeCallback([0.3], integ -> nothing), doubled,
+                )
+                @test SciMLBase.solve(prob, alg; dt = 0.1, callback = cb, save_on = false).t ==
+                    [0.0, 1.0]
+            end
+            integ = SciMLBase.init(prob, alg; dt = 0.1, save_on = false)
+            SciMLBase.step!(integ)
+            @test SciMLBase.savevalues!(integ, true) == (false, false)
+            @test SciMLBase.solve!(integ).t == [0.0, 1.0]
+        end
+
         @testset "save_start and save_end" begin
             nostart = SciMLBase.solve(
                 prob, alg; dt = 0.1, saveat = [0.0, 0.3, 1.0], save_start = false,
@@ -5195,6 +5230,31 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             prob, alg; dt = 0.1, internalnorm = (u, t) -> maximum(abs, u),
         )
         @test_logs min_level = Logging.Warn SciMLBase.solve(prob, alg; dt = 0.1)
+        for kw in (
+                (; progress = true), (; failfactor = 4.0),
+                (; step_limiter = (u, integ, p, t) -> nothing),
+                (; stage_limiter = (u, integ, p, t) -> nothing),
+            )
+            @test_logs (:warn, r"does not support") SciMLBase.solve(prob, alg; dt = 0.1, kw...)
+        end
+        @test_logs min_level = Logging.Warn SciMLBase.solve(
+            prob, alg; dt = 0.1, progress = false, progress_steps = 10,
+        )
+    end
+
+    @testset "error norms follow OrdinaryDiffEq's defaults and switches" begin
+        known = SciMLBase.ODEFunction(decay!; analytic = (u0, p, t) -> u0 .* exp(-t))
+        prob = SciMLBase.ODEProblem(known, [1.0], (0.0, 1.0))
+        for kw in ((;), (; tstops = [0.5]))
+            norms(; more...) = sort(
+                collect(
+                    keys(SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); kw..., more...).errors),
+                ),
+            )
+            @test norms() == [:final, :l2, :l∞]
+            @test norms(timeseries_errors = false) == [:final]
+            @test norms(dense_errors = true) == [:L2, :L∞, :final, :l2, :l∞]
+        end
     end
 
     @testset "No Jacobian buffer is allocated when none is used" begin

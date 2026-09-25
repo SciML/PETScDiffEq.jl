@@ -1182,7 +1182,10 @@ _failed_step(e, h) =
     e isa LibPETSc.PetscError && !h.pivot_raises &&
     (e.code == PETSC_ERR_MAT_LU_ZRPVT || e.code == PETSC_ERR_FP)
 
-function _warn_failed_step(alg, code)
+_verbose(kwargs) = get(kwargs, :verbose, true) !== false
+
+function _warn_failed_step(alg, code, kwargs)
+    _verbose(kwargs) || return nothing
     why = code == PETSC_ERR_FP ?
         "PETSc hit a floating point exception, an overflow or a NaN in the step or in " *
         "its error estimate" :
@@ -2587,7 +2590,8 @@ _default_options(::TSAlpha2) = ["-ts_adapt_type", "basic"]
 
 const UNSUPPORTED_KWARGS = (
     :internalnorm, :calck, :alias_u0, :sensealg,
-    :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
+    :controller, :qmax, :qmin, :gamma, :beta1, :beta2, :failfactor,
+    :step_limiter, :stage_limiter,
 )
 
 mutable struct TSHandles{CTX, L, R, S}
@@ -3113,6 +3117,8 @@ function _setup(
             @warn "PETScDiffEq does not support `$key` and is ignoring it"
         end
     end
+    get(kwargs, :progress, false) === true &&
+        @warn "PETScDiffEq does not support `progress` and is ignoring it"
     prob.u0 isa AbstractVector{<:Union{Real, Complex}} || throw(
         ArgumentError("PETScDiffEq requires an AbstractVector u0 of real or complex numbers"),
     )
@@ -3659,7 +3665,7 @@ _underflows(h::TSHandles{<:Any, <:Any, Float32}, alg, uend, retcode) =
     _uses_ifunction(alg) && _tiny(uend, h.ctx.comm) &&
     (_tiny(h.u0, h.ctx.comm) || retcode != SciMLBase.ReturnCode.Success)
 
-function _assemble(prob, alg, h::TSHandles, tend, uend, st)
+function _assemble(prob, alg, h::TSHandles, tend, uend, st, kwargs)
     ctx = h.ctx
     tf, t0, tol = h.tf, h.t0, _near(h.tf)
     # -ts_exact_final_time interpolate reports a point past tf mid-sequence.
@@ -3725,6 +3731,8 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     return SciMLBase.build_solution(
         prob, alg, ts, ctx.us; retcode = retcode, stats = stats,
         dense = ctx.dense, interp = _interp(ctx, ts, dus),
+        timeseries_errors = get(kwargs, :timeseries_errors, true),
+        dense_errors = get(kwargs, :dense_errors, false),
     )
 end
 
@@ -3795,11 +3803,11 @@ function _solve_unlocked(
                 LibPETSc.TSSolve(pl, h.ts, _solution_vec(h))
             end
             raised = h.stopped != 0
-            raised && _retry_solve!(h, alg, floor, forced) || break
+            raised && _retry_solve!(h, alg, floor, forced, kwargs) || break
         end
         _throw_if_threw!(ctx)
         failure === nothing || throw(failure)
-        h.stopped == 0 || _warn_failed_step(alg, h.stopped)
+        h.stopped == 0 || _warn_failed_step(alg, h.stopped, kwargs)
         # PETSc sets the solve time only when TSSolve returns normally, and a step that
         # raises leaves its rejected trial in the solution vector.
         tend, uend = raised ? (ctx.end_s, copy(ctx.end_u)) :
@@ -3808,7 +3816,7 @@ function _solve_unlocked(
     finally
         _destroy!(h)
     end
-    sol = _assemble(prob, alg, h, tend, uend, st)
+    sol = _assemble(prob, alg, h, tend, uend, st, kwargs)
     ctx.comm === nothing || _throw_if_threw!(ctx)
     return sol
 end
@@ -3859,12 +3867,12 @@ function _retryable!(h)
     return true
 end
 
-function _retry_solve!(h, alg, floor, forced)
+function _retry_solve!(h, alg, floor, forced, kwargs)
     ctx, pl = h.ctx, h.petsclib
     _retryable!(h) || return false
     code, h.stopped = h.stopped, 0
     dt, _ = _retry_step(h, ctx.end_s, LibPETSc.TSGetTimeStep(pl, h.ts), floor, forced, code)
-    dt === nothing && (_warn_failed_step(alg, code); return false)
+    dt === nothing && (_warn_failed_step(alg, code, kwargs); return false)
     # TSSolve zeroes its counters when it starts on step 0.
     if LibPETSc.TSGetStepNumber(pl, h.ts) == 0
         st = _read_stats(h)
@@ -4131,8 +4139,13 @@ SciMLBase.change_t_via_interpolation!(
     integ::PETScIntegrator, t, modify_save_endpoint::Type{Val{T}} = Val{false},
 ) where {T} = _locked(() -> _change_t_unlocked(integ, t, modify_save_endpoint))
 
+function _save_here!(integ::PETScIntegrator)
+    get(integ.kwargs, :save_on, true) && _record!(integ.h.ctx, integ.tdir * integ.t, integ.u)
+    return nothing
+end
+
 function _savevalues_unlocked(integ::PETScIntegrator, force_save = false)
-    integ.finished && return (false, false)
+    (integ.finished || !get(integ.kwargs, :save_on, true)) && return (false, false)
     ctx = integ.h.ctx
     n = length(ctx.ts)
     _save_step!(integ, integ.t, false)
@@ -4406,14 +4419,14 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     residual = integ.event_residual[best_k]
     best_cb.rootfind === SciMLBase.NoRootFind ? fill!(residual, 0.0) :
         _fill_conditions!(residual, integ, best_cb, integ.t)
-    best_cb.save_positions[1] && !saved && _record!(ctx, integ.tdir * integ.t, integ.u)
+    best_cb.save_positions[1] && !saved && _save_here!(integ)
     integ.derivative_discontinuity = true
     _pin_step!(integ)
     _checked_everywhere(() -> _fire!(integ, best_cb, best_crossing), ctx.comm)
     integ.finished && return true
     _rollback!(integ, integ.t, dt, false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
-    best_cb.save_positions[2] && _record!(ctx, integ.tdir * integ.t, integ.u)
+    best_cb.save_positions[2] && _save_here!(integ)
     return true
 end
 
@@ -4423,7 +4436,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
     for cb in integ.callbacks
         integ.finished && return nothing
         _checked_anywhere(() -> cb.condition(integ.u, integ.t, integ), ctx.comm) || continue
-        cb.save_positions[1] && !saved && _record!(ctx, integ.tdir * integ.t, integ.u)
+        cb.save_positions[1] && !saved && _save_here!(integ)
         saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
@@ -4436,7 +4449,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
             ctx.pdirty = true
         end
-        cb.save_positions[2] && _record!(ctx, integ.tdir * integ.t, integ.u)
+        cb.save_positions[2] && _save_here!(integ)
     end
     return nothing
 end
@@ -4457,8 +4470,7 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
         ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
     )
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
-    initialize_save && any(cb -> cb.save_positions[2], cbs) &&
-        _record!(h.ctx, h.tdir * integ.t, integ.u)
+    initialize_save && any(cb -> cb.save_positions[2], cbs) && _save_here!(integ)
     return nothing
 end
 
@@ -4519,7 +4531,7 @@ function _reject_step!(integ::PETScIntegrator, before, taken)
     forced = get(integ.kwargs, :force_dtmin, false) === true
     dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, code)
     if dt === nothing
-        code == 0 || _warn_failed_step(integ.alg, code)
+        code == 0 || _warn_failed_step(integ.alg, code, integ.kwargs)
         if outer !== nothing
             integ.tprev = outer[1]
             copyto!(integ.uprev, outer[2])
@@ -4716,7 +4728,9 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
         end
     end
     st = _read_stats(h)
-    sol = _assemble(integ.prob, integ.alg, h, integ.tdir * integ.t, copy(integ.u), st)
+    sol = _assemble(
+        integ.prob, integ.alg, h, integ.tdir * integ.t, copy(integ.u), st, integ.kwargs,
+    )
     integ.sol = retcode === nothing ? sol : SciMLBase.solution_new_retcode(sol, retcode)
     integ.finished = true
     _destroy!(h)
@@ -4838,14 +4852,14 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         return _reject_step!(integ, before, LibPETSc.TSGetTimeStep(pl, h.ts))
     end
     h.stopped == 0 ? _undo_failed_irk!(ctx, pl, h.ts.ptr) :
-        _warn_failed_step(integ.alg, h.stopped)
+        _warn_failed_step(integ.alg, h.stopped, integ.kwargs)
     integ.t = _user_t(integ.tdir, LibPETSc.TSGetTime(pl, h.ts))
     if integ.tdir * integ.t <= integ.tdir * integ.tprev
         if h.stopped == 0 && SciMLBase.isadaptive(integ) &&
                 Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
             ctx.unstable_hit = true
-            @warn "`$(_warn_name(integ.alg))` ends here because its step fell below the " *
-                "floating point spacing at t = $(integ.t)"
+            _verbose(integ.kwargs) && @warn "`$(_warn_name(integ.alg))` ends here because " *
+                "its step fell below the floating point spacing at t = $(integ.t)"
         end
         _finish!(integ)
         return nothing
