@@ -2340,6 +2340,28 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "the post-step check allocates nothing" begin
+            integ = SciMLBase.init(
+                SciMLBase.ODEProblem(decay!, [1.0], (0.0, 10.0)), PETScDiffEq.TSRK("5dp"),
+            )
+            SciMLBase.step!(integ)
+            h = integ.h
+            h.ctx.halt_stalled = true
+            PETScDiffEq._set_post_step!(h.petsclib, h.ts, h.ctx)
+            ptr = h.ts.ptr
+            function post(n)
+                for _ in 1:n
+                    PETScDiffEq._post_step!(ptr)
+                end
+                return nothing
+            end
+            post(2)
+            @test (@allocated post(100)) == 0
+            @test !h.ctx.stalled
+            @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
+            @test isempty(PETScDiffEq.POST_STEP_CTX)
+        end
+
         @testset "verbose = false silences the warning for a solve that ends early" begin
             breaks = SciMLBase.ODEProblem(
                 (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
