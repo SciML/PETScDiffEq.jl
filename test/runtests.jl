@@ -5967,6 +5967,321 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
             end
         end
+
+        @testset "the rest of SciMLBase's integrator interface" begin
+            RC = SciMLBase.ReturnCode
+            lv = SciMLBase.ODEProblem(
+                lotka_volterra!, [1.0, 1.0], (0.0, 2.0), [1.5, 1.0, 3.0, 1.0],
+            )
+            first_dt(p, alg; kw...) = (
+                i = SciMLBase.init(p, alg; kw...); dt = i.dt; SciMLBase.terminate!(i); dt
+            )
+
+            @testset "check_error, check_error! and postamble! as OrdinaryDiffEq has them" begin
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"))
+                @test SciMLBase.check_error(integ) == RC.Success
+                @test integ.sol.retcode == RC.Default
+                SciMLBase.step!(integ)
+                @test integ.sol.retcode == RC.Success
+                @test SciMLBase.check_error!(integ) == RC.Success
+                @test !integ.finished
+                SciMLBase.postamble!(integ)
+                @test SciMLBase.done(integ)
+                @test integ.sol.retcode == RC.Success
+                @test integ.sol.t == [0.0, integ.t]
+                @test integ.sol.u[end] == integ.u
+                SciMLBase.postamble!(integ)
+                @test length(integ.sol.t) == 2
+
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"))
+                SciMLBase.postamble!(integ)
+                @test integ.sol.retcode == RC.Default
+                @test integ.sol.t == [0.0]
+
+                finals = Ref(0)
+                cb = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> false, integ -> nothing;
+                    finalize = (c, u, t, integ) -> (finals[] += 1),
+                )
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); callback = cb)
+                SciMLBase.step!(integ)
+                SciMLBase.postamble!(integ)
+                SciMLBase.postamble!(integ)
+                @test finals[] == 1
+
+                integ = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"); maxiters = 3)
+                SciMLBase.solve!(integ)
+                @test SciMLBase.check_error(integ) == RC.MaxIters
+                @test SciMLBase.check_error!(integ) == RC.MaxIters
+                @test integ.sol.retcode == RC.MaxIters
+
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"))
+                SciMLBase.solve!(integ)
+                @test SciMLBase.check_error(integ) == RC.Success
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"))
+                SciMLBase.step!(integ)
+                SciMLBase.terminate!(integ)
+                @test SciMLBase.check_error(integ) == RC.Terminated
+
+                seen = RC.T[]
+                watch = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> false, integ -> nothing;
+                    finalize = (c, u, t, integ) -> push!(seen, SciMLBase.check_error(integ)),
+                )
+                stop = SciMLBase.DiscreteCallback((u, t, integ) -> t > 0.5, SciMLBase.terminate!)
+                SciMLBase.solve(
+                    lv, PETScDiffEq.TSRK("5dp"); callback = SciMLBase.CallbackSet(stop, watch),
+                )
+                integ = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"); callback = watch)
+                SciMLBase.step!(integ)
+                SciMLBase.terminate!(integ, RC.Failure)
+                @test seen == [RC.Terminated, RC.Failure]
+            end
+
+            @testset "last_step_failed is a fixed step whose Newton solve failed" begin
+                cubic!(du, u, p, t) = (du[1] = -1.0e4 * u[1]^3 + sin(t); nothing)
+                stiff = SciMLBase.ODEProblem(cubic!, [10.0], (0.0, 1.0))
+                one_newton = ["-snes_max_it", "1"]
+                integ = SciMLBase.init(
+                    stiff, PETScDiffEq.TSImplicit("beuler", one_newton); dt = 0.5,
+                    adaptive = false,
+                )
+                @test !SciMLBase.last_step_failed(integ)
+                SciMLBase.step!(integ)
+                @test integ.sol.retcode == RC.ConvergenceFailure
+                @test SciMLBase.check_error(integ) == RC.ConvergenceFailure
+                @test SciMLBase.last_step_failed(integ)
+                integ = SciMLBase.init(stiff, PETScDiffEq.TSImplicit("bdf", one_newton); dt = 0.5)
+                SciMLBase.step!(integ)
+                @test integ.sol.retcode == RC.Success
+                @test integ.sol.stats.nnonlinconvfail > 0
+                @test !SciMLBase.last_step_failed(integ)
+            end
+
+            @testset "the proposed step is signed, and can come from another integrator" begin
+                lv_back = SciMLBase.ODEProblem(lotka_volterra!, [1.0, 1.0], (2.0, 0.0), lv.p)
+                integ = SciMLBase.init(lv_back, PETScDiffEq.TSRK("5dp"))
+                @test SciMLBase.get_proposed_dt(integ) == integ.dt < 0
+                SciMLBase.step!(integ)
+                proposed = SciMLBase.get_proposed_dt(integ)
+                @test proposed < 0
+                SciMLBase.set_proposed_dt!(integ, proposed / 2)
+                @test SciMLBase.get_proposed_dt(integ) == proposed / 2
+                SciMLBase.solve!(integ)
+                @test SciMLBase.get_proposed_dt(integ) < 0
+
+                ahead = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"))
+                SciMLBase.step!(ahead)
+                SciMLBase.step!(ahead)
+                integ = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"))
+                SciMLBase.set_proposed_dt!(integ, ahead)
+                @test SciMLBase.get_proposed_dt(integ) == SciMLBase.get_proposed_dt(ahead)
+                SciMLBase.solve!(integ)
+                SciMLBase.solve!(ahead)
+            end
+
+            @testset "auto_dt_reset! takes the step init would take from here" begin
+                integ = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"); dt = 0.5)
+                SciMLBase.auto_dt_reset!(integ)
+                @test integ.dt == SciMLBase.get_proposed_dt(integ) ==
+                    first_dt(lv, PETScDiffEq.TSRK("5dp"))
+                SciMLBase.terminate!(integ)
+
+                integ = SciMLBase.init(
+                    lv, PETScDiffEq.TSRK("5dp"); save_everystep = false, tstops = [0.1],
+                )
+                SciMLBase.step!(integ)
+                nf = integ.sol.stats.nf
+                SciMLBase.auto_dt_reset!(integ)
+                @test integ.sol.stats.nf == nf + 2
+                here = SciMLBase.remake(lv; u0 = copy(integ.u), tspan = (integ.t, 2.0))
+                @test integ.dt == first_dt(here, PETScDiffEq.TSRK("5dp"); tstops = [0.1])
+                @test integ.dt < first_dt(here, PETScDiffEq.TSRK("5dp"))
+                SciMLBase.step!(integ)
+                @test integ.t == 0.1
+                SciMLBase.solve!(integ)
+                @test integ.sol.retcode == RC.Success
+
+                split = SciMLBase.SplitODEProblem(
+                    (du, u, p, t) -> (du .= -u; nothing), (du, u, p, t) -> (du .= sin(t); nothing),
+                    [1.0], (0.0, 1.0),
+                )
+                integ = SciMLBase.init(split, PETScDiffEq.TSARKIMEX("4"); dt = 0.1)
+                SciMLBase.step!(integ)
+                counts = (integ.sol.stats.nf, integ.sol.stats.nf2)
+                SciMLBase.auto_dt_reset!(integ)
+                @test (integ.sol.stats.nf, integ.sol.stats.nf2) == counts .+ 2
+                SciMLBase.terminate!(integ)
+
+                lv_back = SciMLBase.ODEProblem(lotka_volterra!, [1.0, 1.0], (2.0, 0.0), lv.p)
+                integ = SciMLBase.init(lv_back, PETScDiffEq.TSRosW("ra34pw2"); dt = 0.5)
+                SciMLBase.auto_dt_reset!(integ)
+                @test integ.dt == first_dt(lv_back, PETScDiffEq.TSRosW("ra34pw2")) < 0
+                SciMLBase.terminate!(integ)
+
+                massive = SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0],
+                    (0.0, 1.0),
+                )
+                integ = SciMLBase.init(massive, PETScDiffEq.TSImplicit("bdf"); dt = 0.1)
+                SciMLBase.auto_dt_reset!(integ)
+                @test integ.dt == first_dt(massive, PETScDiffEq.TSImplicit("bdf"))
+                SciMLBase.terminate!(integ)
+
+                integ = SciMLBase.init(
+                    prob, PETScDiffEq.TSGeneric("rk"; explicit = true); dt = 0.1,
+                )
+                @test_throws "which `TSGeneric` does not know" SciMLBase.auto_dt_reset!(integ)
+                SciMLBase.terminate!(integ)
+
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.02, adaptive = false)
+                SciMLBase.step!(integ)
+                SciMLBase.auto_dt_reset!(integ)
+                here = SciMLBase.remake(prob; u0 = copy(integ.u), tspan = (integ.t, 1.0))
+                @test integ.dt == first_dt(here, PETScDiffEq.TSRK("5dp"))
+                @test SciMLBase.get_proposed_dt(integ) == 0.02
+                SciMLBase.step!(integ)
+                @test integ.dt ≈ 0.02
+                SciMLBase.reinit!(integ; reset_dt = true)
+                @test integ.dt == first_dt(prob, PETScDiffEq.TSRK("5dp"))
+                @test SciMLBase.get_proposed_dt(integ) == 0.02
+                SciMLBase.step!(integ)
+                @test integ.t == 0.02
+                SciMLBase.terminate!(integ)
+            end
+
+            @testset "reinit! takes reset_dt and reinit_cache" begin
+                integ = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"); dt = 0.5)
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                proposed = SciMLBase.get_proposed_dt(integ)
+                SciMLBase.reinit!(integ; reset_dt = false)
+                @test SciMLBase.get_proposed_dt(integ) == integ.dt == proposed
+                SciMLBase.reinit!(integ; reset_dt = true, reinit_cache = false)
+                @test integ.dt == first_dt(lv, PETScDiffEq.TSRK("5dp"))
+                SciMLBase.reinit!(integ, [2.0, 0.5]; reset_dt = true)
+                @test integ.dt ==
+                    first_dt(SciMLBase.remake(lv; u0 = [2.0, 0.5]), PETScDiffEq.TSRK("5dp"))
+                SciMLBase.reinit!(integ)
+                @test integ.dt == 0.5
+                SciMLBase.solve!(integ)
+                ended = SciMLBase.get_proposed_dt(integ)
+                SciMLBase.reinit!(integ; reset_dt = false)
+                @test SciMLBase.get_proposed_dt(integ) == integ.dt == ended
+                SciMLBase.step!(integ)
+                @test integ.t == ended
+                @test SciMLBase.solve!(integ).retcode == RC.Success
+
+                integ = SciMLBase.init(
+                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false, tstops = [0.33],
+                )
+                SciMLBase.step!(integ)
+                SciMLBase.set_proposed_dt!(integ, 0.05)
+                SciMLBase.reinit!(integ; reset_dt = false)
+                steps = Float64[]
+                while !SciMLBase.done(integ)
+                    SciMLBase.step!(integ)
+                    push!(steps, integ.dt)
+                end
+                @test 0.33 in integ.sol.t
+                @test maximum(steps) ≈ 0.05
+
+                integ = SciMLBase.init(
+                    prob, PETScDiffEq.TSGeneric("rk"; explicit = true); dt = 0.1,
+                )
+                SciMLBase.step!(integ)
+                @test_throws "which `TSGeneric` does not know" SciMLBase.reinit!(
+                    integ; reset_dt = true,
+                )
+                @test integ.t == 0.1
+                SciMLBase.solve!(integ)
+                @test integ.sol.retcode == RC.Success
+            end
+
+            @testset "a reinit! whose f throws frees the TS it made" begin
+                live() = count(h -> !h.destroyed, keys(PETScDiffEq.LIVE_HANDLES))
+                refuses!(du, u, p, t) = (any(>(5.0), u) && error("f refuses"); du .= -u; nothing)
+                refusing = SciMLBase.ODEProblem(refuses!, ones(3), (0.0, 1.0))
+                for (reset_dt, dense) in ((nothing, true), (true, false))
+                    integ = SciMLBase.init(refusing, PETScDiffEq.TSRK("5dp"); dt = 0.1, dense)
+                    SciMLBase.step!(integ)
+                    before = live()
+                    @test_throws "f refuses" SciMLBase.reinit!(integ, fill(10.0, 3); reset_dt)
+                    @test live() <= before
+                    @test SciMLBase.solve!(integ).retcode == RC.Success
+                end
+            end
+
+            @testset "set_abstol! and set_reltol! hold for the steps after" begin
+                integ = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"); dt = 0.01)
+                SciMLBase.set_abstol!(integ, 1.0e-10)
+                SciMLBase.set_reltol!(integ, 1.0e-8)
+                @test (integ.opts.abstol, integ.opts.reltol) == (1.0e-10, 1.0e-8)
+                ref = SciMLBase.solve(
+                    lv, PETScDiffEq.TSRK("5dp"); dt = 0.01, abstol = 1.0e-10, reltol = 1.0e-8,
+                )
+                sol = SciMLBase.solve!(integ)
+                @test sol.t == ref.t
+                @test sol.u == ref.u
+            end
+
+            @testset "the state cannot change length" begin
+                integ = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"))
+                SciMLBase.step!(integ)
+                for call in (
+                        () -> resize!(integ, 3), () -> deleteat!(integ, 1),
+                        () -> SciMLBase.addat!(integ, 3:3),
+                    )
+                    @test_throws "cannot change the length of the state" call()
+                end
+                @test SciMLBase.solve!(integ).retcode == RC.Success
+            end
+
+            @testset "change_t_via_interpolation! rewrites what was saved past the new time" begin
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                SciMLBase.change_t_via_interpolation!(integ, 0.15, Val{false}, nothing)
+                @test integ.t == 0.15
+                @test abs(integ.u[1] - exp(-0.15)) < 1.0e-8
+                SciMLBase.terminate!(integ)
+
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                SciMLBase.change_t_via_interpolation!(integ, 0.15, Val{true})
+                @test integ.sol.t == [0.0, 0.1, 0.15]
+                @test integ.sol.u[end] == integ.u
+                SciMLBase.solve!(integ)
+                @test issorted(integ.sol.t)
+                @test allunique(integ.sol.t)
+                @test maximum(t -> abs(integ.sol(t)[1] - exp(-t)), 0.1:0.005:0.15) < 5.0e-8
+
+                back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
+                integ = SciMLBase.init(back, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                SciMLBase.change_t_via_interpolation!(integ, 0.85, Val{true})
+                @test integ.sol.t == [1.0, 0.9, 0.85]
+                SciMLBase.solve!(integ)
+                @test issorted(integ.sol.t; rev = true)
+                @test allunique(integ.sol.t)
+
+                integ = SciMLBase.init(
+                    prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false,
+                    saveat = [0.15, 0.5],
+                )
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                @test integ.sol.t == [0.15]
+                SciMLBase.change_t_via_interpolation!(integ, 0.12, Val{true})
+                @test isempty(integ.sol.t)
+                SciMLBase.set_u!(integ, 2 .* integ.u)
+                sol = SciMLBase.solve!(integ)
+                @test sol.t == [0.15, 0.5]
+                @test abs(sol.u[1][1] - 2exp(-0.15)) < 1.0e-7
+            end
+        end
     end
 
     @testset "a replaced integ.p is the one solved with" begin
@@ -6278,7 +6593,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test integ.t ≈ 0.9
             @test integ.tprev == 1.0
             @test integ.dt < 0
-            @test SciMLBase.get_proposed_dt(integ) > 0
+            @test SciMLBase.get_proposed_dt(integ) ≈ -0.1
             @test SciMLBase.get_du(integ) ≈ -integ.u
             @test_throws ArgumentError SciMLBase.add_tstop!(integ, 0.95)
             t1 = integ.t

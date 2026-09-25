@@ -460,6 +460,21 @@ crossing_last_row(idx, level) =
         terminate!(integ)
         @test integ.sol.retcode == ReturnCode.Terminated
         @test same_everywhere(integ.sol.t)
+
+        integ = init(heat_problem(rows, TSRK("5dp"; comm)), TSRK("5dp"; comm); dt = 1.0e-5)
+        SciMLBase.auto_dt_reset!(integ)
+        serial_dt = if rank == 0
+            serial = init(heat_problem(1:N, TSRK("5dp")), TSRK("5dp"))
+            terminate!(serial)
+            serial.dt
+        end
+        @test abs(integ.dt - MPI.bcast(serial_dt, 0, comm)) <= ROUNDOFF * integ.dt
+        step!(integ)
+        @test SciMLBase.check_error!(integ) == ReturnCode.Success
+        SciMLBase.postamble!(integ)
+        @test integ.sol.retcode == ReturnCode.Success
+        @test integ.sol.t[end] == integ.t
+        @test same_everywhere(integ.sol.t)
     end
 
     @testset "a callback throwing on one rank raises on every rank" begin
@@ -497,6 +512,15 @@ crossing_last_row(idx, level) =
         armed[] = false
         step!(integ)
         @test !anywhere(any(isnan, integ((integ.tprev + integ.t) / 2)))
+        terminate!(integ)
+
+        integ = init(
+            ODEProblem(f!, heat0(rows), (0.0, 0.1)), TSRK("5dp"; comm); dense = false, FIXED...,
+        )
+        step!(integ)
+        armed[] = true
+        @test raised(caught(() -> reinit!(integ; reset_dt = true)), "f threw")
+        armed[] = false
         terminate!(integ)
     end
 

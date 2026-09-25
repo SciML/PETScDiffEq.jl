@@ -4058,8 +4058,8 @@ Base.setproperty!(integ::PETScIntegrator, name::Symbol, v) = name === :p ?
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
 function _proposed_dt_unlocked(integ::PETScIntegrator)
-    integ.finished && return abs(integ.dt)
-    return LibPETSc.TSGetTimeStep(integ.h.petsclib, integ.h.ts)
+    integ.finished && return integ.tdir * abs(integ.dt)
+    return integ.tdir * LibPETSc.TSGetTimeStep(integ.h.petsclib, integ.h.ts)
 end
 
 SciMLBase.get_proposed_dt(integ::PETScIntegrator) = _locked(() -> _proposed_dt_unlocked(integ))
@@ -4072,6 +4072,8 @@ end
 
 SciMLBase.set_proposed_dt!(integ::PETScIntegrator, dt) =
     _locked(() -> _set_proposed_dt_unlocked(integ, dt))
+SciMLBase.set_proposed_dt!(integ::PETScIntegrator, other::SciMLBase.DEIntegrator) =
+    SciMLBase.set_proposed_dt!(integ, SciMLBase.get_proposed_dt(other))
 _make_opts(h::TSHandles{<:Any, <:Any, R}, kwargs) where {R} = PETScIntegratorOpts(
     h, get(kwargs, :adaptive, true) === true,
     get(kwargs, :abstol, 1.0e-6), get(kwargs, :reltol, 1.0e-3),
@@ -4164,7 +4166,32 @@ function _change_t_unlocked(
     )
     LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * t)
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
+    T && _rewind_saves!(integ)
     _raise_threw!(integ)
+    return nothing
+end
+
+function _unrecord!(ctx::TSContext)
+    pop!(ctx.ts)
+    pop!(ctx.us)
+    ctx.user_ts === nothing || pop!(ctx.user_ts)
+    if ctx.dense
+        pop!(ctx.dus)
+        ctx.user_dus === nothing || pop!(ctx.user_dus)
+    end
+    return nothing
+end
+
+function _rewind_saves!(integ::PETScIntegrator)
+    ctx = integ.h.ctx
+    s = integ.tdir * integ.t
+    while !isempty(ctx.ts) && ctx.ts[end] > s
+        _unrecord!(ctx)
+    end
+    while ctx.saveat_idx > 1 && ctx.saveat[ctx.saveat_idx - 1] > s
+        ctx.saveat_idx -= 1
+    end
+    ctx.save_everystep && !_last_recorded(ctx, s) && _record_end!(ctx, s, integ.u)
     return nothing
 end
 
@@ -4687,6 +4714,7 @@ end
 
 function _reinit_unlocked(
         integ::PETScIntegrator, u0 = integ.prob.u0;
+        reset_dt = nothing, reinit_cache = true,
         t0 = integ.prob.tspan[1], tf = integ.prob.tspan[2],
         erase_sol = true, saveat = nothing, tstops = integ.tstops_cache,
         d_discontinuities = integ.d_discontinuities_cache,
@@ -4700,28 +4728,41 @@ function _reinit_unlocked(
         u0 = _partition(integ.prob.u0, u0)
     end
     old = integ.h
+    reset_dt === true && _check_estimable(integ.alg)
+    dt = reset_dt === false ? _proposed_dt_unlocked(integ) : nothing
     prob = SciMLBase.remake(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
         p = integ.p,
     )
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
-    LibPETSc.TSSetUp(h.petsclib, h.ts)
-    _match_steps_here!(h)
-    if !erase_sol
-        append!(h.ctx.ts, old.ctx.ts)
-        append!(h.ctx.us, old.ctx.us)
-        if h.ctx.dense
-            if old.ctx.dense
-                append!(h.ctx.dus, old.ctx.dus)
-            else
-                for (t, u) in zip(old.ctx.ts, old.ctx.us)
-                    push!(h.ctx.dus, _kept(h.ctx, _derivative(h.ctx, t, u)))
+    try
+        LibPETSc.TSSetUp(h.petsclib, h.ts)
+        _match_steps_here!(h)
+        if !erase_sol
+            append!(h.ctx.ts, old.ctx.ts)
+            append!(h.ctx.us, old.ctx.us)
+            if h.ctx.dense
+                if old.ctx.dense
+                    append!(h.ctx.dus, old.ctx.dus)
+                else
+                    for (t, u) in zip(old.ctx.ts, old.ctx.us)
+                        push!(h.ctx.dus, _kept(h.ctx, _derivative(h.ctx, t, u)))
+                    end
                 end
             end
         end
+        initialize_save && _initial_save!(h)
+        if reset_dt === true
+            dt = _estimate_dt(
+                h, integ.alg, _make_opts(h, integ.kwargs), h.u0, h.t0,
+                _tstops(vcat(tstops, d_discontinuities), h),
+            )
+        end
+    catch
+        _destroy!(h)
+        rethrow()
     end
-    initialize_save && _initial_save!(h)
     _destroy!(old)
     integ.h = h
     integ.u = _integ_state(integ.prob, h.u0)
@@ -4739,6 +4780,7 @@ function _reinit_unlocked(
     integ.tstops = _tstops(vcat(tstops, d_discontinuities), h)
     integ.d_discontinuities = d_discontinuities
     integ.finished = false
+    dt === nothing || _use_dt!(integ, dt, reset_dt === true)
     for ev in integ.event_t
         fill!(ev, NaN)
     end
@@ -4761,6 +4803,7 @@ end
 function _finish!(integ::PETScIntegrator, retcode = nothing)
     integ.finished && return nothing
     h = integ.h
+    retcode === nothing || (integ.sol = SciMLBase.solution_new_retcode(integ.sol, retcode))
     _checked_everywhere(h.ctx.comm) do
         for cb in (integ.callbacks..., integ.continuous...)
             cb.finalize(cb, integ.u, integ.t, integ)
@@ -4948,6 +4991,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     else
         _past_discontinuity!(integ)
         _live_stats!(integ)
+        integ.sol.retcode == SciMLBase.ReturnCode.Default &&
+            (integ.sol = SciMLBase.solution_new_retcode(integ.sol, SciMLBase.ReturnCode.Success))
     end
     return nothing
 end
@@ -4964,6 +5009,97 @@ end
 SciMLBase.solve!(integ::PETScIntegrator) = _locked(() -> _solve_integrator_unlocked(integ))
 
 SciMLBase.done(integ::PETScIntegrator) = integ.finished
+
+SciMLBase.check_error(integ::PETScIntegrator) =
+    integ.sol.retcode == SciMLBase.ReturnCode.Default ? SciMLBase.ReturnCode.Success :
+    integ.sol.retcode
+
+function _postamble_unlocked(integ::PETScIntegrator)
+    integ.finished || _finish!(integ, integ.sol.retcode)
+    return nothing
+end
+
+SciMLBase.postamble!(integ::PETScIntegrator) = _locked(() -> _postamble_unlocked(integ))
+
+SciMLBase.last_step_failed(integ::PETScIntegrator) =
+    integ.finished && !SciMLBase.isadaptive(integ) &&
+    integ.sol.retcode == SciMLBase.ReturnCode.ConvergenceFailure
+
+SciMLBase.change_t_via_interpolation!(
+    integ::PETScIntegrator, t, modify_save_endpoint::Type{Val{T}}, reinitialize_alg,
+) where {T} = SciMLBase.change_t_via_interpolation!(integ, t, modify_save_endpoint)
+
+SciMLBase.set_abstol!(integ::PETScIntegrator, abstol) = (integ.opts.abstol = abstol; nothing)
+SciMLBase.set_reltol!(integ::PETScIntegrator, reltol) = (integ.opts.reltol = reltol; nothing)
+
+_counted(::Nothing, calls, k) = nothing
+_counted(f, calls, k) = function (du, u, p, t)
+    calls[k] += 1
+    return f(du, u, p, t)
+end
+
+_check_estimable(alg) = alg isa TSGeneric && throw(
+    ArgumentError(
+        "the first step is estimated from the method's order, which `TSGeneric` " *
+            "does not know; set the step with set_proposed_dt! instead",
+    ),
+)
+
+function _estimate_dt(h::TSHandles{<:Any, <:Any, R}, alg, opts, u, s, stops) where {R}
+    _check_estimable(alg)
+    ctx = h.ctx
+    dtmin = abs(getfield(opts, :dtmin))
+    ctx.dae && return max(R(1.0e-6) * abs(h.tf - h.t0), _min_step(s))
+    ctx.M === nothing ||
+        return max(nextfloat(max(dtmin, eps(s))), R(1.0e-6), _min_step(s))
+    i = findfirst(>(s), stops)
+    stop = i === nothing ? h.tf : min(stops[i], h.tf)
+    threw, calls = Ref{Any}(nothing), [0, 0]
+    f2 = ctx.f2! === nothing ? nothing : _guard_f(ctx.f2!, ctx.comm, threw)
+    dt = _initial_dt(
+        _counted(_guard_f(ctx.f!, ctx.comm, threw), calls, 1), _counted(f2, calls, 2),
+        u, ctx.p, s, one(R), SciMLBase.alg_order(alg),
+        getfield(opts, :abstol), getfield(opts, :reltol), dtmin,
+        min(abs(getfield(opts, :dtmax)), stop - s), ctx.comm,
+    )
+    ctx.nf += calls[1]
+    ctx.nf2 += calls[2]
+    _throw_anywhere(ctx.comm, threw[])
+    return dt
+end
+
+function _use_dt!(integ::PETScIntegrator, dt, estimated = false)
+    dt = abs(oftype(integ.t, dt))
+    integ.dt = integ.tdir * dt
+    estimated && !SciMLBase.isadaptive(integ) && return nothing
+    LibPETSc.TSSetTimeStep(integ.h.petsclib, integ.h.ts, dt)
+    integ.dtcache = integ.dt
+    return nothing
+end
+
+function _auto_dt_unlocked(integ::PETScIntegrator)
+    integ.finished && return nothing
+    h = integ.h
+    _use_dt!(
+        integ, _estimate_dt(h, integ.alg, integ.opts, integ.u, integ.tdir * integ.t, integ.tstops),
+        true,
+    )
+    _live_stats!(integ)
+    return nothing
+end
+
+SciMLBase.auto_dt_reset!(integ::PETScIntegrator) = _locked(() -> _auto_dt_unlocked(integ))
+
+_no_resize() = throw(
+    ArgumentError(
+        "PETScDiffEq cannot change the length of the state: PETSc sizes its vectors, " *
+            "matrices and solvers when the integrator is made, so a state of another " *
+            "length needs a new integrator",
+    ),
+)
+Base.resize!(::PETScIntegrator, ::Int) = _no_resize()
+Base.deleteat!(::PETScIntegrator, idxs) = _no_resize()
+SciMLBase.addat!(::PETScIntegrator, idxs, val = nothing) = _no_resize()
 
 include("autodiff.jl")
 include("adjoint.jl")
