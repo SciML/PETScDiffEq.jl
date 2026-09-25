@@ -272,6 +272,27 @@ end
         @test everywhere(got.u == ref.u)
     end
 
+    @testset "an implicit solve on a periodic grid of any size" begin
+        ring = PETSc.DMDA(
+            pl, comm, (LibPETSc.DM_BOUNDARY_PERIODIC,), (N,), 1, 1;
+            points_per_proc = (LibPETSc.PetscInt.(counts),),
+        )
+        wave(idx) = cospi.(2 .* idx ./ N) .+ 0.5 .* sinpi.(6 .* idx ./ N)
+        got = solve(ODEProblem(heat_dm!, wave(rows), SPAN, ring), implicit(; dm = ring); TOL...)
+        @test got.retcode == ReturnCode.Success
+        us = natural(got, ring, N)
+        if rank == 0
+            ring!(du, u, p, t) = laplacian!(du, u, u[end], u[1])
+            I = repeat(1:N; inner = 3)
+            J = [mod1(i + d, N) for i in 1:N for d in -1:1]
+            fn = ODEFunction(ring!; jac_prototype = sparse(I, J, ones(3N), N, N))
+            serial = solve(ODEProblem(fn, wave(1:N), SPAN), implicit(); TOL...)
+            @test got.t[end] == serial.t[end]
+            @test maximum(abs, us[end] - serial.u[end]) <= ROUNDOFF
+        end
+        PETScCompat.destroy!(ring)
+    end
+
     @testset "2-D heat, explicit and implicit" begin
         slab = uneven(NY)
         across = grid_da((nranks, 1), (LibPETSc.PetscInt.(uneven(NX)), nothing))
