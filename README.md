@@ -262,8 +262,7 @@ what it needs, what it refuses and how to check `jac` and `paramjac`.
 
 ## MPI
 
-`TSRK`, `TSRosW`, `TSImplicit`, `TSIRK`, `TSDAE`, `TSARKIMEX` and
-`TSGeneric(ts_type; explicit = true)` take a `comm` keyword. With a communicator
+Every algorithm takes a `comm` keyword. With a communicator
 other than the default `MPI.COMM_SELF` the solve runs distributed over it: every rank of
 `comm` calls `solve` with the same arguments, and `u0` is the block of the state that rank
 owns, the blocks following each other in rank order. Each rank's `sol.u` holds its own rows,
@@ -369,6 +368,13 @@ ILU(0) block on each rank, to a relative tolerance of 1e-5, so such a solve agre
 serial one to that accuracy rather than to round-off. Options such as `-ksp_rtol` or
 `-sub_pc_type` in `petsc_options` change that solver.
 
+`TSMPRK`'s `slow` and `medium` index the rank's own rows, and either may be empty on some
+ranks as long as some rank names a slow row and, for `"2a23"` and `"2a33"`, a medium one. An
+implicit `TSGeneric` runs distributed for `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`,
+`"arkimex"`, `"irk"`, `"alpha"` and `"dirk"`, as `TSImplicit` does. Other implicit types are
+refused: `"glle"`'s step control follows the round-off of the distributed linear solve, so it
+takes other steps than a serial solve and ends with another error, larger or smaller.
+
 `PETScAdjoint` runs distributed too, for `TSRK`, `TSImplicit("beuler")` and
 `TSImplicit("cn")`. It needs the problem's `jac`, filling this rank's rows of a sparse
 prototype as above, and when there are parameters a `paramjac` filling this rank's rows,
@@ -436,17 +442,16 @@ and `du` owned. Everything else the package calls, such as a callback, `unstable
 DM itself stays free for further solves. A DMDA on `MPI.COMM_SELF`, or on a single rank, gives
 a serial solve. Only a DMDA is taken so far.
 
-A distributed solve refuses, with an `ArgumentError`, `TSMPRK` and an implicit `TSGeneric`, and
-one with a `dm` refuses `PETScAdjoint` as well. Solving from several threads at once, as
-`EnsembleThreads` does, is not refused, but nothing then keeps the ranks' solves in the same
-order, which they need.
+A solve with a `dm` refuses, with an `ArgumentError`, `TSMPRK`, an implicit `TSGeneric` and
+`PETScAdjoint`. Solving from several threads at once, as `EnsembleThreads` does, is not
+refused, but nothing then keeps the ranks' solves in the same order, which they need.
 
 ## Limitations
 
-Only the algorithms named under MPI run distributed so far, and not on a
-`DynamicalODEProblem` or `SecondOrderODEProblem`; every other solve runs on `MPI.COMM_SELF`. PETSc TS is built for large distributed problems, and reaching it
-from the SciML interface is what this package is for; use OrdinaryDiffEq.jl for serial
-problems where it applies.
+A `DynamicalODEProblem` or `SecondOrderODEProblem` does not run distributed yet, whatever the
+algorithm, so `TSBasicSymplectic` and `TSAlpha2` run on `MPI.COMM_SELF` only. PETSc TS is
+built for large distributed problems, and reaching it from the SciML interface is what this
+package is for; use OrdinaryDiffEq.jl for serial problems where it applies.
 
 On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.

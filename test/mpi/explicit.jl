@@ -500,12 +500,42 @@ crossing_last_row(idx, level) =
         terminate!(integ)
     end
 
+    @testset "TSMPRK with its splits spread over the ranks" begin
+        slow, medium = 1:11, 12:17
+        mine(g, idx) = [k for (k, i) in enumerate(idx) if i in g]
+        mprk(idx, sub, c) = sub in ("2a23", "2a33") ?
+            TSMPRK(mine(slow, idx), mine(medium, idx), sub; comm = c) :
+            TSMPRK(mine(slow, idx), sub; comm = c)
+        for sub in ("p2", "p3", "2a22", "2a23", "2a33")
+            sol, ref = against_serial(comm, MPI.COMM_SELF) do idx, c
+                a = mprk(idx, sub, c)
+                prob = ODEProblem(parallel(a) ? heat! : heat_serial!, heat0(idx), (0.0, 0.02))
+                solve(prob, a; dt = 1.0e-4)
+            end
+            @test sol.retcode == ReturnCode.Success
+            @test matches_serial(sol, ref)
+            rank == 0 && @test sol.stats.nf == ref.stats.nf
+            u = gathered(sol.u[end], counts)
+            rank == 0 && @test maximum(abs, u - heat_exact(1:N, 0.02)) <= 5.0e-6
+        end
+        f = heat_throwing(t -> t > 0.01)
+        prob = ODEProblem(f, heat0(rows), (0.0, 0.02))
+        @test raised(caught(() -> solve(prob, mprk(rows, "p2", comm); dt = 1.0e-4)), "f threw")
+    end
+
     @testset "refusals" begin
         prob = decay_problem(rows)
-        for alg in (TSMPRK([1]; comm), TSGeneric("alpha"; comm))
-            @test refused(() -> solve(prob, alg; dt = 0.1), "cannot run")
-        end
         n = length(rows)
+        for (alg, what) in (
+                (TSMPRK(Int[]; comm), "`slow` names no index on any rank"),
+                (TSMPRK(collect(1:n); comm), "leaving nothing fast"),
+                (TSMPRK([1], Int[], "2a23"; comm), "needs a `medium` index on some rank"),
+                (TSGeneric("beuler"; explicit = true, comm), "cannot run"),
+            )
+            @test refused(() -> solve(prob, alg; dt = 0.1), what)
+        end
+        e = caught(() -> solve(prob, TSMPRK([rank == thrower ? n + 1 : 1]; comm); dt = 0.1))
+        @test rank == thrower ? e isa ArgumentError && occursin("names index", e.msg) : remote(e)
         jac = ODEFunction(decay!; jac = (J, u, p, t) -> nothing)
         @test refused(
             () -> solve(ODEProblem(jac, decay0(rows), (0.0, 1.0), rows), TSRK("5dp"; comm)),
