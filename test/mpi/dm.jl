@@ -47,7 +47,6 @@ refused(f, what) = (e = caught(f); e isa ArgumentError && occursin(what, e.msg))
 refused_on_thrower(e, what) =
     rank == thrower ? e isa ArgumentError && occursin(what, e.msg) : remote(e)
 
-# Each rank's owned points of a DM vector, summed onto rank 0 in natural order.
 function natural(u, dm, dims)
     full = zeros(dims)
     a = reshape_local_array(u, dm)
