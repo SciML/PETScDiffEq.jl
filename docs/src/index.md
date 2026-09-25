@@ -60,8 +60,11 @@ The options available in `solve` are documented
 This package supports `dt`, `adaptive`, `dtmin`, `force_dtmin`, `dtmax`, `reltol` and
 `abstol` (either may be a vector of per-component tolerances), `saveat`, `save_everystep`,
 `save_start`, `save_end`, `save_on`, `save_idxs`, `dense`, `callback`, `tstops`,
-`d_discontinuities`, `unstable_check` and `isoutofdomain`. Keywords it cannot
-honour emit a warning rather than being silently dropped.
+`d_discontinuities`, `unstable_check`, `isoutofdomain`, `timeseries_errors`,
+`dense_errors` and `verbose`. The warning a solve that ends early gives is logged at the
+`instability` level of a `DEVerbosity`, so `verbose = DEVerbosity(SciMLLogging.None())`
+silences it, as do `SciMLLogging.None()` and `false`. Keywords it cannot honour emit a
+warning rather than being silently dropped.
 
 Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
 only when it names them or `save_start` or `save_end` asks, and `save_everystep = true`
