@@ -2803,8 +2803,8 @@ end
 
 const _NOT_SELF = "on a communicator other than MPI.COMM_SELF"
 
-_in_threads_loop() =
-    current_task() !== Base.roottask && ccall(:jl_in_threaded_region, Cint, ()) != 0
+_in_threads_loop() = Threads.threadpoolsize() > 1 && current_task() !== Base.roottask &&
+    ccall(:jl_in_threaded_region, Cint, ()) != 0
 
 function _check_irk_layout(n, N, comm)
     nranks = MPI.Comm_size(comm)
