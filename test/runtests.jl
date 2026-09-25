@@ -2325,7 +2325,7 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test isempty(PETScDiffEq.POST_STEP_CTX)
         end
 
-        @testset "verbose = false silences the warning for a solve that ends early" begin
+        @testset "verbose silences the warning for a solve that ends early" begin
             breaks = SciMLBase.ODEProblem(
                 (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
             )
@@ -2333,11 +2333,22 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
                 (du, u, p, t) -> (du[1] = u[1]^2; nothing), [1.0], (0.0, 2.0),
             )
             never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
-            for pr in (breaks, runaway), kw in ((;), (; callback = never))
+            logging = PETScDiffEq.DiffEqBase.SciMLLogging
+            quiet = PETScDiffEq.DiffEqBase.DEVerbosity(logging.None())
+            for pr in (breaks, runaway), kw in ((;), (; callback = never)),
+                    verbose in (
+                        false, logging.None(), quiet,
+                        PETScDiffEq.DiffEqBase.DEVerbosity(instability = logging.Silent()),
+                    )
                 sol = @test_logs min_level = Logging.Warn SciMLBase.solve(
-                    pr, PETScDiffEq.TSRK("5dp"); verbose = false, kw...,
+                    pr, PETScDiffEq.TSRK("5dp"); verbose, kw...,
                 )
                 @test sol.retcode == SciMLBase.ReturnCode.Unstable
+            end
+            for verbose in (false, logging.None(), quiet)
+                integ = SciMLBase.init(breaks, PETScDiffEq.TSRK("5dp"))
+                integ.opts.verbose = verbose
+                @test_logs min_level = Logging.Warn SciMLBase.solve!(integ)
             end
         end
 

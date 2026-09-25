@@ -10,6 +10,7 @@ using PETSc: PETSc
 using Libdl: Libdl
 using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
+using SciMLLogging: SciMLLogging
 using SciMLOperators: SciMLOperators
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
     sparse
@@ -879,17 +880,24 @@ _failed_step(e, h) =
     e isa LibPETSc.PetscError && !h.pivot_raises &&
     (e.code == PETSC_ERR_MAT_LU_ZRPVT || e.code == PETSC_ERR_FP)
 
-_verbose(kwargs) = get(kwargs, :verbose, true) !== false
+_verbosity(v::SciMLLogging.AbstractVerbosityPreset) = DiffEqBase.DEVerbosity(v)
+_verbosity(v) = v
 
-function _warn_failed_step(alg, code, kwargs)
-    _verbose(kwargs) || return nothing
-    why = code == PETSC_ERR_FP ?
-        "PETSc hit a floating point exception, an overflow or a NaN in the step or in " *
-        "its error estimate" :
-        "the LU factorization of its Newton matrix hit a zero pivot"
-    @warn "`$(_warn_name(alg))` ends here because $why"
+function _ends_early(alg, why, verbose)
+    SciMLLogging.@SciMLMessage(
+        "`$(_warn_name(alg))` ends here because $why", _verbosity(verbose), :instability,
+    )
     return nothing
 end
+
+_warn_failed_step(alg, code, verbose) = _ends_early(
+    alg,
+    code == PETSC_ERR_FP ?
+        "PETSc hit a floating point exception, an overflow or a NaN in the step or in " *
+        "its error estimate" :
+        "the LU factorization of its Newton matrix hit a zero pivot",
+    verbose,
+)
 
 function _ts_dm(pl, ts)
     dm = Ref{Ptr{Cvoid}}(C_NULL)
@@ -2794,6 +2802,7 @@ function _solve_unlocked(
     ctx, pl = h.ctx, h.petsclib
     floor = abs(oftype(h.t0, something(get(kwargs, :dtmin, nothing), 0.0)))
     forced = get(kwargs, :force_dtmin, false) === true
+    verbose = get(kwargs, :verbose, true)
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
         if ctx.comm === nothing
@@ -2810,12 +2819,12 @@ function _solve_unlocked(
             end
             raised = h.stopped != 0
             raised && ctx.err === nothing && failure === nothing &&
-                _retry_solve!(h, alg, floor, forced, kwargs) || break
+                _retry_solve!(h, alg, floor, forced, verbose) || break
         end
         _throw_if_threw!(ctx)
         failure === nothing || throw(failure)
-        h.stopped == 0 || _warn_failed_step(alg, h.stopped, kwargs)
-        ctx.stalled && _stalled!(h, alg, _user_t(h.tdir, ctx.end_s), kwargs)
+        h.stopped == 0 || _warn_failed_step(alg, h.stopped, verbose)
+        ctx.stalled && _stalled!(h, alg, _user_t(h.tdir, ctx.end_s), verbose)
         # PETSc sets the solve time only when TSSolve returns normally, and a step that
         # raises leaves its rejected trial in the solution vector.
         tend, uend = raised || ctx.stalled ? (ctx.end_s, copy(ctx.end_u)) :
@@ -2829,22 +2838,21 @@ function _solve_unlocked(
     return sol
 end
 
-function _stalled!(h, alg, t, kwargs)
+function _stalled!(h, alg, t, verbose)
     pl, ctx = h.petsclib, h.ctx
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.TSGetStepNumber(pl, h.ts) - 1)
     ctx.nreject += 1
     ctx.unstable_hit = true
-    _verbose(kwargs) && @warn "`$(_warn_name(alg))` ends here because its step fell below " *
-        "the floating point spacing at t = $t"
+    _ends_early(alg, "its step fell below the floating point spacing at t = $t", verbose)
     return nothing
 end
 
-function _retry_solve!(h, alg, floor, forced, kwargs)
+function _retry_solve!(h, alg, floor, forced, verbose)
     ctx, pl = h.ctx, h.petsclib
     h.stopped == PETSC_ERR_FP && _return_work_vec!(ctx, h.ts) || return false
     h.stopped = 0
     dt, _ = _retry_step(h, ctx.end_s, LibPETSc.TSGetTimeStep(pl, h.ts), floor, forced, true)
-    dt === nothing && (_warn_failed_step(alg, PETSC_ERR_FP, kwargs); return false)
+    dt === nothing && (_warn_failed_step(alg, PETSC_ERR_FP, verbose); return false)
     # TSSolve zeroes its counters when it starts on step 0.
     LibPETSc.TSGetStepNumber(pl, h.ts) == 0 &&
         (ctx.nreject += Int(LibPETSc.TSGetStepRejections(pl, h.ts)))
@@ -2865,7 +2873,7 @@ mutable struct PETScIntegratorOpts{H, R}
     reltol::Any
     dtmin::R
     dtmax::R
-    verbose::Bool
+    verbose::Any
     force_dtmin::Bool
 end
 
@@ -3012,7 +3020,7 @@ _make_opts(h::TSHandles{<:Any, <:Any, R}, kwargs) where {R} = PETScIntegratorOpt
     get(kwargs, :abstol, 1.0e-6), get(kwargs, :reltol, 1.0e-3),
     R(something(get(kwargs, :dtmin, nothing), 0.0)),
     R(something(get(kwargs, :dtmax, nothing), Inf)),
-    get(kwargs, :verbose, true) === true, get(kwargs, :force_dtmin, false) === true,
+    get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
 )
 
 SciMLBase.isadaptive(integ::PETScIntegrator) =
@@ -3502,7 +3510,7 @@ function _reject_step!(integ::PETScIntegrator, before, taken)
     forced = get(integ.kwargs, :force_dtmin, false) === true
     dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, failed)
     if dt === nothing
-        failed && _warn_failed_step(integ.alg, PETSC_ERR_FP, integ.kwargs)
+        failed && _warn_failed_step(integ.alg, PETSC_ERR_FP, integ.opts.verbose)
         _restore_prev!(integ, outer)
         ctx.fstart = nothing
         _finish!(integ)
@@ -3814,11 +3822,11 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     if h.stopped == PETSC_ERR_FP && SciMLBase.isadaptive(integ) && _return_work_vec!(ctx, h.ts)
         return _reject_step!(integ, before, LibPETSc.TSGetTimeStep(pl, h.ts))
     end
-    h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped, integ.kwargs)
+    h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped, integ.opts.verbose)
     integ.t = _user_t(integ.tdir, LibPETSc.TSGetTime(pl, h.ts))
     if integ.tdir * integ.t <= integ.tdir * start
         if h.stopped == 0 && Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
-            _stalled!(h, integ.alg, integ.t, integ.kwargs)
+            _stalled!(h, integ.alg, integ.t, integ.opts.verbose)
         end
         _restore_prev!(integ, before[5])
         _finish!(integ)
