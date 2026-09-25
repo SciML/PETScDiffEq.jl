@@ -18,8 +18,12 @@ squares are OrdinaryDiffEq or Sundials. Lines of one color are the same method o
 nearest counterpart. Five pairs share their coefficients, which fixed-step solves confirm by
 agreeing to rounding: `TSRK("3bs")` and `BS3`, `TSRK("5dp")` and `DP5`,
 `TSRosW("ra34pw2")` and `ROS34PW2`, `TSRosW("rodas3")` and `Rodas3`, and
-`TSARKIMEX("4")` and `KenCarp4`. `TSRK("7vr")` and `TSRK("8vr")` use different Verner pairs
-from `Vern7` and `Vern8`.
+`TSARKIMEX("4")` and `KenCarp4`, the last with tight Newton tolerances. For the two `TSRosW`
+pairs this holds only when ``f`` does not depend on ``t``, as in all four problems here.
+PETSc's Rosenbrock-W leaves out the time derivative of ``f``, so when ``f`` depends on ``t``,
+`TSRosW("ra34pw2")` keeps its order but no longer matches `ROS34PW2`, and `TSRosW("rodas3")`
+falls to first order; see [`TSRosW`](@ref). `TSRK("7vr")` and `TSRK("8vr")` use different
+Verner pairs from `Vern7` and `Vern8`.
 
 The numbers were measured with Julia 1.10.12, one thread, on a 16-CPU Modal container,
 with PETSc_jll 3.22.2 and the package versions in
