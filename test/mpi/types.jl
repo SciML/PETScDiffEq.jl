@@ -110,10 +110,11 @@ end
 
 const TYPES = (Float32, ComplexF64, ComplexF32)
 const BOUNDS = Dict(
-    Float32 => (serial = 5.0e-5, exact = 1.0e-4),
-    ComplexF64 => (serial = 5.0e-8, exact = 1.0e-4),
-    ComplexF32 => (serial = 2.0e-5, exact = 1.0e-4),
+    Float32 => (implicit = 1.0e-6, adaptive = 5.0e-5, fixed = 1.0e-6),
+    ComplexF64 => (implicit = 5.0e-8, adaptive = 1.0e-14, fixed = 1.0e-14),
+    ComplexF32 => (implicit = 2.0e-6, adaptive = 2.0e-5, fixed = 1.0e-6),
 )
+const EXACT = 1.0e-4
 
 @testset "MPI number types, $nranks ranks" begin
     @testset "$S" for S in TYPES
@@ -138,8 +139,9 @@ const BOUNDS = Dict(
                 @test eltype(sol.t) === R && eltype(sol.u[end]) === S
                 u = gathered(sol.u[end])
                 if rank == 0
-                    @test maximum(abs, u - ref.u[end]) <= bound.serial
-                    @test maximum(abs, u - heat_exact(S, 0.1)) <= bound.exact
+                    gap = jac === nothing ? bound.adaptive : bound.implicit
+                    @test maximum(abs, u - ref.u[end]) <= gap
+                    @test maximum(abs, u - heat_exact(S, 0.1)) <= EXACT
                 end
             end
         end
@@ -160,8 +162,9 @@ const BOUNDS = Dict(
                 us = gathered(sol)
                 rank == 0 || continue
                 what == "vector tolerances" || @test sol.t == ref.t
-                @test maximum(abs, us[end] - ref.u[end]) <= bound.serial
-                what == "vector tolerances" || @test maxdiff(us, ref.u) <= bound.serial
+                gap = what == "fixed step" ? bound.fixed : bound.adaptive
+                @test maximum(abs, us[end] - ref.u[end]) <= gap
+                what == "vector tolerances" || @test maxdiff(us, ref.u) <= gap
             end
         end
 
@@ -192,8 +195,8 @@ const BOUNDS = Dict(
                 @test got.fired == ref.fired > 0
                 @test length(got.sol.t) == length(ref.sol.t)
                 @test maximum(abs, got.sol.t - ref.sol.t) <= 4 * eps(R)
-                @test maxdiff(us, ref.sol.u) <= bound.serial
-                @test maxdiff(mids, ref.mids) <= bound.serial
+                @test maxdiff(us, ref.sol.u) <= bound.fixed
+                @test maxdiff(mids, ref.mids) <= bound.fixed
             end
         end
 
@@ -209,9 +212,11 @@ const BOUNDS = Dict(
             end
             @test sol.retcode == ReturnCode.Unstable
             @test same_everywhere(sol.t)
+            us = gathered(sol)
             if rank == 0
                 @test length(sol.t) == length(ref.t)
                 @test maximum(abs, sol.t - ref.t) <= 4 * eps(R)
+                @test maxdiff(us, ref.u) <= bound.adaptive
                 @test sol.stats.nreject == ref.stats.nreject
             end
         end
