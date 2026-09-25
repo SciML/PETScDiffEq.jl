@@ -5705,6 +5705,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
                 @test_throws "which `TSGeneric` does not know" SciMLBase.auto_dt_reset!(integ)
                 SciMLBase.terminate!(integ)
+
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.02, adaptive = false)
+                SciMLBase.step!(integ)
+                SciMLBase.auto_dt_reset!(integ)
+                here = SciMLBase.remake(prob; u0 = copy(integ.u), tspan = (integ.t, 1.0))
+                @test integ.dt == first_dt(here, PETScDiffEq.TSRK("5dp"))
+                @test SciMLBase.get_proposed_dt(integ) == 0.02
+                SciMLBase.step!(integ)
+                @test integ.dt ≈ 0.02
+                SciMLBase.reinit!(integ; reset_dt = true)
+                @test integ.dt == first_dt(prob, PETScDiffEq.TSRK("5dp"))
+                @test SciMLBase.get_proposed_dt(integ) == 0.02
+                SciMLBase.step!(integ)
+                @test integ.t == 0.02
+                SciMLBase.terminate!(integ)
             end
 
             @testset "reinit! takes reset_dt and reinit_cache" begin

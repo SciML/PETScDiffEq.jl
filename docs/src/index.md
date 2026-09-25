@@ -121,7 +121,8 @@ also gives `MaxIters` or `Unstable`. `check_error!` and `postamble!` work as Sci
 defines them, `postamble!` finishing the integrator where it is. Unlike OrdinaryDiffEq's,
 a finished integrator cannot step again. `auto_dt_reset!` takes the step `init` would take
 from the current state, and `reinit!` does the same with `reset_dt = true`, or keeps
-the proposed step with `reset_dt = false`. `get_proposed_dt` is signed, negative on a
+the proposed step with `reset_dt = false`. A fixed-step integrator goes on at its fixed size
+through both, as OrdinaryDiffEq's does, and only `dt` shows the estimate. `get_proposed_dt` is signed, negative on a
 reversed span, and `set_proposed_dt!` also takes another integrator whose proposed step it
 copies. `set_abstol!` and `set_reltol!` hold for the steps after.
 `change_t_via_interpolation!` with `Val{true}` drops what was saved past the new time, and
