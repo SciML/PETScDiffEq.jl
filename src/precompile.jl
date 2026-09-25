@@ -63,11 +63,6 @@ end
             _run_workload()
         catch
             # A PETSc that cannot run here must leave the package loadable.
-        finally
-            for pl in PETSc.petsclibs
-                PETScCompat.isinitialized(pl) && !PETScCompat.isfinalized(pl) &&
-                    PETSc.finalize(pl)
-            end
         end
     end
     # The workload's pointers and handles belong to the precompiling process.
