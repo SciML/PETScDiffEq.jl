@@ -33,7 +33,7 @@ problems, and slower than the same method in OrdinaryDiffEq wherever the coeffic
 
 | Problem | Fastest PETScDiffEq method, relative to the fastest overall | Same method, PETScDiffEq relative to OrdinaryDiffEq |
 |:--- | ---:| ---:|
-| Lotka-Volterra, 2 states | 35 | 29 (`TSRK("5dp")`, `DP5`) |
+| Lotka-Volterra, 2 states | 32 | 29 (`TSRK("5dp")`, `DP5`) |
 | HIRES, 8 states | 21 | 16 (`TSRosW("ra34pw2")`, `ROS34PW2`) |
 | Robertson DAE, 3 states | at least 51 | 26 (`TSRosW("ra34pw2")`, `ROS34PW2`) |
 | Brusselator, 1000 states | 7.1 | 1.8 (`TSRosW("ra34pw2")` with LU, `ROS34PW2`) |
@@ -52,8 +52,8 @@ with `abstol` from 1e-6 to 1e-13 and `reltol` from 1e-3 to 1e-10. The reference 
 
 ![Lotka-Volterra work-precision](assets/workprecision/lotka_volterra.png)
 
-Time to an error of 1e-8, interpolated between the measured points
-([data](assets/workprecision/lotka_volterra.csv)):
+Time to an error of 1e-8, interpolated between the measured points that no other run beats on
+both error and time ([data](assets/workprecision/lotka_volterra.csv)):
 
 | Solver | Time (ms) | Relative to the fastest |
 |:--- | ---:| ---:|
@@ -63,7 +63,7 @@ Time to an error of 1e-8, interpolated between the measured points
 | `DP5` | 0.0681 | 2.0 |
 | `TSRK("7vr")` | 1.28 | 36.9 |
 | `Vern7` | 0.0346 | 1.0 |
-| `TSRK("8vr")` | 1.22 | 35.3 |
+| `TSRK("8vr")` | 1.1 | 31.7 |
 | `Vern8` | 0.0408 | 1.2 |
 | `Tsit5` | 0.062 | 1.8 |
 | `CVODE_Adams` | 0.409 | 11.8 |
@@ -114,7 +114,7 @@ Time to an error of 1e-6 ([data](assets/workprecision/robertson_dae.csv)):
 |:--- | ---:| ---:|
 | `TSDAE("bdf"; order = 5)` | 5.51 | 62.2 |
 | `DFBDF` | 0.425 | 4.8 |
-| `IDA` | 0.14 | 1.6 |
+| `IDA` | 0.138 | 1.6 |
 | `TSImplicit("bdf"; order = 5)`, mass matrix | 5.41 | 61.1 |
 | `FBDF`, mass matrix | 0.407 | 4.6 |
 | `TSRosW("ra34pw2")`, mass matrix | 4.51 | 50.9 |
