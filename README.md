@@ -16,6 +16,18 @@ using Pkg
 Pkg.add("PETScDiffEq")
 ```
 
+Precompiling the package runs a few small solves through PETSc, so that the first `solve`
+of a session compiles much less. To precompile without them:
+
+```julia
+using PETScDiffEq, Preferences
+set_preferences!(PETScDiffEq, "precompile_workload" => false; force = true)
+```
+
+Precompiling under `mpiexec` or `srun` skips these solves, and later sessions reuse that
+build until the package or one of its dependencies changes, so load the package once
+without the launcher before the first parallel run.
+
 ## Common API Usage
 
 This library adds the common interface to PETSc's TS solvers.
@@ -54,6 +66,9 @@ estimate. `TSGeneric` needs it too, since which of its types adapt is not known 
 - `TSIRK(nstages)`, Gauss-Legendre implicit Runge-Kutta of order `2 * nstages`
 - `TSARKIMEX(subtype)`, additive Runge-Kutta IMEX, for a `SplitODEProblem`
 - `TSDAE(subtype)`, the same implicit methods applied to a `DAEProblem`
+- `TSBasicSymplectic(subtype)`, symplectic splitting methods for a `DynamicalODEProblem` or
+  `SecondOrderODEProblem`
+- `TSAlpha2()`, generalized-alpha for a `SecondOrderODEProblem`
 - `TSGeneric(ts_type)`, a pass-through to any other PETSc `TSType` by name
 
 Each has a docstring covering its subtypes, whether it adapts and what it requires, so
@@ -69,8 +84,11 @@ The options available in `solve` are documented
 This package supports `dt`, `adaptive`, `dtmin`, `force_dtmin`, `dtmax`, `reltol` and
 `abstol` (either may be a vector of per-component tolerances), `saveat`, `save_everystep`,
 `save_start`, `save_end`, `save_on`, `save_idxs`, `dense`, `callback`, `tstops`,
-`d_discontinuities`, `unstable_check`, `isoutofdomain` and `initializealg`. Keywords it
-cannot honour emit a warning rather than being silently dropped.
+`d_discontinuities`, `unstable_check`, `isoutofdomain`, `timeseries_errors`,
+`dense_errors`, `verbose` and `initializealg`. The warning a solve that ends early gives is logged at the
+`instability` level of a `DEVerbosity`, so `verbose = DEVerbosity(SciMLLogging.None())`
+silences it, as do `SciMLLogging.None()` and `false`. Keywords it cannot honour emit a
+warning rather than being silently dropped.
 
 Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
 only when it names them or `save_start` or `save_end` asks, and `save_everystep = true`
@@ -83,18 +101,26 @@ the step after each starts one ULP past it, so the right-hand side there sees th
 when written as `if t > t_d`. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
 step that leaves the domain is taken again at a fifth of its size, as OrdinaryDiffEq takes it;
 one that cannot be made small enough ends the solve with `Unstable`, or `DtLessThanMin` at
-`dtmin`. An explicit adaptive step whose error estimate is NaN or infinite, as when the
-right-hand side returns NaN or the state overflows, is taken again smaller the same way, and
-both kinds of retry count in `stats.nreject`. An implicit method's Newton solve fails on a NaN
-instead, which ends the solve with `ConvergenceFailure`.
+`dtmin`. An adaptive step whose error estimate is NaN or infinite, as when an explicit
+method's right-hand side returns NaN or the state overflows, is taken again smaller the same
+way, and both kinds of retry count in `stats.nreject`. An adaptive implicit step whose Newton
+or linear solve fails, as when its right-hand side returns NaN, or whose Newton matrix has a
+zero pivot, is taken again at PETSc's `-ts_adapt_scale_solve_failed` share of its size, a
+quarter by default, as many times as it takes, and counts in `stats.nnonlinconvfail` rather
+than `stats.nreject`. OrdinaryDiffEq counts a failed Newton solve the same way, but counts a
+zero pivot, and a Rosenbrock step that turns NaN, in `stats.nreject`. A fixed-step solve ends
+at its first failed Newton or linear solve with `ConvergenceFailure`, as OrdinaryDiffEq's
+Newton-based methods do with `adaptive = false`.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
-state stops being finite, a step overflows or turns NaN at every size tried, with a warning,
-an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
+state stops being finite, a step overflows, turns NaN or fails its Newton or linear solve at
+every size tried, with a warning, an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
 returns true, which is asked before each step with the step about to be taken, as
-OrdinaryDiffEq asks it, `ConvergenceFailure` when a nonlinear
-solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are taken, and
-`Failure` for a zero pivot, with a warning, or another step PETSc cannot take. Where
+OrdinaryDiffEq asks it, `ConvergenceFailure` when a fixed-step nonlinear
+solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are accepted, where
+OrdinaryDiffEq counts rejected and failed attempts too, and
+`Failure` for a zero pivot in a fixed-step solve, with a warning, or another step PETSc cannot
+take. Where
 `petsc_options` asks PETSc to raise, with `-ksp_error_if_not_converged`,
 `-snes_error_if_not_converged` or `-ts_error_if_step_fails`, it raises instead.
 
@@ -105,8 +131,8 @@ output uses for everything else, `TSGeneric` and a type `petsc_options` changes 
 With a mass matrix or a `DAEProblem` only PETSc's is available, and a type that has none
 raises an `ArgumentError` when such a state is needed.
 
-`ODEProblem`, `SplitODEProblem` and `DAEProblem` are supported, in place or out of
-place, along with
+`ODEProblem`, `SplitODEProblem`, `DAEProblem`, `DynamicalODEProblem` and
+`SecondOrderODEProblem` are supported, in place or out of place, along with
 `ODEFunction`'s `jac`, `jac_prototype` and `mass_matrix`. Supply a `jac_prototype` for
 anything sparse: without one the Jacobian is dense and forces a dense factorization.
 
@@ -122,7 +148,77 @@ wrong in its first digit, so keep them for a right-hand side ForwardDiff cannot 
 
 `DiscreteCallback`, `ContinuousCallback`, `VectorContinuousCallback` and `CallbackSet`
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`
-and `terminate!`.
+and `terminate!`. After a step the running solution's retcode is `Success`, as
+OrdinaryDiffEq's is. `check_error` gives `Success` while the integrator can go on and the
+retcode it stopped with after that. In a callback's `finalize` it gives the retcode passed to
+`terminate!`, and `Success` for a solve that ended any other way, where OrdinaryDiffEq's
+also gives `MaxIters` or `Unstable`. `check_error!` and `postamble!` work as SciMLBase
+defines them, `postamble!` finishing the integrator where it is. Like `terminate!`, it saves
+the point it stops at whenever the final time would be saved; under a `saveat` that does not
+name that point, OrdinaryDiffEq saves it only with `save_end = true` or when nothing is saved
+yet. Unlike OrdinaryDiffEq's, a finished integrator cannot step again. `auto_dt_reset!` takes
+the step `init` would take from the current state, and `reinit!` does the same with
+`reset_dt = true`, or keeps the proposed step with `reset_dt = false`. A fixed-step
+integrator goes on at its fixed size through both, as OrdinaryDiffEq's does, and only `dt`
+shows the estimate. `get_proposed_dt` is signed, negative on a reversed span, and
+`set_proposed_dt!` also takes another integrator whose proposed step it copies. `set_abstol!`
+and `set_reltol!` hold for the steps after, until `reinit!` goes back to the tolerances `init`
+was given, where OrdinaryDiffEq's `reinit!` keeps them. `change_t_via_interpolation!` with
+`Val{true}` drops what was saved past the new time, and saves the new end when
+`save_everystep` asks for every step. `resize!`, `deleteat!` and `addat!` raise an
+`ArgumentError`, since PETSc sizes its vectors and solvers when the integrator is made.
+
+## Second-order and partitioned problems
+
+A `SecondOrderODEProblem`, `u'' = f(u', u, p, t)`, and a `DynamicalODEProblem`, whose state is
+a velocity `v` and a position `u` with `v' = f1(v, u, p, t)` and `u' = f2(v, u, p, t)`, have
+two PETSc integrators of their own. Every other serial algorithm solves them as the
+first-order system `[v; u]' = [f1; f2]`, as OrdinaryDiffEq's general methods do.
+
+`TSBasicSymplectic` steps the velocity and the position in turn with `f1` and `f2`, so, as for
+OrdinaryDiffEq's symplectic methods, `f1` must not depend on `v` nor `f2` on `u`. Its
+subtypes `"sieuler"`, `"velverlet"`, `"3"` and `"4"` are of order 1 to 4 and step at a fixed
+`dt`, and their energy error stays bounded over long times where a non-symplectic method's
+grows:
+
+```julia
+using PETScDiffEq, SciMLBase
+
+pendulum!(ddu, du, u, p, t) = (ddu .= -sin.(u); nothing)
+prob = SecondOrderODEProblem(pendulum!, [0.0], [2.0], (0.0, 1000.0))
+sol = solve(prob, TSBasicSymplectic("4"); dt = 0.1)
+energy(s) = s.x[1][1]^2 / 2 - cos(s.x[2][1])
+maximum(abs(energy(s) - energy(sol.u[1])) for s in sol.u)  # 6.4e-6, as large at t = 1000 as at t = 500
+```
+
+`f1` is given the time of the positions it is evaluated at, so a force that depends on `t`
+keeps each method's order; PETSc's own time for that update runs ahead of the positions.
+`"velverlet"` then gives OrdinaryDiffEq's `VelocityVerlet` answer to round-off.
+
+`TSAlpha2` is PETSc's implicit generalized-alpha method of order 2, for stiff second-order
+systems such as structural dynamics. `radius`, from 0 to 1, is its spectral radius at an
+infinite step: below 1 it damps the frequencies the step cannot resolve, which radius 1, the
+default, carries on undamped. It adapts on PETSc's error estimate with scalar `abstol` and
+`reltol`, or steps at `dt` with `adaptive = false`. Its Jacobian, from a `jac` or from
+`autodiff` as for the other implicit families, is that of the first-order system, `2n` by
+`2n`; it takes no sparse `jac_prototype` yet.
+
+```julia
+K, C = [1.0e6 0.0; 0.0 1.0], [200.0 0.0; 0.0 0.02]
+spring!(ddu, du, u, p, t) = (ddu .= -K * u .- C * du; nothing)
+prob = SecondOrderODEProblem(spring!, [0.0, 0.0], [1.0, 1.0], (0.0, 5.0))
+sol = solve(prob, TSAlpha2(; radius = 0.5); dt = 0.1, adaptive = false)
+```
+
+The states come back as OrdinaryDiffEq returns them: `sol.u[i]`, `sol(t)`, `integrator.u` and
+`get_du(integrator)` are `ArrayPartition(v, u)`, so `sol.u[i].x[2]` is the position, while
+`save_idxs` indexes the flat `[v; u]` and saves plain vectors. Between steps `sol(t)` is the
+cubic Hermite interpolant of the velocity and the position, which is also what OrdinaryDiffEq
+gives for `VelocityVerlet`. `stats.nf` counts evaluations of `f1`, or of the whole system,
+and `stats.nf2` those of `f2` alone.
+
+These problems run on `MPI.COMM_SELF` only, take no mass matrix and no `PETScAdjoint`, and
+`TSAlpha2` does not integrate backward in time.
 
 ## DAE initialization
 
@@ -221,8 +317,7 @@ what it needs, what it refuses and how to check `jac` and `paramjac`.
 
 ## MPI
 
-`TSRK`, `TSRosW`, `TSImplicit`, `TSIRK`, `TSDAE`, `TSARKIMEX` and
-`TSGeneric(ts_type; explicit = true)` take a `comm` keyword. With a communicator
+Every algorithm takes a `comm` keyword. With a communicator
 other than the default `MPI.COMM_SELF` the solve runs distributed over it: every rank of
 `comm` calls `solve` with the same arguments, and `u0` is the block of the state that rank
 owns, the blocks following each other in rank order. Each rank's `sol.u` holds its own rows,
@@ -265,16 +360,19 @@ started PETSc on every rank.
 `saveat`, `tstops`, `d_discontinuities`, a fixed `dt` and dense output work as in a serial
 solve. Vector `abstol` and `reltol`, `save_idxs` and `p` are per rank.
 `unstable_check` and `isoutofdomain` are asked on each rank's rows, and `true` on any rank
-counts on all of them. When `f`, `jac` or one of those checks throws on some ranks, those
-ranks go on with NaN until the ranks next agree, at the end of the step or when its nonlinear
-solve fails, and then every rank throws, so an `f` that throws has to do so after its own
-communication.
+counts on all of them. A step that turns NaN or overflows on any rank's rows is taken again
+smaller on every rank, and a fixed-step solve stops at the first state that is not finite on
+some rank, as in a serial solve. When `f`, `jac` or one of those checks throws on some ranks,
+those ranks go on with NaN until the ranks next agree, at the end of the step or when its
+nonlinear solve fails, and then every rank throws rather than retrying the step, so an `f`
+that throws has to do so after its own communication.
 
 Callbacks and the integrator interface run distributed too, as long as every rank makes the
 same calls with the same arguments in the same order: `init`, `step!`, `solve!`, `reinit!`,
 `terminate!`, `set_u!`, `add_tstop!`, `add_saveat!`, `savevalues!`,
-`change_t_via_interpolation!`, `set_proposed_dt!`, `integrator(t)` and `get_du` are all
-collective, and the last two can call `f`. `integrator.u` holds the rank's own rows, and so
+`change_t_via_interpolation!`, `set_proposed_dt!`, `set_abstol!`, `set_reltol!`,
+`postamble!`, `auto_dt_reset!`, `integrator(t)` and `get_du` are all collective.
+`integrator.u` holds the rank's own rows, and so
 does the state given to `set_u!` or `reinit!`. `set_proposed_dt!` takes the smallest step any
 rank proposes.
 
@@ -326,22 +424,102 @@ ILU(0) block on each rank, to a relative tolerance of 1e-5, so such a solve agre
 serial one to that accuracy rather than to round-off. Options such as `-ksp_rtol` or
 `-sub_pc_type` in `petsc_options` change that solver.
 
-A distributed solve refuses, with an `ArgumentError`, `TSMPRK`, an implicit `TSGeneric` and
-`PETScAdjoint`. Solving from several threads at once, as `EnsembleThreads` does, is not
-refused, but nothing then keeps the ranks' solves in the same order, which they need.
+`TSMPRK`'s `slow` and `medium` index the rank's own rows, and either may be empty on some
+ranks as long as some rank names a slow row and, for `"2a23"` and `"2a33"`, a medium one. An
+implicit `TSGeneric` runs distributed for `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`,
+`"arkimex"`, `"irk"`, `"alpha"` and `"dirk"`, as `TSImplicit` does. Other implicit types are
+refused: `"glle"`'s step control follows the round-off of the distributed linear solve, so it
+takes other steps than a serial solve and ends with another error, larger or smaller.
+
+`PETScAdjoint` runs distributed too, for `TSRK`, `TSImplicit("beuler")` and
+`TSImplicit("cn")`. It needs the problem's `jac`, filling this rank's rows of a sparse
+prototype as above, and when there are parameters a `paramjac` filling this rank's rows,
+since automatic differentiation would call `f` a different number of times on each rank; both
+are collective like `f`. An explicit method takes such a `jac` in its own solve too, and
+ignores it there. `dgdu_discrete` gets this rank's rows of the state and writes their
+gradient, and `dgdp_discrete` gives this rank's share of the cost's direct derivative with
+respect to `p`, which the ranks add up. `du0` comes back as this rank's rows and `dp` as the
+whole gradient, the same on every rank. The cost times, `no_start`, the length of `p` and
+whether `dgdp_discrete` is given have to agree across the ranks. A `jac`, `paramjac`, cost
+function or `f` that throws on some ranks makes every rank throw, as in a solve. The
+transposed linear solves of `TSImplicit` use the solver above;
+`["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
+
+A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
+which every algorithm that takes `comm` takes as well. The solve then runs on the DM's
+communicator, which `comm` may name too but not contradict, and `u0` is the block of the grid
+this rank owns, in the DM's order. `f(du, u, p, t)` gets `u` ghosted: before every call to `f`,
+including the package's own calls for the first step size, dense output, callbacks, `get_du`
+and the Jacobian, the state is scattered into a local vector from `DMGetLocalVector` with
+`DMGlobalToLocalBegin` and `DMGlobalToLocalEnd`, so `u` also holds the neighbouring ranks'
+points within the stencil width. `du` is the owned block. `PETScDiffEq.reshape_local_array(x, dm)`
+views either one by grid point in global numbering, as `x[c, i]` on a 1-D grid and `x[c, i, j]`
+on a 2-D one, where `c` is the degree of freedom at the point. It is PETSc.jl's
+`reshape_local_array`, which PETSc.jl 0.4 calls `reshapelocalarray`. With `DM_BOUNDARY_GHOSTED`
+the ghost points past the edge of the grid read zero, so this heat equation is zero at both
+ends:
+
+```julia
+using MPI, PETScDiffEq, SciMLBase
+using PETScDiffEq: PETSc, LibPETSc
+
+MPI.Init()
+petsclib = PETSc.getlib(; PetscScalar = Float64)
+PETSc.initialize(petsclib)
+N = 64
+dx = 1 / (N + 1)
+da = PETSc.DMDA(petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), 1, 1)
+
+function heat!(du, u, da, t)
+    U = PETScDiffEq.reshape_local_array(u, da)
+    D = PETScDiffEq.reshape_local_array(du, da)
+    for i in axes(D, 2)
+        D[1, i] = (U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2
+    end
+end
+
+xs, _, _, xm = LibPETSc.DMDAGetCorners(petsclib, da)
+prob = ODEProblem(heat!, sinpi.((xs .+ (1:xm)) .* dx), (0.0, 0.1), da)
+sol = solve(prob, TSRK("5dp"; dm = da))
+sol_bdf = solve(prob, TSImplicit("bdf"; dm = da))
+```
+
+With a `dm` the implicit algorithms need no `jac_prototype`. Their Jacobian is the DM's own
+matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil and which PETSc fills
+by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()` and the
+other backends are refused; the stencil has to cover every point `f` reads. A `jac` is refused
+for now, and with it `TSIRK`, which needs one, as is a `jac_prototype`, since the DM gives the
+pattern. The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
+`TSARKIMEX` and `TSGeneric(ts_type; explicit = true)`, `saveat`, dense output, callbacks and
+the integrator interface, a `Diagonal` mass matrix, a `SplitODEProblem`, whose `f2` gets `u`
+ghosted as `f` does, and a `DAEProblem`, whose residual `f(r, du, u, p, t)` gets `u` ghosted
+and `du` owned. Everything else the package calls, such as a callback, `unstable_check` or
+`isoutofdomain`, sees the owned block. The TS works on a copy of the DM from `DMClone`, so the
+DM itself stays free for further solves. A DMDA on `MPI.COMM_SELF`, or on a single rank, gives
+a serial solve. Only a DMDA is taken so far.
+
+A solve with a `dm` refuses `TSMPRK`, an implicit `TSGeneric` and `PETScAdjoint` with an
+`ArgumentError`. A distributed solve, with a `dm` or without, is refused inside
+`Threads.@threads` on more than one thread, as `EnsembleThreads` runs its trajectories:
+nothing there keeps the ranks' solves in the same order, and ranks taking them in different
+orders run different solves as one and can return wrong results without an error.
+Distributed solves running at once from `Threads.@spawn` tasks are not refused, so the caller
+has to keep them in the same order on every rank. An ensemble of distributed solves runs with
+`EnsembleSerial()`.
 
 ## Limitations
 
-Only the algorithms named under MPI run distributed so far; every other solve runs on
-`MPI.COMM_SELF`. PETSc TS is built for large distributed problems, and reaching it
-from the SciML interface is what this package is for; use OrdinaryDiffEq.jl for serial
-problems where it applies.
+A `DynamicalODEProblem` or `SecondOrderODEProblem` does not run distributed yet, whatever the
+algorithm, so `TSBasicSymplectic` and `TSAlpha2` run on `MPI.COMM_SELF` only. PETSc TS is
+built for large distributed problems, and reaching it from the SciML interface is what this
+package is for; use OrdinaryDiffEq.jl for serial problems where it applies.
 
 On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.
 
 Solves from several threads, such as an `EnsembleThreads` ensemble, are safe but run one
-at a time: PETSc's options and MPI are shared by the whole process.
+at a time: PETSc's options and MPI are shared by the whole process. Distributed ones are not,
+as the MPI section says.
 
 Finish or terminate every integrator you start. One dropped part way is released by a
 finalizer, and if that finalizer runs at process exit, after MPI has shut down, PETSc's

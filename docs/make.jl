@@ -9,7 +9,7 @@ makedocs(;
     format = Documenter.HTML(;
         canonical = "https://docs.sciml.ai/PETScDiffEq/stable/",
     ),
-    pages = ["Home" => "index.md"],
+    pages = ["Home" => "index.md", "Work-precision benchmarks" => "benchmarks.md"],
 )
 
 deploydocs(; repo = "github.com/SciML/PETScDiffEq.jl.git", push_preview = true)

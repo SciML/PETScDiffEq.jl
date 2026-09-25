@@ -10,6 +10,7 @@ using PETSc: PETSc
 using Libdl: Libdl
 using PETSc.LibPETSc: LibPETSc
 using SciMLBase: SciMLBase
+using SciMLLogging: SciMLLogging
 using SciMLOperators: SciMLOperators
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
     sparse
@@ -18,7 +19,7 @@ using SparseMatrixColorings: SparseMatrixColorings
 include("petsc_compat.jl")
 
 export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSDAE, TSMPRK, TSGeneric,
-    PETScIntegrator, PETScAdjoint
+    TSBasicSymplectic, TSAlpha2, PETScIntegrator, PETScAdjoint
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 abstract type PETScTSDAEAlgorithm <: SciMLBase.AbstractDAEAlgorithm end
@@ -26,7 +27,7 @@ abstract type PETScTSDAEAlgorithm <: SciMLBase.AbstractDAEAlgorithm end
 const AnyPETScTS = Union{PETScTSAlgorithm, PETScTSDAEAlgorithm}
 
 """
-    TSRK(subtype = "5dp", petsc_options = String[]; comm = MPI.COMM_SELF)
+    TSRK(subtype = "5dp", petsc_options = String[]; comm = MPI.COMM_SELF, dm = nothing)
 
 Explicit Runge-Kutta from PETSc's `TSRK`. `subtype` is a PETSc `TSRKType`
 without its prefix, such as `"3bs"`, `"5dp"`, `"5f"` or `"5bs"`.
@@ -42,22 +43,25 @@ for example `["-ts_adapt_type", "none"]`. They are parsed after the options
 this package sets, so they win.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, with `u0`
-holding this rank's rows; see the MPI section of the documentation.
+holding this rank's rows; see the MPI section of the documentation. A `dm`, a DMDA from
+PETSc.jl, runs it on the DM's communicator and gives `f` the state ghosted from the DM, as
+that section describes.
 """
 struct TSRK <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 TSRK(
     subtype::AbstractString = "5dp",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF,
-) = TSRK(String(subtype), String[String(o) for o in petsc_options], comm)
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+) = TSRK(String(subtype), String[String(o) for o in petsc_options], _alg_comm(comm, dm), dm)
 
 """
-    TSRosW(subtype = "ra34pw2", petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSRosW(subtype = "ra34pw2", petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 Rosenbrock-W from PETSc's `TSROSW`. `subtype` is a PETSc `TSRosWType` without
 its prefix, such as `"2m"`, `"ra34pw2"` or `"r34prw"`.
@@ -92,24 +96,29 @@ within its first two steps and a fixed-step solve diverges.
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
+`autodiff` defaults to `AutoFiniteDiff()` as well.
 """
 struct TSRosW <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 TSRosW(
     subtype::AbstractString = "ra34pw2",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSRosW(
-    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _alg_comm(comm, dm), dm,
 )
 
 """
-    TSImplicit(subtype = "beuler"; order = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSImplicit(subtype = "beuler"; order = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
     TSImplicit(subtype, theta; ...)
     TSImplicit(subtype, [theta,] petsc_options; ...)
 
@@ -135,6 +144,8 @@ under ForwardDiff.
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
+`autodiff` defaults to `AutoFiniteDiff()` as well.
 """
 struct TSImplicit <: PETScTSAlgorithm
     subtype::String
@@ -143,6 +154,7 @@ struct TSImplicit <: PETScTSAlgorithm
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 function _bdf_order(subtype, order)
@@ -154,37 +166,43 @@ function _bdf_order(subtype, order)
 end
 
 TSImplicit(
-    subtype::AbstractString = "beuler"; order = nothing, comm::MPI.Comm = MPI.COMM_SELF,
-    autodiff = _default_autodiff(comm),
+    subtype::AbstractString = "beuler"; order = nothing,
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
     String(subtype), nothing, _bdf_order(subtype, order), String[], _check_autodiff(autodiff),
-    comm,
+    _alg_comm(comm, dm), dm,
 )
 TSImplicit(
-    subtype::AbstractString, theta::Real; order = nothing, comm::MPI.Comm = MPI.COMM_SELF,
-    autodiff = _default_autodiff(comm),
+    subtype::AbstractString, theta::Real; order = nothing,
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
     String(subtype), Float64(theta), _bdf_order(subtype, order), String[],
-    _check_autodiff(autodiff), comm,
+    _check_autodiff(autodiff), _alg_comm(comm, dm), dm,
 )
 TSImplicit(
     subtype::AbstractString, petsc_options::AbstractVector{<:AbstractString};
-    order = nothing, comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    order = nothing, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
     String(subtype), nothing, _bdf_order(subtype, order),
-    String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _alg_comm(comm, dm), dm,
 )
 TSImplicit(
     subtype::AbstractString, theta::Real,
     petsc_options::AbstractVector{<:AbstractString}; order = nothing,
-    comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
     String(subtype), Float64(theta), _bdf_order(subtype, order),
-    String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _alg_comm(comm, dm), dm,
 )
 
 """
-    TSIRK(nstages = 3, petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSIRK(nstages = 3, petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 Gauss-Legendre implicit Runge-Kutta from PETSc's `TSIRK`, of order `2 *
 nstages`: one stage is the implicit midpoint rule at order 2, two stages give
@@ -211,24 +229,28 @@ as `dt` shrinks instead of failing, which is worse than an error.
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There it needs a `jac`, filling this rank's rows of a sparse `jac_prototype` whose columns are
 global, and each rank has to hold PETSc's own share of the state, which splits it evenly with
-the first ranks taking one row more; see the MPI section of the documentation.
+the first ranks taking one row more; see the MPI section of the documentation. A `dm` is
+refused, since a solve with one takes no `jac`.
 """
 struct TSIRK <: PETScTSAlgorithm
     nstages::Int
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 TSIRK(
     nstages::Integer = 3, petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSIRK(
-    Int(nstages), String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    Int(nstages), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _alg_comm(comm, dm), dm,
 )
 
 """
-    TSDAE(subtype = "bdf", petsc_options = String[]; order = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSDAE(subtype = "bdf", petsc_options = String[]; order = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 Fully implicit methods applied to a `DAEProblem`, whose residual `G(t, u, u') = 0`
 is exactly the form PETSc's `IFunction` takes. `subtype` is `"beuler"`, `"cn"`,
@@ -249,6 +271,8 @@ derivative itself, so `du0` is used only to check and solve for a consistent sta
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
+`autodiff` defaults to `AutoFiniteDiff()` as well.
 """
 struct TSDAE <: PETScTSDAEAlgorithm
     subtype::String
@@ -256,19 +280,21 @@ struct TSDAE <: PETScTSDAEAlgorithm
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 TSDAE(
     subtype::AbstractString = "bdf",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    order = nothing, comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    order = nothing, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSDAE(
     String(subtype), _bdf_order(subtype, order), String[String(o) for o in petsc_options],
-    _check_autodiff(autodiff), comm,
+    _check_autodiff(autodiff), _alg_comm(comm, dm), dm,
 )
 
 """
-    TSARKIMEX(subtype = "3", petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSARKIMEX(subtype = "3", petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 Additive Runge-Kutta IMEX from PETSc's `TSARKIMEX`. `subtype` is a PETSc
 `TSARKIMEXType` without its prefix, such as `"2e"`, `"3"`, `"4"` or `"5"`.
@@ -291,28 +317,53 @@ plain `ODEProblem` PETSc does not use its explicit tableau, and it keeps order 3
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
+`autodiff` defaults to `AutoFiniteDiff()` as well.
 """
 struct TSARKIMEX <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 TSARKIMEX(
     subtype::AbstractString = "3",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSARKIMEX(
-    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _alg_comm(comm, dm), dm,
 )
 
 const _MPRK_TWO_WAY = ("2a22", "2a32", "p2", "p3")
 const _MPRK_THREE_WAY = ("2a23", "2a33")
 
+function _check_mprk(slow, medium, subtype, distributed)
+    for (name, v) in (("slow", slow), ("medium", medium))
+        all(i -> i >= 1, v) || throw(ArgumentError("`$name` indices start at 1"))
+        length(unique(v)) == length(v) || throw(ArgumentError("`$name` repeats an index"))
+    end
+    isempty(intersect(slow, medium)) ||
+        throw(ArgumentError("`slow` and `medium` share an index"))
+    three = !isempty(medium) || distributed && subtype in _MPRK_THREE_WAY
+    subtype in (three ? _MPRK_THREE_WAY : _MPRK_TWO_WAY) || throw(
+        ArgumentError(
+            !three ?
+                "`$subtype` needs a `medium` split as well; without one use " *
+                join(map(t -> "\"$t\"", _MPRK_TWO_WAY), ", ") :
+                "`$subtype` takes only two splits, so leave `medium` out; with " *
+                "one use " * join(map(t -> "\"$t\"", _MPRK_THREE_WAY), " or "),
+        ),
+    )
+    return nothing
+end
+
 """
-    TSMPRK(slow, subtype = "p2", petsc_options = String[]; comm = MPI.COMM_SELF)
-    TSMPRK(slow, medium, subtype = "2a23", petsc_options = String[]; comm = MPI.COMM_SELF)
+    TSMPRK(slow, subtype = "p2", petsc_options = String[]; comm = MPI.COMM_SELF, dm = nothing)
+    TSMPRK(slow, medium, subtype = "2a23", petsc_options = String[]; comm = MPI.COMM_SELF, dm = nothing)
 
 PETSc's multirate partitioned Runge-Kutta. `slow` lists the indices of the state
 that are integrated with the outer step; everything else is advanced on a smaller
@@ -331,6 +382,10 @@ than an explicit single-rate method's: on `u' = [-u1, -100u2]` with only the fir
 component slow, `"p3"` holds to `dt = 0.0425` against `TSRK("5dp")`'s `0.03`. The
 ratio is fixed by the tableau rather than by the stiffness, so a separation much
 wider than that is not something these methods can absorb.
+
+A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
+There `slow` and `medium` index this rank's rows and may be empty on some ranks, as long as
+some rank names a slow row and, for `"2a23"` and `"2a33"`, a medium one. A `dm` is refused.
 """
 struct TSMPRK <: PETScTSAlgorithm
     slow::Vector{Int}
@@ -338,30 +393,17 @@ struct TSMPRK <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 
     function TSMPRK(
             slow::Vector{Int}, medium::Vector{Int}, subtype::String,
-            petsc_options::Vector{String}, comm::MPI.Comm,
+            petsc_options::Vector{String}, comm::MPI.Comm, dm,
         )
-        isempty(slow) && throw(ArgumentError("`slow` needs at least one index"))
-        for (name, v) in (("slow", slow), ("medium", medium))
-            all(i -> i >= 1, v) || throw(ArgumentError("`$name` indices start at 1"))
-            length(unique(v)) == length(v) ||
-                throw(ArgumentError("`$name` repeats an index"))
+        if comm == MPI.COMM_SELF
+            isempty(slow) && throw(ArgumentError("`slow` needs at least one index"))
+            _check_mprk(slow, medium, subtype, false)
         end
-        isempty(intersect(slow, medium)) ||
-            throw(ArgumentError("`slow` and `medium` share an index"))
-        wanted = isempty(medium) ? _MPRK_TWO_WAY : _MPRK_THREE_WAY
-        subtype in wanted || throw(
-            ArgumentError(
-                isempty(medium) ?
-                    "`$subtype` needs a `medium` split as well; without one use " *
-                    join(map(t -> "\"$t\"", _MPRK_TWO_WAY), ", ") :
-                    "`$subtype` takes only two splits, so leave `medium` out; with " *
-                    "one use " * join(map(t -> "\"$t\"", _MPRK_THREE_WAY), " or "),
-            ),
-        )
-        return new(sort(slow), sort(medium), subtype, petsc_options, comm)
+        return new(sort(slow), sort(medium), subtype, petsc_options, comm, dm)
     end
 end
 
@@ -369,10 +411,10 @@ TSMPRK(
     slow::AbstractVector{<:Integer},
     subtype::AbstractString = "p2",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF,
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
 ) = TSMPRK(
     Vector{Int}(slow), Int[], String(subtype),
-    String[String(o) for o in petsc_options], comm,
+    String[String(o) for o in petsc_options], _alg_comm(comm, dm), dm,
 )
 
 TSMPRK(
@@ -380,14 +422,99 @@ TSMPRK(
     medium::AbstractVector{<:Integer},
     subtype::AbstractString = "2a23",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF,
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
 ) = TSMPRK(
     Vector{Int}(slow), Vector{Int}(medium), String(subtype),
-    String[String(o) for o in petsc_options], comm,
+    String[String(o) for o in petsc_options], _alg_comm(comm, dm), dm,
+)
+
+const _SYMPLECTIC_TYPES = Dict(
+    "sieuler" => "1", "velverlet" => "2", "1" => "1", "2" => "2", "3" => "3", "4" => "4",
 )
 
 """
-    TSGeneric(ts_type, petsc_options = String[]; explicit = false, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSBasicSymplectic(subtype = "velverlet", petsc_options = String[]; comm = MPI.COMM_SELF)
+
+PETSc's basic symplectic integrators, `TSBASICSYMPLECTIC`, for a `DynamicalODEProblem`
+or a `SecondOrderODEProblem`. `subtype` is `"sieuler"` (or `"1"`), semi-implicit Euler of
+order 1, `"velverlet"` (or `"2"`), velocity Verlet of order 2, `"3"`, Ruth's method of
+order 3, or `"4"`, Forest and Ruth's method of order 4.
+
+PETSc steps the two parts in turn, the velocity `v` with `f1(dv, v, u, p, t)` at the
+current positions and the position `u` with `f2(du, v, u, p, t)` at the current velocities,
+so, as for OrdinaryDiffEq's symplectic methods, `f1` must not depend on `v` nor `f2` on
+`u`. On such a separable problem the energy error stays bounded over long times instead of
+drifting. `f1` is given the time of the positions it is evaluated at, so a force that depends
+on `t` keeps the method's order.
+
+Fixed step: these methods have no error estimate, so they step at the `dt` you give and warn
+if you pass a tolerance. Being explicit they ignore a `jac` and refuse a mass matrix.
+
+Distributed partitioned states are not supported yet, so a `comm` other than
+`MPI.COMM_SELF` is refused.
+"""
+struct TSBasicSymplectic <: PETScTSAlgorithm
+    subtype::String
+    petsc_options::Vector{String}
+    comm::MPI.Comm
+end
+
+function TSBasicSymplectic(
+        subtype::AbstractString = "velverlet",
+        petsc_options::AbstractVector{<:AbstractString} = String[];
+        comm::MPI.Comm = MPI.COMM_SELF,
+    )
+    name = get(_SYMPLECTIC_TYPES, String(subtype), nothing)
+    name === nothing && throw(
+        ArgumentError(
+            "TSBasicSymplectic has no subtype \"$subtype\"; use \"sieuler\", " *
+                "\"velverlet\", \"3\" or \"4\"",
+        ),
+    )
+    return TSBasicSymplectic(name, String[String(o) for o in petsc_options], comm)
+end
+
+"""
+    TSAlpha2(petsc_options = String[]; radius = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+
+PETSc's generalized-alpha method for second-order systems, `TSALPHA2`, for a
+`SecondOrderODEProblem` `u'' = f(u', u, p, t)`. Implicit and of order 2. `radius` is the
+spectral radius at an infinite step, from 0 to 1: PETSc's default, 1, damps nothing, and a
+smaller one damps the highest frequencies more.
+
+Adapts on PETSc's error estimate for the method, which PETSc leaves off unless asked, so
+`reltol` and `abstol` apply. They have to be scalars, since PETSc weighs the velocity with the
+position's tolerances. `adaptive = false` steps at the `dt` you give.
+
+Each step solves for the acceleration, with the Jacobian of `f` in `u` and `u'`. That comes
+from a `jac`, which is the Jacobian of the first-order system `[v; u]' = [f(v, u, p, t); v]`,
+`2n` by `2n` in the order of the state, as OrdinaryDiffEq's implicit methods take it, or
+without one from `autodiff`, as for [`TSImplicit`](@ref). A mass matrix is refused.
+
+Distributed partitioned states are not supported yet, so a `comm` other than
+`MPI.COMM_SELF` is refused.
+"""
+struct TSAlpha2 <: PETScTSAlgorithm
+    radius::Union{Nothing, Float64}
+    petsc_options::Vector{String}
+    autodiff::ADTypes.AbstractADType
+    comm::MPI.Comm
+end
+
+function TSAlpha2(
+        petsc_options::AbstractVector{<:AbstractString} = String[];
+        radius = nothing, comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm, nothing),
+    )
+    radius === nothing || 0 <= radius <= 1 ||
+        throw(ArgumentError("`radius` must be between 0 and 1, got $radius"))
+    return TSAlpha2(
+        radius === nothing ? nothing : Float64(radius),
+        String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    )
+end
+
+"""
+    TSGeneric(ts_type, petsc_options = String[]; explicit = false, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 Any other PETSc `TSType` by name. An implicit one such as `"alpha"` works with
 the default; an explicit one such as `"euler"` or `"ssp"` needs
@@ -400,11 +527,19 @@ Whether the named type adapts is not known here, so no tolerance warning is
 issued for it. Only `"euler"` and `"alpha"` have been run through this
 package's own convergence tests.
 
-`"alpha2"`, `"basicsymplectic"`, `"discgrad"`, `"eimex"`, `"mimex"` and `"mprk"` are
-refused: each is driven through a PETSc setup call this package does not make, and
-without it they crash or integrate to zero rather than saying anything.
+`"discgrad"`, `"eimex"`, `"mimex"` and `"mprk"` are refused: each is driven through a
+PETSc setup call this package does not make, and without it they crash or integrate to
+zero rather than saying anything. `"alpha2"` and `"basicsymplectic"` are refused too, since
+they need a second-order or partitioned problem; use [`TSAlpha2`](@ref) or
+[`TSBasicSymplectic`](@ref).
 
-An explicit type takes a `comm` other than `MPI.COMM_SELF` as [`TSRK`](@ref) does.
+A `comm` other than `MPI.COMM_SELF` runs an explicit type as [`TSRK`](@ref) runs, and an
+implicit `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`, `"arkimex"`, `"irk"`, `"alpha"` or
+`"dirk"` as [`TSImplicit`](@ref) runs, with `autodiff` defaulting to `AutoFiniteDiff()`. Other
+implicit types are refused there: `"glle"`'s step control follows the round-off of the
+distributed linear solve, so it takes other steps than a serial solve and ends with another
+error, larger or smaller. A `dm` runs an explicit type as it runs [`TSRK`](@ref) and refuses an
+implicit one.
 """
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
@@ -412,11 +547,12 @@ struct TSGeneric <: PETScTSAlgorithm
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 const _NEEDS_OTHER_SETUP = Dict(
-    "alpha2" => "is for second-order systems and needs TSSetI2Function",
-    "basicsymplectic" => "needs TSRHSSplitSetIS to declare its position and momentum parts",
+    "alpha2" => "is for a SecondOrderODEProblem; use TSAlpha2",
+    "basicsymplectic" => "is for a DynamicalODEProblem or SecondOrderODEProblem; use TSBasicSymplectic",
     "discgrad" => "needs TSDiscGradSetFormulation",
     "eimex" => "needs its own right-hand-side split, and integrates to zero without one",
     "mimex" => "needs TSRHSSplit to declare its slow and fast parts",
@@ -431,7 +567,8 @@ const _ROSW_NO_STEP = ("lassp3p4s2c", "llssp3p4s2c", "ark3")
 function TSGeneric(
         ts_type::AbstractString,
         petsc_options::AbstractVector{<:AbstractString} = String[];
-        explicit::Bool = false, autodiff = AutoForwardDiff(), comm::MPI.Comm = MPI.COMM_SELF,
+        explicit::Bool = false, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+        autodiff = _default_autodiff(comm, dm),
     )
     t = String(ts_type)
     haskey(_NEEDS_OTHER_SETUP, t) && throw(
@@ -444,7 +581,8 @@ function TSGeneric(
         ArgumentError("`irk` is an implicit PETSc type, so it cannot take `explicit = true`"),
     )
     return TSGeneric(
-        t, explicit, String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+        t, explicit, String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+        _alg_comm(comm, dm), dm,
     )
 end
 
@@ -455,6 +593,8 @@ _uses_ifunction(::TSIRK) = true
 _uses_ifunction(::TSDAE) = true
 _uses_ifunction(::TSARKIMEX) = true
 _uses_ifunction(::TSMPRK) = false
+_uses_ifunction(::TSBasicSymplectic) = false
+_uses_ifunction(::TSAlpha2) = true
 _uses_ifunction(alg::TSGeneric) = !alg.explicit
 
 const _RK_NO_ESTIMATE = ("1fe", "2b", "3", "4")
@@ -468,6 +608,8 @@ _adapts(alg::TSDAE) = alg.subtype == "bdf"
 _adapts(alg::TSARKIMEX) = !(alg.subtype in _ARKIMEX_NO_ESTIMATE)
 _adapts(alg::TSImplicit) = alg.subtype == "bdf"
 _adapts(::TSMPRK) = false
+_adapts(::TSBasicSymplectic) = false
+_adapts(::TSAlpha2) = true
 _adapts(::TSGeneric) = nothing
 
 const _RK_CUBIC_INTERP = ("5dp",)
@@ -482,14 +624,14 @@ _petsc_interpolant(alg::TSRK) = alg.subtype in _RK_CUBIC_INTERP
 _petsc_interpolant(alg::TSRosW) = alg.subtype in _ROSW_CUBIC_INTERP
 _petsc_interpolant(alg::TSARKIMEX) = alg.subtype in _ARKIMEX_CUBIC_INTERP
 _petsc_interpolant(alg::Union{TSImplicit, TSDAE}) = alg.subtype == "bdf"
-_petsc_interpolant(::Union{TSIRK, TSMPRK, TSGeneric}) = false
+_petsc_interpolant(::Union{TSIRK, TSMPRK, TSGeneric, TSBasicSymplectic, TSAlpha2}) = false
 
 # TSIRK's TSInterpolate leaves the output untouched instead of failing.
 _interpolates(::TSRK) = true
 _interpolates(alg::TSRosW) = !(alg.subtype in _ROSW_NO_INTERP)
 _interpolates(alg::TSARKIMEX) = !(alg.subtype in _ARKIMEX_NO_INTERP)
 _interpolates(::Union{TSImplicit, TSDAE}) = true
-_interpolates(::Union{TSIRK, TSMPRK}) = false
+_interpolates(::Union{TSIRK, TSMPRK, TSBasicSymplectic, TSAlpha2}) = false
 _interpolates(::TSGeneric) = nothing
 
 const _RK_ORDER = Dict(
@@ -522,6 +664,8 @@ SciMLBase.alg_order(alg::TSRosW) = _order(_ROSW_ORDER, "TSRosW", alg.subtype)
 SciMLBase.alg_order(alg::TSARKIMEX) = _order(_ARKIMEX_ORDER, "TSARKIMEX", alg.subtype)
 SciMLBase.alg_order(alg::TSMPRK) = _order(_MPRK_ORDER, "TSMPRK", alg.subtype)
 SciMLBase.alg_order(alg::TSIRK) = 2 * alg.nstages
+SciMLBase.alg_order(alg::TSBasicSymplectic) = parse(Int, alg.subtype)
+SciMLBase.alg_order(::TSAlpha2) = 2
 SciMLBase.alg_order(alg::TSImplicit) = _implicit_order(alg.subtype, alg.theta, alg.order)
 SciMLBase.alg_order(alg::TSDAE) = _implicit_order(alg.subtype, nothing, alg.order)
 
@@ -541,7 +685,7 @@ struct COOJacobian{S}
     vals::Vector{S}
 end
 
-mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
+mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     petsclib::L
     f!::F
     f2!::F2
@@ -561,10 +705,10 @@ mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
     row_buf::Vector{Vector{S}}
     J::JBUF
     ts::Vector{R}
-    us::Vector{Vector{U}}
-    dus::Vector{Vector{U}}
+    us::Vector{A}
+    dus::Vector{A}
     user_ts::Union{Nothing, Vector{R}}
-    user_dus::Union{Nothing, Vector{Vector{U}}}
+    user_dus::Union{Nothing, Vector{A}}
     saveat::Vector{R}
     saveat_idx::Int
     save_everystep::Bool
@@ -604,9 +748,19 @@ mutable struct TSContext{R, S, U, F, F2, JAC, JBUF, P, L, V}
     nreject::Int
     halt_nonfinite::Bool
     coo::Union{Nothing, COOJacobian{S}}
+    flat_vec::Any
+    partitioned_u::Any
+    forced::Bool
+    stuck::Union{Nothing, String}
+    nfail::Int
+    nits::Int
+    tbound::R
+    halt_stalled::Bool
+    stalled::Bool
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
+_alg_dm(alg) = hasproperty(alg, :dm) ? alg.dm : nothing
 
 _everywhere(::Nothing, b::Bool) = b
 _everywhere(comm::MPI.Comm, b::Bool) = MPI.Allreduce(b, &, comm)
@@ -695,6 +849,142 @@ end
 _smallest(::Nothing, x) = x
 _smallest(comm::MPI.Comm, x) = MPI.Allreduce(x, min, comm)
 
+_dm_lib(::LibPETSc.AbstractPetscDM{L}) where {L} = PETSc.getlib(L)
+
+function _dm_comm(dm)
+    comm = Ref{MPI.API.MPI_Comm}()
+    _check_code(
+        ccall(
+            _symbol(_dm_lib(dm), :PetscObjectGetComm), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{MPI.API.MPI_Comm}), dm.ptr, comm,
+        ),
+    )
+    return MPI.Comm(comm[])
+end
+
+function _alg_comm(comm, dm)
+    dm === nothing && return something(comm, MPI.COMM_SELF)
+    dm isa LibPETSc.AbstractPetscDM || throw(
+        ArgumentError(
+            "`dm` takes a PETSc DM, such as a DMDA from PETSc.jl, not a $(typeof(dm))",
+        ),
+    )
+    own = _dm_comm(dm)
+    comm === nothing && return MPI.Comm_size(own) == 1 ? MPI.COMM_SELF : own
+    MPI.Comm_compare(comm, own) in (MPI.IDENT, MPI.CONGRUENT) || throw(
+        ArgumentError(
+            "the `dm` lives on other ranks than `comm`; leave `comm` out to run on the " *
+                "DM's own",
+        ),
+    )
+    return comm
+end
+
+function _dm_vec!(pl, name, dm, v = Ref{Ptr{Cvoid}}(C_NULL))
+    _check_code(
+        ccall(
+            _symbol(pl, name), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}), dm, v,
+        ),
+    )
+    return v
+end
+
+function _dm_type(pl, dm)
+    name = Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :DMGetType), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}),
+            dm.ptr, name,
+        ),
+    )
+    return name[] == C_NULL ? "" : unsafe_string(name[])
+end
+
+function _dm_local_size(pl, dm)
+    v = _dm_vec!(pl, :DMGetGlobalVector, dm.ptr)
+    try
+        n = Ref{LibPETSc.PetscInt}(0)
+        _check_code(
+            ccall(
+                _symbol(pl, :VecGetLocalSize), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{LibPETSc.PetscInt}), v[], n,
+            ),
+        )
+        return Int(n[])
+    finally
+        _dm_vec!(pl, :DMRestoreGlobalVector, dm.ptr, v)
+    end
+end
+
+_clone_dm(pl, dm) = LibPETSc.PetscDM(_dm_vec!(pl, :DMClone, dm.ptr)[], pl)
+
+function _referenced(pl, obj)
+    _check_code(
+        ccall(_symbol(pl, :PetscObjectReference), LibPETSc.PetscErrorCode, (Ptr{Cvoid},), obj),
+    )
+    return obj
+end
+
+function _scatter!(pl, dm, u, loc)
+    glob = _dm_vec!(pl, :DMGetGlobalVector, dm)
+    try
+        _writevec!(pl, PETSc.VecPtr(pl, glob[], false), u)
+        _check_code(
+            ccall(_symbol(pl, :VecZeroEntries), LibPETSc.PetscErrorCode, (Ptr{Cvoid},), loc),
+        )
+        for name in (:DMGlobalToLocalBegin, :DMGlobalToLocalEnd)
+            _check_code(
+                ccall(
+                    _symbol(pl, name), LibPETSc.PetscErrorCode,
+                    (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Ptr{Cvoid}),
+                    dm, glob[], Cint(LibPETSc.INSERT_VALUES), loc,
+                ),
+            )
+        end
+    finally
+        _dm_vec!(pl, :DMRestoreGlobalVector, dm, glob)
+    end
+    return nothing
+end
+
+struct Ghosted{F, L}
+    f::F
+    petsclib::L
+    dm::Ptr{Cvoid}
+end
+
+function _ghosted(call, g::Ghosted, u)
+    pl, dm = g.petsclib, g.dm
+    loc = _dm_vec!(pl, :DMGetLocalVector, dm)
+    try
+        _scatter!(pl, dm, u, loc[])
+        v = PETSc.VecPtr(pl, loc[], false)
+        a = LibPETSc.VecGetArrayRead(pl, v)
+        try
+            call(a)
+        finally
+            LibPETSc.VecRestoreArrayRead(pl, v, a)
+        end
+    finally
+        _dm_vec!(pl, :DMRestoreLocalVector, dm, loc)
+    end
+    return nothing
+end
+
+(g::Ghosted)(du, u, p, t) = _ghosted(a -> g.f(du, a, p, t), g, u)
+(g::Ghosted)(r, du, u, p, t) = _ghosted(a -> g.f(r, du, a, p, t), g, u)
+
+"""
+    PETScDiffEq.reshape_local_array(x, dm)
+
+This rank's part of a vector on the DMDA `dm`, indexed by grid point in global numbering:
+`a[c, i]` on a 1-D grid and `a[c, i, j]` on a 2-D one, where `c` runs over the degrees of
+freedom at each point. `x` can be the ghosted array `f` receives or the block of the state the
+rank owns, such as `du`, `u0` or a saved state, and `a` shares its memory. This is PETSc.jl's
+`reshape_local_array`, which PETSc.jl 0.4 calls `reshapelocalarray` and pads to three grid axes.
+"""
+reshape_local_array(x, dm) = PETScCompat.reshape_local_array(x, dm)
+
 function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     full = Vector{S}(x)
     idxs = ctx.save_idxs
@@ -702,12 +992,15 @@ function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     ctx.user_ts === nothing || push!(ctx.user_ts, _user_t(ctx.tdir, R(t)))
     if ctx.dense
         du === nothing && (du = _derivative(ctx, R(t), full))
-        push!(ctx.dus, _select(du, idxs))
+        push!(ctx.dus, _kept(ctx, _select(du, idxs)))
         ctx.user_dus === nothing || push!(ctx.user_dus, -ctx.dus[end])
     end
-    push!(ctx.us, _select(full, idxs))
+    push!(ctx.us, _kept(ctx, _select(full, idxs)))
     return du
 end
+
+_kept(ctx::TSContext{R, S, A}, x) where {R, S, A} =
+    A <: Vector ? x : A((x[1:ctx.f!.nv], x[(ctx.f!.nv + 1):end]))
 
 function _record_end!(ctx, t, x)
     du = _record!(ctx, t, x, ctx.fend)
@@ -715,30 +1008,51 @@ function _record_end!(ctx, t, x)
     return nothing
 end
 
+# TSStep_IRK takes a step whose Newton solve failed.
+function _undo_failed_irk!(ctx, pl, ts_ptr)
+    ctx.alg_name == "irk" && _snes_failed(pl, ts_ptr) !== nothing || return false
+    code = ccall(_symbol(pl, :TSRollBack), LibPETSc.PetscErrorCode, (LibPETSc.CTS,), ts_ptr)
+    code == 0 || throw(LibPETSc.PetscError(code))
+    ctx.nfail += 1
+    LibPETSc.TSSetConvergedReason(
+        pl, LibPETSc.TS(ts_ptr, pl), LibPETSc.TS_DIVERGED_NONLINEAR_SOLVE,
+    )
+    return true
+end
+
 # PETSc's `dt_min` clamps and takes the step whatever its error, so check the floor here.
 function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
-    ctx = POST_STEP_CTX[ts_ptr]::TSContext
+    ctx, ts = POST_STEP_CTX[ts_ptr]::Tuple
     ctx.comm === nothing || return _post_step_collective!(ctx, ts_ptr)
+    return _post_step_serial!(ctx, ts)
+end
+
+function _post_step_serial!(ctx, ts)
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
     try
         pl = ctx.petsclib
-        ts = LibPETSc.TS(ts_ptr, pl)
-        Int(LibPETSc.TSGetConvergedReason(pl, ts)) < 0 && return LibPETSc.PetscErrorCode(0)
+        _undo_failed_irk!(ctx, pl, ts.ptr) && return LibPETSc.PetscErrorCode(0)
+        reason = Int(LibPETSc.TSGetConvergedReason(pl, ts))
+        reason < 0 && return LibPETSc.PetscErrorCode(0)
         s = LibPETSc.TSGetTime(pl, ts)
         smax = LibPETSc.TSGetMaxTime(pl, ts)
         s >= smax - _near(smax) && return LibPETSc.PetscErrorCode(0)
         hnext = LibPETSc.TSGetTimeStep(pl, ts)
         stop = false
-        if ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
+        if ctx.halt_stalled && reason == 0 && s <= LibPETSc.TSGetPrevTime(pl, ts)
+            ctx.stalled = stop = true
+        elseif ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
             ctx.dt_too_small = stop = true
         end
         if !stop && (ctx.unstable !== nothing || ctx.halt_nonfinite)
             x = Ref{LibPETSc.CVec}(C_NULL)
             ccall(
                 _symbol(pl, :TSGetSolution), LibPETSc.PetscErrorCode,
-                (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x,
+                (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts, x,
             )
-            u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
+            flat = ctx.flat_vec === nothing ? PETSc.VecPtr(pl, x[], false) : ctx.flat_vec
+            u = _readvec!(ctx.u, pl, flat)
+            ctx.partitioned_u === nothing || (u = copyto!(ctx.partitioned_u, u))
             ctx.unstable !== nothing &&
                 ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s)) &&
                 (ctx.unstable_hit = stop = true)
@@ -757,29 +1071,34 @@ function _post_step_collective!(ctx, ts_ptr)
     pl = ctx.petsclib
     try
         ts = LibPETSc.TS(ts_ptr, pl)
-        small = unstable = false
+        _undo_failed_irk!(ctx, pl, ts_ptr)
+        small = unstable = nonfinite = false
         s = LibPETSc.TSGetTime(pl, ts)
         smax = LibPETSc.TSGetMaxTime(pl, ts)
         if Int(LibPETSc.TSGetConvergedReason(pl, ts)) >= 0 && s < smax - _near(smax)
             hnext = LibPETSc.TSGetTimeStep(pl, ts)
             small = ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
-            if !small && ctx.unstable !== nothing
+            if !small && (ctx.unstable !== nothing || ctx.halt_nonfinite)
                 x = Ref{LibPETSc.CVec}(C_NULL)
                 ccall(
                     _symbol(pl, :TSGetSolution), LibPETSc.PetscErrorCode,
                     (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x,
                 )
                 u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
-                unstable = _asked(ctx) do
-                    ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s))
+                if ctx.unstable !== nothing
+                    unstable = _asked(ctx) do
+                        ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s))
+                    end
                 end
+                nonfinite = ctx.halt_nonfinite && !all(isfinite, u)
             end
         end
-        threw, unstable = MPI.Allreduce([ctx.err !== nothing, unstable], |, ctx.comm)
+        threw, unstable, nonfinite =
+            MPI.Allreduce([ctx.err !== nothing, unstable, nonfinite], |, ctx.comm)
         threw && ctx.err === nothing && (ctx.err = _remote_error())
         ctx.dt_too_small |= small
         ctx.unstable_hit |= unstable
-        (threw || small || unstable) &&
+        (threw || small || unstable || nonfinite) &&
             LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_CONVERGED_USER)
     catch e
         ctx.err = e
@@ -790,11 +1109,12 @@ end
 
 const POST_STEP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
-# The post-step callback gets no context, and asking the TS may use another build's symbol.
+# The post-step and domain-error callbacks get no context, and asking the TS may use another
+# build's symbol.
 const POST_STEP_CTX = Dict{LibPETSc.CTS, Any}()
 
 function _set_post_step!(pl, ts, ctx)
-    POST_STEP_CTX[ts.ptr] = ctx
+    POST_STEP_CTX[ts.ptr] = (ctx, ts)
     ccall(
         _symbol(pl, :TSSetPostStep), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Ptr{Cvoid}), ts, POST_STEP_PTR[],
@@ -838,8 +1158,8 @@ function _derivative(ctx::TSContext{R, S}, t, u) where {R, S}
     return du
 end
 
-_saved(ctx::TSContext{R, S, U}, u) where {R, S, U} =
-    ctx.save_idxs === nothing ? Vector{U}(u) : U[u[i] for i in ctx.save_idxs]
+_saved(ctx::TSContext{R, S, A}, u) where {R, S, A} = ctx.save_idxs === nothing ?
+    Vector{eltype(A)}(u) : eltype(A)[u[i] for i in ctx.save_idxs]
 
 _interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, dus) :
     SciMLBase.LinearInterpolation(ts, ctx.us)
@@ -872,14 +1192,24 @@ _failed_step(e, h) =
     e isa LibPETSc.PetscError && !h.pivot_raises &&
     (e.code == PETSC_ERR_MAT_LU_ZRPVT || e.code == PETSC_ERR_FP)
 
-function _warn_failed_step(alg, code)
-    why = code == PETSC_ERR_FP ?
-        "PETSc hit a floating point exception, an overflow or a NaN in the step or in " *
-        "its error estimate" :
-        "the LU factorization of its Newton matrix hit a zero pivot"
-    @warn "`$(_warn_name(alg))` ends here because $why"
+_verbosity(v::SciMLLogging.AbstractVerbosityPreset) = DiffEqBase.DEVerbosity(v)
+_verbosity(v) = v
+
+function _ends_early(alg, why, verbose)
+    SciMLLogging.@SciMLMessage(
+        "`$(_warn_name(alg))` ends here because $why", _verbosity(verbose), :instability,
+    )
     return nothing
 end
+
+_warn_failed_step(alg, code, verbose) = _ends_early(
+    alg,
+    code == PETSC_ERR_FP ?
+        "PETSc hit a floating point exception, an overflow or a NaN in the step or in " *
+        "its error estimate" :
+        "the LU factorization of its Newton matrix hit a zero pivot",
+    verbose,
+)
 
 function _ts_dm(pl, ts)
     dm = Ref{Ptr{Cvoid}}(C_NULL)
@@ -909,6 +1239,20 @@ function _hold_work_vec!(ctx, ts)
     return nothing
 end
 
+# Each SNESSolve empties the DM's cache, dropping the held vector to our one reference.
+function _rehold_work_vec!(ctx, ts)
+    if ctx.workvec != C_NULL
+        refs = Ref{PETSc.inttype(ctx.petsclib)}(0)
+        ccall(
+            _symbol(ctx.petsclib, :PetscObjectGetReference), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Cvoid}), ctx.workvec, refs,
+        )
+        refs[] > 1 && return nothing
+        _release_work_vec!(ctx)
+    end
+    return _hold_work_vec!(ctx, ts)
+end
+
 function _return_work_vec!(ctx, ts)
     ctx.workvec == C_NULL && return false
     pl = ctx.petsclib
@@ -934,10 +1278,14 @@ function _release_work_vec!(ctx)
     return nothing
 end
 
-function _retry_step(h, s, taken, floor, forced, failed)
+function _retry_step(h, s, taken, floor, forced, code)
     ctx = h.ctx
-    ctx.nreject += 1
-    smaller = taken / 5
+    pivot, failed = code == PETSC_ERR_MAT_LU_ZRPVT, code != 0
+    pivot ? (ctx.nfail += 1) : (ctx.nreject += 1)
+    smaller = taken / (
+        pivot ? inv(_adapt_real(h.petsclib, h.ts.ptr, :TSAdaptGetScaleSolveFailed, typeof(taken))) :
+            5
+    )
     if forced && smaller < floor
         failed && taken <= floor || return min(floor, taken), true
         ctx.unstable_hit = true
@@ -949,6 +1297,164 @@ function _retry_step(h, s, taken, floor, forced, failed)
         return nothing, false
     end
     return smaller, false
+end
+
+function _snes(pl, ts_ptr)
+    snes = Ref{LibPETSc.CSNES}(C_NULL)
+    ccall(
+        _symbol(pl, :TSGetSNES), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts_ptr, snes,
+    )
+    return snes[]
+end
+
+function _snes_failed(pl, ts_ptr)
+    snes, reason = _snes(pl, ts_ptr), Ref{Cint}(0)
+    ccall(
+        _symbol(pl, :SNESGetConvergedReason), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{Cint}), snes, reason,
+    )
+    return reason[] < 0 ? snes : nothing
+end
+
+# An explicit RosW stage runs no SNESSolve, so it still sees the last attempt's failed reason.
+function _stale_failure!(pl, snes, y)
+    x = Ref{LibPETSc.CVec}(C_NULL)
+    ccall(
+        _symbol(pl, :SNESGetSolution), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{LibPETSc.CVec}), snes, x,
+    )
+    x[] == y && return false
+    ccall(
+        _symbol(pl, :SNESSetConvergedReason), LibPETSc.PetscErrorCode, (LibPETSc.CSNES, Cint),
+        snes, 0,
+    )
+    return true
+end
+
+function _jacobian_lag(pl, snes)
+    lag = Ref{PETSc.inttype(pl)}(0)
+    ccall(
+        _symbol(pl, :SNESGetLagJacobian), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{Cvoid}), snes, lag,
+    )
+    return lag[]
+end
+
+# TSStep_RosW lifts its Jacobian lag only after its last stage, so a failed stage leaves it frozen.
+function _unfreeze_jacobian!(pl, snes)
+    _jacobian_lag(pl, snes) < 0 && ccall(
+        _symbol(pl, :SNESSetLagJacobian), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, LibPETSc.PetscInt), snes, LibPETSc.PetscInt(1),
+    )
+    return nothing
+end
+
+# TSAdaptChoose takes its DM work vector after the last stage, and BDF and theta take none.
+function _last_stage(ctx, pl, ts_ptr, y)
+    ctx.alg_name in ("bdf", "theta", "beuler", "cn") && return false
+    startswith(ctx.alg_name, "rosw") && return _jacobian_lag(pl, _snes(pl, ts_ptr)) >= 0
+    ns, stages = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{LibPETSc.CVec}}(C_NULL)
+    ccall(
+        _symbol(pl, :TSGetStages), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{Cvoid}, Ptr{Ptr{LibPETSc.CVec}}), ts_ptr, ns, stages,
+    )
+    return ns[] == 0 || unsafe_load(stages[], ns[]) == y
+end
+
+function _adapt_real(pl, ts_ptr, name, ::Type{R}) where {R}
+    adapt, lo, hi = Ref{Ptr{Cvoid}}(C_NULL), Ref{R}(0), Ref{R}(0)
+    ccall(
+        _symbol(pl, :TSGetAdapt), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{Ptr{Cvoid}}), ts_ptr, adapt,
+    )
+    if name === :TSAdaptGetStepLimits
+        ccall(
+            _symbol(pl, name), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{R}, Ptr{R}),
+            adapt[], lo, hi,
+        )
+    else
+        ccall(_symbol(pl, name), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{R}), adapt[], lo)
+    end
+    return lo[]
+end
+
+# TSAdaptCheckStage calls this before reading the SNES reason and skips its shrink once a
+# reason is set.
+function _check_stage!(
+        ts_ptr::LibPETSc.CTS, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx, _ = POST_STEP_CTX[ts_ptr]::Tuple
+    return _check_stage_body!(ctx, ts_ptr, t, y, accept)
+end
+
+function _check_stage_body!(ctx, ts_ptr, t::R, y, accept) where {R}
+    ctx.comm === nothing && ctx.err !== nothing && return LibPETSc.PetscErrorCode(0)
+    try
+        pl = ctx.petsclib
+        ctx.retry_fp && _last_stage(ctx, pl, ts_ptr, y) && _rehold_work_vec!(ctx, ts_ptr)
+        ts = LibPETSc.TS(ts_ptr, pl)
+        h, s = LibPETSc.TSGetTimeStep(pl, ts), LibPETSc.TSGetTime(pl, ts)
+        snes = _snes_failed(pl, ts_ptr)
+        snes === nothing || _stale_failure!(pl, snes, y) && (snes = nothing)
+        if snes === nothing
+            s + h == s || return LibPETSc.PetscErrorCode(0)
+            # PetscBool is 4 bytes before PETSc 3.24 and 1 after, and PETSc set it true.
+            unsafe_store!(Ptr{UInt8}(accept), 0x00)
+            ctx.unstable_hit = true
+            ctx.stuck = "its step fell below the floating point spacing at t = " *
+                "$(_user_t(ctx.tdir, s))"
+            LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_DIVERGED_STEP_REJECTED)
+            return LibPETSc.PetscErrorCode(0)
+        end
+        if _threw!(ctx)
+            LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_DIVERGED_NONLINEAR_SOLVE)
+            return LibPETSc.PetscErrorCode(0)
+        end
+        startswith(ctx.alg_name, "rosw") && _unfreeze_jacobian!(pl, snes)
+        scale = _adapt_real(pl, ts_ptr, :TSAdaptGetScaleSolveFailed, R)
+        next = h * scale
+        floor = ctx.forced ? _adapt_real(pl, ts_ptr, :TSAdaptGetStepLimits, R) : zero(R)
+        if next < floor
+            if h > floor * (1 + sqrt(eps(R)))
+                LibPETSc.TSSetTimeStep(pl, ts, floor / scale)
+                return LibPETSc.PetscErrorCode(0)
+            end
+            ctx.unstable_hit = true
+        elseif ctx.dtmin > 0 && next < ctx.dtmin
+            ctx.dt_too_small = true
+        elseif next < 100 * eps(max(abs(s), ctx.tbound))
+            ctx.unstable_hit = true
+        elseif next < h
+            return LibPETSc.PetscErrorCode(0)
+        end
+        ctx.stuck = "its nonlinear solve failed at every step size tried"
+        LibPETSc.TSSetConvergedReason(
+            pl, ts, next < h ? LibPETSc.TS_DIVERGED_STEP_REJECTED :
+                LibPETSc.TS_DIVERGED_NONLINEAR_SOLVE,
+        )
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+function _retry_failed_solves!(pl, ts, ctx, ptr, opts)
+    for (name, setter) in
+        (("ts_max_snes_failures", :TSSetMaxSNESFailures), ("ts_max_reject", :TSSetMaxStepRejections))
+        any(o -> _names_option(o, name), opts) && continue
+        ccall(
+            _symbol(pl, setter), LibPETSc.PetscErrorCode, (LibPETSc.CTS, LibPETSc.PetscInt),
+            ts, LibPETSc.PetscInt(-1),
+        )
+    end
+    POST_STEP_CTX[ts.ptr] = (ctx, ts)
+    ccall(
+        _symbol(pl, :TSSetFunctionDomainError), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{Cvoid}), ts, ptr,
+    )
+    return nothing
 end
 
 function _pivot_raises(pl, ts)
@@ -996,6 +1502,27 @@ function _set_pc_type!(pl, ts, type)
     )
     code == 0 || throw(LibPETSc.PetscError(code))
     return nothing
+end
+
+# PETSc's DMDA colouring refuses a periodic axis whose size its colour count does not divide.
+function _dm_colours(pl, dm)
+    coloring = Ref{Ptr{Cvoid}}(C_NULL)
+    ccall(
+        _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
+        _symbol(pl, :PetscReturnErrorHandler), C_NULL,
+    )
+    code = ccall(
+        _symbol(pl, :DMCreateColoring), LibPETSc.PetscErrorCode,
+        (Ptr{Cvoid}, Cint, Ptr{Ptr{Cvoid}}), dm, Cint(LibPETSc.IS_COLORING_GLOBAL), coloring,
+    )
+    ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ())
+    code == 0 && _check_code(
+        ccall(
+            _symbol(pl, :ISColoringDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+            coloring,
+        ),
+    )
+    return code == 0
 end
 
 function _colour_jacobian!(pl, ts, mat)
@@ -1232,6 +1759,75 @@ _reverse_residual(g) =
 _reverse_dae_jac(j) =
     (J, dv, u, p, gamma, s) -> (dv .*= -1; j(J, dv, u, p, -gamma, _user_t(-one(s), s)); dv .*= -1; nothing)
 
+# A DynamicalODEProblem's state is ArrayPartition(v, u), stepped here as the flat [v; u].
+struct Partitioned{F1, F2}
+    f1::F1
+    f2::F2
+    nv::Int
+    kicks::Vector{Float64}
+    kick::Base.RefValue{Int}
+end
+
+Partitioned(f1, f2, nv) = Partitioned(f1, f2, nv, Float64[], Ref(0))
+
+function (d::Partitioned)(dx, x, p, t)
+    n = length(x)
+    v, u = view(x, 1:d.nv), view(x, (d.nv + 1):n)
+    d.f1(view(dx, 1:d.nv), v, u, p, t)
+    d.f2(view(dx, (d.nv + 1):n), v, u, p, t)
+    return nothing
+end
+
+_as_inplace_part(f, iip::Bool) = iip ? f : (d, v, u, p, t) -> (d .= f(v, u, p, t); nothing)
+
+_partitioned(f, iip, nv) = Partitioned(
+    _as_inplace_part(SciMLBase.unwrapped_f(f.f1.f), iip),
+    _as_inplace_part(SciMLBase.unwrapped_f(f.f2.f), iip), nv,
+)
+
+_reverse_part(f) = (d, v, u, p, s) -> (f(d, v, u, p, _user_t(-one(s), s)); d .*= -1; nothing)
+_reverse_rhs(d::Partitioned) =
+    Partitioned(_reverse_part(d.f1), _reverse_part(d.f2), d.nv, d.kicks, d.kick)
+
+const _CBRT2 = cbrt(2.0)
+const _FR = 1 / (2 - _CBRT2)
+const _SYMPLECTIC_TABLES = Dict(
+    "1" => ([1.0], [1.0]),
+    "2" => ([0.0, 1.0], [0.5, 0.5]),
+    "3" => ([1.0, -2 / 3, 2 / 3], [-1 / 24, 3 / 4, 7 / 24]),
+    "4" => (
+        [_FR / 2, (1 - _CBRT2) * _FR / 2, (1 - _CBRT2) * _FR / 2, _FR / 2],
+        [_FR, -_CBRT2 * _FR, _FR, 0.0],
+    ),
+)
+
+# PETSc advances the time of a kick by the kick coefficients, not the drifts that moved the
+# positions, so each kick's time is rescaled to the positions' own.
+function _set_kicks!(d::Partitioned, type)
+    c, k = _SYMPLECTIC_TABLES[type]
+    empty!(d.kicks)
+    for i in eachindex(k)
+        iszero(k[i]) || push!(d.kicks, sum(c[1:i]) / sum(k[1:i]))
+    end
+    d.kick[] = 0
+    return nothing
+end
+
+function _kick_time(d::Partitioned, sub_ts, pl, t)
+    isempty(d.kicks) && return t
+    i = d.kick[] % length(d.kicks) + 1
+    d.kick[] = i
+    t0 = LibPETSc.TSGetTime(pl, LibPETSc.TS(sub_ts, pl))
+    return t0 + (t - t0) * oftype(t, d.kicks[i])
+end
+
+_partition(template, x) = copyto!(similar(template, eltype(x)), x)
+
+function _partitioned_jac(jac, template, iip)
+    iip && return (J, x, p, t) -> jac(J, _partition(template, x), p, t)
+    return (J, x, p, t) -> (_copy_jac!(J, jac(_partition(template, x), p, t)); nothing)
+end
+
 # `+ zero(s)` turns -0.0 into 0.0, which `isless` would otherwise put before 0.0.
 _user_t(tdir, s) = tdir * s + zero(s)
 
@@ -1379,8 +1975,8 @@ function _mprk_part!(ctx, t, x_ptr, f_ptr, idxs)
     pl = ctx.petsclib
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        if !(ctx.part_valid && ctx.part_t == t && ctx.part_u == ctx.u)
-            ctx.f!(ctx.du, ctx.u, ctx.p, t)
+        if !_everywhere(ctx.comm, ctx.part_valid && ctx.part_t == t && ctx.part_u == ctx.u)
+            _call_f!(ctx, ctx.du, ctx.u, t)
             ctx.nf += 1
             ctx.part_t = t
             copyto!(ctx.part_u, ctx.u)
@@ -1433,6 +2029,122 @@ function _mprk_fast!(
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _mprk_part!(ctx, t, x_ptr, f_ptr, ctx.fast_idxs)
+end
+
+# PETSc hands each part only the other part's values, so ctx.u keeps the latest of both.
+function _symplectic_part!(ctx, sub_ts, t, x_ptr, f_ptr, momentum::Bool)
+    pl = ctx.petsclib
+    try
+        d, n = ctx.f!, length(ctx.u)
+        momentum && (t = _kick_time(d, sub_ts, pl, t))
+        v, u = view(ctx.u, 1:d.nv), view(ctx.u, (d.nv + 1):n)
+        _readvec!(momentum ? u : v, pl, PETSc.VecPtr(pl, x_ptr, false))
+        out = momentum ? view(ctx.du, 1:d.nv) : view(ctx.du, (d.nv + 1):n)
+        (momentum ? d.f1 : d.f2)(out, v, u, ctx.p, t)
+        momentum ? (ctx.nf += 1) : (ctx.nf2 += 1)
+        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), out)
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+function _momentum!(
+        sub_ts::LibPETSc.CTS,
+        t,
+        x_ptr::LibPETSc.CVec,
+        f_ptr::LibPETSc.CVec,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    return _symplectic_part!(ctx, sub_ts, t, x_ptr, f_ptr, true)
+end
+
+function _position!(
+        sub_ts::LibPETSc.CTS,
+        t,
+        x_ptr::LibPETSc.CVec,
+        f_ptr::LibPETSc.CVec,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    return _symplectic_part!(ctx, sub_ts, t, x_ptr, f_ptr, false)
+end
+
+function _read_second_order!(ctx, u_ptr, v_ptr)
+    pl, nv = ctx.petsclib, ctx.f!.nv
+    _readvec!(view(ctx.u, 1:nv), pl, PETSc.VecPtr(pl, v_ptr, false))
+    _readvec!(view(ctx.u, (nv + 1):length(ctx.u)), pl, PETSc.VecPtr(pl, u_ptr, false))
+    return nv
+end
+
+function _i2function!(
+        ::LibPETSc.CTS,
+        t,
+        u_ptr::LibPETSc.CVec,
+        v_ptr::LibPETSc.CVec,
+        a_ptr::LibPETSc.CVec,
+        f_ptr::LibPETSc.CVec,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    return _i2function_body!(ctx, t, u_ptr, v_ptr, a_ptr, f_ptr)
+end
+
+function _i2function_body!(ctx, t, u_ptr, v_ptr, a_ptr, f_ptr)
+    pl = ctx.petsclib
+    try
+        nv = _read_second_order!(ctx, u_ptr, v_ptr)
+        a = _readvec!(view(ctx.mudot, 1:nv), pl, PETSc.VecPtr(pl, a_ptr, false))
+        acc, r = view(ctx.du, 1:nv), view(ctx.resid, 1:nv)
+        ctx.f!.f1(acc, view(ctx.u, 1:nv), view(ctx.u, (nv + 1):length(ctx.u)), ctx.p, t)
+        @. r = a - acc
+        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), r)
+        ctx.nf += 1
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+function _i2jacobian!(
+        ::LibPETSc.CTS,
+        t,
+        u_ptr::LibPETSc.CVec,
+        v_ptr::LibPETSc.CVec,
+        a_ptr::LibPETSc.CVec,
+        shift_v,
+        shift_a,
+        A_ptr::LibPETSc.CMat,
+        B_ptr::LibPETSc.CMat,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    return _i2jacobian_body!(ctx, t, u_ptr, v_ptr, shift_v, shift_a, A_ptr, B_ptr)
+end
+
+# Rows 1:nv of the flat Jacobian hold df/dv in columns 1:nv and df/du in columns nv+1:end.
+function _i2jacobian_body!(ctx, t, u_ptr, v_ptr, shift_v, shift_a, A_ptr, B_ptr)
+    A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
+    B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
+    try
+        nv = _read_second_order!(ctx, u_ptr, v_ptr)
+        ctx.jac!(ctx.J, ctx.u, ctx.p, t)
+        ctx.njacs += 1
+        J = ctx.J
+        @inbounds for j in 1:nv, i in 1:nv
+            ctx.W[j, i] = shift_a * (i == j) - shift_v * J[i, j] - J[i, nv + j]
+        end
+        _setblock!(ctx, B, nv)
+        PETSc.assemble!(B)
+        B.ptr == A.ptr || PETSc.assemble!(A)
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
 end
 
 function _ijacobian!(
@@ -1526,9 +2238,10 @@ end
 
 function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
-    x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
+    x = ctx.flat_vec === nothing ? PETSc.VecPtr(ctx.petsclib, x_ptr, false) : ctx.flat_vec
     try
-        ctx.retry_fp && ctx.workvec == C_NULL && _hold_work_vec!(ctx, ts_ptr)
+        (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
+            _hold_work_vec!(ctx, ts_ptr)
         ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
         tol = _near(t)
         landed = false
@@ -1590,6 +2303,11 @@ struct Callbacks
     mprk_slow::Ptr{Cvoid}
     mprk_medium::Ptr{Cvoid}
     mprk_fast::Ptr{Cvoid}
+    momentum::Ptr{Cvoid}
+    position::Ptr{Cvoid}
+    i2function::Ptr{Cvoid}
+    i2jacobian::Ptr{Cvoid}
+    stage_check::Ptr{Cvoid}
 end
 
 const CALLBACKS = Dict{DataType, Callbacks}()
@@ -1652,6 +2370,37 @@ for R in (Float32, Float64)
             LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
         ),
+        @cfunction(
+            _momentum!,
+            LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+        ),
+        @cfunction(
+            _position!,
+            LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+        ),
+        @cfunction(
+            _i2function!,
+            LibPETSc.PetscErrorCode,
+            (
+                LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, LibPETSc.CVec,
+                LibPETSc.CVec, Ptr{Cvoid},
+            )
+        ),
+        @cfunction(
+            _i2jacobian!,
+            LibPETSc.PetscErrorCode,
+            (
+                LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, LibPETSc.CVec, $R, $R,
+                LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid},
+            )
+        ),
+        @cfunction(
+            _check_stage!,
+            LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, $R, LibPETSc.CVec, Ptr{Cvoid})
+        ),
     )
 end
 
@@ -1672,11 +2421,11 @@ function __init__()
 end
 
 # PETSc.jl's `TSRHSSplitSetRHSFunction` wrapper takes no context, so ccall it.
-function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr)
+function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr, comm = MPI.COMM_SELF, rstart = 0)
     n = LibPETSc.PetscInt(length(idxs))
     is = LibPETSc.ISCreateGeneral(
-        petsclib, MPI.COMM_SELF, n,
-        LibPETSc.PetscInt[i - 1 for i in idxs], LibPETSc.PETSC_COPY_VALUES,
+        petsclib, comm, n,
+        LibPETSc.PetscInt[rstart + i - 1 for i in idxs], LibPETSc.PETSC_COPY_VALUES,
     )
     LibPETSc.TSRHSSplitSetIS(petsclib, ts, name, is)
     code = ccall(
@@ -1688,6 +2437,8 @@ function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr)
         throw(ErrorException("TSRHSSplitSetRHSFunction(\"$name\") failed with $code"))
     return nothing
 end
+
+_check_code(code) = iszero(code) ? nothing : throw(LibPETSc.PetscError(code))
 
 # PETSc.jl fixes `LibPETSc.PetscInt` at Int64 whatever the loaded library uses.
 function _check_inttype(petsclib)
@@ -1720,6 +2471,8 @@ _ts_type(::TSIRK) = "irk"
 _ts_type(alg::TSDAE) = alg.subtype
 _ts_type(::TSARKIMEX) = "arkimex"
 _ts_type(::TSMPRK) = "mprk"
+_ts_type(::TSBasicSymplectic) = "basicsymplectic"
+_ts_type(::TSAlpha2) = "alpha2"
 _ts_type(alg::TSGeneric) = alg.ts_type
 
 _warn_name(alg::Union{TSRK, TSRosW, TSARKIMEX}) = "$(_ts_type(alg)) $(alg.subtype)"
@@ -1838,16 +2591,26 @@ function _set_subtype!(petsclib, ts, alg::TSDAE)
     return nothing
 end
 _set_subtype!(petsclib, ts, ::TSMPRK) = nothing
+_set_subtype!(petsclib, ts, ::TSBasicSymplectic) = nothing
+function _set_subtype!(petsclib, ts, alg::TSAlpha2)
+    alg.radius === nothing ||
+        LibPETSc.TSAlpha2SetRadius(petsclib, ts, petsclib.PetscReal(alg.radius))
+    return nothing
+end
 _set_subtype!(petsclib, ts, ::TSGeneric) = nothing
 
 _default_options(::AnyPETScTS) = String[]
 # Without -ts_use_splitrhsfunction PETSc never calls the per-part functions.
 _default_options(alg::TSMPRK) =
     ["-ts_mprk_type", alg.subtype, "-ts_use_splitrhsfunction", "true"]
+_default_options(alg::TSBasicSymplectic) = ["-ts_basicsymplectic_type", alg.subtype]
+# PETSc estimates alpha2's error but leaves its adaptor off unless asked.
+_default_options(::TSAlpha2) = ["-ts_adapt_type", "basic"]
 
 const UNSUPPORTED_KWARGS = (
     :internalnorm, :calck, :alias_u0, :sensealg,
-    :controller, :qmax, :qmin, :gamma, :beta1, :beta2,
+    :controller, :qmax, :qmin, :gamma, :beta1, :beta2, :failfactor,
+    :step_limiter, :stage_limiter,
 )
 
 mutable struct TSHandles{CTX, L, R, S}
@@ -1873,6 +2636,8 @@ mutable struct TSHandles{CTX, L, R, S}
     tolvecs::Vector{Any}
     tolbufs::Vector{Vector{S}}
     destroyed::Bool
+    solution::Any
+    dms::Vector{Ptr{Cvoid}}
     init_failed::Bool
 end
 
@@ -1934,6 +2699,14 @@ function _destroy!(h::TSHandles)
     h.ts === nothing || _return_work_vec!(h.ctx, h.ts)
     _release_work_vec!(h.ctx)
     h.ts === nothing || LibPETSc.TSDestroy(h.petsclib, h.ts)
+    for dm in h.dms
+        _check_code(
+            ccall(
+                _symbol(h.petsclib, :DMDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+                Ref(dm),
+            ),
+        )
+    end
     return nothing
 end
 
@@ -2038,7 +2811,30 @@ end
 
 const SupportedProblem = Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}
 
+function _mprk_splits(alg::TSMPRK, n, comm)
+    named = vcat(alg.slow, alg.medium)
+    _checked_everywhere(comm) do
+        comm === nothing || _check_mprk(alg.slow, alg.medium, alg.subtype, true)
+        all(<=(n), named) || throw(
+            ArgumentError("`slow` or `medium` names index $(maximum(named)), but the state has $n"),
+        )
+    end
+    rest = setdiff(1:n, named)
+    _everywhere(comm, isempty(rest)) && throw(
+        ArgumentError("`slow` and `medium` cover the whole state, leaving nothing fast"),
+    )
+    comm === nothing && return alg.slow, alg.medium, rest
+    _everywhere(comm, isempty(alg.slow)) &&
+        throw(ArgumentError("`slow` names no index on any rank"))
+    alg.subtype in _MPRK_THREE_WAY && _everywhere(comm, isempty(alg.medium)) &&
+        throw(ArgumentError("`$(alg.subtype)` needs a `medium` index on some rank"))
+    return alg.slow, alg.medium, rest
+end
+
 const _NOT_SELF = "on a communicator other than MPI.COMM_SELF"
+
+_in_threads_loop() = Threads.threadpoolsize() > 1 && current_task() !== Base.roottask &&
+    ccall(:jl_in_threaded_region, Cint, ()) != 0
 
 function _check_irk_layout(n, N, comm)
     nranks = MPI.Comm_size(comm)
@@ -2053,44 +2849,141 @@ function _check_irk_layout(n, N, comm)
     )
 end
 
-const _DISTRIBUTED_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "irk")
+function _check_dynamical(prob, alg, has_mass)
+    parts = prob.u0 isa AbstractVector && hasproperty(prob.u0, :x) ? prob.u0.x : ()
+    length(parts) == 2 && all(x -> x isa AbstractVector, parts) || throw(
+        ArgumentError(
+            "PETScDiffEq takes a DynamicalODEProblem or SecondOrderODEProblem whose initial " *
+                "velocity and position are both vectors",
+        ),
+    )
+    has_mass && throw(
+        ArgumentError(
+            "PETScDiffEq does not take a mass matrix on a DynamicalODEProblem or " *
+                "SecondOrderODEProblem",
+        ),
+    )
+    alg isa TSAlpha2 || return nothing
+    prob.f.jac_prototype isa SparseArrays.AbstractSparseMatrix && throw(
+        ArgumentError("TSAlpha2 takes no sparse `jac_prototype` yet; it builds a dense Jacobian"),
+    )
+    prob.problem_type isa SciMLBase.SecondOrderODEProblem || throw(
+        ArgumentError(
+            "TSAlpha2 needs a SecondOrderODEProblem, where u' is the velocity; a " *
+                "DynamicalODEProblem's f2 can be anything",
+        ),
+    )
+    length(parts[1]) == length(parts[2]) || throw(
+        ArgumentError(
+            "TSAlpha2 needs the initial velocity and position to have the same length, " *
+                "got $(length(parts[1])) and $(length(parts[2]))",
+        ),
+    )
+    return nothing
+end
 
-function _refuse_distributed(prob, alg, is_dae, N)
-    alg isa Union{TSRK, TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX} ||
+const _DISTRIBUTED_IMPLICIT =
+    ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "irk", "alpha", "dirk")
+const _DM_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex")
+const _WITH_DM = "with a `dm`"
+
+function _check_diagonal_mass(prob, is_dae, where)
+    n = length(prob.u0)
+    mass = is_dae ? nothing : prob.f.mass_matrix
+    (mass === nothing || mass == LinearAlgebra.I) && return nothing
+    mass isa LinearAlgebra.Diagonal || throw(
+        ArgumentError(
+            "PETScDiffEq takes only a `Diagonal` mass matrix $where, not a " *
+                "$(nameof(typeof(mass)))",
+        ),
+    )
+    size(mass) == (n, n) || throw(
+        ArgumentError(
+            "the mass matrix is $(join(size(mass), " x ")), but this rank's block of " *
+                "the state has $n rows",
+        ),
+    )
+    return nothing
+end
+
+function _refuse_dm(prob, alg, is_dae)
+    irk = alg isa TSIRK ? ", and TSIRK needs a `jac`, which a `dm` solve does not take" : ""
+    alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX} ||
         alg isa TSGeneric && alg.explicit || throw(
         ArgumentError(
             "PETScDiffEq cannot run " *
                 "$(alg isa TSGeneric ? "an implicit TSGeneric" : nameof(typeof(alg))) " *
-                "$_NOT_SELF; TSRK, TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX and " *
-                "TSGeneric(...; explicit = true) can",
+                "$_WITH_DM; TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX and " *
+                "TSGeneric(...; explicit = true) can$irk",
         ),
     )
+    prob.f.jac === nothing || throw(
+        ArgumentError(
+            "PETScDiffEq does not take a `jac` $_WITH_DM yet; leave it out, and an implicit " *
+                "method has PETSc colour the DM's matrix and difference `f`",
+        ),
+    )
+    prob.f.jac_prototype === nothing || throw(
+        ArgumentError("the `dm` gives the Jacobian's pattern, so leave out `jac_prototype`"),
+    )
+    _uses_ifunction(alg) || return nothing
+    _petsc_differences(alg) || throw(
+        ArgumentError(
+            "PETScDiffEq cannot use `$(_autodiff(alg))` $_WITH_DM, since `f` then takes " *
+                "the ghosted array PETSc fills; leave `autodiff` at its default there, " *
+                "`AutoFiniteDiff()`, for the DM's colouring",
+        ),
+    )
+    _check_diagonal_mass(prob, is_dae, _WITH_DM)
+    return nothing
+end
+
+function _check_dm(petsclib, dm)
+    dm isa LibPETSc.AbstractPetscDM{typeof(petsclib)} || throw(
+        ArgumentError(
+            "the `dm` belongs to PETSc's $(_build_name(PETSc.scalartype(_dm_lib(dm)))) " *
+                "build, but `u0` and `tspan` together run this problem in its " *
+                "$(_build_name(PETSc.scalartype(petsclib))) one",
+        ),
+    )
+    type = _dm_type(petsclib, dm)
+    type == "da" || throw(
+        ArgumentError(
+            "PETScDiffEq takes only a DMDA as the `dm` so far, not a DM of type `$type`",
+        ),
+    )
+    return nothing
+end
+
+function _refuse_distributed(prob, alg, is_dae, N)
+    prob.f isa SciMLBase.DynamicalODEFunction && throw(
+        ArgumentError(
+            "PETScDiffEq cannot run a DynamicalODEProblem or SecondOrderODEProblem " *
+                "$_NOT_SELF yet",
+        ),
+    )
+    if alg isa TSGeneric
+        types = alg.explicit ? _EXPLICIT_ONLY : _DISTRIBUTED_IMPLICIT
+        alg.ts_type in types || throw(
+            ArgumentError(
+                "TSGeneric(\"$(alg.ts_type)\") cannot run $_NOT_SELF; only " *
+                    "$(join(types, ", ")) can",
+            ),
+        )
+    end
     has_jac = prob.f.jac !== nothing
     if !_uses_ifunction(alg)
-        has_jac && throw(
+        has_jac || return nothing
+        prob.f.jac_prototype isa SparseMatrixCSC || throw(
             ArgumentError(
-                "PETScDiffEq does not take a `jac` for an explicit method $_NOT_SELF; " *
-                    "it never uses one, so leave it out",
+                "PETScDiffEq does not take a `jac` for an explicit method $_NOT_SELF without a " *
+                    "sparse `jac_prototype` holding this rank's rows, with global column " *
+                    "indices; the solve never uses it, and PETScAdjoint needs that prototype",
             ),
         )
-        return nothing
     end
     n = length(prob.u0)
-    mass = is_dae ? nothing : prob.f.mass_matrix
-    if !(mass === nothing || mass == LinearAlgebra.I)
-        mass isa LinearAlgebra.Diagonal || throw(
-            ArgumentError(
-                "PETScDiffEq takes only a `Diagonal` mass matrix $_NOT_SELF, not a " *
-                    "$(nameof(typeof(mass)))",
-            ),
-        )
-        size(mass) == (n, n) || throw(
-            ArgumentError(
-                "the mass matrix is $(join(size(mass), " x ")), but this rank's block of " *
-                    "the state has $n rows",
-            ),
-        )
-    end
+    _check_diagonal_mass(prob, is_dae, _NOT_SELF)
     proto = prob.f.jac_prototype
     if has_jac
         proto isa SparseMatrixCSC || throw(
@@ -2108,7 +3001,7 @@ function _refuse_distributed(prob, alg, is_dae, N)
                     "PETSc's colouring",
             ),
         )
-        alg isa TSIRK && throw(
+        _ts_type(alg) == "irk" && throw(
             ArgumentError(
                 "TSIRK needs a `jac` $_NOT_SELF, since PETSc builds its coupled-stage " *
                     "matrix from one and has no finite-difference fallback for it",
@@ -2171,6 +3064,45 @@ function _structure(S, P::SparseMatrixCSC)
     )
 end
 
+# PETSc steps only the position, as its solution, with the velocity beside it. Both alias
+# the halves of `h.u`, so everything that reads or writes `h.u` sees the pair.
+function _set_second_order_solution!(h::TSHandles{<:Any, <:Any, <:Any, S}, nv) where {S}
+    pl, n = h.petsclib, length(h.u0)
+    a = LibPETSc.VecGetArrayRead(pl, h.u)
+    ptr = pointer(a)
+    LibPETSc.VecRestoreArrayRead(pl, h.u, a)
+    part(p, len) = LibPETSc.VecCreateSeqWithArray(
+        pl, MPI.COMM_SELF, LibPETSc.PetscInt(1), LibPETSc.PetscInt(len),
+        unsafe_wrap(Array, p, len),
+    )
+    v = part(ptr, nv)
+    push!(h.tolvecs, v)
+    u = part(ptr + nv * sizeof(S), n - nv)
+    push!(h.tolvecs, u)
+    h.solution = u
+    _check_code(
+        ccall(
+            _symbol(pl, :TS2SetSolution), LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, LibPETSc.CVec, LibPETSc.CVec), h.ts, u, v,
+        ),
+    )
+    h.ctx.flat_vec = h.u
+    return nothing
+end
+
+function _second_order_jacobian!(h::TSHandles{<:Any, <:Any, <:Any, S}, nv, ptrs, ctxptr) where {S}
+    pl = h.petsclib
+    h.jac_mat = PETScCompat.PetscMat(pl, zeros(S, nv, nv))
+    _check_code(
+        ccall(
+            _symbol(pl, :TSSetI2Jacobian), LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
+            h.ts, h.jac_mat, h.jac_mat, ptrs.i2jacobian, ctxptr,
+        ),
+    )
+    return nothing
+end
+
 # PETSc cannot parse Julia's Float32 printing (`1.0f-5`).
 _option(x::Real) = string(Float64(x))
 
@@ -2206,6 +3138,10 @@ function _setup(
             @warn "PETScDiffEq does not support `$key` and is ignoring it"
         end
     end
+    for key in (:progress, :advance_to_tstop, :stop_at_next_tstop)
+        get(kwargs, key, false) === true &&
+            @warn "PETScDiffEq does not support `$key` and is ignoring it"
+    end
     prob.u0 isa AbstractVector{<:Union{Real, Complex}} || throw(
         ArgumentError("PETScDiffEq requires an AbstractVector u0 of real or complex numbers"),
     )
@@ -2229,6 +3165,17 @@ function _setup(
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     mass_matrix = is_dae ? nothing : prob.f.mass_matrix
     has_mass = !(mass_matrix === nothing || mass_matrix == LinearAlgebra.I)
+    dyn = prob.f isa SciMLBase.DynamicalODEFunction
+    if dyn
+        _check_dynamical(prob, alg, has_mass)
+    elseif alg isa Union{TSBasicSymplectic, TSAlpha2}
+        throw(
+            ArgumentError(
+                "$(nameof(typeof(alg))) needs a " *
+                    (alg isa TSAlpha2 ? "" : "DynamicalODEProblem or a ") * "SecondOrderODEProblem",
+            ),
+        )
+    end
     if has_mass && !_uses_ifunction(alg)
         throw(
             ArgumentError(
@@ -2241,9 +3188,23 @@ function _setup(
         throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
     end
     comm = _distributed(alg) ? alg.comm : nothing
-    N = comm === nothing ? length(prob.u0) : MPI.Allreduce(length(prob.u0), +, comm)
-    comm === nothing || _checked_everywhere(comm) do
-        _refuse_distributed(prob, alg, is_dae, N)
+    dm = _alg_dm(alg)
+    N, looped = comm === nothing ? (length(prob.u0), 0) :
+        MPI.Allreduce([length(prob.u0), Int(_in_threads_loop())], +, comm)
+    looped > 0 && throw(
+        ArgumentError(
+            "PETScDiffEq cannot solve $_NOT_SELF when a rank calls it inside " *
+                "`Threads.@threads`, as `EnsembleThreads` runs its trajectories: the ranks " *
+                "could take them in different orders and return wrong results; use " *
+                "`EnsembleSerial()`",
+        ),
+    )
+    if dm !== nothing
+        _checked_everywhere(() -> _refuse_dm(prob, alg, is_dae), comm)
+    elseif comm !== nothing
+        _checked_everywhere(comm) do
+            _refuse_distributed(prob, alg, is_dae, N)
+        end
     end
 
     R, S, U = eltypes
@@ -2252,34 +3213,38 @@ function _setup(
     # From here on, times are PETSc's forward-running s = tdir * t.
     tdir = t0 < tf ? one(R) : -one(R)
     t0, tf = tdir * t0, tdir * tf
+    alg isa TSAlpha2 && tdir < 0 &&
+        throw(ArgumentError("TSAlpha2 cannot integrate backward in time"))
 
     u0 = Vector{S}(vec(prob.u0))
     n = length(u0)
+    nv = dyn ? length(prob.u0.x[1]) : 0
 
-    slow_idxs, medium_idxs, fast_idxs = if alg isa TSMPRK
-        named = vcat(alg.slow, alg.medium)
-        maximum(named) <= n || throw(
-            ArgumentError("`slow` or `medium` names index $(maximum(named)), but the state has $n"),
-        )
-        rest = setdiff(1:n, named)
-        isempty(rest) && throw(
-            ArgumentError("`slow` and `medium` cover the whole state, leaving nothing fast"),
-        )
-        alg.slow, alg.medium, rest
-    else
-        (Int[], Int[], Int[])
-    end
+    slow_idxs, medium_idxs, fast_idxs =
+        alg isa TSMPRK ? _mprk_splits(alg, n, comm) : (Int[], Int[], Int[])
 
     petsclib = _petsclib(S)
     _check_inttype(petsclib)
     PETScCompat.isinitialized(petsclib) || PETSc.initialize(petsclib)
     _arm_exit_cleanup!(petsclib)
+    if dm !== nothing
+        _checked_everywhere(() -> _check_dm(petsclib, dm), comm)
+        _checked_everywhere(comm) do
+            m = _dm_local_size(petsclib, dm)
+            m == n || throw(
+                ArgumentError(
+                    "`u0` has $n entries on this rank, but the `dm` gives it $m, its own " *
+                        "grid points times the degrees of freedom at each",
+                ),
+            )
+        end
+    end
 
     iip = SciMLBase.isinplace(prob)
     # SciMLBase's wrapper is typed for the problem's types, so unwrap where PETSc's differ.
     unwrap = eltype(prob.u0) === S && eltype(prob.tspan) === R ? identity :
         SciMLBase.unwrapped_f
-    f1 = unwrap(is_split ? prob.f.f1.f : prob.f.f)
+    f1 = dyn ? _partitioned(prob.f, iip, nv) : unwrap(is_split ? prob.f.f1.f : prob.f.f)
     is_dae && !iip &&
         throw(ArgumentError("PETScDiffEq requires an in-place DAEProblem residual"))
     f2 = is_split ? unwrap(prob.f.f2.f) : nothing
@@ -2291,17 +3256,20 @@ function _setup(
             ),
         )
     end
-    f1 = is_dae ? f1 : _as_inplace(f1, iip)
+    f1 = is_dae || dyn ? f1 : _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
+    if dm !== nothing
+        f1 = Ghosted(f1, petsclib, dm.ptr)
+        f2 = f2 === nothing ? nothing : Ghosted(f2, petsclib, dm.ptr)
+    end
     builds_jac = _uses_ifunction(alg) && prob.f.jac === nothing && !_petsc_differences(alg)
     has_jac = _uses_ifunction(alg) && (prob.f.jac !== nothing || builds_jac)
-    _refuse_method(_warn_name(alg), has_mass, has_jac, is_split, is_dae)
     ad_calls = builds_jac ? Ref(0) : nothing
     jac_fn = if !has_jac
         nothing
     elseif builds_jac
         # Dual numbers need the unwrapped function.
-        f_ad = SciMLBase.unwrapped_f(is_split ? prob.f.f1.f : prob.f.f)
+        f_ad = dyn ? f1 : SciMLBase.unwrapped_f(is_split ? prob.f.f1.f : prob.f.f)
         user_t0 = R(prob.tspan[1])
         advice = something(jac_advice, is_dae ? _DAE_ADVICE : _ODE_ADVICE)
         is_dae ?
@@ -2310,9 +3278,11 @@ function _setup(
                 advice,
             ) :
             _ad_jacobian(
-                _autodiff(alg), _as_inplace(f_ad, iip), prob.f.jac_prototype, u0, prob.p,
-                user_t0, ad_calls, advice,
+                _autodiff(alg), dyn ? f_ad : _as_inplace(f_ad, iip), prob.f.jac_prototype, u0,
+                prob.p, user_t0, ad_calls, advice,
             )
+    elseif dyn
+        _partitioned_jac(prob.f.jac, prob.u0, iip)
     else
         is_dae ? unwrap(prob.f.jac) : _as_inplace_jac(unwrap(prob.f.jac), iip)
     end
@@ -2320,6 +3290,7 @@ function _setup(
         _check_tol(abstol, n, "abstol")
         _check_tol(reltol, n, "reltol")
     end
+    alg isa TSAlpha2 && (_scalar_tol(abstol); _scalar_tol(reltol))
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
     initialized = _initialize!(
         u0, prob, initializealg, f1, jac_fn, petsclib, comm, R(prob.tspan[1]),
@@ -2387,16 +3358,17 @@ function _setup(
     save_end || filter!(!at_end, saveat_times)
     M = if !has_mass
         nothing
-    elseif comm === nothing
+    elseif comm === nothing && dm === nothing
         Matrix{S}(mass_matrix)
     else
         LinearAlgebra.Diagonal(Vector{S}(mass_matrix.diag))
     end
     missing_diag = uses_sparse_jac ?
         [i for i in 1:n if !_stored(J0, i, i)] : Int[]
-    W0 = has_jac && !uses_sparse_jac ? zeros(S, n, n) : zeros(S, 0, 0)
+    m = alg isa TSAlpha2 ? nv : n
+    W0 = has_jac && !uses_sparse_jac ? zeros(S, m, m) : zeros(S, 0, 0)
     idx0 = has_jac && !uses_sparse_jac ?
-        LibPETSc.PetscInt[i - 1 for i in 1:n] : LibPETSc.PetscInt[]
+        LibPETSc.PetscInt[i - 1 for i in 1:m] : LibPETSc.PetscInt[]
     row_cols0, row_src, row_buf = uses_sparse_jac && comm === nothing ?
         _row_structure(J0, n, M) : (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{S}[])
     kept = if save_idxs === nothing
@@ -2429,15 +3401,21 @@ function _setup(
             ),
         )
     end
-    uvec = _state_vec(petsclib, comm, n)
+    clone = dm === nothing ? nothing : _clone_dm(petsclib, dm)
+    uvec = clone === nothing ? _state_vec(petsclib, comm, n) :
+        LibPETSc.DMCreateGlobalVector(petsclib, clone)
+    A = dyn && kept === nothing ? typeof(similar(prob.u0, U)) : Vector{U}
+    # f scatters through the caller's DM, so the handle holds a reference to it.
+    dms = clone === nothing ? Ptr{Cvoid}[] : [clone.ptr, _referenced(petsclib, dm.ptr)]
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
-        similar(u0), similar(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0,
+        similar(u0), copy(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0,
         idx0,
         row_cols0, row_src, row_buf, J0,
-        R[], Vector{U}[], Vector{U}[], nothing, nothing,
+        R[], A[], A[], nothing, nothing,
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
-        _work_vec(petsclib, comm, uvec, n),
+        clone === nothing ? _work_vec(petsclib, comm, uvec, n) :
+            LibPETSc.DMCreateGlobalVector(petsclib, clone),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
         R(NaN), similar(u0), t0, copy(u0), nothing, nothing, false,
         slow_idxs, medium_idxs, fast_idxs,
@@ -2445,13 +3423,16 @@ function _setup(
         _floor(R, dtmin, force_dtmin, adaptive && _adapts(alg) !== false), false,
         unstable_check, false, tdir, isoutofdomain,
         0, 0, 0, nothing, comm,
-        comm === nothing && adaptive && _adapts(alg) !== false && !_uses_ifunction(alg),
-        C_NULL, 0, false, nothing,
+        (comm === nothing || !_uses_ifunction(alg)) && adaptive && _adapts(alg) !== false,
+        C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
+        force_dtmin && dtmin !== nothing && dtmin != 0,
+        nothing, 0, 0, max(abs(t0), abs(tf)),
+        false, false,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0, false, false,
-        Any[], Vector{S}[], false, !initialized,
+        Any[], Vector{S}[], false, nothing, dms, !initialized,
     )
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -2463,6 +3444,7 @@ function _setup(
     try
         h.ts = LibPETSc.TSCreate(petsclib, something(comm, MPI.COMM_SELF))
         ts = h.ts
+        clone === nothing || LibPETSc.TSSetDM(petsclib, ts, clone)
         LibPETSc.TSSetProblemType(petsclib, ts, LibPETSc.TS_NONLINEAR)
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
         _set_subtype!(petsclib, ts, alg)
@@ -2471,27 +3453,49 @@ function _setup(
         PETScCompat.with_local_array!(u; read = false, write = true) do ua
             copyto!(ua, u0)
         end
-        LibPETSc.TSSetSolution(petsclib, ts, u)
+        alg isa TSAlpha2 ? _set_second_order_solution!(h, nv) :
+            LibPETSc.TSSetSolution(petsclib, ts, u)
 
         ctxptr = pointer_from_objref(ctx)
         ptrs = _callbacks(petsclib)
         GC.@preserve ctx begin
-            if _uses_ifunction(alg)
+            if alg isa TSAlpha2
+                _check_code(
+                    ccall(
+                        _symbol(petsclib, :TSSetI2Function), LibPETSc.PetscErrorCode,
+                        (LibPETSc.CTS, LibPETSc.CVec, Ptr{Cvoid}, Ptr{Cvoid}),
+                        ts, C_NULL, ptrs.i2function, ctxptr,
+                    ),
+                )
+            elseif _uses_ifunction(alg)
                 LibPETSc.TSSetIFunction(petsclib, ts, nothing, ptrs.ifunction, ctxptr)
             else
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, ptrs.rhs, ctxptr)
             end
+            if alg isa TSBasicSymplectic
+                _set_split!(petsclib, ts, "position", (nv + 1):n, ptrs.position, ctxptr)
+                _set_split!(petsclib, ts, "momentum", 1:nv, ptrs.momentum, ctxptr)
+            end
             if alg isa TSMPRK
-                _set_split!(petsclib, ts, "slow", slow_idxs, ptrs.mprk_slow, ctxptr)
-                isempty(medium_idxs) || _set_split!(
-                    petsclib, ts, "medium", medium_idxs, ptrs.mprk_medium, ctxptr,
+                layout = (
+                    something(comm, MPI.COMM_SELF),
+                    comm === nothing ? 0 : first(LibPETSc.VecGetOwnershipRange(petsclib, u)),
                 )
-                _set_split!(petsclib, ts, "fast", fast_idxs, ptrs.mprk_fast, ctxptr)
+                _set_split!(petsclib, ts, "slow", slow_idxs, ptrs.mprk_slow, ctxptr, layout...)
+                alg.subtype in _MPRK_THREE_WAY && _set_split!(
+                    petsclib, ts, "medium", medium_idxs, ptrs.mprk_medium, ctxptr, layout...,
+                )
+                _set_split!(petsclib, ts, "fast", fast_idxs, ptrs.mprk_fast, ctxptr, layout...)
             end
             if is_split
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, ptrs.split_rhs, ctxptr)
             end
-            if comm !== nothing && _uses_ifunction(alg)
+            if alg isa TSAlpha2
+                has_jac && _second_order_jacobian!(h, nv, ptrs, ctxptr)
+            elseif clone !== nothing && _uses_ifunction(alg)
+                h.fd_mat = LibPETSc.DMCreateMatrix(petsclib, clone)
+                _colour_jacobian!(petsclib, ts, h.fd_mat)
+            elseif comm !== nothing && _uses_ifunction(alg)
                 rstart = first(LibPETSc.VecGetOwnershipRange(petsclib, u))
                 P = has_jac ? J0 : _structure(S, SparseMatrixCSC(prob.f.jac_prototype))
                 rows, cols, coo = _coo_structure(P, rstart, M)
@@ -2567,6 +3571,9 @@ function _setup(
                     _option(_above(abs(R(dtmax)), forced ? abs(R(dtmin)) : zero(R))),
                 ],
             )
+            clone !== nothing && _uses_ifunction(alg) &&
+                !_everywhere(comm, _dm_colours(petsclib, clone.ptr)) &&
+                append!(effective_options, ["-snes_fd_color_use_mat"])
             append!(effective_options, alg.petsc_options)
             append!(effective_options, extra_options)
             if !isempty(effective_options)
@@ -2581,9 +3588,16 @@ function _setup(
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
             end
-            # An option can change the type or subtype, so recheck the refusals.
+            # An option can change the type or subtype, so refuse on what PETSc runs.
             chosen = LibPETSc.TSGetType(petsclib, ts)
-            !(alg isa TSMPRK) && haskey(_NEEDS_OTHER_SETUP, chosen) && throw(
+            alg isa Union{TSBasicSymplectic, TSAlpha2} && chosen != _ts_type(alg) && throw(
+                ArgumentError(
+                    "$(nameof(typeof(alg))) runs PETSc's `$(_ts_type(alg))`, so an option " *
+                        "cannot change it to `$chosen`",
+                ),
+            )
+            alg isa TSBasicSymplectic && _set_kicks!(ctx.f!, _symplectic_type(petsclib, ts))
+            chosen != _ts_type(alg) && haskey(_NEEDS_OTHER_SETUP, chosen) && throw(
                 ArgumentError(
                     "PETScDiffEq cannot drive `$chosen`, which $(_NEEDS_OTHER_SETUP[chosen])",
                 ),
@@ -2600,11 +3614,14 @@ function _setup(
                         "`TSGeneric(\"irk\")` rather than an option on an explicit algorithm",
                 ),
             )
-            distributable = _uses_ifunction(alg) ? _DISTRIBUTED_IMPLICIT : _EXPLICIT_ONLY
-            comm === nothing || chosen in distributable || throw(
+            distributable = _uses_ifunction(alg) ?
+                (dm === nothing ? _DISTRIBUTED_IMPLICIT : _DM_IMPLICIT) :
+                alg isa TSMPRK ? ("mprk", _EXPLICIT_ONLY...) : _EXPLICIT_ONLY
+            comm === nothing && dm === nothing || chosen in distributable || throw(
                 ArgumentError(
-                    "`$chosen` cannot run $_NOT_SELF when an option picks it for " *
-                        "$(nameof(typeof(alg))); only $(join(distributable, ", ")) can",
+                    "`$chosen` cannot run $(dm === nothing ? _NOT_SELF : _WITH_DM) when an " *
+                        "option picks it for $(nameof(typeof(alg))); only " *
+                        "$(join(distributable, ", ")) can",
                 ),
             )
             comm === nothing || chosen != "irk" || _check_irk_layout(n, N, comm)
@@ -2624,8 +3641,8 @@ function _setup(
             # Only valid once TSSetFromOptions has reached the linear solve.
             h.pivot_raises = _pivot_raises(petsclib, ts) ||
                 _option_flag(effective_options, "ts_error_if_step_fails")
-            if !dt_given &&
-                    LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
+            fixed = LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
+            if !dt_given && fixed
                 throw(
                     ArgumentError(
                         "PETScDiffEq needs `dt` here: PETSc will step this solve at a fixed " *
@@ -2633,6 +3650,11 @@ function _setup(
                             "`-ts_adapt_type none` is set",
                     ),
                 )
+            end
+            if fixed
+                ctx.retry_fp = false
+            elseif _uses_ifunction(alg)
+                _retry_failed_solves!(petsclib, ts, ctx, ptrs.stage_check, effective_options)
             end
             if running != ctx.alg_name
                 ctx.hermite = !has_mass && !is_dae
@@ -2647,14 +3669,16 @@ function _setup(
     return h
 end
 
+# PETSc counts a failed nonlinear solve as a rejected step too; OrdinaryDiffEq does not.
 function _read_stats(h::TSHandles)
-    pl, ts = h.petsclib, h.ts
+    pl, ts, ctx = h.petsclib, h.ts, h.ctx
+    fails = Int(LibPETSc.TSGetSNESFailures(pl, ts))
     return (
         reason = LibPETSc.TSGetConvergedReason(pl, ts),
         nsteps = Int(LibPETSc.TSGetStepNumber(pl, ts)),
-        nreject = Int(LibPETSc.TSGetStepRejections(pl, ts)) + h.ctx.nreject,
-        nnonliniter = Int(LibPETSc.TSGetSNESIterations(pl, ts)),
-        nnonlinfail = Int(LibPETSc.TSGetSNESFailures(pl, ts)),
+        nreject = Int(LibPETSc.TSGetStepRejections(pl, ts)) - fails + ctx.nreject,
+        nnonliniter = Int(LibPETSc.TSGetSNESIterations(pl, ts)) + ctx.nits,
+        nnonlinfail = fails + ctx.nfail,
     )
 end
 
@@ -2670,7 +3694,7 @@ _underflows(h::TSHandles{<:Any, <:Any, Float32}, alg, uend, retcode) =
     _uses_ifunction(alg) && _tiny(uend, h.ctx.comm) &&
     (_tiny(h.u0, h.ctx.comm) || retcode != SciMLBase.ReturnCode.Success)
 
-function _assemble(prob, alg, h::TSHandles, tend, uend, st)
+function _assemble(prob, alg, h::TSHandles, tend, uend, st, kwargs)
     ctx = h.ctx
     tf, t0, tol = h.tf, h.t0, _near(h.tf)
     # -ts_exact_final_time interpolate reports a point past tf mid-sequence.
@@ -2716,6 +3740,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     else
         SciMLBase.ReturnCode.Failure
     end
+    ctx.stuck === nothing || @warn "`$(_warn_name(alg))` ends here because $(ctx.stuck)"
     if h.jac_mat !== nothing && h.ad_calls === nothing && st.nsteps > 0 && ctx.njacs == 0
         @warn "`$(_ts_type(alg))` took $(st.nsteps) steps without ever calling the " *
             "Jacobian this package gave PETSc, so it is not solving implicitly and the " *
@@ -2735,12 +3760,14 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st)
     return SciMLBase.build_solution(
         prob, alg, ts, ctx.us; retcode = retcode, stats = stats,
         dense = ctx.dense, interp = _interp(ctx, ts, dus),
+        timeseries_errors = get(kwargs, :timeseries_errors, true),
+        dense_errors = get(kwargs, :dense_errors, false),
     )
 end
 
-# Block Jacobi reads its sub-solvers' options when it first sets them up, inside the solve.
+# Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
 function _with_options(f, h::TSHandles)
-    h.ctx.comm === nothing && return f()
+    h.ctx.comm === nothing && isempty(h.dms) && return f()
     push!(h.opts)
     try
         return f()
@@ -2771,9 +3798,11 @@ function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
-    # MPRK misses tf, Float32 landing refuses short steps, and isoutofdomain retries steps.
+    # MPRK and basicsymplectic miss tf, Float32 landing refuses short steps, and
+    # isoutofdomain retries steps.
     if !_no_callback(callback) || !isempty(tstops) || !isempty(d_discontinuities) ||
-            alg isa TSMPRK || get(kwargs, :isoutofdomain, nothing) !== nothing ||
+            alg isa Union{TSMPRK, TSBasicSymplectic} ||
+            get(kwargs, :isoutofdomain, nothing) !== nothing ||
             first(_eltypes(prob)) === Float32
         integ = _init_unlocked(
             prob, alg; callback = callback, tstops = tstops,
@@ -2791,37 +3820,94 @@ function _solve_unlocked(
     ctx, pl = h.ctx, h.petsclib
     floor = abs(oftype(h.t0, something(get(kwargs, :dtmin, nothing), 0.0)))
     forced = get(kwargs, :force_dtmin, false) === true
+    verbose = get(kwargs, :verbose, true)
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
-        if ctx.comm === nothing &&
-                LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
-            ctx.halt_nonfinite = true
+        fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
+        ctx.halt_stalled = ctx.comm === nothing
+        if fixed || ctx.halt_stalled
+            ctx.halt_nonfinite = fixed
             _set_post_step!(pl, h.ts, ctx)
         end
         raised, failure = false, nothing
         while true
             _release_work_vec!(ctx)
             failure = _run!(h) do
-                LibPETSc.TSSolve(pl, h.ts, h.u)
+                LibPETSc.TSSolve(pl, h.ts, _solution_vec(h))
             end
             raised = h.stopped != 0
-            raised && ctx.err === nothing && failure === nothing &&
-                _retry_solve!(h, alg, floor, forced) || break
+            raised && _retry_solve!(h, alg, floor, forced, verbose) || break
         end
         _throw_if_threw!(ctx)
         failure === nothing || throw(failure)
-        h.stopped == 0 || _warn_failed_step(alg, h.stopped)
+        h.stopped == 0 || _warn_failed_step(alg, h.stopped, verbose)
+        ctx.stalled && _stalled!(h, alg, _user_t(h.tdir, ctx.end_s), verbose)
         # PETSc sets the solve time only when TSSolve returns normally, and a step that
         # raises leaves its rejected trial in the solution vector.
-        tend, uend = raised ? (ctx.end_s, copy(ctx.end_u)) :
+        tend, uend = raised || ctx.stalled ? (ctx.end_s, copy(ctx.end_u)) :
             (LibPETSc.TSGetSolveTime(pl, h.ts), _readvec!(similar(h.u0), pl, h.u))
         st = _read_stats(h)
     finally
         _destroy!(h)
     end
-    sol = _assemble(prob, alg, h, tend, uend, st)
+    sol = _assemble(prob, alg, h, tend, uend, st, kwargs)
     ctx.comm === nothing || _throw_if_threw!(ctx)
     return sol
+end
+
+_solution_vec(h::TSHandles) = something(h.solution, h.u)
+
+_scalar_tol(tol) = tol isa AbstractVector && throw(
+    ArgumentError(
+        "TSAlpha2 takes a scalar `abstol` and `reltol`, since PETSc weighs the position and " *
+            "the velocity with the same tolerances",
+    ),
+)
+
+function _symplectic_type(pl, ts)
+    name = Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :TSBasicSymplecticGetType), LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, Ptr{Ptr{Cchar}}), ts, name,
+        ),
+    )
+    return unsafe_string(name[])
+end
+
+# BDF and theta estimate their error without a DM work vector, so none is left out.
+function _dm_clear(pl, ts)
+    ccall(
+        _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
+        _symbol(pl, :PetscReturnErrorHandler), C_NULL,
+    )
+    try
+        return ccall(
+            _symbol(pl, :DMClearGlobalVectors), LibPETSc.PetscErrorCode, (Ptr{Cvoid},),
+            _ts_dm(pl, ts),
+        ) == 0
+    finally
+        ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ())
+    end
+end
+
+function _retryable!(h)
+    ctx = h.ctx
+    ctx.retry_fp || return false
+    h.stopped == PETSC_ERR_FP &&
+        return !_threw!(ctx) && (_return_work_vec!(ctx, h.ts) || _dm_clear(h.petsclib, h.ts))
+    h.stopped == PETSC_ERR_MAT_LU_ZRPVT || return false
+    startswith(ctx.alg_name, "rosw") && _unfreeze_jacobian!(h.petsclib, _snes(h.petsclib, h.ts))
+    return true
+end
+
+function _stalled!(h, alg, t, verbose)
+    pl, ctx = h.petsclib, h.ctx
+    LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.TSGetStepNumber(pl, h.ts) - 1)
+    ctx.nreject += 1
+    ctx.unstable_hit = true
+    _ends_early(alg, "its step fell below the floating point spacing at t = $t", verbose)
+    return nothing
 end
 
 function _initial_failure(prob, alg, h)
@@ -2835,15 +3921,17 @@ function _initial_failure(prob, alg, h)
     return SciMLBase.solution_new_retcode(sol, SciMLBase.ReturnCode.InitialFailure)
 end
 
-function _retry_solve!(h, alg, floor, forced)
+function _retry_solve!(h, alg, floor, forced, verbose)
     ctx, pl = h.ctx, h.petsclib
-    h.stopped == PETSC_ERR_FP && _return_work_vec!(ctx, h.ts) || return false
-    h.stopped = 0
-    dt, _ = _retry_step(h, ctx.end_s, LibPETSc.TSGetTimeStep(pl, h.ts), floor, forced, true)
-    dt === nothing && (_warn_failed_step(alg, PETSC_ERR_FP); return false)
+    _retryable!(h) || return false
+    code, h.stopped = h.stopped, 0
+    dt, _ = _retry_step(h, ctx.end_s, LibPETSc.TSGetTimeStep(pl, h.ts), floor, forced, code)
+    dt === nothing && (_warn_failed_step(alg, code, verbose); return false)
     # TSSolve zeroes its counters when it starts on step 0.
-    LibPETSc.TSGetStepNumber(pl, h.ts) == 0 &&
-        (ctx.nreject += Int(LibPETSc.TSGetStepRejections(pl, h.ts)))
+    if LibPETSc.TSGetStepNumber(pl, h.ts) == 0
+        st = _read_stats(h)
+        ctx.nreject, ctx.nits, ctx.nfail = st.nreject, st.nnonliniter, st.nnonlinfail
+    end
     PETScCompat.with_local_array!(ua -> copyto!(ua, ctx.end_u), h.u; read = false, write = true)
     ctx.hermite && (ctx.fend = ctx.fstart)
     LibPETSc.TSSetTimeStep(pl, h.ts, dt)
@@ -2854,6 +3942,11 @@ end
 SciMLBase.__solve(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
     _locked(() -> _solve_unlocked(prob, alg; kwargs...))
 
+SciMLBase.__solve(
+    prob::SupportedProblem, alg::AnyPETScTS, ::AbstractVector, ::AbstractVector, ks = nothing;
+    kwargs...,
+) = SciMLBase.__solve(prob, alg; kwargs...)
+
 mutable struct PETScIntegratorOpts{H, R}
     h::H
     adaptive::Bool
@@ -2861,14 +3954,16 @@ mutable struct PETScIntegratorOpts{H, R}
     reltol::Any
     dtmin::R
     dtmax::R
-    verbose::Bool
+    verbose::Any
     force_dtmin::Bool
+    save_on::Bool
 end
 
 function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {H, R}
     h = getfield(o, :h)
     name in (:abstol, :reltol) &&
         _checked_everywhere(() -> _check_tol(v, length(h.u0), name), h.ctx.comm)
+    name in (:abstol, :reltol) && h.solution !== nothing && _scalar_tol(v)
     setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : v)
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib
@@ -2905,13 +4000,15 @@ These are in the types PETSc steps in. The clock, and so `t`, `dt` and the saved
 `Float32` for a `Float32` or `ComplexF32` state with a `Float32` span and `Float64`
 otherwise, whatever the span's type. The state is the problem's own, except that a
 whole-number one is stepped in `Float64` and a single-precision one with a `Float64` span in
-double precision, while the solution it saves stays in single.
+double precision, while the solution it saves stays in single. For a `DynamicalODEProblem` or
+`SecondOrderODEProblem` the state is an `ArrayPartition` of the velocity and the position, as
+in OrdinaryDiffEq.
 """
-mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC} <:
-    SciMLBase.AbstractODEIntegrator{Alg, true, Vector{S}, R}
+mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractVector{S}} <:
+    SciMLBase.AbstractODEIntegrator{Alg, true, UT, R}
     alg::Alg
-    u::Vector{S}
-    uprev::Vector{S}
+    u::UT
+    uprev::UT
     t::R
     tprev::R
     dt::R
@@ -2923,9 +4020,9 @@ mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC} <:
     continuous::CC
     f::Any
     opts::Any
-    ucache::Vector{S}
-    tmp1::Vector{S}
-    tmp2::Vector{S}
+    ucache::UT
+    tmp1::UT
+    tmp2::UT
     event_t::Vector{Vector{R}}
     event_residual::Vector{Vector{Float64}}
     kwargs::Any
@@ -2989,8 +4086,8 @@ Base.setproperty!(integ::PETScIntegrator, name::Symbol, v) = name === :p ?
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
 function _proposed_dt_unlocked(integ::PETScIntegrator)
-    integ.finished && return abs(integ.dt)
-    return LibPETSc.TSGetTimeStep(integ.h.petsclib, integ.h.ts)
+    integ.finished && return integ.tdir * abs(integ.dt)
+    return integ.tdir * LibPETSc.TSGetTimeStep(integ.h.petsclib, integ.h.ts)
 end
 
 SciMLBase.get_proposed_dt(integ::PETScIntegrator) = _locked(() -> _proposed_dt_unlocked(integ))
@@ -3003,12 +4100,15 @@ end
 
 SciMLBase.set_proposed_dt!(integ::PETScIntegrator, dt) =
     _locked(() -> _set_proposed_dt_unlocked(integ, dt))
+SciMLBase.set_proposed_dt!(integ::PETScIntegrator, other::SciMLBase.DEIntegrator) =
+    SciMLBase.set_proposed_dt!(integ, SciMLBase.get_proposed_dt(other))
 _make_opts(h::TSHandles{<:Any, <:Any, R}, kwargs) where {R} = PETScIntegratorOpts(
     h, get(kwargs, :adaptive, true) === true,
     get(kwargs, :abstol, 1.0e-6), get(kwargs, :reltol, 1.0e-3),
     R(something(get(kwargs, :dtmin, nothing), 0.0)),
     R(something(get(kwargs, :dtmax, nothing), Inf)),
-    get(kwargs, :verbose, true) === true, get(kwargs, :force_dtmin, false) === true,
+    get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
+    get(kwargs, :save_on, true) === true,
 )
 
 SciMLBase.isadaptive(integ::PETScIntegrator) =
@@ -3031,8 +4131,11 @@ end
 function _checked_du(integ::PETScIntegrator)
     du = integ.tdir .* _derivative(integ.h.ctx, integ.tdir * integ.t, integ.u)
     _raise_threw!(integ)
-    return du
+    return _integ_state(integ.prob, du, identity)
 end
+
+_integ_state(prob, x, f = copy) =
+    prob.f isa SciMLBase.DynamicalODEFunction ? _partition(prob.u0, x) : f(x)
 
 SciMLBase.get_du(integ::PETScIntegrator) = _checked_du(integ)
 function SciMLBase.get_du!(out, integ::PETScIntegrator)
@@ -3091,7 +4194,32 @@ function _change_t_unlocked(
     )
     LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * t)
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
+    T && _rewind_saves!(integ)
     _raise_threw!(integ)
+    return nothing
+end
+
+function _unrecord!(ctx::TSContext)
+    pop!(ctx.ts)
+    pop!(ctx.us)
+    ctx.user_ts === nothing || pop!(ctx.user_ts)
+    if ctx.dense
+        pop!(ctx.dus)
+        ctx.user_dus === nothing || pop!(ctx.user_dus)
+    end
+    return nothing
+end
+
+function _rewind_saves!(integ::PETScIntegrator)
+    ctx = integ.h.ctx
+    s = integ.tdir * integ.t
+    while !isempty(ctx.ts) && ctx.ts[end] > s
+        _unrecord!(ctx)
+    end
+    while ctx.saveat_idx > 1 && ctx.saveat[ctx.saveat_idx - 1] > s
+        ctx.saveat_idx -= 1
+    end
+    ctx.save_everystep && !_last_recorded(ctx, s) && _record_end!(ctx, s, integ.u)
     return nothing
 end
 
@@ -3099,8 +4227,13 @@ SciMLBase.change_t_via_interpolation!(
     integ::PETScIntegrator, t, modify_save_endpoint::Type{Val{T}} = Val{false},
 ) where {T} = _locked(() -> _change_t_unlocked(integ, t, modify_save_endpoint))
 
+function _save_here!(integ::PETScIntegrator)
+    integ.opts.save_on && _record!(integ.h.ctx, integ.tdir * integ.t, integ.u)
+    return nothing
+end
+
 function _savevalues_unlocked(integ::PETScIntegrator, force_save = false)
-    integ.finished && return (false, false)
+    (integ.finished || !integ.opts.save_on) && return (false, false)
     ctx = integ.h.ctx
     n = length(ctx.ts)
     _save_step!(integ, integ.t, false)
@@ -3374,14 +4507,14 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     residual = integ.event_residual[best_k]
     best_cb.rootfind === SciMLBase.NoRootFind ? fill!(residual, 0.0) :
         _fill_conditions!(residual, integ, best_cb, integ.t)
-    best_cb.save_positions[1] && !saved && _record!(ctx, integ.tdir * integ.t, integ.u)
+    best_cb.save_positions[1] && !saved && _save_here!(integ)
     integ.derivative_discontinuity = true
     _pin_step!(integ)
     _checked_everywhere(() -> _fire!(integ, best_cb, best_crossing), ctx.comm)
     integ.finished && return true
     _rollback!(integ, integ.t, dt, false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
-    best_cb.save_positions[2] && _record!(ctx, integ.tdir * integ.t, integ.u)
+    best_cb.save_positions[2] && _save_here!(integ)
     return true
 end
 
@@ -3391,7 +4524,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
     for cb in integ.callbacks
         integ.finished && return nothing
         _checked_anywhere(() -> cb.condition(integ.u, integ.t, integ), ctx.comm) || continue
-        cb.save_positions[1] && !saved && _record!(ctx, integ.tdir * integ.t, integ.u)
+        cb.save_positions[1] && !saved && _save_here!(integ)
         saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
@@ -3404,7 +4537,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
             ctx.pdirty = true
         end
-        cb.save_positions[2] && _record!(ctx, integ.tdir * integ.t, integ.u)
+        cb.save_positions[2] && _save_here!(integ)
     end
     return nothing
 end
@@ -3425,8 +4558,7 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
         ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
     )
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
-    initialize_save && any(cb -> cb.save_positions[2], cbs) &&
-        _record!(h.ctx, h.tdir * integ.t, integ.u)
+    initialize_save && any(cb -> cb.save_positions[2], cbs) && _save_here!(integ)
     return nothing
 end
 
@@ -3447,10 +4579,12 @@ function _init_unlocked(
     stops = _tstops(stops_given, h)
     dt0 = h.tdir * LibPETSc.TSGetTimeStep(h.petsclib, h.ts)
     integ = PETScIntegrator(
-        alg, copy(h.u0), copy(h.u0), _user_t(h.tdir, h.t0), _user_t(h.tdir, h.t0),
+        alg, _integ_state(prob, h.u0), _integ_state(prob, h.u0), _user_t(h.tdir, h.t0),
+        _user_t(h.tdir, h.t0),
         dt0, h.tdir,
         prob.p, h, prob, callbacks, continuous, prob.f, _make_opts(h, kwargs),
-        copy(h.u0), similar(h.u0), similar(h.u0),
+        _integ_state(prob, h.u0), _integ_state(prob, h.u0, similar),
+        _integ_state(prob, h.u0, similar),
         Vector{R}[fill(R(NaN), _ncond(cb)) for cb in continuous],
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
         stops, tstops, d_discontinuities, d_discontinuities, dt0,
@@ -3462,7 +4596,7 @@ function _init_unlocked(
         return integ
     end
     try
-        _initialize_callbacks!(integ, true)
+        _initialize_callbacks!(integ, get(kwargs, :initialize_save, true))
     catch
         _destroy!(h)
         rethrow()
@@ -3474,13 +4608,22 @@ end
 SciMLBase.__init(prob::SupportedProblem, alg::AnyPETScTS; kwargs...) =
     _locked(() -> _init_unlocked(prob, alg; kwargs...))
 
+function _restore_prev!(integ::PETScIntegrator, outer)
+    outer === nothing && return nothing
+    integ.tprev = outer[1]
+    copyto!(integ.uprev, outer[2])
+    return nothing
+end
+
 function _reject_step!(integ::PETScIntegrator, before, taken)
     h = integ.h
     ctx, pl = h.ctx, h.petsclib
-    failed, h.stopped = h.stopped != 0, 0
+    code, h.stopped = h.stopped, 0
     nstep, integ.dt, integ.dtcache, ctx.pdirty, outer = before
-    integ.t = integ.tprev
-    copyto!(integ.u, integ.uprev)
+    if code == 0
+        integ.t = integ.tprev
+        copyto!(integ.u, integ.uprev)
+    end
     PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
     )
@@ -3488,13 +4631,10 @@ function _reject_step!(integ::PETScIntegrator, before, taken)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
     floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
     forced = get(integ.kwargs, :force_dtmin, false) === true
-    dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, failed)
+    dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, code)
     if dt === nothing
-        failed && _warn_failed_step(integ.alg, PETSC_ERR_FP)
-        if outer !== nothing
-            integ.tprev = outer[1]
-            copyto!(integ.uprev, outer[2])
-        end
+        code == 0 || _warn_failed_step(integ.alg, code, integ.opts.verbose)
+        _restore_prev!(integ, outer)
         ctx.fstart = nothing
         _finish!(integ)
         return nothing
@@ -3607,6 +4747,7 @@ end
 
 function _reinit_unlocked(
         integ::PETScIntegrator, u0 = integ.prob.u0;
+        reset_dt = nothing, reinit_cache = true,
         t0 = integ.prob.tspan[1], tf = integ.prob.tspan[2],
         erase_sol = true, saveat = nothing, tstops = integ.tstops_cache,
         d_discontinuities = integ.d_discontinuities_cache,
@@ -3616,7 +4757,12 @@ function _reinit_unlocked(
     _check_real(d_discontinuities, :d_discontinuities)
     R = typeof(integ.t)
     tstops, d_discontinuities = _times(R, tstops), _times(R, d_discontinuities)
+    if integ.prob.f isa SciMLBase.DynamicalODEFunction && !hasproperty(u0, :x)
+        u0 = _partition(integ.prob.u0, u0)
+    end
     old = integ.h
+    reset_dt === true && _check_estimable(integ.alg)
+    dt = reset_dt === false ? _proposed_dt_unlocked(integ) : nothing
     prob = SciMLBase.remake(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
         p = integ.p,
@@ -3624,31 +4770,42 @@ function _reinit_unlocked(
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
     reinit_dae || (setup_kwargs = merge(setup_kwargs, (initializealg = SciMLBase.NoInit(),)))
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
-    LibPETSc.TSSetUp(h.petsclib, h.ts)
-    _match_steps_here!(h)
-    if !erase_sol
-        append!(h.ctx.ts, old.ctx.ts)
-        append!(h.ctx.us, old.ctx.us)
-        if h.ctx.dense
-            if old.ctx.dense
-                append!(h.ctx.dus, old.ctx.dus)
-            else
-                for (t, u) in zip(old.ctx.ts, old.ctx.us)
-                    push!(h.ctx.dus, _derivative(h.ctx, t, u))
+    try
+        LibPETSc.TSSetUp(h.petsclib, h.ts)
+        _match_steps_here!(h)
+        if !erase_sol
+            append!(h.ctx.ts, old.ctx.ts)
+            append!(h.ctx.us, old.ctx.us)
+            if h.ctx.dense
+                if old.ctx.dense
+                    append!(h.ctx.dus, old.ctx.dus)
+                else
+                    for (t, u) in zip(old.ctx.ts, old.ctx.us)
+                        push!(h.ctx.dus, _kept(h.ctx, _derivative(h.ctx, t, u)))
+                    end
                 end
             end
         end
+        initialize_save && _initial_save!(h)
+        if reset_dt === true
+            dt = _estimate_dt(
+                h, integ.alg, _make_opts(h, integ.kwargs), h.u0, h.t0,
+                _tstops(vcat(tstops, d_discontinuities), h),
+            )
+        end
+    catch
+        _destroy!(h)
+        rethrow()
     end
-    initialize_save && _initial_save!(h)
     _destroy!(old)
     integ.h = h
-    integ.u = copy(h.u0)
-    integ.uprev = copy(h.u0)
+    integ.u = _integ_state(integ.prob, h.u0)
+    integ.uprev = _integ_state(integ.prob, h.u0)
     integ.f = integ.prob.f
     integ.opts = _make_opts(h, integ.kwargs)
-    integ.ucache = copy(h.u0)
-    integ.tmp1 = similar(h.u0)
-    integ.tmp2 = similar(h.u0)
+    integ.ucache = _integ_state(integ.prob, h.u0)
+    integ.tmp1 = _integ_state(integ.prob, h.u0, similar)
+    integ.tmp2 = _integ_state(integ.prob, h.u0, similar)
     integ.tdir = h.tdir
     integ.t = _user_t(h.tdir, h.t0)
     integ.tprev = _user_t(h.tdir, h.t0)
@@ -3657,6 +4814,7 @@ function _reinit_unlocked(
     integ.tstops = _tstops(vcat(tstops, d_discontinuities), h)
     integ.d_discontinuities = d_discontinuities
     integ.finished = false
+    dt === nothing || _use_dt!(integ, dt, reset_dt === true)
     for ev in integ.event_t
         fill!(ev, NaN)
     end
@@ -3684,13 +4842,16 @@ end
 function _finish!(integ::PETScIntegrator, retcode = nothing)
     integ.finished && return nothing
     h = integ.h
+    retcode === nothing || (integ.sol = SciMLBase.solution_new_retcode(integ.sol, retcode))
     _checked_everywhere(h.ctx.comm) do
         for cb in (integ.callbacks..., integ.continuous...)
             cb.finalize(cb, integ.u, integ.t, integ)
         end
     end
     st = _read_stats(h)
-    sol = _assemble(integ.prob, integ.alg, h, integ.tdir * integ.t, copy(integ.u), st)
+    sol = _assemble(
+        integ.prob, integ.alg, h, integ.tdir * integ.t, copy(integ.u), st, integ.kwargs,
+    )
     integ.sol = retcode === nothing ? sol : SciMLBase.solution_new_retcode(sol, retcode)
     integ.finished = true
     _destroy!(h)
@@ -3714,19 +4875,20 @@ function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near
     ctx = h.ctx
     tol = _near(integ.t)
     n = length(ctx.ts)
+    on = integ.opts.save_on
     landed = false
     while ctx.saveat_idx <= length(ctx.saveat) &&
             ctx.saveat[ctx.saveat_idx] <= integ.tdir * upto + slack
         want = ctx.saveat[ctx.saveat_idx]
-        if abs(want - integ.tdir * integ.t) <= tol
+        if on && abs(want - integ.tdir * integ.t) <= tol
             _record_end!(ctx, want, integ.u)
             landed = true
-        else
+        elseif on
             _record!(ctx, want, _interpolate!(integ, want))
         end
         ctx.saveat_idx += 1
     end
-    endpoint && ctx.save_everystep && !landed &&
+    endpoint && on && ctx.save_everystep && !landed &&
         _record_end!(ctx, integ.tdir * upto, integ.u)
     return length(ctx.ts) > n && _last_recorded(ctx, integ.tdir * upto)
 end
@@ -3777,8 +4939,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty,
         outer === nothing && ctx.domain !== nothing ? (integ.tprev, copy(integ.uprev)) : outer,
     )
-    copyto!(integ.uprev, integ.u)
-    integ.tprev = integ.t
+    start = integ.t
     reuse = ctx.hermite && integ.tdir * integ.t == ctx.end_s &&
         _everywhere(ctx.comm, integ.u == ctx.end_u && !ctx.pdirty)
     ctx.fstart = reuse ? ctx.fend : nothing
@@ -3798,7 +4959,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
     end
     h.stopped = 0
-    ctx.retry_fp && ctx.workvec == C_NULL && _hold_work_vec!(ctx, h.ts)
+    (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
+        _hold_work_vec!(ctx, h.ts)
     failure = _run!(h) do
         LibPETSc.TSStep(pl, h.ts)
     end
@@ -3808,21 +4970,22 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         throw(err)
     end
     failure === nothing || throw(failure)
-    if h.stopped == PETSC_ERR_FP && SciMLBase.isadaptive(integ) && _return_work_vec!(ctx, h.ts)
+    if h.stopped != 0 && SciMLBase.isadaptive(integ) && _retryable!(h)
         return _reject_step!(integ, before, LibPETSc.TSGetTimeStep(pl, h.ts))
     end
-    h.stopped == 0 || _warn_failed_step(integ.alg, h.stopped)
+    h.stopped == 0 ? _undo_failed_irk!(ctx, pl, h.ts.ptr) :
+        _warn_failed_step(integ.alg, h.stopped, integ.opts.verbose)
     integ.t = _user_t(integ.tdir, LibPETSc.TSGetTime(pl, h.ts))
-    if integ.tdir * integ.t <= integ.tdir * integ.tprev
-        if h.stopped == 0 && SciMLBase.isadaptive(integ) &&
-                Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
-            ctx.unstable_hit = true
-            @warn "`$(_warn_name(integ.alg))` ends here because its step fell below the " *
-                "floating point spacing at t = $(integ.t)"
+    if integ.tdir * integ.t <= integ.tdir * start
+        if h.stopped == 0 && Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
+            _stalled!(h, integ.alg, integ.t, integ.opts.verbose)
         end
+        _restore_prev!(integ, before[5])
         _finish!(integ)
         return nothing
     end
+    copyto!(integ.uprev, integ.u)
+    integ.tprev = start
     if stop === nothing
         h.matches || (integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts))
         if integ.tdir * integ.t != h.tf && integ.tdir * integ.t >= h.tf - tol
@@ -3868,6 +5031,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     else
         _past_discontinuity!(integ)
         _live_stats!(integ)
+        integ.sol.retcode == SciMLBase.ReturnCode.Default &&
+            (integ.sol = SciMLBase.solution_new_retcode(integ.sol, SciMLBase.ReturnCode.Success))
     end
     return nothing
 end
@@ -3885,8 +5050,100 @@ SciMLBase.solve!(integ::PETScIntegrator) = _locked(() -> _solve_integrator_unloc
 
 SciMLBase.done(integ::PETScIntegrator) = integ.finished
 
+SciMLBase.check_error(integ::PETScIntegrator) =
+    integ.sol.retcode == SciMLBase.ReturnCode.Default ? SciMLBase.ReturnCode.Success :
+    integ.sol.retcode
+
+function _postamble_unlocked(integ::PETScIntegrator)
+    integ.finished || _finish!(integ, integ.sol.retcode)
+    return nothing
+end
+
+SciMLBase.postamble!(integ::PETScIntegrator) = _locked(() -> _postamble_unlocked(integ))
+
+SciMLBase.last_step_failed(integ::PETScIntegrator) =
+    integ.finished && !SciMLBase.isadaptive(integ) &&
+    integ.sol.retcode == SciMLBase.ReturnCode.ConvergenceFailure
+
+SciMLBase.change_t_via_interpolation!(
+    integ::PETScIntegrator, t, modify_save_endpoint::Type{Val{T}}, reinitialize_alg,
+) where {T} = SciMLBase.change_t_via_interpolation!(integ, t, modify_save_endpoint)
+
+SciMLBase.set_abstol!(integ::PETScIntegrator, abstol) = (integ.opts.abstol = abstol; nothing)
+SciMLBase.set_reltol!(integ::PETScIntegrator, reltol) = (integ.opts.reltol = reltol; nothing)
+
+_counted(::Nothing, calls, k) = nothing
+_counted(f, calls, k) = function (du, u, p, t)
+    calls[k] += 1
+    return f(du, u, p, t)
+end
+
+_check_estimable(alg) = alg isa TSGeneric && throw(
+    ArgumentError(
+        "the first step is estimated from the method's order, which `TSGeneric` " *
+            "does not know; set the step with set_proposed_dt! instead",
+    ),
+)
+
+function _estimate_dt(h::TSHandles{<:Any, <:Any, R}, alg, opts, u, s, stops) where {R}
+    _check_estimable(alg)
+    ctx = h.ctx
+    dtmin = abs(getfield(opts, :dtmin))
+    ctx.dae && return max(R(1.0e-6) * abs(h.tf - h.t0), _min_step(s))
+    ctx.M === nothing ||
+        return max(nextfloat(max(dtmin, eps(s))), R(1.0e-6), _min_step(s))
+    i = findfirst(>(s), stops)
+    stop = i === nothing ? h.tf : min(stops[i], h.tf)
+    threw, calls = Ref{Any}(nothing), [0, 0]
+    f2 = ctx.f2! === nothing ? nothing : _guard_f(ctx.f2!, ctx.comm, threw)
+    dt = _initial_dt(
+        _counted(_guard_f(ctx.f!, ctx.comm, threw), calls, 1), _counted(f2, calls, 2),
+        u, ctx.p, s, one(R), SciMLBase.alg_order(alg),
+        getfield(opts, :abstol), getfield(opts, :reltol), dtmin,
+        min(abs(getfield(opts, :dtmax)), stop - s), ctx.comm,
+    )
+    ctx.nf += calls[1]
+    ctx.nf2 += calls[2]
+    _throw_anywhere(ctx.comm, threw[])
+    return dt
+end
+
+function _use_dt!(integ::PETScIntegrator, dt, estimated = false)
+    dt = abs(oftype(integ.t, dt))
+    integ.dt = integ.tdir * dt
+    estimated && !SciMLBase.isadaptive(integ) && return nothing
+    LibPETSc.TSSetTimeStep(integ.h.petsclib, integ.h.ts, dt)
+    integ.dtcache = integ.dt
+    return nothing
+end
+
+function _auto_dt_unlocked(integ::PETScIntegrator)
+    integ.finished && return nothing
+    h = integ.h
+    _use_dt!(
+        integ, _estimate_dt(h, integ.alg, integ.opts, integ.u, integ.tdir * integ.t, integ.tstops),
+        true,
+    )
+    _live_stats!(integ)
+    return nothing
+end
+
+SciMLBase.auto_dt_reset!(integ::PETScIntegrator) = _locked(() -> _auto_dt_unlocked(integ))
+
+_no_resize() = throw(
+    ArgumentError(
+        "PETScDiffEq cannot change the length of the state: PETSc sizes its vectors, " *
+            "matrices and solvers when the integrator is made, so a state of another " *
+            "length needs a new integrator",
+    ),
+)
+Base.resize!(::PETScIntegrator, ::Int) = _no_resize()
+Base.deleteat!(::PETScIntegrator, idxs) = _no_resize()
+SciMLBase.addat!(::PETScIntegrator, idxs, val = nothing) = _no_resize()
+
 include("autodiff.jl")
 include("adjoint.jl")
 include("initialization.jl")
+include("precompile.jl")
 
 end

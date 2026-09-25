@@ -96,6 +96,7 @@ function heat_throwing(when)
 end
 
 const FIXED = (; dt = 1.0e-3, adaptive = false)
+adaptive_step(kw) = !haskey(kw, :dt)
 algorithm_pairs() = (
     (TSRK("5dp"; comm), TSRK("5dp")),
     (TSGeneric("ssp"; explicit = true, comm), TSGeneric("ssp"; explicit = true)),
@@ -112,6 +113,8 @@ function against_serial(run, alg, serial_alg)
     return got, rank == 0 ? run(1:N, serial_alg) : got
 end
 
+nan_gap(a, b) = isnan.(a) == isnan.(b) ? maximum(abs, replace(a - b, NaN => 0.0)) : Inf
+
 function matches_serial(sol, ref; exact_t = true)
     n = length(sol.t)
     MPI.Allreduce(n, min, comm) == MPI.Allreduce(n, max, comm) || return false
@@ -120,7 +123,8 @@ function matches_serial(sol, ref; exact_t = true)
     rank == 0 || return same
     length(sol.t) == length(ref.t) || return false
     times = exact_t ? sol.t == ref.t : maximum(abs, sol.t - ref.t) <= ROUNDOFF
-    return same && times && sol.retcode == ref.retcode && maxdiff(us, ref.u) <= ROUNDOFF
+    gap = maximum(nan_gap.(us, ref.u))
+    return same && times && sol.retcode == ref.retcode && gap <= ROUNDOFF
 end
 
 halve_at(s) = DiscreteCallback((u, t, i) -> t == s, i -> (i.u .*= 0.5))
@@ -237,6 +241,41 @@ crossing_last_row(idx, level) =
             sol = solve(prob, TSRK("5dp"; comm); dt = 0.01, adaptive = false, kw...)
             @test sol.retcode == ReturnCode.Unstable
             @test same_everywhere(sol.t)
+        end
+    end
+
+    @testset "a NaN on one rank's rows is retried or stops as a serial solve does" begin
+        breaks!(du, u, idx, t) =
+            (du .= ifelse.((idx .== N) .& (t > 0.5), NaN, -rate.(idx) .* u); nothing)
+        exchanging!(du, u, idx, t) = (halo(u); breaks!(du, u, idx, t))
+        breaks(idx, a) =
+            ODEProblem(parallel(a) ? exchanging! : breaks!, decay0(idx), (0.0, 1.0), idx)
+        never = DiscreteCallback((u, t, i) -> false, i -> nothing)
+        warned(f) = (r = Test.collect_test_logs(f); (r[2], length(r[1])))
+        unstable, small = ReturnCode.Unstable, ReturnCode.DtLessThanMin
+        for (subtype, kw, retcode) in (
+                ("5dp", (;), unstable),
+                ("5dp", (; saveat = 0.05), unstable),
+                ("3bs", (; callback = never), unstable),
+                ("5dp", (; dtmin = 0.01), small),
+                ("5dp", (; dtmin = 0.01, callback = never), small),
+                ("5dp", FIXED, unstable),
+                ("4", (; dt = 0.01), unstable),
+                ("4", (; dt = 0.01, callback = never), unstable),
+            )
+            alg, serial_alg = TSRK(subtype; comm), TSRK(subtype)
+            (sol, warnings), (ref, _) = against_serial(alg, serial_alg) do idx, a
+                warned(() -> solve(breaks(idx, a), a; kw...))
+            end
+            @test sol.retcode == retcode
+            @test warnings == (adaptive_step(kw) ? 1 : 0)
+            @test matches_serial(sol, ref)
+            @test anywhere(!all(isfinite, sol.u[end])) == !adaptive_step(kw)
+            @test !anywhere(any(u -> !all(isfinite, u), sol.u[1:(end - 1)]))
+            @test same_everywhere((sol.stats.naccept, sol.stats.nreject))
+            rank == 0 && @test (sol.stats.naccept, sol.stats.nreject, sol.stats.nf) ==
+                (ref.stats.naccept, ref.stats.nreject, ref.stats.nf)
+            rank == 0 && adaptive_step(kw) && @test sol.stats.nreject > 5
         end
     end
 
@@ -421,6 +460,21 @@ crossing_last_row(idx, level) =
         terminate!(integ)
         @test integ.sol.retcode == ReturnCode.Terminated
         @test same_everywhere(integ.sol.t)
+
+        integ = init(heat_problem(rows, TSRK("5dp"; comm)), TSRK("5dp"; comm); dt = 1.0e-5)
+        SciMLBase.auto_dt_reset!(integ)
+        serial_dt = if rank == 0
+            serial = init(heat_problem(1:N, TSRK("5dp")), TSRK("5dp"))
+            terminate!(serial)
+            serial.dt
+        end
+        @test abs(integ.dt - MPI.bcast(serial_dt, 0, comm)) <= ROUNDOFF * integ.dt
+        step!(integ)
+        @test SciMLBase.check_error!(integ) == ReturnCode.Success
+        SciMLBase.postamble!(integ)
+        @test integ.sol.retcode == ReturnCode.Success
+        @test integ.sol.t[end] == integ.t
+        @test same_everywhere(integ.sol.t)
     end
 
     @testset "a callback throwing on one rank raises on every rank" begin
@@ -459,14 +513,73 @@ crossing_last_row(idx, level) =
         step!(integ)
         @test !anywhere(any(isnan, integ((integ.tprev + integ.t) / 2)))
         terminate!(integ)
+
+        integ = init(
+            ODEProblem(f!, heat0(rows), (0.0, 0.1)), TSRK("5dp"; comm); dense = false, FIXED...,
+        )
+        step!(integ)
+        armed[] = true
+        @test raised(caught(() -> reinit!(integ; reset_dt = true)), "f threw")
+        armed[] = false
+        terminate!(integ)
+    end
+
+    @testset "TSMPRK with its splits spread over the ranks" begin
+        slow, medium = 1:11, 12:17
+        mine(g, idx) = [k for (k, i) in enumerate(idx) if i in g]
+        mprk(idx, sub, c) = sub in ("2a23", "2a33") ?
+            TSMPRK(mine(slow, idx), mine(medium, idx), sub; comm = c) :
+            TSMPRK(mine(slow, idx), sub; comm = c)
+        for sub in ("p2", "p3", "2a22", "2a23", "2a33")
+            sol, ref = against_serial(comm, MPI.COMM_SELF) do idx, c
+                a = mprk(idx, sub, c)
+                prob = ODEProblem(parallel(a) ? heat! : heat_serial!, heat0(idx), (0.0, 0.02))
+                solve(prob, a; dt = 1.0e-4)
+            end
+            @test sol.retcode == ReturnCode.Success
+            @test matches_serial(sol, ref)
+            rank == 0 && @test sol.stats.nf == ref.stats.nf
+            u = gathered(sol.u[end], counts)
+            rank == 0 && @test maximum(abs, u - heat_exact(1:N, 0.02)) <= 5.0e-6
+        end
+        f = heat_throwing(t -> t > 0.01)
+        prob = ODEProblem(f, heat0(rows), (0.0, 0.02))
+        @test raised(caught(() -> solve(prob, mprk(rows, "p2", comm); dt = 1.0e-4)), "f threw")
+    end
+
+    @testset "a Threads.@threads loop on one thread" begin
+        sols = Vector{Any}(undef, 2)
+        Threads.@threads for i in 1:2
+            sols[i] = solve(decay_problem(rows), TSRK("5dp"; comm))
+        end
+        ref = solve(decay_problem(rows), TSRK("5dp"; comm))
+        @test all(s -> s.retcode == ReturnCode.Success && s.u == ref.u, sols)
     end
 
     @testset "refusals" begin
         prob = decay_problem(rows)
-        for alg in (TSMPRK([1]; comm), TSGeneric("alpha"; comm))
-            @test refused(() -> solve(prob, alg; dt = 0.1), "cannot run")
-        end
         n = length(rows)
+        for (alg, what) in (
+                (TSMPRK(Int[]; comm), "`slow` names no index on any rank"),
+                (TSMPRK(collect(1:n); comm), "leaving nothing fast"),
+                (TSMPRK([1], Int[], "2a23"; comm), "needs a `medium` index on some rank"),
+                (TSGeneric("beuler"; explicit = true, comm), "cannot run"),
+            )
+            @test refused(() -> solve(prob, alg; dt = 0.1), what)
+        end
+        for (slow, medium, sub, what) in (
+                ([n + 1], Int[], "p2", "names index"),
+                ([0], Int[], "p2", "indices start at 1"),
+                ([1, 1], Int[], "p2", "repeats an index"),
+                ([1], [1], "2a23", "share an index"),
+                ([1], [2], "p2", "takes only two splits"),
+            )
+            e = caught() do
+                mine = rank == thrower ? (slow, medium) : ([1], Int[])
+                solve(prob, TSMPRK(mine..., sub; comm); dt = 0.1)
+            end
+            @test rank == thrower ? e isa ArgumentError && occursin(what, e.msg) : remote(e)
+        end
         jac = ODEFunction(decay!; jac = (J, u, p, t) -> nothing)
         @test refused(
             () -> solve(ODEProblem(jac, decay0(rows), (0.0, 1.0), rows), TSRK("5dp"; comm)),
@@ -476,13 +589,6 @@ crossing_last_row(idx, level) =
         @test refused(
             () -> solve(ODEProblem(mass, decay0(rows), (0.0, 1.0), rows), TSRK("5dp"; comm)),
             "mass matrix",
-        )
-        @test refused(
-            () -> PETScDiffEq._discrete_adjoint(
-                prob, TSRK("4"; comm), PETScAdjoint(); t = [1.0],
-                dgdu_discrete = (out, u, p, t, i) -> (out .= u), dt = 0.1, adaptive = false,
-            ),
-            "PETScAdjoint",
         )
         @test refused(
             () -> solve(prob, TSRK("5dp", ["-ts_type", "beuler"]; comm); dt = 0.1),
