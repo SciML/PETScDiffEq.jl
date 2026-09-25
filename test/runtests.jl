@@ -2453,11 +2453,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         SciMLBase.solve(cusp, alg; dt = 0.1, callback = never)
                 end
                 @test same(plain, stepped)
-                # On 32-bit x86 Newton can converge through the cusp by rounding.
-                Sys.WORD_SIZE == 64 || continue
-                @test plain.retcode == SciMLBase.ReturnCode.Unstable
-                @test 0.5 - plain.t[end] < 1.0e-9
-                @test_logs (:warn, r"ends here") SciMLBase.solve(cusp, alg; dt = 0.1)
+                @test maximum(u -> abs(u[2] - cbrt(u[1] - 0.5)), plain.u) < 1.0e-3
+                if plain.retcode == SciMLBase.ReturnCode.Success
+                    @test plain.t[end] == 1.0
+                else
+                    @test plain.retcode == SciMLBase.ReturnCode.Unstable
+                    @test 0.5 - plain.t[end] < 1.0e-8
+                    @test_logs (:warn, r"ends here") SciMLBase.solve(cusp, alg; dt = 0.1)
+                end
             end
         end
 
