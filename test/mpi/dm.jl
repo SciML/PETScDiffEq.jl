@@ -498,7 +498,8 @@ end
         rank == 0 && @test maximum(abs, u - exp(-SPAN[2]) .* heat_exact(SPAN[2])) <= 5.0e-9
 
         residual(f) = (r, du, u, p, t) -> (f(r, u, p, t); r .= du .- r; nothing)
-        du0 = zeros(length(rows))
+        du0 = similar(heat0(rows))
+        heat!(du0, heat0(rows), nothing, 0.0)
         got = solve(
             DAEProblem(residual(heat_dm!), du0, heat0(rows), SPAN, da), TSDAE("bdf"; dm = da, comm);
             TOL...,
