@@ -4560,7 +4560,7 @@ function _reject_step!(integ::PETScIntegrator, before, taken)
     ctx, pl = h.ctx, h.petsclib
     code, h.stopped = h.stopped, 0
     nstep, integ.dt, integ.dtcache, ctx.pdirty, outer = before
-    if !failed
+    if code == 0
         integ.t = integ.tprev
         copyto!(integ.u, integ.uprev)
     end
