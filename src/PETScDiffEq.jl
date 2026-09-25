@@ -491,7 +491,7 @@ end
 
 function TSAlpha2(
         petsc_options::AbstractVector{<:AbstractString} = String[];
-        radius = nothing, comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+        radius = nothing, comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm, nothing),
     )
     radius === nothing || 0 <= radius <= 1 ||
         throw(ArgumentError("`radius` must be between 0 and 1, got $radius"))
