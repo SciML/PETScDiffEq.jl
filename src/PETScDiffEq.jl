@@ -4089,7 +4089,7 @@ function _reinit_unlocked(
                 append!(h.ctx.dus, old.ctx.dus)
             else
                 for (t, u) in zip(old.ctx.ts, old.ctx.us)
-                    push!(h.ctx.dus, _derivative(h.ctx, t, u))
+                    push!(h.ctx.dus, _kept(h.ctx, _derivative(h.ctx, t, u)))
                 end
             end
         end

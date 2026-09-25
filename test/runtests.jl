@@ -6891,6 +6891,25 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test seen == sol.u[2:end]
         end
 
+        @testset "erase_sol = false across a change of saving: $(nameof(typeof(alg)))" for alg in (
+                PETScDiffEq.TSRK("4"), PETScDiffEq.TSBasicSymplectic("4"), PETScDiffEq.TSAlpha2(),
+            )
+            prob = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
+            integ = SciMLBase.init(prob, alg; dt = 0.01, adaptive = false, saveat = 0.5)
+            kept = SciMLBase.solve!(integ)
+            @test !kept.dense
+            SciMLBase.reinit!(
+                integ, kept.u[end]; t0 = 1.0, tf = 2.0, saveat = Float64[], erase_sol = false,
+            )
+            sol = SciMLBase.solve!(integ)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.dense
+            @test length(sol.interp.du) == length(sol.u)
+            @test all(du -> du isa typeof(prob.u0), sol.interp.du)
+            @test maximum(abs.(collect(sol(0.25)) .- osc_exact(0.25))) < 3.0e-4
+            @test maximum(abs.(collect(sol(1.5)) .- osc_exact(1.5))) < 3.0e-5
+        end
+
         @testset "the other algorithms step the first-order form" begin
             prob = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
             jac!(J, x, p, t) = (@test hasproperty(x, :x); J .= [0 -1; 1 0]; nothing)
