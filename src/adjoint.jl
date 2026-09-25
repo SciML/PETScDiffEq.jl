@@ -61,6 +61,15 @@ a tighter `-ksp_rtol`, when that matters. Options PETSc reads only while the adj
 runs, such as `-ts_trajectory_view` and `-ts_adjoint_view_solution`, have no effect in
 `petsc_options`, though they do when set globally, for example through `PETSC_OPTIONS`.
 
+With an algorithm whose `comm` is not `MPI.COMM_SELF`, the adjoint runs distributed as the
+solve does, for the same three families. The `ODEFunction` then needs `jac`, filling this
+rank's rows of a sparse `jac_prototype` with global columns, and `paramjac` when there are
+parameters, filling this rank's rows; both are collective like `f`. `dgdu_discrete` gets this
+rank's rows of the state and writes their derivative, and `dgdp_discrete` gives this rank's
+share of the direct derivative, which the ranks add up. `du0` holds this rank's rows, and `dp`
+is the whole gradient on every rank. The cost times, `no_start`, the length of `p` and whether
+`dgdp_discrete` is given must agree across the ranks.
+
 Returns `(du0, dp')`, where `dp` is `nothing` when `p` is `nothing` or
 `SciMLBase.NullParameters()`. Integral costs, and differentiating `solve` itself with a
 reverse-mode AD package, are not supported.
@@ -106,11 +115,33 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     lam::Any
     mu::Any
     err::Any
+    coo::Union{Nothing, COOJacobian{Float64}}
+    comm::Union{Nothing, MPI.Comm}
+end
+
+# A throwing rank fills NaN and keeps making PETSc's collective calls until the ranks agree.
+function _adjoint_call!(f, adj, out)
+    adj.comm === nothing && return f()
+    try
+        f()
+    catch e
+        adj.err === nothing && (adj.err = e)
+        fill!(out, NaN)
+    end
+    return nothing
 end
 
 _load_jacobian!(::AdjointContext{<:Any, <:Any, <:Any, Matrix{Float64}}, A) = nothing
 
 function _load_jacobian!(adj::AdjointContext{<:Any, <:Any, <:Any, <:SparseMatrixCSC}, A)
+    if adj.coo !== nothing
+        coo, J = adj.coo, adj.J.nzval
+        @inbounds for k in eachindex(coo.vals)
+            coo.vals[k] = coo.src[k] == 0 ? 0.0 : J[coo.src[k]]
+        end
+        LibPETSc.MatSetValuesCOO(adj.petsclib, A, coo.vals, LibPETSc.INSERT_VALUES)
+        return nothing
+    end
     n = length(adj.u)
     @inbounds for i in 1:n
         src = adj.row_src[i]
@@ -139,7 +170,7 @@ function _adjoint_rhsjacobian_body!(adj, s, x_ptr, A_ptr)
     pl = adj.petsclib
     try
         _readvec!(adj.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        adj.jac!(adj.J, adj.u, adj.p, s)
+        _adjoint_call!(() -> adj.jac!(adj.J, adj.u, adj.p, s), adj, _stored_values(adj.J))
         A = LibPETSc.PetscMat(A_ptr, pl)
         _load_jacobian!(adj, A)
         PETSc.assemble!(A)
@@ -181,7 +212,9 @@ function _adjoint_paramjac_body!(adj, s, x_ptr, A_ptr)
     pl = adj.petsclib
     try
         _readvec!(adj.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        adj.paramjac!(adj.pJ, adj.u, adj.p, _user_t(adj.tdir, s))
+        _adjoint_call!(adj, adj.pJ) do
+            adj.paramjac!(adj.pJ, adj.u, adj.p, _user_t(adj.tdir, s))
+        end
         LinearAlgebra.rmul!(adj.pJ, adj.pscale)
         PETSc.assemble!(LibPETSc.PetscMat(A_ptr, pl))
     catch e
@@ -260,7 +293,7 @@ function _adjoint_jump_body!(adj, step)
             adj.no_start && k == 1 && continue
             copyto!(adj.u, adj.u_at_step[step])
             fill!(adj.g, 0.0)
-            adj.dgdu!(adj.g, adj.u, adj.p, adj.cost_t[k], k)
+            _adjoint_call!(() -> adj.dgdu!(adj.g, adj.u, adj.p, adj.cost_t[k], k), adj, adj.g)
             adj.work .+= adj.g
         end
         _writevec!(pl, adj.lam, adj.work)
@@ -397,7 +430,12 @@ function _adjoint_solve_kwargs(prob, kwargs)
     return Base.structdiff(merged, NamedTuple{dropped})
 end
 
-function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete)
+function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, comm)
+    prob.f isa SciMLBase.DynamicalODEFunction && throw(
+        ArgumentError(
+            "PETScAdjoint does not support a DynamicalODEProblem or SecondOrderODEProblem",
+        ),
+    )
     (prob isa SciMLBase.AbstractODEProblem && !(prob.f isa SciMLBase.SplitFunction)) ||
         throw(
         ArgumentError(
@@ -436,6 +474,12 @@ function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_disc
                 "other source for it",
         ),
     )
+    comm === nothing || prob.f.jac !== nothing || throw(
+        ArgumentError(
+            "PETScAdjoint needs the ODEFunction's `jac` $_NOT_SELF, since automatic " *
+                "differentiation would call `f` a different number of times on each rank",
+        ),
+    )
     p = prob.p
     has_p = !(p === nothing || p isa SciMLBase.NullParameters)
     has_p && !(p isa AbstractVector{<:Real}) && throw(
@@ -449,6 +493,13 @@ function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_disc
             "PETScAdjoint needs the ODEFunction's `paramjac` under " *
                 "`autodiff = AutoFiniteDiff()` when the problem has parameters: PETSc " *
                 "builds the parameter gradient from it",
+        ),
+    )
+    has_p && !isempty(p) && comm !== nothing && prob.f.paramjac === nothing && throw(
+        ArgumentError(
+            "PETScAdjoint needs the ODEFunction's `paramjac` $_NOT_SELF when the problem has " *
+                "parameters, since automatic differentiation would call `f` a different " *
+                "number of times on each rank",
         ),
     )
     !has_p && dgdp_discrete !== nothing && throw(
@@ -523,10 +574,24 @@ function _check_adjoint_ts(h::TSHandles, alg, cost_s)
     return implicit
 end
 
-function _throw_callback_error(ctx, adj)
-    ctx.err === nothing || throw(ctx.err)
-    adj.err === nothing || throw(adj.err)
-    return nothing
+_throw_callback_error(ctx, adj, comm = nothing) =
+    _throw_anywhere(comm, ctx.err === nothing ? adj.err : ctx.err)
+
+function _check_agreement(comm, args)
+    _everywhere(comm, MPI.bcast(args, 0, comm) == args) && return nothing
+    throw(
+        ArgumentError(
+            "PETScAdjoint $_NOT_SELF needs the same cost times `t`, `no_start`, number of " *
+                "parameters and choice of `dgdp_discrete` on every rank",
+        ),
+    )
+end
+
+function _gathered(pl, v, len, comm)
+    lo, hi = LibPETSc.VecGetOwnershipRange(pl, v)
+    full = zeros(len)
+    _readvec!(view(full, (lo + 1):hi), pl, v)
+    return MPI.Allreduce(full, +, comm)
 end
 
 function _destroy_adjoint!(adj::AdjointContext)
@@ -544,13 +609,19 @@ function _discrete_adjoint_unlocked(
         t = nothing, dgdu_discrete = nothing, dgdp_discrete = nothing, no_start = false,
         kwargs...,
     )
-    _distributed(alg) &&
-        throw(ArgumentError("PETScAdjoint does not support a solve $_NOT_SELF yet"))
-    solve_kwargs = _adjoint_solve_kwargs(prob, kwargs)
-    has_p = _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete)
+    _alg_dm(alg) === nothing ||
+        throw(ArgumentError("PETScAdjoint does not support a solve $_WITH_DM yet"))
+    comm = _distributed(alg) ? alg.comm : nothing
+    solve_kwargs, has_p, skip_start = _checked_everywhere(comm) do
+        given = _adjoint_solve_kwargs(prob, kwargs)
+        checked = _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, comm)
+        given, checked, Bool(no_start)
+    end
     p = prob.p
     np = has_p ? length(p) : 0
     cost_t = collect(Float64, t)
+    comm === nothing ||
+        _check_agreement(comm, (cost_t, skip_start, np, dgdp_discrete === nothing))
 
     h = _setup(
         prob, alg; solve_kwargs...,
@@ -560,6 +631,7 @@ function _discrete_adjoint_unlocked(
     )
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
     n = length(h.u0)
+    N = comm === nothing ? n : MPI.Allreduce(n, +, comm)
     adj = nothing
     local du0, dp
     try
@@ -581,28 +653,39 @@ function _discrete_adjoint_unlocked(
             proto = prob.f.jac_prototype
             J = proto isa SparseMatrixCSC ? SparseMatrixCSC{Float64, Int}(proto) : zeros(n, n)
         end
-        rows = J isa SparseMatrixCSC ? _row_structure(J, n) :
+        rows = J isa SparseMatrixCSC && comm === nothing ? _row_structure(J, n) :
             (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
+        coo_rows, coo_cols, coo = if comm === nothing || implicit
+            nothing, nothing, nothing
+        else
+            _coo_structure(J, first(LibPETSc.VecGetOwnershipRange(pl, h.u)), nothing)
+        end
         adj = AdjointContext(
             pl, h.tdir, p, jac, J, rows...,
             np == 0 ? nothing : prob.f.paramjac === nothing ?
                 _ad_paramjacobian(backend, f_ad, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE) :
                 _as_inplace_jac(prob.f.paramjac, iip),
             zeros(n, np),
-            implicit ? -h.tdir : h.tdir, dgdu_discrete, Bool(no_start),
+            implicit ? -h.tdir : h.tdir, dgdu_discrete, skip_start,
             cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
+            coo, comm,
         )
         adjptr = pointer_from_objref(adj)
         GC.@preserve ctx adj begin
-            if !implicit
+            if !implicit && comm !== nothing
+                adj.jac_mat = LibPETSc.MatCreate(pl, comm)
+                _coo_matrix!(adj.jac_mat, pl, n, N, coo_rows, coo_cols)
+            elseif !implicit
                 adj.jac_mat = J isa SparseMatrixCSC ?
                     PETScCompat.PetscMat(
                         pl, MPI.COMM_SELF, _jacobian_pattern(J, n); with_arrays = true,
                     ) :
                     PETScCompat.PetscMat(pl, J)
+            end
+            if !implicit
                 code = ccall(
                     _symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
                     (LibPETSc.CTS, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
@@ -611,7 +694,12 @@ function _discrete_adjoint_unlocked(
                 _check_code(code, "TSSetRHSJacobian")
             end
             if np > 0
-                adj.pmat = PETScCompat.PetscMat(pl, adj.pJ)
+                # MPIDENSE stores this rank's rows of every column, column-major, which is adj.pJ.
+                adj.pmat = comm === nothing ? PETScCompat.PetscMat(pl, adj.pJ) :
+                    LibPETSc.MatCreateDense(
+                        pl, comm, LibPETSc.PetscInt(n), LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE),
+                        LibPETSc.PetscInt(N), LibPETSc.PetscInt(np), pointer(adj.pJ),
+                    )
                 name = implicit ? :TSSetIJacobianP : :TSSetRHSJacobianP
                 code = ccall(
                     _symbol(pl, name), LibPETSc.PetscErrorCode,
@@ -620,10 +708,19 @@ function _discrete_adjoint_unlocked(
                     implicit ? ADJ_IJACOBIANP_PTR[] : ADJ_RHSJACOBIANP_PTR[], adjptr,
                 )
                 _check_code(code, String(name))
-                adj.mu = PETScCompat.PetscVec(pl, adj.mu_buf)
+                if comm === nothing
+                    adj.mu = PETScCompat.PetscVec(pl, adj.mu_buf)
+                else
+                    adj.mu, left = LibPETSc.MatCreateVecs(pl, adj.pmat)
+                    PETScCompat.destroy!(left)
+                end
                 push!(adj.muarr, adj.mu.ptr)
             end
-            adj.lam = PETScCompat.PetscVec(pl, adj.lam_buf)
+            adj.lam = comm === nothing ? PETScCompat.PetscVec(pl, adj.lam_buf) :
+                LibPETSc.VecCreateMPIWithArray(
+                    pl, comm, LibPETSc.PetscInt(1), LibPETSc.PetscInt(n),
+                    LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), adj.lam_buf,
+                )
             push!(adj.lamarr, adj.lam.ptr)
             LibPETSc.TSMonitorSet(pl, ts, ADJ_RECORD_PTR[], adjptr)
             code = ccall(
@@ -635,11 +732,12 @@ function _discrete_adjoint_unlocked(
 
             try
                 _quiet_errors(h) do
-                    LibPETSc.TSSolve(pl, ts, h.u)
+                    _with_options(() -> LibPETSc.TSSolve(pl, ts, h.u), h)
                 end
             catch
                 ctx.err === nothing && adj.err === nothing && rethrow()
             end
+            # The forward solve's post-step reduction has already put an error on every rank.
             _throw_callback_error(ctx, adj)
             stopped_at = _user_t(h.tdir, LibPETSc.TSGetTime(pl, ts))
             ctx.unstable_hit && throw(
@@ -665,7 +763,7 @@ function _discrete_adjoint_unlocked(
                 ),
             )
             # PETSc reports TS_CONVERGED_TIME even when the state overflowed.
-            all(isfinite, _readvec!(zeros(n), pl, h.u)) || throw(
+            _everywhere(comm, all(isfinite, _readvec!(zeros(n), pl, h.u))) || throw(
                 ArgumentError(
                     "the forward solve ended on a state that is not finite, which `solve` " *
                         "reports as ReturnCode.Unstable, so there is no gradient to compute; " *
@@ -702,7 +800,7 @@ function _discrete_adjoint_unlocked(
             catch
                 ctx.err === nothing && adj.err === nothing && rethrow()
             end
-            _throw_callback_error(ctx, adj)
+            _throw_callback_error(ctx, adj, comm)
             reason = LibPETSc.TSGetConvergedReason(pl, ts)
             reason == LibPETSc.TS_CONVERGED_ITS || throw(
                 ArgumentError(
@@ -713,7 +811,8 @@ function _discrete_adjoint_unlocked(
                 ),
             )
             du0 = _readvec!(zeros(n), pl, adj.lam)
-            dp = np > 0 ? _readvec!(zeros(np), pl, adj.mu) : zeros(0)
+            dp = np == 0 ? zeros(0) : comm === nothing ? _readvec!(zeros(np), pl, adj.mu) :
+                _gathered(pl, adj.mu, np, comm)
         end
     finally
         _destroy!(h)
@@ -721,12 +820,16 @@ function _discrete_adjoint_unlocked(
     end
     if dgdp_discrete !== nothing
         gp = zeros(np)
-        for (step, ks) in adj.cost_at_step, k in ks
-            no_start && k == 1 && continue
-            fill!(gp, 0.0)
-            dgdp_discrete(gp, copy(adj.u_at_step[step]), p, cost_t[k], k)
-            dp .+= gp
+        mine = comm === nothing ? dp : zeros(np)
+        _checked_everywhere(comm) do
+            for (step, ks) in adj.cost_at_step, k in ks
+                skip_start && k == 1 && continue
+                fill!(gp, 0.0)
+                dgdp_discrete(gp, copy(adj.u_at_step[step]), p, cost_t[k], k)
+                mine .+= gp
+            end
         end
+        comm === nothing || (dp .+= MPI.Allreduce(mine, +, comm))
     end
     return _like(prob.u0, du0), has_p ? _like(p, dp)' : nothing
 end

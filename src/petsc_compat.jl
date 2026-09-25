@@ -18,6 +18,7 @@ const V05 = pkgversion(PETSc) >= v"0.5.0-"
     const TSRosWSetType = LibPETSc.TSRosWSetType
     const TSIRKSetType = LibPETSc.TSIRKSetType
     const TSARKIMEXSetType = LibPETSc.TSARKIMEXSetType
+    const reshape_local_array = PETSc.reshape_local_array
 else
     # A development checkout can carry a version number older than its API.
     let pl = first(PETSc.petsclibs)
@@ -48,6 +49,12 @@ else
     TSRosWSetType(pl, ts, s) = _cstr(p -> LibPETSc.TSRosWSetType(pl, ts, p), s)
     TSIRKSetType(pl, ts, s) = _cstr(p -> LibPETSc.TSIRKSetType(pl, ts, p), s)
     TSARKIMEXSetType(pl, ts, s) = _cstr(p -> LibPETSc.TSARKIMEXSetType(pl, ts, p), s)
+
+    # 0.4 pads every DM to three dimensions, so its trailing axes are dropped here.
+    function reshape_local_array(x, dm::LibPETSc.AbstractPetscDM{L}) where {L}
+        a = PETSc.reshapelocalarray(x, dm)
+        return reshape(a, axes(a)[1:(LibPETSc.DMGetDimension(PETSc.getlib(L), dm) + 1)])
+    end
 end
 
 end
