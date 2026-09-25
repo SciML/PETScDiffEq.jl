@@ -325,6 +325,34 @@ const METHODS = (
         end
     end
 
+    @testset "a failed Newton solve is taken again smaller on every rank" begin
+        breaks(f, i) = (du, u, p, t) -> (f(du, u, p, t); t > 0.05 && i > 0 && (du[i] = NaN); nothing)
+        for (make, _) in METHODS
+            fn = heat_function(breaks(heat!, rank == thrower ? 1 : 0), rows; jac = true)
+            sol = @test_logs (:warn, r"nonlinear solve failed") solve(
+                ODEProblem(fn, heat0(rows), SPAN), make(comm); TOL...,
+            )
+            @test sol.retcode == ReturnCode.Unstable
+            @test same_everywhere(sol.t)
+            @test 0.05 - sol.t[end] < 1.0e-12
+            @test sol.stats.nnonlinconvfail > 10
+        end
+        irk_counts = even(N)
+        idx = owned(irk_counts)
+        irk_first = sum(irk_counts[1:thrower]) + 1
+        fn = heat_function(breaks(heat!, rank == thrower ? 1 : 0), idx; jac = true)
+        sol = solve(ODEProblem(fn, heat0(idx), SPAN), TSIRK(2; comm); dt = 1.0e-3)
+        @test sol.retcode == ReturnCode.ConvergenceFailure
+        us = gathered(sol, irk_counts)
+        if rank == 0
+            serial = heat_function(breaks(heat_serial!, irk_first), 1:N; jac = true)
+            ref = solve(ODEProblem(serial, heat0(1:N), SPAN), TSIRK(2); dt = 1.0e-3)
+            @test ref.retcode == ReturnCode.ConvergenceFailure
+            @test sol.t == ref.t
+            @test maxdiff(us, ref.u) <= SERIAL_GAP
+        end
+    end
+
     @testset "the single-precision underflow warning is decided on the whole state" begin
         decay!(du, u, p, t) = (du .= -u; nothing)
         decay_jac!(J, u, p, t) = (foreach(k -> J[k, rows[k]] = -1, eachindex(rows)); nothing)
