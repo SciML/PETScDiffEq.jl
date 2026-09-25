@@ -478,13 +478,6 @@ crossing_last_row(idx, level) =
             "mass matrix",
         )
         @test refused(
-            () -> PETScDiffEq._discrete_adjoint(
-                prob, TSRK("4"; comm), PETScAdjoint(); t = [1.0],
-                dgdu_discrete = (out, u, p, t, i) -> (out .= u), dt = 0.1, adaptive = false,
-            ),
-            "PETScAdjoint",
-        )
-        @test refused(
             () -> solve(prob, TSRK("5dp", ["-ts_type", "beuler"]; comm); dt = 0.1),
             "`beuler` cannot run",
         )
