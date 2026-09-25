@@ -26,7 +26,7 @@ abstract type PETScTSDAEAlgorithm <: SciMLBase.AbstractDAEAlgorithm end
 const AnyPETScTS = Union{PETScTSAlgorithm, PETScTSDAEAlgorithm}
 
 """
-    TSRK(subtype = "5dp", petsc_options = String[]; comm = MPI.COMM_SELF)
+    TSRK(subtype = "5dp", petsc_options = String[]; comm = MPI.COMM_SELF, dm = nothing)
 
 Explicit Runge-Kutta from PETSc's `TSRK`. `subtype` is a PETSc `TSRKType`
 without its prefix, such as `"3bs"`, `"5dp"`, `"5f"` or `"5bs"`.
@@ -42,22 +42,25 @@ for example `["-ts_adapt_type", "none"]`. They are parsed after the options
 this package sets, so they win.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, with `u0`
-holding this rank's rows; see the MPI section of the documentation.
+holding this rank's rows; see the MPI section of the documentation. A `dm`, a DMDA from
+PETSc.jl, runs it on the DM's communicator and gives `f` the state ghosted from the DM, as
+that section describes.
 """
 struct TSRK <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 TSRK(
     subtype::AbstractString = "5dp",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF,
-) = TSRK(String(subtype), String[String(o) for o in petsc_options], comm)
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+) = TSRK(String(subtype), String[String(o) for o in petsc_options], _alg_comm(comm, dm), dm)
 
 """
-    TSRosW(subtype = "ra34pw2", petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSRosW(subtype = "ra34pw2", petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 Rosenbrock-W from PETSc's `TSROSW`. `subtype` is a PETSc `TSRosWType` without
 its prefix, such as `"2m"`, `"ra34pw2"` or `"r34prw"`.
@@ -92,24 +95,29 @@ within its first two steps and a fixed-step solve diverges.
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
+`autodiff` defaults to `AutoFiniteDiff()` as well.
 """
 struct TSRosW <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 TSRosW(
     subtype::AbstractString = "ra34pw2",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSRosW(
-    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _alg_comm(comm, dm), dm,
 )
 
 """
-    TSImplicit(subtype = "beuler"; order = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSImplicit(subtype = "beuler"; order = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
     TSImplicit(subtype, theta; ...)
     TSImplicit(subtype, [theta,] petsc_options; ...)
 
@@ -135,6 +143,8 @@ under ForwardDiff.
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
+`autodiff` defaults to `AutoFiniteDiff()` as well.
 """
 struct TSImplicit <: PETScTSAlgorithm
     subtype::String
@@ -143,6 +153,7 @@ struct TSImplicit <: PETScTSAlgorithm
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 function _bdf_order(subtype, order)
@@ -154,37 +165,43 @@ function _bdf_order(subtype, order)
 end
 
 TSImplicit(
-    subtype::AbstractString = "beuler"; order = nothing, comm::MPI.Comm = MPI.COMM_SELF,
-    autodiff = _default_autodiff(comm),
+    subtype::AbstractString = "beuler"; order = nothing,
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
     String(subtype), nothing, _bdf_order(subtype, order), String[], _check_autodiff(autodiff),
-    comm,
+    _alg_comm(comm, dm), dm,
 )
 TSImplicit(
-    subtype::AbstractString, theta::Real; order = nothing, comm::MPI.Comm = MPI.COMM_SELF,
-    autodiff = _default_autodiff(comm),
+    subtype::AbstractString, theta::Real; order = nothing,
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
     String(subtype), Float64(theta), _bdf_order(subtype, order), String[],
-    _check_autodiff(autodiff), comm,
+    _check_autodiff(autodiff), _alg_comm(comm, dm), dm,
 )
 TSImplicit(
     subtype::AbstractString, petsc_options::AbstractVector{<:AbstractString};
-    order = nothing, comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    order = nothing, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
     String(subtype), nothing, _bdf_order(subtype, order),
-    String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _alg_comm(comm, dm), dm,
 )
 TSImplicit(
     subtype::AbstractString, theta::Real,
     petsc_options::AbstractVector{<:AbstractString}; order = nothing,
-    comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
     String(subtype), Float64(theta), _bdf_order(subtype, order),
-    String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _alg_comm(comm, dm), dm,
 )
 
 """
-    TSIRK(nstages = 3, petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSIRK(nstages = 3, petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 Gauss-Legendre implicit Runge-Kutta from PETSc's `TSIRK`, of order `2 *
 nstages`: one stage is the implicit midpoint rule at order 2, two stages give
@@ -211,24 +228,28 @@ as `dt` shrinks instead of failing, which is worse than an error.
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There it needs a `jac`, filling this rank's rows of a sparse `jac_prototype` whose columns are
 global, and each rank has to hold PETSc's own share of the state, which splits it evenly with
-the first ranks taking one row more; see the MPI section of the documentation.
+the first ranks taking one row more; see the MPI section of the documentation. A `dm` is
+refused, since a solve with one takes no `jac`.
 """
 struct TSIRK <: PETScTSAlgorithm
     nstages::Int
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 TSIRK(
     nstages::Integer = 3, petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSIRK(
-    Int(nstages), String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    Int(nstages), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _alg_comm(comm, dm), dm,
 )
 
 """
-    TSDAE(subtype = "bdf", petsc_options = String[]; order = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSDAE(subtype = "bdf", petsc_options = String[]; order = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 Fully implicit methods applied to a `DAEProblem`, whose residual `G(t, u, u') = 0`
 is exactly the form PETSc's `IFunction` takes. `subtype` is `"beuler"`, `"cn"`,
@@ -248,6 +269,8 @@ since PETSc derives the initial derivative itself.
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
+`autodiff` defaults to `AutoFiniteDiff()` as well.
 """
 struct TSDAE <: PETScTSDAEAlgorithm
     subtype::String
@@ -255,19 +278,21 @@ struct TSDAE <: PETScTSDAEAlgorithm
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 TSDAE(
     subtype::AbstractString = "bdf",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    order = nothing, comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    order = nothing, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSDAE(
     String(subtype), _bdf_order(subtype, order), String[String(o) for o in petsc_options],
-    _check_autodiff(autodiff), comm,
+    _check_autodiff(autodiff), _alg_comm(comm, dm), dm,
 )
 
 """
-    TSARKIMEX(subtype = "3", petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSARKIMEX(subtype = "3", petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 Additive Runge-Kutta IMEX from PETSc's `TSARKIMEX`. `subtype` is a PETSc
 `TSARKIMEXType` without its prefix, such as `"2e"`, `"3"`, `"4"` or `"5"`.
@@ -290,28 +315,33 @@ plain `ODEProblem` PETSc does not use its explicit tableau, and it keeps order 3
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
+`autodiff` defaults to `AutoFiniteDiff()` as well.
 """
 struct TSARKIMEX <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 TSARKIMEX(
     subtype::AbstractString = "3",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm),
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+    autodiff = _default_autodiff(comm, dm),
 ) = TSARKIMEX(
-    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _alg_comm(comm, dm), dm,
 )
 
 const _MPRK_TWO_WAY = ("2a22", "2a32", "p2", "p3")
 const _MPRK_THREE_WAY = ("2a23", "2a33")
 
 """
-    TSMPRK(slow, subtype = "p2", petsc_options = String[]; comm = MPI.COMM_SELF)
-    TSMPRK(slow, medium, subtype = "2a23", petsc_options = String[]; comm = MPI.COMM_SELF)
+    TSMPRK(slow, subtype = "p2", petsc_options = String[]; comm = MPI.COMM_SELF, dm = nothing)
+    TSMPRK(slow, medium, subtype = "2a23", petsc_options = String[]; comm = MPI.COMM_SELF, dm = nothing)
 
 PETSc's multirate partitioned Runge-Kutta. `slow` lists the indices of the state
 that are integrated with the outer step; everything else is advanced on a smaller
@@ -337,10 +367,11 @@ struct TSMPRK <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 
     function TSMPRK(
             slow::Vector{Int}, medium::Vector{Int}, subtype::String,
-            petsc_options::Vector{String}, comm::MPI.Comm,
+            petsc_options::Vector{String}, comm::MPI.Comm, dm,
         )
         isempty(slow) && throw(ArgumentError("`slow` needs at least one index"))
         for (name, v) in (("slow", slow), ("medium", medium))
@@ -360,7 +391,7 @@ struct TSMPRK <: PETScTSAlgorithm
                     "one use " * join(map(t -> "\"$t\"", _MPRK_THREE_WAY), " or "),
             ),
         )
-        return new(sort(slow), sort(medium), subtype, petsc_options, comm)
+        return new(sort(slow), sort(medium), subtype, petsc_options, comm, dm)
     end
 end
 
@@ -368,10 +399,10 @@ TSMPRK(
     slow::AbstractVector{<:Integer},
     subtype::AbstractString = "p2",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF,
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
 ) = TSMPRK(
     Vector{Int}(slow), Int[], String(subtype),
-    String[String(o) for o in petsc_options], comm,
+    String[String(o) for o in petsc_options], _alg_comm(comm, dm), dm,
 )
 
 TSMPRK(
@@ -379,10 +410,10 @@ TSMPRK(
     medium::AbstractVector{<:Integer},
     subtype::AbstractString = "2a23",
     petsc_options::AbstractVector{<:AbstractString} = String[];
-    comm::MPI.Comm = MPI.COMM_SELF,
+    comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
 ) = TSMPRK(
     Vector{Int}(slow), Vector{Int}(medium), String(subtype),
-    String[String(o) for o in petsc_options], comm,
+    String[String(o) for o in petsc_options], _alg_comm(comm, dm), dm,
 )
 
 const _SYMPLECTIC_TYPES = Dict(
@@ -471,7 +502,7 @@ function TSAlpha2(
 end
 
 """
-    TSGeneric(ts_type, petsc_options = String[]; explicit = false, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSGeneric(ts_type, petsc_options = String[]; explicit = false, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 Any other PETSc `TSType` by name. An implicit one such as `"alpha"` works with
 the default; an explicit one such as `"euler"` or `"ssp"` needs
@@ -490,7 +521,7 @@ zero rather than saying anything. `"alpha2"` and `"basicsymplectic"` are refused
 they need a second-order or partitioned problem; use [`TSAlpha2`](@ref) or
 [`TSBasicSymplectic`](@ref).
 
-An explicit type takes a `comm` other than `MPI.COMM_SELF` as [`TSRK`](@ref) does.
+An explicit type takes a `comm` other than `MPI.COMM_SELF`, or a `dm`, as [`TSRK`](@ref) does.
 """
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
@@ -498,6 +529,7 @@ struct TSGeneric <: PETScTSAlgorithm
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 const _NEEDS_OTHER_SETUP = Dict(
@@ -517,7 +549,8 @@ const _ROSW_NO_STEP = ("lassp3p4s2c", "llssp3p4s2c", "ark3")
 function TSGeneric(
         ts_type::AbstractString,
         petsc_options::AbstractVector{<:AbstractString} = String[];
-        explicit::Bool = false, autodiff = AutoForwardDiff(), comm::MPI.Comm = MPI.COMM_SELF,
+        explicit::Bool = false, autodiff = AutoForwardDiff(),
+        comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     )
     t = String(ts_type)
     haskey(_NEEDS_OTHER_SETUP, t) && throw(
@@ -530,7 +563,8 @@ function TSGeneric(
         ArgumentError("`irk` is an implicit PETSc type, so it cannot take `explicit = true`"),
     )
     return TSGeneric(
-        t, explicit, String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+        t, explicit, String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+        _alg_comm(comm, dm), dm,
     )
 end
 
@@ -788,6 +822,137 @@ end
 
 _smallest(::Nothing, x) = x
 _smallest(comm::MPI.Comm, x) = MPI.Allreduce(x, min, comm)
+
+_check_code(code) = (code == 0 || throw(LibPETSc.PetscError(code)); nothing)
+
+_dm_lib(::LibPETSc.AbstractPetscDM{L}) where {L} = PETSc.getlib(L)
+
+function _dm_comm(dm)
+    comm = Ref{MPI.API.MPI_Comm}()
+    _check_code(
+        ccall(
+            _symbol(_dm_lib(dm), :PetscObjectGetComm), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{MPI.API.MPI_Comm}), dm.ptr, comm,
+        ),
+    )
+    return MPI.Comm(comm[])
+end
+
+function _alg_comm(comm, dm)
+    dm === nothing && return something(comm, MPI.COMM_SELF)
+    dm isa LibPETSc.AbstractPetscDM || throw(
+        ArgumentError(
+            "`dm` takes a PETSc DM, such as a DMDA from PETSc.jl, not a $(typeof(dm))",
+        ),
+    )
+    own = _dm_comm(dm)
+    comm === nothing && return MPI.Comm_size(own) == 1 ? MPI.COMM_SELF : own
+    MPI.Comm_compare(comm, own) in (MPI.IDENT, MPI.CONGRUENT) || throw(
+        ArgumentError(
+            "the `dm` lives on other ranks than `comm`; leave `comm` out to run on the " *
+                "DM's own",
+        ),
+    )
+    return comm
+end
+
+function _dm_vec!(pl, name, dm, v = Ref{Ptr{Cvoid}}(C_NULL))
+    _check_code(
+        ccall(
+            _symbol(pl, name), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}), dm, v,
+        ),
+    )
+    return v
+end
+
+function _dm_type(pl, dm)
+    name = Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :DMGetType), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}),
+            dm.ptr, name,
+        ),
+    )
+    return name[] == C_NULL ? "" : unsafe_string(name[])
+end
+
+function _dm_local_size(pl, dm)
+    v = _dm_vec!(pl, :DMGetGlobalVector, dm.ptr)
+    try
+        n = Ref{LibPETSc.PetscInt}(0)
+        _check_code(
+            ccall(
+                _symbol(pl, :VecGetLocalSize), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{LibPETSc.PetscInt}), v[], n,
+            ),
+        )
+        return Int(n[])
+    finally
+        _dm_vec!(pl, :DMRestoreGlobalVector, dm.ptr, v)
+    end
+end
+
+_clone_dm(pl, dm) = LibPETSc.PetscDM(_dm_vec!(pl, :DMClone, dm.ptr)[], pl)
+
+function _scatter!(pl, dm, u, loc)
+    glob = _dm_vec!(pl, :DMGetGlobalVector, dm)
+    try
+        _writevec!(pl, PETSc.VecPtr(pl, glob[], false), u)
+        _check_code(
+            ccall(_symbol(pl, :VecZeroEntries), LibPETSc.PetscErrorCode, (Ptr{Cvoid},), loc),
+        )
+        for name in (:DMGlobalToLocalBegin, :DMGlobalToLocalEnd)
+            _check_code(
+                ccall(
+                    _symbol(pl, name), LibPETSc.PetscErrorCode,
+                    (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Ptr{Cvoid}),
+                    dm, glob[], Cint(LibPETSc.INSERT_VALUES), loc,
+                ),
+            )
+        end
+    finally
+        _dm_vec!(pl, :DMRestoreGlobalVector, dm, glob)
+    end
+    return nothing
+end
+
+struct Ghosted{F, L, D}
+    f::F
+    petsclib::L
+    dm::D
+end
+
+function _ghosted(call, g::Ghosted, u)
+    pl, dm = g.petsclib, g.dm.ptr
+    loc = _dm_vec!(pl, :DMGetLocalVector, dm)
+    try
+        _scatter!(pl, dm, u, loc[])
+        v = PETSc.VecPtr(pl, loc[], false)
+        a = LibPETSc.VecGetArrayRead(pl, v)
+        try
+            call(a)
+        finally
+            LibPETSc.VecRestoreArrayRead(pl, v, a)
+        end
+    finally
+        _dm_vec!(pl, :DMRestoreLocalVector, dm, loc)
+    end
+    return nothing
+end
+
+(g::Ghosted)(du, u, p, t) = _ghosted(a -> g.f(du, a, p, t), g, u)
+(g::Ghosted)(r, du, u, p, t) = _ghosted(a -> g.f(r, du, a, p, t), g, u)
+
+"""
+    PETScDiffEq.reshape_local_array(x, dm)
+
+This rank's part of a vector on the DMDA `dm`, indexed by grid point in global numbering:
+`a[c, i]` on a 1-D grid and `a[c, i, j]` on a 2-D one, where `c` runs over the degrees of
+freedom at each point. `x` can be the ghosted array `f` receives or the block of the state the
+rank owns, such as `du`, `u0` or a saved state, and `a` shares its memory. This is PETSc.jl's
+`reshape_local_array`, which PETSc.jl 0.4 calls `reshapelocalarray` and pads to three grid axes.
+"""
+reshape_local_array(x, dm) = PETScCompat.reshape_local_array(x, dm)
 
 function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     full = Vector{S}(x)
@@ -2199,6 +2364,7 @@ mutable struct TSHandles{CTX, L, R, S}
     tolbufs::Vector{Vector{S}}
     destroyed::Bool
     solution::Any
+    dm::Any
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -2259,6 +2425,12 @@ function _destroy!(h::TSHandles)
     h.ts === nothing || _return_work_vec!(h.ctx, h.ts)
     _release_work_vec!(h.ctx)
     h.ts === nothing || LibPETSc.TSDestroy(h.petsclib, h.ts)
+    h.dm === nothing || _check_code(
+        ccall(
+            _symbol(h.petsclib, :DMDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+            Ref(h.dm.ptr),
+        ),
+    )
     return nothing
 end
 
@@ -2412,6 +2584,76 @@ function _check_dynamical(prob, alg, has_mass)
 end
 
 const _DISTRIBUTED_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "irk")
+const _DM_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex")
+const _WITH_DM = "with a `dm`"
+
+function _check_diagonal_mass(prob, is_dae, where)
+    n = length(prob.u0)
+    mass = is_dae ? nothing : prob.f.mass_matrix
+    (mass === nothing || mass == LinearAlgebra.I) && return nothing
+    mass isa LinearAlgebra.Diagonal || throw(
+        ArgumentError(
+            "PETScDiffEq takes only a `Diagonal` mass matrix $where, not a " *
+                "$(nameof(typeof(mass)))",
+        ),
+    )
+    size(mass) == (n, n) || throw(
+        ArgumentError(
+            "the mass matrix is $(join(size(mass), " x ")), but this rank's block of " *
+                "the state has $n rows",
+        ),
+    )
+    return nothing
+end
+
+function _refuse_dm(prob, alg, is_dae)
+    irk = alg isa TSIRK ? ", and TSIRK needs a `jac`, which a `dm` solve does not take" : ""
+    alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX} ||
+        alg isa TSGeneric && alg.explicit || throw(
+        ArgumentError(
+            "PETScDiffEq cannot run " *
+                "$(alg isa TSGeneric ? "an implicit TSGeneric" : nameof(typeof(alg))) " *
+                "$_WITH_DM; TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX and " *
+                "TSGeneric(...; explicit = true) can$irk",
+        ),
+    )
+    prob.f.jac === nothing || throw(
+        ArgumentError(
+            "PETScDiffEq does not take a `jac` $_WITH_DM yet; leave it out, and an implicit " *
+                "method has PETSc colour the DM's matrix and difference `f`",
+        ),
+    )
+    prob.f.jac_prototype === nothing || throw(
+        ArgumentError("the `dm` gives the Jacobian's pattern, so leave out `jac_prototype`"),
+    )
+    _uses_ifunction(alg) || return nothing
+    _petsc_differences(alg) || throw(
+        ArgumentError(
+            "PETScDiffEq cannot use `$(_autodiff(alg))` $_WITH_DM, since `f` then takes " *
+                "the ghosted array PETSc fills; leave `autodiff` at its default there, " *
+                "`AutoFiniteDiff()`, for the DM's colouring",
+        ),
+    )
+    _check_diagonal_mass(prob, is_dae, _WITH_DM)
+    return nothing
+end
+
+function _check_dm(petsclib, dm)
+    dm isa LibPETSc.AbstractPetscDM{typeof(petsclib)} || throw(
+        ArgumentError(
+            "the `dm` belongs to PETSc's $(_build_name(PETSc.scalartype(_dm_lib(dm)))) " *
+                "build, but the state's element type runs this problem in its " *
+                "$(_build_name(PETSc.scalartype(petsclib))) one",
+        ),
+    )
+    type = _dm_type(petsclib, dm)
+    type == "da" || throw(
+        ArgumentError(
+            "PETScDiffEq takes only a DMDA as the `dm` so far, not a DM of type `$type`",
+        ),
+    )
+    return nothing
+end
 
 function _refuse_distributed(prob, alg, is_dae, N)
     prob.f isa SciMLBase.DynamicalODEFunction && throw(
@@ -2441,21 +2683,7 @@ function _refuse_distributed(prob, alg, is_dae, N)
         )
     end
     n = length(prob.u0)
-    mass = is_dae ? nothing : prob.f.mass_matrix
-    if !(mass === nothing || mass == LinearAlgebra.I)
-        mass isa LinearAlgebra.Diagonal || throw(
-            ArgumentError(
-                "PETScDiffEq takes only a `Diagonal` mass matrix $_NOT_SELF, not a " *
-                    "$(nameof(typeof(mass)))",
-            ),
-        )
-        size(mass) == (n, n) || throw(
-            ArgumentError(
-                "the mass matrix is $(join(size(mass), " x ")), but this rank's block of " *
-                    "the state has $n rows",
-            ),
-        )
-    end
+    _check_diagonal_mass(prob, is_dae, _NOT_SELF)
     proto = prob.f.jac_prototype
     if has_jac
         proto isa SparseMatrixCSC || throw(
@@ -2655,9 +2883,14 @@ function _setup(
         throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
     end
     comm = _distributed(alg) ? alg.comm : nothing
+    dm = alg.dm
     N = comm === nothing ? length(prob.u0) : MPI.Allreduce(length(prob.u0), +, comm)
-    comm === nothing || _checked_everywhere(comm) do
-        _refuse_distributed(prob, alg, is_dae, N)
+    if dm !== nothing
+        _checked_everywhere(() -> _refuse_dm(prob, alg, is_dae), comm)
+    elseif comm !== nothing
+        _checked_everywhere(comm) do
+            _refuse_distributed(prob, alg, is_dae, N)
+        end
     end
 
     R, S, U = eltypes
@@ -2691,6 +2924,18 @@ function _setup(
     _check_inttype(petsclib)
     PETScCompat.isinitialized(petsclib) || PETSc.initialize(petsclib)
     _arm_exit_cleanup!(petsclib)
+    if dm !== nothing
+        _checked_everywhere(() -> _check_dm(petsclib, dm), comm)
+        _checked_everywhere(comm) do
+            m = _dm_local_size(petsclib, dm)
+            m == n || throw(
+                ArgumentError(
+                    "`u0` has $n entries on this rank, but the `dm` gives it $m, its own " *
+                        "grid points times the degrees of freedom at each",
+                ),
+            )
+        end
+    end
 
     iip = SciMLBase.isinplace(prob)
     # SciMLBase's wrapper is typed for the problem's types, so unwrap where PETSc's differ.
@@ -2710,6 +2955,10 @@ function _setup(
     end
     f1 = is_dae || dyn ? f1 : _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
+    if dm !== nothing
+        f1 = Ghosted(f1, petsclib, dm)
+        f2 = f2 === nothing ? nothing : Ghosted(f2, petsclib, dm)
+    end
     builds_jac = _uses_ifunction(alg) && prob.f.jac === nothing && !_petsc_differences(alg)
     has_jac = _uses_ifunction(alg) && (prob.f.jac !== nothing || builds_jac)
     _refuse_method(_warn_name(alg), has_mass, has_jac, is_split, is_dae)
@@ -2801,7 +3050,7 @@ function _setup(
     save_end || filter!(!at_end, saveat_times)
     M = if !has_mass
         nothing
-    elseif comm === nothing
+    elseif comm === nothing && dm === nothing
         Matrix{S}(mass_matrix)
     else
         LinearAlgebra.Diagonal(Vector{S}(mass_matrix.diag))
@@ -2844,7 +3093,9 @@ function _setup(
             ),
         )
     end
-    uvec = _state_vec(petsclib, comm, n)
+    clone = dm === nothing ? nothing : _clone_dm(petsclib, dm)
+    uvec = clone === nothing ? _state_vec(petsclib, comm, n) :
+        LibPETSc.DMCreateGlobalVector(petsclib, clone)
     A = dyn && kept === nothing ? typeof(similar(prob.u0, U)) : Vector{U}
     ctx = TSContext(
         petsclib, f1, f2, jac_fn, prob.p,
@@ -2853,7 +3104,8 @@ function _setup(
         row_cols0, row_src, row_buf, J0,
         R[], A[], A[], nothing, nothing,
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
-        _work_vec(petsclib, comm, uvec, n),
+        clone === nothing ? _work_vec(petsclib, comm, uvec, n) :
+            LibPETSc.DMCreateGlobalVector(petsclib, clone),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
         R(NaN), similar(u0), t0, copy(u0), nothing, nothing, false,
         slow_idxs, medium_idxs, fast_idxs,
@@ -2867,7 +3119,7 @@ function _setup(
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0, false, false,
-        Any[], Vector{S}[], false, nothing,
+        Any[], Vector{S}[], false, nothing, clone,
     )
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -2879,6 +3131,7 @@ function _setup(
     try
         h.ts = LibPETSc.TSCreate(petsclib, something(comm, MPI.COMM_SELF))
         ts = h.ts
+        clone === nothing || LibPETSc.TSSetDM(petsclib, ts, clone)
         LibPETSc.TSSetProblemType(petsclib, ts, LibPETSc.TS_NONLINEAR)
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
         _set_subtype!(petsclib, ts, alg)
@@ -2922,6 +3175,9 @@ function _setup(
             end
             if alg isa TSAlpha2
                 has_jac && _second_order_jacobian!(h, nv, ptrs, ctxptr)
+            elseif clone !== nothing && _uses_ifunction(alg)
+                h.fd_mat = LibPETSc.DMCreateMatrix(petsclib, clone)
+                _colour_jacobian!(petsclib, ts, h.fd_mat)
             elseif comm !== nothing && _uses_ifunction(alg)
                 rstart = first(LibPETSc.VecGetOwnershipRange(petsclib, u))
                 P = has_jac ? J0 : _structure(S, SparseMatrixCSC(prob.f.jac_prototype))
@@ -3038,11 +3294,13 @@ function _setup(
                         "`TSGeneric(\"irk\")` rather than an option on an explicit algorithm",
                 ),
             )
-            distributable = _uses_ifunction(alg) ? _DISTRIBUTED_IMPLICIT : _EXPLICIT_ONLY
-            comm === nothing || chosen in distributable || throw(
+            distributable = !_uses_ifunction(alg) ? _EXPLICIT_ONLY :
+                dm === nothing ? _DISTRIBUTED_IMPLICIT : _DM_IMPLICIT
+            comm === nothing && dm === nothing || chosen in distributable || throw(
                 ArgumentError(
-                    "`$chosen` cannot run $_NOT_SELF when an option picks it for " *
-                        "$(nameof(typeof(alg))); only $(join(distributable, ", ")) can",
+                    "`$chosen` cannot run $(dm === nothing ? _NOT_SELF : _WITH_DM) when an " *
+                        "option picks it for $(nameof(typeof(alg))); only " *
+                        "$(join(distributable, ", ")) can",
                 ),
             )
             comm === nothing || chosen != "irk" || _check_irk_layout(n, N, comm)
