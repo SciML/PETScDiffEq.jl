@@ -98,13 +98,13 @@ the step after each starts one ULP past it, so the right-hand side there sees th
 when written as `if t > t_d`. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
 step that leaves the domain is taken again at a fifth of its size, as OrdinaryDiffEq takes it;
 one that cannot be made small enough ends the solve with `Unstable`, or `DtLessThanMin` at
-`dtmin`. An adaptive step whose error estimate is NaN or infinite, as when the
-right-hand side returns NaN or the state overflows, is taken again smaller the same way, and
-both kinds of retry count in `stats.nreject`. An adaptive implicit step whose Newton or
-linear solve fails, or whose Newton matrix has a zero pivot, is taken again at PETSc's
-`-ts_adapt_scale_solve_failed` share of its size, a quarter by default, as many times as it
-takes, and counts in `stats.nnonlinconvfail` rather than `stats.nreject`, as in
-OrdinaryDiffEq. A fixed-step solve ends at its first failed Newton solve with
+`dtmin`. An adaptive step whose error estimate is NaN or infinite, as when an explicit
+method's right-hand side returns NaN or the state overflows, is taken again smaller the same
+way, and both kinds of retry count in `stats.nreject`. An adaptive implicit step whose Newton
+or linear solve fails, as when its right-hand side returns NaN, or whose Newton matrix has a
+zero pivot, is taken again at PETSc's `-ts_adapt_scale_solve_failed` share of its size, a
+quarter by default, as many times as it takes, and counts in `stats.nnonlinconvfail` rather
+than `stats.nreject`, as in OrdinaryDiffEq. A fixed-step solve ends at its first failed Newton solve with
 `ConvergenceFailure`, as OrdinaryDiffEq's does with `adaptive = false`.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
