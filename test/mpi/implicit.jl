@@ -293,7 +293,8 @@ const METHODS = (
         dae = DAEProblem(
             DAEFunction(residual; jac_prototype = proto), zero(heat0(rows)), heat0(rows), SPAN,
         )
-        @test raised(caught(() -> solve(dae, TSDAE("bdf"; comm))), "residual")
+        noinit = (; initializealg = SciMLBase.NoInit())
+        @test raised(caught(() -> solve(dae, TSDAE("bdf"; comm); noinit...)), "residual")
         f1 = heat_function(heat!, rows; jac = true)
         f2(when) = function (du, u, p, t)
             du .= -u
