@@ -6695,7 +6695,8 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test collect(sol.u[end]) ≈ [v, u] rtol = 1.0e-12
         end
 
-        @testset "the energy error stays bounded" begin
+        # PETSc's absolute-eps step check fails a span this long on 32-bit x86.
+        Sys.WORD_SIZE == 64 && @testset "the energy error stays bounded" begin
             energy(s) = s.x[1][1]^2 / 2 - cos(s.x[2][1])
             prob = SciMLBase.SecondOrderODEProblem(pend!, [0.0], [2.0], (0.0, 1000.0))
             function drift(alg)
