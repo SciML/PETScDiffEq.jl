@@ -135,7 +135,9 @@ const METHODS = (
 @testset "MPI implicit, $nranks ranks" begin
     @testset "autodiff defaults to PETSc's colouring" begin
         @test TSRosW(; comm).autodiff isa AutoFiniteDiff
+        @test TSGeneric("alpha"; comm).autodiff isa AutoFiniteDiff
         @test TSImplicit("bdf").autodiff isa AutoForwardDiff
+        @test TSGeneric("alpha").autodiff isa AutoForwardDiff
     end
 
     @testset "1-D heat with a local-row jac and with colouring" begin
@@ -160,6 +162,29 @@ const METHODS = (
             @test sol.t == ref.t
             @test maxdiff(us, ref.u) <= SERIAL_GAP
             @test maxdiff(us, heat_exact.(sol.t)) <= 4.0e-6
+        end
+    end
+
+    @testset "an implicit TSGeneric" begin
+        heat(idx, f; jac) = ODEProblem(heat_function(f, idx; jac), heat0(idx), SPAN)
+        cases = (("alpha", 3.0e-8, (; dt = 1.0e-4)), ("dirk", 5.0e-7, (; dt = 1.0e-4, TOL...)))
+        for (type, err, kw) in cases, (jac, ad) in SOURCES
+            sol = compare(
+                heat(rows, heat!; jac), TSGeneric(type; comm), heat(1:N, heat_serial!; jac),
+                TSGeneric(type; autodiff = ad), heat_exact(SPAN[2]), err; kw...,
+            )
+            @test (sol.stats.njacs > 0) == jac
+        end
+        irk_counts = even(N)
+        idx = owned(irk_counts)
+        irk(idx, f) = ODEProblem(heat_function(f, idx; jac = true), heat0(idx), SPAN)
+        sol = solve(irk(idx, heat!), TSGeneric("irk"; comm); dt = 1.0e-3)
+        @test sol.retcode == ReturnCode.Success
+        us = gathered(sol, irk_counts)
+        if rank == 0
+            ref = solve(irk(1:N, heat_serial!), TSGeneric("irk"); dt = 1.0e-3)
+            @test sol.t == ref.t
+            @test maxdiff(us, ref.u) <= SERIAL_GAP
         end
     end
 
@@ -355,17 +380,17 @@ const METHODS = (
             () -> solve(coloured, TSImplicit("bdf"; comm, autodiff = AutoForwardDiff())),
             "cannot use `AutoForwardDiff()`",
         )
-        @test refused(() -> solve(coloured, TSIRK(2; comm); dt = 1.0e-3), "TSIRK needs a `jac`")
+        for alg in (TSIRK(2; comm), TSGeneric("irk"; comm))
+            @test refused(() -> solve(coloured, alg; dt = 1.0e-3), "TSIRK needs a `jac`")
+        end
         dense_mass = [i == j ? 2.0 : 0.0 for i in 1:n, j in 1:n]
         @test refused(
             () -> solve(heat(heat_function(heat!, rows; jac = false, mass_matrix = dense_mass)), bdf),
             "only a `Diagonal` mass matrix",
         )
-        for alg in (TSMPRK([1]; comm), TSGeneric("alpha"; comm))
-            @test refused(() -> solve(heat(ODEFunction(heat!)), alg; dt = 0.1), "cannot run")
-        end
+        @test refused(() -> solve(coloured, TSGeneric("glle"; comm); dt = 0.1), "cannot run")
         @test refused(
-            () -> solve(coloured, TSImplicit("bdf", ["-ts_type", "alpha"]; comm)), "`alpha` cannot run",
+            () -> solve(coloured, TSImplicit("bdf", ["-ts_type", "glle"]; comm)), "`glle` cannot run",
         )
         proto = heat_proto(rows)
         wrong = rank == thrower ? [proto; spzeros(1, N)] : proto

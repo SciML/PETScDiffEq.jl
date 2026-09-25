@@ -7259,8 +7259,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             setup = "push!(LOAD_PATH, \"@stdlib\"); using Pkg; " *
                 "Pkg.develop(path = $(repr(root))); Pkg.instantiate()"
             run(`$julia --project=$dir -e $setup`)
-            for script in ("explicit.jl", "implicit.jl", "adjoint.jl", "dm.jl", "exit.jl"), np in (1, 2, 3)
-                cmd = `$(MPI.mpiexec()) -n $np $julia --project=$dir $(joinpath(dir, script))`
+            scripts = (
+                "explicit.jl", "implicit.jl", "adjoint.jl", "dm.jl", "types.jl", "ensemble.jl",
+                "exit.jl",
+            )
+            for script in scripts, np in (1, 2, 3)
+                threads = script == "ensemble.jl" ? 2 : 1
+                rank_cmd = `$julia --threads=$threads --project=$dir $(joinpath(dir, script))`
+                cmd = `$(MPI.mpiexec()) -n $np $rank_cmd`
                 proc = run(pipeline(cmd; stdout, stderr); wait = false)
                 # A rank left waiting in a collective hangs rather than fails, and a rank
                 # killed there can hang again in its exit hooks.

@@ -339,6 +339,26 @@ TSARKIMEX(
 const _MPRK_TWO_WAY = ("2a22", "2a32", "p2", "p3")
 const _MPRK_THREE_WAY = ("2a23", "2a33")
 
+function _check_mprk(slow, medium, subtype, distributed)
+    for (name, v) in (("slow", slow), ("medium", medium))
+        all(i -> i >= 1, v) || throw(ArgumentError("`$name` indices start at 1"))
+        length(unique(v)) == length(v) || throw(ArgumentError("`$name` repeats an index"))
+    end
+    isempty(intersect(slow, medium)) ||
+        throw(ArgumentError("`slow` and `medium` share an index"))
+    three = !isempty(medium) || distributed && subtype in _MPRK_THREE_WAY
+    subtype in (three ? _MPRK_THREE_WAY : _MPRK_TWO_WAY) || throw(
+        ArgumentError(
+            !three ?
+                "`$subtype` needs a `medium` split as well; without one use " *
+                join(map(t -> "\"$t\"", _MPRK_TWO_WAY), ", ") :
+                "`$subtype` takes only two splits, so leave `medium` out; with " *
+                "one use " * join(map(t -> "\"$t\"", _MPRK_THREE_WAY), " or "),
+        ),
+    )
+    return nothing
+end
+
 """
     TSMPRK(slow, subtype = "p2", petsc_options = String[]; comm = MPI.COMM_SELF, dm = nothing)
     TSMPRK(slow, medium, subtype = "2a23", petsc_options = String[]; comm = MPI.COMM_SELF, dm = nothing)
@@ -360,6 +380,10 @@ than an explicit single-rate method's: on `u' = [-u1, -100u2]` with only the fir
 component slow, `"p3"` holds to `dt = 0.0425` against `TSRK("5dp")`'s `0.03`. The
 ratio is fixed by the tableau rather than by the stiffness, so a separation much
 wider than that is not something these methods can absorb.
+
+A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
+There `slow` and `medium` index this rank's rows and may be empty on some ranks, as long as
+some rank names a slow row and, for `"2a23"` and `"2a33"`, a medium one. A `dm` is refused.
 """
 struct TSMPRK <: PETScTSAlgorithm
     slow::Vector{Int}
@@ -373,24 +397,10 @@ struct TSMPRK <: PETScTSAlgorithm
             slow::Vector{Int}, medium::Vector{Int}, subtype::String,
             petsc_options::Vector{String}, comm::MPI.Comm, dm,
         )
-        isempty(slow) && throw(ArgumentError("`slow` needs at least one index"))
-        for (name, v) in (("slow", slow), ("medium", medium))
-            all(i -> i >= 1, v) || throw(ArgumentError("`$name` indices start at 1"))
-            length(unique(v)) == length(v) ||
-                throw(ArgumentError("`$name` repeats an index"))
+        if comm == MPI.COMM_SELF
+            isempty(slow) && throw(ArgumentError("`slow` needs at least one index"))
+            _check_mprk(slow, medium, subtype, false)
         end
-        isempty(intersect(slow, medium)) ||
-            throw(ArgumentError("`slow` and `medium` share an index"))
-        wanted = isempty(medium) ? _MPRK_TWO_WAY : _MPRK_THREE_WAY
-        subtype in wanted || throw(
-            ArgumentError(
-                isempty(medium) ?
-                    "`$subtype` needs a `medium` split as well; without one use " *
-                    join(map(t -> "\"$t\"", _MPRK_TWO_WAY), ", ") :
-                    "`$subtype` takes only two splits, so leave `medium` out; with " *
-                    "one use " * join(map(t -> "\"$t\"", _MPRK_THREE_WAY), " or "),
-            ),
-        )
         return new(sort(slow), sort(medium), subtype, petsc_options, comm, dm)
     end
 end
@@ -521,7 +531,13 @@ zero rather than saying anything. `"alpha2"` and `"basicsymplectic"` are refused
 they need a second-order or partitioned problem; use [`TSAlpha2`](@ref) or
 [`TSBasicSymplectic`](@ref).
 
-An explicit type takes a `comm` other than `MPI.COMM_SELF`, or a `dm`, as [`TSRK`](@ref) does.
+A `comm` other than `MPI.COMM_SELF` runs an explicit type as [`TSRK`](@ref) runs, and an
+implicit `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`, `"arkimex"`, `"irk"`, `"alpha"` or
+`"dirk"` as [`TSImplicit`](@ref) runs, with `autodiff` defaulting to `AutoFiniteDiff()`. Other
+implicit types are refused there: `"glle"`'s step control follows the round-off of the
+distributed linear solve, so it takes other steps than a serial solve and ends with another
+error, larger or smaller. A `dm` runs an explicit type as it runs [`TSRK`](@ref) and refuses an
+implicit one.
 """
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
@@ -549,8 +565,8 @@ const _ROSW_NO_STEP = ("lassp3p4s2c", "llssp3p4s2c", "ark3")
 function TSGeneric(
         ts_type::AbstractString,
         petsc_options::AbstractVector{<:AbstractString} = String[];
-        explicit::Bool = false, autodiff = AutoForwardDiff(),
-        comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+        explicit::Bool = false, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+        autodiff = _default_autodiff(comm, dm),
     )
     t = String(ts_type)
     haskey(_NEEDS_OTHER_SETUP, t) && throw(
@@ -1046,29 +1062,33 @@ function _post_step_collective!(ctx, ts_ptr)
     try
         ts = LibPETSc.TS(ts_ptr, pl)
         _undo_failed_irk!(ctx, pl, ts_ptr)
-        small = unstable = false
+        small = unstable = nonfinite = false
         s = LibPETSc.TSGetTime(pl, ts)
         smax = LibPETSc.TSGetMaxTime(pl, ts)
         if Int(LibPETSc.TSGetConvergedReason(pl, ts)) >= 0 && s < smax - _near(smax)
             hnext = LibPETSc.TSGetTimeStep(pl, ts)
             small = ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
-            if !small && ctx.unstable !== nothing
+            if !small && (ctx.unstable !== nothing || ctx.halt_nonfinite)
                 x = Ref{LibPETSc.CVec}(C_NULL)
                 ccall(
                     _symbol(pl, :TSGetSolution), LibPETSc.PetscErrorCode,
                     (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x,
                 )
                 u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
-                unstable = _asked(ctx) do
-                    ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s))
+                if ctx.unstable !== nothing
+                    unstable = _asked(ctx) do
+                        ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s))
+                    end
                 end
+                nonfinite = ctx.halt_nonfinite && !all(isfinite, u)
             end
         end
-        threw, unstable = MPI.Allreduce([ctx.err !== nothing, unstable], |, ctx.comm)
+        threw, unstable, nonfinite =
+            MPI.Allreduce([ctx.err !== nothing, unstable, nonfinite], |, ctx.comm)
         threw && ctx.err === nothing && (ctx.err = _remote_error())
         ctx.dt_too_small |= small
         ctx.unstable_hit |= unstable
-        (threw || small || unstable) &&
+        (threw || small || unstable || nonfinite) &&
             LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_CONVERGED_USER)
     catch e
         ctx.err = e
@@ -1934,8 +1954,8 @@ function _mprk_part!(ctx, t, x_ptr, f_ptr, idxs)
     pl = ctx.petsclib
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        if !(ctx.part_valid && ctx.part_t == t && ctx.part_u == ctx.u)
-            ctx.f!(ctx.du, ctx.u, ctx.p, t)
+        if !_everywhere(ctx.comm, ctx.part_valid && ctx.part_t == t && ctx.part_u == ctx.u)
+            _call_f!(ctx, ctx.du, ctx.u, t)
             ctx.nf += 1
             ctx.part_t = t
             copyto!(ctx.part_u, ctx.u)
@@ -2379,11 +2399,11 @@ function __init__()
 end
 
 # PETSc.jl's `TSRHSSplitSetRHSFunction` wrapper takes no context, so ccall it.
-function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr)
+function _set_split!(petsclib, ts, name, idxs, fptr, ctxptr, comm = MPI.COMM_SELF, rstart = 0)
     n = LibPETSc.PetscInt(length(idxs))
     is = LibPETSc.ISCreateGeneral(
-        petsclib, MPI.COMM_SELF, n,
-        LibPETSc.PetscInt[i - 1 for i in idxs], LibPETSc.PETSC_COPY_VALUES,
+        petsclib, comm, n,
+        LibPETSc.PetscInt[rstart + i - 1 for i in idxs], LibPETSc.PETSC_COPY_VALUES,
     )
     LibPETSc.TSRHSSplitSetIS(petsclib, ts, name, is)
     code = ccall(
@@ -2767,7 +2787,30 @@ end
 
 const SupportedProblem = Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}
 
+function _mprk_splits(alg::TSMPRK, n, comm)
+    named = vcat(alg.slow, alg.medium)
+    _checked_everywhere(comm) do
+        comm === nothing || _check_mprk(alg.slow, alg.medium, alg.subtype, true)
+        all(<=(n), named) || throw(
+            ArgumentError("`slow` or `medium` names index $(maximum(named)), but the state has $n"),
+        )
+    end
+    rest = setdiff(1:n, named)
+    _everywhere(comm, isempty(rest)) && throw(
+        ArgumentError("`slow` and `medium` cover the whole state, leaving nothing fast"),
+    )
+    comm === nothing && return alg.slow, alg.medium, rest
+    _everywhere(comm, isempty(alg.slow)) &&
+        throw(ArgumentError("`slow` names no index on any rank"))
+    alg.subtype in _MPRK_THREE_WAY && _everywhere(comm, isempty(alg.medium)) &&
+        throw(ArgumentError("`$(alg.subtype)` needs a `medium` index on some rank"))
+    return alg.slow, alg.medium, rest
+end
+
 const _NOT_SELF = "on a communicator other than MPI.COMM_SELF"
+
+_in_threads_loop() = Threads.threadpoolsize() > 1 && current_task() !== Base.roottask &&
+    ccall(:jl_in_threaded_region, Cint, ()) != 0
 
 function _check_irk_layout(n, N, comm)
     nranks = MPI.Comm_size(comm)
@@ -2815,7 +2858,8 @@ function _check_dynamical(prob, alg, has_mass)
     return nothing
 end
 
-const _DISTRIBUTED_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "irk")
+const _DISTRIBUTED_IMPLICIT =
+    ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "irk", "alpha", "dirk")
 const _DM_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex")
 const _WITH_DM = "with a `dm`"
 
@@ -2894,15 +2938,15 @@ function _refuse_distributed(prob, alg, is_dae, N)
                 "$_NOT_SELF yet",
         ),
     )
-    alg isa Union{TSRK, TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX} ||
-        alg isa TSGeneric && alg.explicit || throw(
-        ArgumentError(
-            "PETScDiffEq cannot run " *
-                "$(alg isa TSGeneric ? "an implicit TSGeneric" : nameof(typeof(alg))) " *
-                "$_NOT_SELF; TSRK, TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX and " *
-                "TSGeneric(...; explicit = true) can",
-        ),
-    )
+    if alg isa TSGeneric
+        types = alg.explicit ? _EXPLICIT_ONLY : _DISTRIBUTED_IMPLICIT
+        alg.ts_type in types || throw(
+            ArgumentError(
+                "TSGeneric(\"$(alg.ts_type)\") cannot run $_NOT_SELF; only " *
+                    "$(join(types, ", ")) can",
+            ),
+        )
+    end
     has_jac = prob.f.jac !== nothing
     if !_uses_ifunction(alg)
         has_jac || return nothing
@@ -2933,7 +2977,7 @@ function _refuse_distributed(prob, alg, is_dae, N)
                     "PETSc's colouring",
             ),
         )
-        alg isa TSIRK && throw(
+        _ts_type(alg) == "irk" && throw(
             ArgumentError(
                 "TSIRK needs a `jac` $_NOT_SELF, since PETSc builds its coupled-stage " *
                     "matrix from one and has no finite-difference fallback for it",
@@ -3116,7 +3160,16 @@ function _setup(
     end
     comm = _distributed(alg) ? alg.comm : nothing
     dm = _alg_dm(alg)
-    N = comm === nothing ? length(prob.u0) : MPI.Allreduce(length(prob.u0), +, comm)
+    N, looped = comm === nothing ? (length(prob.u0), 0) :
+        MPI.Allreduce([length(prob.u0), Int(_in_threads_loop())], +, comm)
+    looped > 0 && throw(
+        ArgumentError(
+            "PETScDiffEq cannot solve $_NOT_SELF when a rank calls it inside " *
+                "`Threads.@threads`, as `EnsembleThreads` runs its trajectories: the ranks " *
+                "could take them in different orders and return wrong results; use " *
+                "`EnsembleSerial()`",
+        ),
+    )
     if dm !== nothing
         _checked_everywhere(() -> _refuse_dm(prob, alg, is_dae), comm)
     elseif comm !== nothing
@@ -3138,19 +3191,8 @@ function _setup(
     n = length(u0)
     nv = dyn ? length(prob.u0.x[1]) : 0
 
-    slow_idxs, medium_idxs, fast_idxs = if alg isa TSMPRK
-        named = vcat(alg.slow, alg.medium)
-        maximum(named) <= n || throw(
-            ArgumentError("`slow` or `medium` names index $(maximum(named)), but the state has $n"),
-        )
-        rest = setdiff(1:n, named)
-        isempty(rest) && throw(
-            ArgumentError("`slow` and `medium` cover the whole state, leaving nothing fast"),
-        )
-        alg.slow, alg.medium, rest
-    else
-        (Int[], Int[], Int[])
-    end
+    slow_idxs, medium_idxs, fast_idxs =
+        alg isa TSMPRK ? _mprk_splits(alg, n, comm) : (Int[], Int[], Int[])
 
     petsclib = _petsclib(S)
     _check_inttype(petsclib)
@@ -3347,7 +3389,7 @@ function _setup(
         _floor(R, dtmin, force_dtmin, adaptive && _adapts(alg) !== false), false,
         unstable_check, false, tdir, isoutofdomain,
         0, 0, 0, nothing, comm,
-        comm === nothing && adaptive && _adapts(alg) !== false,
+        (comm === nothing || !_uses_ifunction(alg)) && adaptive && _adapts(alg) !== false,
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
@@ -3400,11 +3442,15 @@ function _setup(
                 _set_split!(petsclib, ts, "momentum", 1:nv, ptrs.momentum, ctxptr)
             end
             if alg isa TSMPRK
-                _set_split!(petsclib, ts, "slow", slow_idxs, ptrs.mprk_slow, ctxptr)
-                isempty(medium_idxs) || _set_split!(
-                    petsclib, ts, "medium", medium_idxs, ptrs.mprk_medium, ctxptr,
+                layout = (
+                    something(comm, MPI.COMM_SELF),
+                    comm === nothing ? 0 : first(LibPETSc.VecGetOwnershipRange(petsclib, u)),
                 )
-                _set_split!(petsclib, ts, "fast", fast_idxs, ptrs.mprk_fast, ctxptr)
+                _set_split!(petsclib, ts, "slow", slow_idxs, ptrs.mprk_slow, ctxptr, layout...)
+                alg.subtype in _MPRK_THREE_WAY && _set_split!(
+                    petsclib, ts, "medium", medium_idxs, ptrs.mprk_medium, ctxptr, layout...,
+                )
+                _set_split!(petsclib, ts, "fast", fast_idxs, ptrs.mprk_fast, ctxptr, layout...)
             end
             if is_split
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, ptrs.split_rhs, ctxptr)
@@ -3533,8 +3579,9 @@ function _setup(
                         "`TSGeneric(\"irk\")` rather than an option on an explicit algorithm",
                 ),
             )
-            distributable = !_uses_ifunction(alg) ? _EXPLICIT_ONLY :
-                dm === nothing ? _DISTRIBUTED_IMPLICIT : _DM_IMPLICIT
+            distributable = _uses_ifunction(alg) ?
+                (dm === nothing ? _DISTRIBUTED_IMPLICIT : _DM_IMPLICIT) :
+                alg isa TSMPRK ? ("mprk", _EXPLICIT_ONLY...) : _EXPLICIT_ONLY
             comm === nothing && dm === nothing || chosen in distributable || throw(
                 ArgumentError(
                     "`$chosen` cannot run $(dm === nothing ? _NOT_SELF : _WITH_DM) when an " *
@@ -3737,8 +3784,7 @@ function _solve_unlocked(
     forced = get(kwargs, :force_dtmin, false) === true
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
-        if ctx.comm === nothing &&
-                LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
+        if LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
             ctx.halt_nonfinite = true
             _set_post_step!(pl, h.ts, ctx)
         end
@@ -3749,8 +3795,7 @@ function _solve_unlocked(
                 LibPETSc.TSSolve(pl, h.ts, _solution_vec(h))
             end
             raised = h.stopped != 0
-            raised && ctx.err === nothing && failure === nothing &&
-                _retry_solve!(h, alg, floor, forced) || break
+            raised && _retry_solve!(h, alg, floor, forced) || break
         end
         _throw_if_threw!(ctx)
         failure === nothing || throw(failure)
@@ -3808,7 +3853,7 @@ function _retryable!(h)
     ctx = h.ctx
     ctx.retry_fp || return false
     h.stopped == PETSC_ERR_FP &&
-        return _return_work_vec!(ctx, h.ts) || _dm_clear(h.petsclib, h.ts)
+        return !_threw!(ctx) && (_return_work_vec!(ctx, h.ts) || _dm_clear(h.petsclib, h.ts))
     h.stopped == PETSC_ERR_MAT_LU_ZRPVT || return false
     startswith(ctx.alg_name, "rosw") && _unfreeze_jacobian!(h.petsclib, _snes(h.petsclib, h.ts))
     return true
