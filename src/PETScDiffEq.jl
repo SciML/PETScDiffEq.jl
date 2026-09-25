@@ -1042,7 +1042,7 @@ function _check_stage!(
         ts_ptr::LibPETSc.CTS, t::R, ::LibPETSc.CVec, accept::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode where {R}
     ctx = POST_STEP_CTX[ts_ptr]::TSContext
-    ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
+    ctx.comm === nothing && ctx.err !== nothing && return LibPETSc.PetscErrorCode(0)
     try
         pl = ctx.petsclib
         ctx.retry_fp && _rehold_work_vec!(ctx, ts_ptr)
@@ -1057,6 +1057,10 @@ function _check_stage!(
             ctx.stuck = "its step fell below the floating point spacing at t = " *
                 "$(_user_t(ctx.tdir, s))"
             LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_DIVERGED_STEP_REJECTED)
+            return LibPETSc.PetscErrorCode(0)
+        end
+        if _threw!(ctx)
+            LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_DIVERGED_NONLINEAR_SOLVE)
             return LibPETSc.PetscErrorCode(0)
         end
         startswith(ctx.alg_name, "rosw") && _unfreeze_jacobian!(pl, snes)
