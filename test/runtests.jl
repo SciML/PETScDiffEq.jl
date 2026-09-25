@@ -6094,6 +6094,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test sol.retcode == SciMLBase.ReturnCode.Success
     end
 
+    @testset "solve takes the storage DiffEqDevTools passes, as OrdinaryDiffEq does" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        ref = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"))
+        sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"), ref.u, ref.t, ref.k)
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        @test sol.t == ref.t
+        @test sol.u == ref.u
+        resid!(r, du, u, p, t) = (r[1] = du[1] + u[1]; nothing)
+        dae = SciMLBase.DAEProblem(resid!, [-1.0], [1.0], (0.0, 1.0))
+        ref = SciMLBase.solve(dae, PETScDiffEq.TSDAE("bdf"))
+        sol = SciMLBase.solve(dae, PETScDiffEq.TSDAE("bdf"), ref.u, ref.t)
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        @test sol.t == ref.t
+        @test sol.u == ref.u
+    end
+
     @testset "Input validation" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         with_jac = SciMLBase.ODEProblem(
