@@ -60,7 +60,17 @@ function damped_oscillator_jac!(J, u, p, t)
 end
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
-@testset "PETScDiffEq.jl" begin
+# Julia compiles a block as one thunk before running any of it, so each testset stands alone.
+macro each_toplevel(ts, block)
+    stmts = block.args
+    isdefined(Test, :push_testset) &&
+        return esc(Expr(:toplevel, :(Test.push_testset($ts)), stmts..., :(Test.pop_testset())))
+    wrap(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") ? :(Test.@with_testset $ts $s) : s
+    return esc(Expr(:toplevel, map(wrap, stmts)...))
+end
+
+const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
+@each_toplevel ALL_TESTS begin
     @testset "TSRK convergence order" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         exact = exp(-1.0)
@@ -345,6 +355,33 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         """
         cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $script`
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
+    end
+
+    @testset "a first solve runs precompiled code and loading starts nothing" begin
+        script = """
+        using PETScDiffEq, SciMLBase
+        P = PETScDiffEq
+        all(isempty, (P.CALLBACKS, P.PETSC_SYMBOLS, P.EXIT_CLEANUP_ARMED, P.POST_STEP_CTX)) &&
+            all(isempty, (P.PARALLEL_HANDLES, P.LIVE_HANDLES.ht)) &&
+            !any(P.PETScCompat.isinitialized, P.PETSc.petsclibs) && !P.MPI.Initialized() ||
+            exit(2)
+        f!(du, u, p, t) = (du[1] = -u[1]; nothing)
+        SciMLBase.solve(SciMLBase.ODEProblem(f!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK())
+        """
+        trace = tempname()
+        # Coverage turns off the native code in package images.
+        flags = `--code-coverage=none --track-allocation=none --pkgimages=yes`
+        cmd = `$(Base.julia_cmd()) $flags --project=$(Base.active_project())
+            --trace-compile=$trace -e $script`
+        @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
+        @test count(l -> occursin("PETScDiffEq.", l), readlines(trace)) < 10
+    end
+
+    @testset "precompile workload" begin
+        made = PETScDiffEq.HANDLES_MADE[]
+        withenv(PETScDiffEq._run_workload, "PMI_RANK" => "0")
+        @test PETScDiffEq.HANDLES_MADE[] == made
+        @test PETScDiffEq._run_workload() === nothing
     end
 
     @testset "several PETSc builds in one process" begin
@@ -7046,3 +7083,4 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
         end
     end
 end
+Test.finish(ALL_TESTS)
