@@ -1,6 +1,6 @@
 using MPI, PETScDiffEq, SciMLBase, SparseArrays, Test
 using LinearAlgebra: Diagonal
-using PETScDiffEq: PETSc, AutoFiniteDiff, AutoForwardDiff
+using PETScDiffEq: PETSc, AutoFiniteDiff, AutoForwardDiff, DiffEqBase
 using SciMLBase: ODEProblem, ODEFunction, DAEProblem, DAEFunction, SplitODEProblem, ReturnCode,
     solve
 
@@ -252,6 +252,16 @@ const METHODS = (
                 6.0e-6; layout = 3 .* cell_counts, TOL...,
             )
         end
+        u0 = repeat([2.0, 1.0, 1.0], length(cells))
+        rank == thrower && (u0[1] += 1)
+        off = SciMLBase.remake(cell_problem(cells; jac = true); u0)
+        @test caught(() -> solve(off, TSImplicit("bdf"; comm); TOL...)) isa
+            SciMLBase.CheckInitFailureError
+        brown = DiffEqBase.BrownFullBasicInit()
+        @test refused(
+            () -> solve(off, TSImplicit("bdf"; comm); initializealg = brown, TOL...),
+            "BrownFullBasicInit",
+        )
     end
 
     @testset "SplitODEProblem with an explicit f2" begin

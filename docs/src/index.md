@@ -48,8 +48,8 @@ The options available in `solve` are documented
 This package supports `dt`, `adaptive`, `dtmin`, `force_dtmin`, `dtmax`, `reltol` and
 `abstol` (either may be a vector of per-component tolerances), `saveat`, `save_everystep`,
 `save_start`, `save_end`, `save_on`, `save_idxs`, `dense`, `callback`, `tstops`,
-`d_discontinuities`, `unstable_check` and `isoutofdomain`. Keywords it cannot
-honour emit a warning rather than being silently dropped.
+`d_discontinuities`, `unstable_check`, `isoutofdomain` and `initializealg`. Keywords it
+cannot honour emit a warning rather than being silently dropped.
 
 Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
 only when it names them or `save_start` or `save_end` asks, and `save_everystep = true`
@@ -102,6 +102,35 @@ wrong in its first digit, so keep them for a right-hand side ForwardDiff cannot 
 `DiscreteCallback`, `ContinuousCallback`, `VectorContinuousCallback` and `CallbackSet`
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`
 and `terminate!`.
+
+## DAE initialization
+
+A `DAEProblem`, or an `ODEProblem` whose mass matrix has zero rows and columns, has to start
+where its algebraic equations hold. The `initializealg` keyword picks how, with the algorithms
+OrdinaryDiffEq takes, which come from DiffEqBase:
+
+- `CheckInit()`, the default, evaluates the residual at `u0`, and at `du0` for a
+  `DAEProblem`, and throws a `CheckInitFailureError` when its RMS norm exceeds `abstol`,
+  taken per component when `abstol` is a vector.
+- `BrownFullBasicInit()` keeps the differential variables and solves for the algebraic
+  ones, and for a `DAEProblem` also for the derivatives of the differential ones, which
+  needs `differential_vars`. Its own `abstol`, `1e-10` unless given, decides whether to
+  solve.
+- `ShampineCollocationInit(initdt)` takes one backward Euler step of size `initdt`, or of
+  OrdinaryDiffEq's default size without one, and starts from where it lands.
+- `NoInit()` starts from `u0` as given.
+
+The two that solve use PETSc's SNES with the Jacobian the solve itself uses: the problem's
+`jac`, the ForwardDiff one or PETSc's finite differences, sparse under a `jac_prototype`. So
+they take no `nlsolve`, and when SNES fails the solve returns at `t0` with
+`ReturnCode.InitialFailure`. A start that already passes the check is left untouched, and
+`reinit!` initializes again unless given `reinit_dae = false`. They do not run on a
+communicator other than `MPI.COMM_SELF`, where `CheckInit()` still checks the whole state.
+
+The default is `CheckInit()` even for a problem carrying ModelingToolkit's initialization
+data, which OrdinaryDiffEq would solve with `OverrideInit()`; this package does not solve that
+system and refuses `OverrideInit()` on such a problem. A callback that leaves the algebraic
+equations unsatisfied is not initialized again after it fires.
 
 ## Number types
 
