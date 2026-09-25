@@ -264,8 +264,9 @@ and `gamma` is PETSc's shift. Without one the Jacobian comes from `autodiff`, as
 `order` sets the BDF order, 1 through 6, and carries the same warning as
 [`TSImplicit`](@ref): PETSc's own default is 2.
 
-Only `"bdf"` adapts; the others step at the `dt` you give. `du0` is not used,
-since PETSc derives the initial derivative itself.
+Only `"bdf"` adapts; the others step at the `dt` you give. PETSc derives the initial
+derivative itself, so `du0` is used only to check and solve for a consistent start, as
+`initializealg` asks; see the DAE initialization section of the documentation.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
@@ -1575,9 +1576,10 @@ end
 
 const ZERO_PIVOT_HANDLER_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
-function _quiet_errors(f, h)
-    QUIET_FAILED_STEPS[] = !h.pivot_raises
-    pl = h.petsclib
+_quiet_errors(f, h) = _quiet_errors(f, h.petsclib, h.pivot_raises)
+
+function _quiet_errors(f, pl, raises::Bool)
+    QUIET_FAILED_STEPS[] = !raises
     ccall(
         _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
         (Ptr{Cvoid}, Ptr{Cvoid}), ZERO_PIVOT_HANDLER_PTR[],
@@ -2414,6 +2416,7 @@ function __init__()
         )
     )
     _init_adjoint_pointers!()
+    _init_initialization_pointers!()
     return nothing
 end
 
@@ -2635,6 +2638,7 @@ mutable struct TSHandles{CTX, L, R, S}
     destroyed::Bool
     solution::Any
     dms::Vector{Ptr{Cvoid}}
+    init_failed::Bool
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -3126,6 +3130,7 @@ function _setup(
         extra_options = String[],
         jac_advice = nothing,
         eltypes = _eltypes(prob),
+        initializealg = DiffEqBase.DefaultInit(),
         kwargs...,
     )
     for key in UNSUPPORTED_KWARGS
@@ -3286,6 +3291,12 @@ function _setup(
         _check_tol(reltol, n, "reltol")
     end
     alg isa TSAlpha2 && (_scalar_tol(abstol); _scalar_tol(reltol))
+    ad_before = ad_calls === nothing ? 0 : ad_calls[]
+    initialized = _initialize!(
+        u0, prob, initializealg, f1, jac_fn, petsclib, comm, R(prob.tspan[1]),
+        R(prob.tspan[2]), something(abstol, 1.0e-6), dt, dtmax,
+    )
+    ad_calls === nothing || (ad_calls[] = ad_before)
     if !dt_given
         user_t0 = R(prob.tspan[1])
         est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
@@ -3421,7 +3432,7 @@ function _setup(
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0, false, false,
-        Any[], Vector{S}[], false, nothing, dms,
+        Any[], Vector{S}[], false, nothing, dms, !initialized,
     )
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -3805,6 +3816,7 @@ function _solve_unlocked(
         end
     end
     h = _setup(prob, alg; kwargs...)
+    h.init_failed && return _initial_failure(prob, alg, h)
     ctx, pl = h.ctx, h.petsclib
     floor = abs(oftype(h.t0, something(get(kwargs, :dtmin, nothing), 0.0)))
     forced = get(kwargs, :force_dtmin, false) === true
@@ -3896,6 +3908,17 @@ function _stalled!(h, alg, t, verbose)
     ctx.unstable_hit = true
     _ends_early(alg, "its step fell below the floating point spacing at t = $t", verbose)
     return nothing
+end
+
+function _initial_failure(prob, alg, h)
+    h.save_start && isempty(h.ctx.ts) && _record!(h.ctx, h.t0, h.u0)
+    st = try
+        _read_stats(h)
+    finally
+        _destroy!(h)
+    end
+    sol = _assemble(prob, alg, h, h.t0, copy(h.u0), st)
+    return SciMLBase.solution_new_retcode(sol, SciMLBase.ReturnCode.InitialFailure)
 end
 
 function _retry_solve!(h, alg, floor, forced, verbose)
@@ -4567,6 +4590,11 @@ function _init_unlocked(
         stops, tstops, d_discontinuities, d_discontinuities, dt0,
         _initial_solution(prob, alg, h), false, false,
     )
+    if h.init_failed
+        integ.sol = _initial_failure(prob, alg, h)
+        integ.finished = true
+        return integ
+    end
     try
         _initialize_callbacks!(integ, get(kwargs, :initialize_save, true))
     catch
@@ -4723,7 +4751,7 @@ function _reinit_unlocked(
         t0 = integ.prob.tspan[1], tf = integ.prob.tspan[2],
         erase_sol = true, saveat = nothing, tstops = integ.tstops_cache,
         d_discontinuities = integ.d_discontinuities_cache,
-        reinit_callbacks = true, initialize_save = true,
+        reinit_callbacks = true, initialize_save = true, reinit_dae = true,
     )
     _check_real(tstops, :tstops)
     _check_real(d_discontinuities, :d_discontinuities)
@@ -4740,6 +4768,7 @@ function _reinit_unlocked(
         p = integ.p,
     )
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
+    reinit_dae || (setup_kwargs = merge(setup_kwargs, (initializealg = SciMLBase.NoInit(),)))
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
     try
         LibPETSc.TSSetUp(h.petsclib, h.ts)
@@ -4791,6 +4820,11 @@ function _reinit_unlocked(
     end
     integ.derivative_discontinuity = false
     integ.sol = _initial_solution(integ.prob, integ.alg, h)
+    if h.init_failed
+        integ.sol = _initial_failure(integ.prob, integ.alg, h)
+        integ.finished = true
+        return nothing
+    end
     reinit_callbacks && _initialize_callbacks!(integ, initialize_save)
     _past_discontinuity!(integ)
     return nothing
@@ -4886,6 +4920,7 @@ _resumed_step(integ::PETScIntegrator, stop) = integ.h.matches && !integ.h.fixed 
     max(integ.tdir * integ.dtcache, _min_step(stop)) : integ.tdir * integ.dtcache
 
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
+    integ.sol.retcode == SciMLBase.ReturnCode.InitialFailure && return nothing
     integ.finished && throw(
         ArgumentError(
             "this integrator has finished at t = $(integ.t) and cannot step further; " *
@@ -5108,6 +5143,7 @@ SciMLBase.addat!(::PETScIntegrator, idxs, val = nothing) = _no_resize()
 
 include("autodiff.jl")
 include("adjoint.jl")
+include("initialization.jl")
 include("precompile.jl")
 
 end
