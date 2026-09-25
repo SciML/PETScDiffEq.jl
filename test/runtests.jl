@@ -2199,13 +2199,13 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
 
         @testset "an overflow is Unstable, not a raised error" begin
             square!(du, u, p, t) = (du[1] = u[1]^2; nothing)
-            runaway = SciMLBase.ODEProblem(square!, [1.0], (0.0, 2.0))
-            over = @test_logs (:warn, r"floating point spacing") SciMLBase.solve(
-                runaway, PETScDiffEq.TSRK("5dp");
-                dt = 0.01, abstol = 1.0e-10, reltol = 1.0e-10,
+            huge = SciMLBase.ODEProblem(square!, [1.0e100], (0.0, 1.0))
+            over = @test_logs (:warn, r"floating point exception") SciMLBase.solve(
+                huge, PETScDiffEq.TSRK("5dp"); dt = 1.0e-102,
             )
             @test over.retcode == SciMLBase.ReturnCode.Unstable
-            @test over.t[end] < 2.0
+            @test over.t[end] < 1.0
+            @test all(isfinite, over.u[end])
             @test allunique(over.t)
         end
 
