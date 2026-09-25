@@ -4066,6 +4066,9 @@ function _reinit_unlocked(
     _check_real(d_discontinuities, :d_discontinuities)
     R = typeof(integ.t)
     tstops, d_discontinuities = _times(R, tstops), _times(R, d_discontinuities)
+    if integ.prob.f isa SciMLBase.DynamicalODEFunction && !hasproperty(u0, :x)
+        u0 = _partition(integ.prob.u0, u0)
+    end
     old = integ.h
     prob = SciMLBase.remake(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),

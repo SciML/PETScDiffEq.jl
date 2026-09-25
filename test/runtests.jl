@@ -6916,6 +6916,19 @@ const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
             @test maximum(abs.(collect(sol(1.5)) .- osc_exact(1.5))) < 3.0e-5
         end
 
+        @testset "reinit! with a flat state: $(nameof(typeof(alg)))" for alg in (
+                PETScDiffEq.TSRK("4"), PETScDiffEq.TSBasicSymplectic(), PETScDiffEq.TSAlpha2(),
+            )
+            prob = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
+            integ = SciMLBase.init(prob, alg; dt = 0.1, adaptive = false)
+            SciMLBase.reinit!(integ, [0.5, 0.25])
+            @test integ.u isa typeof(prob.u0)
+            @test collect(integ.u) == [0.5, 0.25]
+            fresh = SciMLBase.SecondOrderODEProblem(osc!, [0.5], [0.25], (0.0, 1.0))
+            @test collect(SciMLBase.solve!(integ).u[end]) ==
+                collect(SciMLBase.solve(fresh, alg; dt = 0.1, adaptive = false).u[end])
+        end
+
         @testset "the other algorithms step the first-order form" begin
             prob = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
             jac!(J, x, p, t) = (@test hasproperty(x, :x); J .= [0 -1; 1 0]; nothing)
