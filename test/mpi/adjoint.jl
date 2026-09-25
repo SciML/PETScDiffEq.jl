@@ -272,6 +272,13 @@ const METHODS = (
                 () -> gradient(heat_with(), rk, times, rows; no_start = rank == thrower),
                 "the same cost times",
             )
+            longer = heat_with(p = rank == thrower ? [P; 0.0] : copy(P))
+            @test refused(() -> gradient(longer, rk, times, rows), "the same cost times")
+            some_dgdp = rank == thrower ? nothing : cost_dp(rows)
+            @test refused(
+                () -> gradient(heat_with(), rk, times, rows; dgdp_discrete = some_dgdp),
+                "the same cost times",
+            )
         end
         grow!(du, u, p, t) = (du .= rank == thrower ? u .^ 2 : -u; nothing)
         grow_jac!(J, u, p, t) =
