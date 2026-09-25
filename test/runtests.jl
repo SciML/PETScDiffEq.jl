@@ -2382,6 +2382,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "a Rosenbrock method whose first stage is explicit" begin
+            positive = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = u[1] < 0 ? NaN : -1000 * u[1]; nothing), [1.0],
+                (0.0, 1.0),
+            )
+            sol = SciMLBase.solve(positive, PETScDiffEq.TSRosW("assp3p3s1c"); dt = 1.0)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.stats.nnonlinconvfail > 0
+            @test maximum(abs(u[1] - exp(-1000t)) for (t, u) in zip(sol.t, sol.u)) < 1.0e-3
+        end
+
         @testset "a Newton solve that diverges at the first step" begin
             square = SciMLBase.ODEProblem(
                 (du, u, p, t) -> (du[1] = u[1]^2; nothing), [1.0], (0.0, 0.9),

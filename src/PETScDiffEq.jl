@@ -1276,6 +1276,21 @@ function _snes_failed(pl, ts_ptr)
     return reason[] < 0 ? snes : nothing
 end
 
+# An explicit RosW stage runs no SNESSolve, so it still sees the last attempt's failed reason.
+function _stale_failure!(pl, snes, y)
+    x = Ref{LibPETSc.CVec}(C_NULL)
+    ccall(
+        _symbol(pl, :SNESGetSolution), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{LibPETSc.CVec}), snes, x,
+    )
+    x[] == y && return false
+    ccall(
+        _symbol(pl, :SNESSetConvergedReason), LibPETSc.PetscErrorCode, (LibPETSc.CSNES, Cint),
+        snes, 0,
+    )
+    return true
+end
+
 # TSStep_RosW lifts its Jacobian lag only after its last stage, so a failed stage leaves it frozen.
 function _unfreeze_jacobian!(pl, snes)
     lag = Ref{LibPETSc.PetscInt}(0)
@@ -1310,7 +1325,7 @@ end
 # TSAdaptCheckStage calls this before reading the SNES reason and skips its shrink once a
 # reason is set.
 function _check_stage!(
-        ts_ptr::LibPETSc.CTS, t::R, ::LibPETSc.CVec, accept::Ptr{Cvoid},
+        ts_ptr::LibPETSc.CTS, t::R, y::LibPETSc.CVec, accept::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode where {R}
     ctx = POST_STEP_CTX[ts_ptr]::TSContext
     ctx.comm === nothing && ctx.err !== nothing && return LibPETSc.PetscErrorCode(0)
@@ -1320,6 +1335,7 @@ function _check_stage!(
         ts = LibPETSc.TS(ts_ptr, pl)
         h, s = LibPETSc.TSGetTimeStep(pl, ts), LibPETSc.TSGetTime(pl, ts)
         snes = _snes_failed(pl, ts_ptr)
+        snes === nothing || _stale_failure!(pl, snes, y) && (snes = nothing)
         if snes === nothing
             s + h == s || return LibPETSc.PetscErrorCode(0)
             # PetscBool is 4 bytes before PETSc 3.24 and 1 after, and PETSc set it true.
