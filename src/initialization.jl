@@ -2,7 +2,8 @@ _rms(r, ::Nothing) = DiffEqBase.ODE_DEFAULT_NORM(r, 0)
 _rms(r, comm::MPI.Comm) = _global_norm(comm, r, 0)
 
 _within(r, tol::Number, comm) = _rms(r, comm) <= tol
-_within(r, tol, comm) = _rms(r ./ tol, comm) <= 1
+# A zero `abstol` entry meets a zero residual, where `r / tol` would be NaN.
+_within(r, tol, comm) = _rms(map((x, t) -> iszero(x) ? zero(x / t) : x / t, r, tol), comm) <= 1
 
 _zero_rows(M::LinearAlgebra.Diagonal) = iszero.(M.diag)
 _zero_rows(M) = [all(iszero, r) for r in eachrow(M)]
