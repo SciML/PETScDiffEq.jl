@@ -83,18 +83,23 @@ the step after each starts one ULP past it, so the right-hand side there sees th
 when written as `if t > t_d`. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
 step that leaves the domain is taken again at a fifth of its size, as OrdinaryDiffEq takes it;
 one that cannot be made small enough ends the solve with `Unstable`, or `DtLessThanMin` at
-`dtmin`. An explicit adaptive step whose error estimate is NaN or infinite, as when the
+`dtmin`. An adaptive step whose error estimate is NaN or infinite, as when the
 right-hand side returns NaN or the state overflows, is taken again smaller the same way, and
-both kinds of retry count in `stats.nreject`. An implicit method's Newton solve fails on a NaN
-instead, which ends the solve with `ConvergenceFailure`.
+both kinds of retry count in `stats.nreject`. An adaptive implicit step whose Newton or
+linear solve fails, or whose Newton matrix has a zero pivot, is taken again at PETSc's
+`-ts_adapt_scale_solve_failed` share of its size, a quarter by default, as many times as it
+takes, and counts in `stats.nnonlinconvfail` rather than `stats.nreject`, as in
+OrdinaryDiffEq. A fixed-step solve ends at its first failed Newton solve with
+`ConvergenceFailure`, as OrdinaryDiffEq's does with `adaptive = false`.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
-state stops being finite, a step overflows or turns NaN at every size tried, with a warning,
-an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
+state stops being finite, a step overflows, turns NaN or fails its Newton solve at every size
+tried, with a warning, an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
 returns true, which is asked before each step with the step about to be taken, as
-OrdinaryDiffEq asks it, `ConvergenceFailure` when a nonlinear
+OrdinaryDiffEq asks it, `ConvergenceFailure` when a fixed-step nonlinear
 solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are taken, and
-`Failure` for a zero pivot, with a warning, or another step PETSc cannot take. Where
+`Failure` for a zero pivot in a fixed-step solve, with a warning, or another step PETSc cannot
+take. Where
 `petsc_options` asks PETSc to raise, with `-ksp_error_if_not_converged`,
 `-snes_error_if_not_converged` or `-ts_error_if_step_fails`, it raises instead.
 
