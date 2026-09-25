@@ -12,6 +12,14 @@ using Pkg
 Pkg.add("PETScDiffEq")
 ```
 
+Precompiling the package runs a few small solves through PETSc, so that the first `solve`
+of a session does not wait for compilation. To precompile without them:
+
+```julia
+using PETScDiffEq, Preferences
+set_preferences!(PETScDiffEq, "precompile_workload" => false; force = true)
+```
+
 ## Common API Usage
 
 This library adds the common interface to PETSc's TS solvers, documented in the
