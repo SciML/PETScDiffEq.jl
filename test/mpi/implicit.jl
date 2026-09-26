@@ -1,6 +1,6 @@
 using MPI, PETScDiffEq, SciMLBase, SparseArrays, Test
 using LinearAlgebra: Diagonal
-using PETScDiffEq: PETSc, AutoFiniteDiff, AutoForwardDiff
+using PETScDiffEq: PETSc, AutoFiniteDiff, AutoForwardDiff, DiffEqBase
 using SciMLBase: ODEProblem, ODEFunction, DAEProblem, DAEFunction, SplitODEProblem, ReturnCode,
     solve
 
@@ -277,6 +277,36 @@ const METHODS = (
                 6.0e-6; layout = 3 .* cell_counts, TOL...,
             )
         end
+        u0 = repeat([2.0, 1.0, 1.0], length(cells))
+        rank == thrower && (u0[1] += 1)
+        off = SciMLBase.remake(cell_problem(cells; jac = true); u0)
+        @test caught(() -> solve(off, TSImplicit("bdf"; comm); TOL...)) isa
+            SciMLBase.CheckInitFailureError
+        brown = DiffEqBase.BrownFullBasicInit()
+        @test refused(
+            () -> solve(off, TSImplicit("bdf"; comm); initializealg = brown, TOL...),
+            "BrownFullBasicInit",
+        )
+    end
+
+    @testset "a rank whose own mass block is the identity" begin
+        algebraic = rank > 0
+        function pair!(du, u, p, t)
+            du[1] = -u[1]
+            du[2] = algebraic ? u[2] - u[1] : -u[2]
+            return nothing
+        end
+        proto = sparse([1, 2, 2], 2rank .+ [1, 1, 2], ones(3), 2, 2nranks)
+        M = Diagonal([1.0, algebraic ? 0.0 : 1.0])
+        pair(y0) = ODEProblem(
+            ODEFunction(pair!; jac_prototype = proto, mass_matrix = M), [1.0, y0], (0.0, 1.0),
+        )
+        bdf = TSImplicit("bdf"; comm)
+        sol = solve(pair(1.0), bdf; dt = 1.0e-3, TOL...)
+        @test sol.retcode == ReturnCode.Success
+        @test maximum(abs, sol.u[end] .- exp(-1)) <= 3.0e-6
+        off = caught(() -> solve(pair(2.0), bdf; dt = 1.0e-3, TOL...))
+        @test nranks == 1 ? off === nothing : off isa SciMLBase.CheckInitFailureError
     end
 
     @testset "SplitODEProblem with an explicit f2" begin
@@ -308,7 +338,8 @@ const METHODS = (
         dae = DAEProblem(
             DAEFunction(residual; jac_prototype = proto), zero(heat0(rows)), heat0(rows), SPAN,
         )
-        @test raised(caught(() -> solve(dae, TSDAE("bdf"; comm))), "residual")
+        noinit = (; initializealg = SciMLBase.NoInit())
+        @test raised(caught(() -> solve(dae, TSDAE("bdf"; comm); noinit...)), "residual")
         f1 = heat_function(heat!, rows; jac = true)
         f2(when) = function (du, u, p, t)
             du .= -u
