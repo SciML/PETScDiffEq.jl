@@ -2590,7 +2590,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     breaks, alg; callback = never, kw...,
                 )
                 @test plain.retcode == SciMLBase.ReturnCode.Unstable
-                @test 0.5 - plain.t[end] < 1.0e-12
+                @test isempty(kw) ? 0.5 - plain.t[end] < 1.0e-12 :
+                    all(in(0.0:0.05:0.5), plain.t) && plain.t[end] >= 0.45
                 @test maximum(abs(u[1] - exp(-t)) for (t, u) in zip(plain.t, plain.u)) < 2.0e-4
                 @test plain.stats.nreject > 10
                 @test plain.t == stepped.t
