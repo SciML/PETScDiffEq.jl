@@ -6505,7 +6505,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 integ = SciMLBase.init(
                     prob, PETScDiffEq.TSGeneric("rk"; explicit = true); dt = 0.1,
                 )
-                @test_throws "which `TSGeneric` does not know" SciMLBase.auto_dt_reset!(integ)
+                SciMLBase.auto_dt_reset!(integ)
+                @test integ.dt == first_dt(prob, PETScDiffEq.TSRK("3bs"))
                 SciMLBase.terminate!(integ)
 
                 integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.02, adaptive = false)
@@ -6564,10 +6565,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     prob, PETScDiffEq.TSGeneric("rk"; explicit = true); dt = 0.1,
                 )
                 SciMLBase.step!(integ)
-                @test_throws "which `TSGeneric` does not know" SciMLBase.reinit!(
-                    integ; reset_dt = true,
-                )
-                @test integ.t == 0.1
+                SciMLBase.reinit!(integ; reset_dt = true)
+                @test integ.t == 0.0
+                @test integ.dt == first_dt(prob, PETScDiffEq.TSRK("3bs"))
                 SciMLBase.solve!(integ)
                 @test integ.sol.retcode == RC.Success
             end
@@ -6825,7 +6825,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 end
                 pl = integ.h.petsclib
                 adapt_type = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, integ.h.ts))
-                @test PETScDiffEq._adapts(alg) == (adapt_type == "basic")
+                @test PETScDiffEq._adapts(integ.h.ctx.alg_name) == (adapt_type == "basic")
                 SciMLBase.terminate!(integ)
             end
         end
@@ -7199,6 +7199,83 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         zero_start = SciMLBase.ODEProblem(decay!, [0.0, 1.0], (0.0, 1.0))
         sol = SciMLBase.solve(zero_start, PETScDiffEq.TSRK("5dp"); abstol = 0.0, reltol = 1.0e-6)
         @test sol.retcode == SciMLBase.ReturnCode.Success
+    end
+
+    @testset "dt, its floor, the warning and isadaptive follow the type an option picks" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
+        same(sol, ran) = sol.retcode == ran.retcode && sol.t == ran.t && sol.u == ran.u
+        bdf = PETScDiffEq.TSImplicit("bdf")
+        to_bdf = PETScDiffEq.TSImplicit("beuler", ["-ts_type", "bdf"])
+        to_beuler = PETScDiffEq.TSImplicit("bdf", ["-ts_type", "beuler"])
+        to_5dp = PETScDiffEq.TSRK("4", ["-ts_rk_type", "5dp"])
+        to_4 = PETScDiffEq.TSRK("5dp", ["-ts_rk_type", "4"])
+        for (pr, alg, runs) in (
+                (prob, to_bdf, bdf), (back, to_bdf, bdf),
+                (prob, PETScDiffEq.TSImplicit("bdf", ["-ts_type", "beuler", "-ts_type", "bdf"]), bdf),
+                (prob, PETScDiffEq.TSGeneric("bdf"), bdf),
+                (prob, to_5dp, PETScDiffEq.TSRK("5dp")),
+                (prob, PETScDiffEq.TSImplicit("beuler", ["-ts_type", "bdf", "-ts_bdf_order", "3"]), PETScDiffEq.TSImplicit("bdf"; order = 3)),
+            )
+            @test same(SciMLBase.solve(pr, alg), SciMLBase.solve(pr, runs))
+            integ, ran = SciMLBase.init(pr, alg), SciMLBase.init(pr, runs)
+            @test SciMLBase.isadaptive(integ)
+            @test integ.dt == ran.dt
+            @test SciMLBase.get_proposed_dt(integ) == SciMLBase.get_proposed_dt(ran)
+            SciMLBase.set_proposed_dt!(integ, 0.5)
+            SciMLBase.auto_dt_reset!(integ)
+            @test integ.dt == ran.dt
+            @test same(SciMLBase.solve!(integ), SciMLBase.solve!(ran))
+            SciMLBase.reinit!(integ; reset_dt = true)
+            SciMLBase.reinit!(ran; reset_dt = true)
+            @test integ.dt == ran.dt
+            SciMLBase.terminate!(integ)
+            SciMLBase.terminate!(ran)
+        end
+        for alg in (
+                to_beuler, to_4, PETScDiffEq.TSGeneric("alpha"),
+                PETScDiffEq.TSImplicit("beuler", ["-ts_type", "bdf", "-ts_type", "beuler"]),
+            )
+            @test_throws "needs `dt`" SciMLBase.solve(prob, alg)
+            @test_throws "needs `dt`" SciMLBase.init(prob, alg)
+        end
+        @test_throws "`beuler` with `adaptive = true`" SciMLBase.solve(prob, to_beuler)
+        @test_throws "`rk 4` with `adaptive = true`" SciMLBase.solve(prob, to_4)
+        @test_throws "`bdf` with `adaptive = false`" SciMLBase.solve(prob, to_bdf; adaptive = false)
+        @test_throws "`-ts_adapt_type none` is set" SciMLBase.solve(
+            prob, PETScDiffEq.TSImplicit("beuler", ["-ts_type", "bdf", "-ts_adapt_type", "none"]),
+        )
+        integ = SciMLBase.init(prob, PETScDiffEq.TSGeneric("bdf", ["-ts_type", "alpha"]); dt = 0.1)
+        SciMLBase.step!(integ)
+        @test_throws "not known for `alpha`" SciMLBase.auto_dt_reset!(integ)
+        @test_throws "not known for `alpha`" SciMLBase.reinit!(integ; reset_dt = true)
+        @test integ.t == 0.1
+        @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
+        with_tol = (; dt = 0.05, reltol = 1.0e-6)
+        for (alg, name) in ((to_beuler, "beuler"), (to_4, "rk 4"), (PETScDiffEq.TSGeneric("beuler"), "beuler"))
+            @test_logs (:warn, Regex("`$name` has no embedded error estimate")) match_mode = :any SciMLBase.solve(
+                prob, alg; with_tol...,
+            )
+        end
+        for alg in (to_bdf, to_5dp, PETScDiffEq.TSGeneric("alpha"))
+            @test_logs min_level = Logging.Warn SciMLBase.solve(prob, alg; with_tol...)
+        end
+        floored = (; dt = 0.01, dtmin = 0.05)
+        for (alg, runs) in (
+                (to_beuler, PETScDiffEq.TSImplicit("beuler")), (to_4, PETScDiffEq.TSRK("4")),
+                (to_bdf, bdf), (to_5dp, PETScDiffEq.TSRK("5dp")),
+            )
+            @test same(SciMLBase.solve(prob, alg; floored...), SciMLBase.solve(prob, runs; floored...))
+            integ, ran = SciMLBase.init(prob, alg; floored...), SciMLBase.init(prob, runs; floored...)
+            @test SciMLBase.isadaptive(integ) == SciMLBase.isadaptive(ran)
+            integ.opts.dtmin = ran.opts.dtmin = 0.2
+            @test integ.h.ctx.dtmin == ran.h.ctx.dtmin
+            @test same(SciMLBase.solve!(integ), SciMLBase.solve!(ran))
+        end
+        @test SciMLBase.solve(prob, to_beuler; floored...).retcode == SciMLBase.ReturnCode.Success
+        @test SciMLBase.solve(prob, to_bdf; floored...).retcode == SciMLBase.ReturnCode.DtLessThanMin
+        @test !SciMLBase.isadaptive(SciMLBase.init(prob, to_beuler; dt = 0.01))
+        @test !SciMLBase.isadaptive(SciMLBase.init(prob, to_4; dt = 0.01))
     end
 
     @testset "solve accepts and ignores the storage DiffEqDevTools passes" begin
