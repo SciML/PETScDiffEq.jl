@@ -523,8 +523,9 @@ implicit residual. The constructor refuses a type given the wrong `explicit`.
 An explicit type also ignores a `jac` and rejects a mass matrix. An implicit one without
 a `jac` gets its Jacobian from `autodiff`, as for [`TSImplicit`](@ref).
 
-Whether the named type adapts is not known here, so no tolerance warning is
-issued for it. Only `"euler"` and `"alpha"` have been run through this
+A type another constructor covers, such as `"bdf"` or `"beuler"`, is treated as that
+constructor treats it. Whether any other type adapts is not known here, so it needs `dt`
+and gets no tolerance warning. Only `"euler"` and `"alpha"` have been run through this
 package's own convergence tests.
 
 `"discgrad"`, `"eimex"`, `"mimex"` and `"mprk"` are refused: each is driven through a
@@ -601,16 +602,15 @@ const _RK_NO_ESTIMATE = ("1fe", "2b", "3", "4")
 const _ROSW_NO_ESTIMATE = ("theta1", "theta2")
 const _ARKIMEX_NO_ESTIMATE = ("prssp2", "ars443", "bpr3")
 
-_adapts(alg::TSRK) = !(alg.subtype in _RK_NO_ESTIMATE)
-_adapts(alg::TSRosW) = !(alg.subtype in _ROSW_NO_ESTIMATE)
-_adapts(::TSIRK) = false
-_adapts(alg::TSDAE) = alg.subtype == "bdf"
-_adapts(alg::TSARKIMEX) = !(alg.subtype in _ARKIMEX_NO_ESTIMATE)
-_adapts(alg::TSImplicit) = alg.subtype == "bdf"
-_adapts(::TSMPRK) = false
-_adapts(::TSBasicSymplectic) = false
-_adapts(::TSAlpha2) = true
-_adapts(::TSGeneric) = nothing
+function _adapts(name::AbstractString)
+    type, sub = first(split(name)), last(split(name))
+    type == "rk" && return !(sub in _RK_NO_ESTIMATE)
+    type == "rosw" && return !(sub in _ROSW_NO_ESTIMATE)
+    type == "arkimex" && return !(sub in _ARKIMEX_NO_ESTIMATE)
+    type in ("bdf", "alpha2") && return true
+    type in ("beuler", "cn", "theta", "irk", "mprk", "basicsymplectic") && return false
+    return nothing
+end
 
 const _RK_CUBIC_INTERP = ("5dp",)
 const _ROSW_CUBIC_INTERP = ("ra34pw2", "lassp3p4s2c", "llssp3p4s2c", "ark3")
@@ -2486,6 +2486,37 @@ function _running_name(petsclib, ts)
     return type
 end
 
+function _irk_stages(pl, ts)
+    n = Ref{LibPETSc.PetscInt}()
+    _check_code(
+        ccall(
+            _symbol(pl, :TSIRKGetNumStages), LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, Ptr{LibPETSc.PetscInt}), ts, n,
+        ),
+    )
+    return Int(n[])
+end
+
+function _running_order(pl, ts, name)
+    type, sub = first(split(name)), last(split(name))
+    type == "rk" && return _order(_RK_ORDER, "TSRK", sub)
+    type == "rosw" && return _order(_ROSW_ORDER, "TSRosW", sub)
+    type == "arkimex" && return _order(_ARKIMEX_ORDER, "TSARKIMEX", sub)
+    type == "bdf" && return Int(LibPETSc.TSBDFGetOrder(pl, ts))
+    type == "beuler" && return 1
+    type in ("cn", "alpha2") && return 2
+    type == "theta" && return LibPETSc.TSThetaGetTheta(pl, ts) == 0.5 ? 2 : 1
+    type == "irk" && return 2 * _irk_stages(pl, ts)
+    type == "mprk" && return _order(_MPRK_ORDER, "TSMPRK", LibPETSc.TSMPRKGetType(pl, ts))
+    type == "basicsymplectic" && return parse(Int, _symplectic_type(pl, ts))
+    throw(
+        ArgumentError(
+            "the first step is estimated from the method's order, which is not known for " *
+                "`$name`; set the step with set_proposed_dt! instead",
+        ),
+    )
+end
+
 function _refuse_method(name, has_mass, has_jac, is_split, is_dae)
     if name == "irk" && has_mass
         throw(
@@ -2640,6 +2671,8 @@ mutable struct TSHandles{CTX, L, R, S}
     solution::Any
     dms::Vector{Ptr{Cvoid}}
     init_failed::Bool
+    f_init::Any
+    jac_init::Any
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -2775,10 +2808,17 @@ function _global_norm(comm, u, t)
     return real(eltype(u))(sqrt(sums[1] / max(sums[2], 1)))
 end
 
+# PETSc's floor clamps only the steps its adaptor chooses, not the one given.
+function _set_first_step!(h::TSHandles{<:Any, <:Any, R}, dt, dtmin, force_dtmin) where {R}
+    step = force_dtmin && dtmin !== nothing ? max(abs(R(dt)), abs(R(dtmin))) : abs(R(dt))
+    LibPETSc.TSSetTimeStep(h.petsclib, h.ts, step)
+    return nothing
+end
+
 _internalnorm(::Nothing) = DiffEqBase.ODE_DEFAULT_NORM
 _internalnorm(comm::MPI.Comm) = (u, t) -> _global_norm(comm, u, t)
 
-# Takes the user's `f` and time, so it runs before `f` is reversed.
+# Takes the user's `f` and time, not the reversed ones the context holds.
 function _initial_dt(
         f1, f2, u0, p, t0::R, tdir, order, abstol, reltol, dtmin, dtmax, comm = nothing,
     ) where {R}
@@ -3155,14 +3195,6 @@ function _setup(
         _check_real(value, name)
     end
     dt_given = dt !== nothing
-    if !dt_given && !(adaptive && _adapts(alg) === true)
-        throw(
-            ArgumentError(
-                "PETScDiffEq needs `dt` unless the solve adapts on an error estimate it " *
-                    "knows about, which `$(_ts_type(alg))` with `adaptive = $adaptive` does not",
-            ),
-        )
-    end
     is_split = prob.f isa SciMLBase.SplitFunction
     is_split && !(alg isa TSARKIMEX) &&
         throw(ArgumentError("PETScDiffEq only supports SplitODEProblem with TSARKIMEX"))
@@ -3302,32 +3334,8 @@ function _setup(
         R(prob.tspan[2]), real.(something(abstol, 1.0e-6)), dt, dtmax,
     )
     ad_calls === nothing || (ad_calls[] = ad_before)
-    if !dt_given
-        user_t0 = R(prob.tspan[1])
-        est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
-        dt = if is_dae
-            max(R(1.0e-6) * abs(tf - t0), _min_step(user_t0))
-        elseif has_mass
-            max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
-        else
-            est_abstol = something(abstol, 1.0e-6)
-            est_reltol = something(reltol, 1.0e-3)
-            user_dtmax = dtmax === nothing || isinf(dtmax) ? R(Inf) : abs(R(dtmax))
-            first_stop = minimum(
-                (abs(R(s) - user_t0) for s in tstops if tdir * (R(s) - user_t0) > 0);
-                init = R(Inf),
-            )
-            threw = Ref{Any}(nothing)
-            estimate = _initial_dt(
-                _guard_f(f1, comm, threw),
-                f2 === nothing ? nothing : _guard_f(f2, comm, threw), u0, prob.p, user_t0, tdir,
-                SciMLBase.alg_order(alg), est_abstol, est_reltol, est_dtmin,
-                min(user_dtmax, first_stop, abs(tf - t0)), comm,
-            )
-            _throw_anywhere(comm, threw[])
-            estimate
-        end
-    end
+    user_f1, user_f2 = f1, f2
+    f_init, jac_init = f1, jac_fn
     if tdir < 0
         f1 = is_dae ? _reverse_residual(f1) : _reverse_rhs(f1)
         f2 = f2 === nothing ? nothing : _reverse_rhs(f2)
@@ -3429,10 +3437,10 @@ function _setup(
         R(NaN), similar(u0), t0, copy(u0), nothing, nothing, false,
         slow_idxs, medium_idxs, fast_idxs,
         R(NaN), similar(u0), false,
-        _floor(R, dtmin, force_dtmin, adaptive && _adapts(alg) !== false), false,
+        zero(R), false,
         unstable_check, false, tdir, isoutofdomain,
         0, 0, 0, nothing, comm,
-        (comm === nothing || !_uses_ifunction(alg)) && adaptive && _adapts(alg) !== false,
+        false,
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
@@ -3442,7 +3450,7 @@ function _setup(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, Int(maxiters), save_start, save_end, end_saveat, false, 0, false,
         false,
-        Any[], Vector{S}[], false, nothing, dms, !initialized,
+        Any[], Vector{S}[], false, nothing, dms, !initialized, f_init, jac_init,
     )
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -3543,24 +3551,13 @@ function _setup(
                 _colour_jacobian!(petsclib, ts, h.fd_mat)
             end
             LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
-            if ctx.dtmin > 0 || ctx.unstable !== nothing || comm !== nothing
-                _set_post_step!(petsclib, ts, ctx)
-            end
             LibPETSc.TSSetTime(petsclib, ts, t0)
-            # PETSc's floor clamps only the steps its adaptor chooses, not the one given.
-            LibPETSc.TSSetTimeStep(
-                petsclib, ts,
-                force_dtmin && dtmin !== nothing ? max(abs(R(dt)), abs(R(dtmin))) : abs(R(dt)),
-            )
+            dt_given && _set_first_step!(h, dt, dtmin, force_dtmin)
             LibPETSc.TSSetMaxTime(petsclib, ts, tf)
             LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(maxiters))
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
             )
-            if (reltol !== nothing || abstol !== nothing) && _adapts(alg) === false
-                @warn "`$(_warn_name(alg))` has no embedded error estimate in PETSc, so " *
-                    "it steps at the requested dt and ignores reltol/abstol"
-            end
             _set_tolerances!(h, something(abstol, 1.0e-6), something(reltol, 1.0e-3))
             effective_options = ["-ts_error_if_step_fails", "false"]
             append!(effective_options, _default_options(alg))
@@ -3652,6 +3649,16 @@ function _setup(
             h.pivot_raises = _pivot_raises(petsclib, ts) ||
                 _option_flag(effective_options, "ts_error_if_step_fails")
             fixed = LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
+            adapts = _adapts(running)
+            if !dt_given && !(adaptive && adapts === true)
+                throw(
+                    ArgumentError(
+                        "PETScDiffEq needs `dt` unless the solve adapts on an error estimate " *
+                            "it knows about, which `$running` with `adaptive = $adaptive` " *
+                            "does not",
+                    ),
+                )
+            end
             if !dt_given && fixed
                 throw(
                     ArgumentError(
@@ -3661,15 +3668,50 @@ function _setup(
                     ),
                 )
             end
-            if fixed
-                ctx.retry_fp = false
-            elseif _uses_ifunction(alg)
-                _retry_failed_solves!(petsclib, ts, ctx, ptrs.stage_check, effective_options)
+            if (reltol !== nothing || abstol !== nothing) && adapts === false
+                @warn "`$running` has no embedded error estimate in PETSc, so it steps at " *
+                    "the requested dt and ignores reltol/abstol"
             end
+            ctx.dtmin = _floor(R, dtmin, force_dtmin, adaptive && adapts !== false)
+            ctx.retry_fp = !fixed && (comm === nothing || !_uses_ifunction(alg)) &&
+                adaptive && adapts !== false
+            if ctx.dtmin > 0 || ctx.unstable !== nothing || comm !== nothing
+                _set_post_step!(petsclib, ts, ctx)
+            end
+            fixed || !_uses_ifunction(alg) ||
+                _retry_failed_solves!(petsclib, ts, ctx, ptrs.stage_check, effective_options)
             if running != ctx.alg_name
                 ctx.hermite = !has_mass && !is_dae
                 ctx.interpolates = nothing
                 ctx.alg_name = running
+            end
+            if !dt_given && !any(o -> _names_option(o, "ts_dt"), effective_options)
+                user_t0 = R(prob.tspan[1])
+                est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
+                dt = if is_dae
+                    max(R(1.0e-6) * abs(tf - t0), _min_step(user_t0))
+                elseif has_mass
+                    max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
+                else
+                    est_abstol = something(abstol, 1.0e-6)
+                    est_reltol = something(reltol, 1.0e-3)
+                    user_dtmax = dtmax === nothing || isinf(dtmax) ? R(Inf) : abs(R(dtmax))
+                    first_stop = minimum(
+                        (abs(R(s) - user_t0) for s in tstops if tdir * (R(s) - user_t0) > 0);
+                        init = R(Inf),
+                    )
+                    threw = Ref{Any}(nothing)
+                    estimate = _initial_dt(
+                        _guard_f(user_f1, comm, threw),
+                        user_f2 === nothing ? nothing : _guard_f(user_f2, comm, threw), u0,
+                        prob.p, user_t0, tdir, _running_order(petsclib, ts, running),
+                        est_abstol, est_reltol, est_dtmin,
+                        min(user_dtmax, first_stop, abs(tf - t0)), comm,
+                    )
+                    _throw_anywhere(comm, threw[])
+                    estimate
+                end
+                _set_first_step!(h, dt, dtmin, force_dtmin)
             end
         end
     catch
@@ -4028,7 +4070,10 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
         lo = abs(getfield(o, :dtmin))
         LibPETSc.TSAdaptSetStepLimits(pl, adapt, lo, _above(hi, lo))
     elseif name === :dtmin
-        h.ctx.dtmin = _floor(R, getfield(o, :dtmin), false, getfield(o, :adaptive))
+        h.ctx.dtmin = _floor(
+            R, getfield(o, :dtmin), false,
+            getfield(o, :adaptive) && _adapts(h.ctx.alg_name) !== false,
+        )
     elseif name === :dtmax
         adapt = LibPETSc.TSGetAdapt(pl, h.ts)
         lo, _ = LibPETSc.TSAdaptGetStepLimits(pl, adapt)
@@ -4185,7 +4230,7 @@ function _make_opts(
 end
 
 SciMLBase.isadaptive(integ::PETScIntegrator) =
-    getfield(integ.opts, :adaptive) && _adapts(integ.alg) !== false
+    getfield(integ.opts, :adaptive) && _adapts(integ.h.ctx.alg_name) !== false
 
 (integ::PETScIntegrator)(t::Number) = copy(_checked_state(integ, t))
 (integ::PETScIntegrator)(t::Number, ::Type{Val{0}}) = copy(_checked_state(integ, t))
@@ -4231,6 +4276,56 @@ function _set_u_unlocked(integ::PETScIntegrator, u)
 end
 
 SciMLBase.set_u!(integ::PETScIntegrator, u) = _locked(() -> _set_u_unlocked(integ, u))
+
+_initializealg(integ::PETScIntegrator) =
+    get(integ.kwargs, :initializealg, DiffEqBase.DefaultInit())
+
+function _initialize_state!(integ::PETScIntegrator, init)
+    h = integ.h
+    prob = integ.p === integ.prob.p ? integ.prob : SciMLBase.remake(integ.prob; p = integ.p)
+    u = integ.u isa Vector ? integ.u : Vector(integ.u)
+    before = h.ad_calls === nothing ? 0 : h.ad_calls[]
+    ok = _initialize!(
+        u, prob, init, h.f_init, h.jac_init, h.petsclib, h.ctx.comm, integ.t,
+        _user_t(integ.tdir, h.tf), real.(integ.opts.abstol),
+        iszero(integ.dt) ? nothing : integ.dt, integ.opts.dtmax,
+    )
+    h.ad_calls === nothing || (h.ad_calls[] = before)
+    u === integ.u || copyto!(integ.u, u)
+    return ok
+end
+
+function _initial_failure!(integ::PETScIntegrator)
+    code = SciMLBase.ReturnCode.InitialFailure
+    integ.finished ? (integ.sol = SciMLBase.solution_new_retcode(integ.sol, code)) :
+        _finish!(integ, code)
+    return nothing
+end
+
+function _reinitialize!(integ::PETScIntegrator, init, before)
+    ctx = integ.h.ctx
+    ctx.dae || ctx.M !== nothing || return nothing
+    init = something(init, _initializealg(integ))
+    # PETSc keeps a DAEProblem's derivative to itself, so a state left alone passes the check.
+    ctx.dae && init isa Union{SciMLBase.CheckInit, DiffEqBase.DefaultInit} &&
+        _everywhere(ctx.comm, integ.u == before) && return nothing
+    _initialize_state!(integ, init) || _initial_failure!(integ)
+    return nothing
+end
+
+function _initialize_dae_unlocked(integ::PETScIntegrator, init)
+    _initialize_state!(integ, init) || return _initial_failure!(integ)
+    integ.finished && return nothing
+    h = integ.h
+    PETScCompat.with_local_array!(
+        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+    )
+    LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    return nothing
+end
+
+SciMLBase.initialize_dae!(integ::PETScIntegrator, init = _initializealg(integ)) =
+    _locked(() -> _initialize_dae_unlocked(integ, init))
 
 function _set_t_unlocked(integ::PETScIntegrator, t)
     integ.t = oftype(integ.t, t)
@@ -4584,11 +4679,15 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     pre = ctx.save_everystep && !saved && !best_cb.save_positions[1] ? copy(integ.u) : nothing
     integ.derivative_discontinuity = true
     _pin_step!(integ)
+    before = ctx.dae ? copy(integ.u) : nothing
     stop = _affect!(integ) do
         _checked_everywhere(() -> _fire!(integ, best_cb, best_crossing), ctx.comm)
     end
     integ.finished && return true
     stop === nothing || (_stop!(integ, best_cb, stop, pre); return true)
+    _anywhere(ctx.comm, integ.derivative_discontinuity) &&
+        _reinitialize!(integ, best_cb.initializealg, before)
+    integ.finished && return true
     _rollback!(integ, integ.t, dt, false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
     best_cb.save_positions[2] && _save_here!(integ)
@@ -4605,10 +4704,13 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
         saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
+        before = ctx.dae ? copy(integ.u) : nothing
         stop = _affect!(() -> _checked_everywhere(() -> cb.affect!(integ), ctx.comm), integ)
         integ.finished && return nothing
         stop === nothing || (_stop!(integ, cb, stop, nothing); return nothing)
         if _anywhere(ctx.comm, integ.derivative_discontinuity)
+            _reinitialize!(integ, cb.initializealg, before)
+            integ.finished && return nothing
             PETScCompat.with_local_array!(
                 ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
             )
@@ -4624,12 +4726,17 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     h = integ.h
     cbs = (integ.callbacks..., integ.continuous...)
     before = copy(integ.u)
+    modified = false
     _checked_everywhere(h.ctx.comm) do
         for cb in cbs
+            integ.derivative_discontinuity = false
             cb.initialize(cb, integ.u, integ.t, integ)
+            modified |= integ.derivative_discontinuity
         end
     end
     integ.derivative_discontinuity = false
+    _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, before)
+    integ.finished && return nothing
     _everywhere(h.ctx.comm, integ.u == before) && return nothing
     copyto!(integ.uprev, integ.u)
     PETScCompat.with_local_array!(
@@ -4751,6 +4858,7 @@ _times(R, ts) = ts isa Number ? [R(ts)] : collect(R, ts)
 
 # d_discontinuities are right-continuous, so the next step starts an ulp past one.
 function _past_discontinuity!(integ::PETScIntegrator)
+    integ.finished && return nothing
     integ.t in integ.d_discontinuities || return nothing
     h = integ.h
     s = nextfloat(integ.tdir * integ.t)
@@ -4844,7 +4952,6 @@ function _reinit_unlocked(
         u0 = _partition(integ.prob.u0, u0)
     end
     old = integ.h
-    reset_dt === true && _check_estimable(integ.alg)
     dt = reset_dt === false ? _proposed_dt_unlocked(integ) : nothing
     prob = SciMLBase.remake(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
@@ -4875,7 +4982,7 @@ function _reinit_unlocked(
         initialize_save && _initial_save!(h)
         if reset_dt === true
             dt = _estimate_dt(
-                h, integ.alg, _make_opts(h, integ.kwargs), h.u0, h.t0,
+                h, _make_opts(h, integ.kwargs), h.u0, h.t0,
                 _tstops(vcat(tstops, d_discontinuities), h),
             )
         end
@@ -5194,15 +5301,7 @@ _counted(f, calls, k) = function (du, u, p, t)
     return f(du, u, p, t)
 end
 
-_check_estimable(alg) = alg isa TSGeneric && throw(
-    ArgumentError(
-        "the first step is estimated from the method's order, which `TSGeneric` " *
-            "does not know; set the step with set_proposed_dt! instead",
-    ),
-)
-
-function _estimate_dt(h::TSHandles{<:Any, <:Any, R}, alg, opts, u, s, stops) where {R}
-    _check_estimable(alg)
+function _estimate_dt(h::TSHandles{<:Any, <:Any, R}, opts, u, s, stops) where {R}
     ctx = h.ctx
     dtmin = abs(getfield(opts, :dtmin))
     ctx.dae && return max(R(1.0e-6) * abs(h.tf - h.t0), _min_step(s))
@@ -5214,7 +5313,7 @@ function _estimate_dt(h::TSHandles{<:Any, <:Any, R}, alg, opts, u, s, stops) whe
     f2 = ctx.f2! === nothing ? nothing : _guard_f(ctx.f2!, ctx.comm, threw)
     dt = _initial_dt(
         _counted(_guard_f(ctx.f!, ctx.comm, threw), calls, 1), _counted(f2, calls, 2),
-        u, ctx.p, s, one(R), SciMLBase.alg_order(alg),
+        u, ctx.p, s, one(R), _running_order(h.petsclib, h.ts, ctx.alg_name),
         getfield(opts, :abstol), getfield(opts, :reltol), dtmin,
         min(abs(getfield(opts, :dtmax)), stop - s), ctx.comm,
     )
@@ -5237,8 +5336,7 @@ function _auto_dt_unlocked(integ::PETScIntegrator)
     integ.finished && return nothing
     h = integ.h
     _use_dt!(
-        integ, _estimate_dt(h, integ.alg, integ.opts, integ.u, integ.tdir * integ.t, integ.tstops),
-        true,
+        integ, _estimate_dt(h, integ.opts, integ.u, integ.tdir * integ.t, integ.tstops), true,
     )
     _live_stats!(integ)
     return nothing
