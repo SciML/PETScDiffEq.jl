@@ -3326,6 +3326,27 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             sol = SciMLBase.solve!(integ)
             @test 0.55 in sol.t
         end
+
+        @testset "LinearizingSavingCallback asks for the derivative" begin
+            rot!(du, u, p, t) = (du[1] = -u[2]; du[2] = u[1]; nothing)
+            spin = SciMLBase.ODEProblem(rot!, [1.0, 0.0], (0.0, 1.0))
+            for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRK("4"))
+                ils = DiffEqCallbacks.IndependentlyLinearizedSolution(spin, 1)
+                cb = DiffEqCallbacks.LinearizingSavingCallback(ils; abstol = 1.0e-8, reltol = 1.0e-8)
+                sol = SciMLBase.solve(spin, alg; dt = 0.1, adaptive = false, callback = cb)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test length(ils) > length(sol.t)
+                worst = zeros(2)
+                for (t, vals) in ils
+                    exact = ([cos(t), sin(t)], [-sin(t), cos(t)])
+                    for k in 1:2
+                        worst[k] = max(worst[k], maximum(abs.(vals[:, k] .- exact[k])))
+                    end
+                end
+                @test worst[1] < 3.0e-6
+                @test worst[2] < 3.0e-5
+            end
+        end
     end
 
     @testset "audit regressions" begin
@@ -6355,6 +6376,111 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws "freed PETSc's interpolant" integ((integ.tprev + integ.t) / 2)
         end
 
+        @testset "the call forms OrdinaryDiffEq's integrator takes" begin
+            rot!(du, u, p, t) = (du[1] = -u[2]; du[2] = u[1]; nothing)
+            spin = SciMLBase.ODEProblem(rot!, [1.0, 0.0], (0.0, 1.0))
+            slope(t) = [-sin(t), cos(t)]
+            rhs(u, t) = (du = similar(u); rot!(du, u, nothing, t); du)
+            # Measured over every step at dt = 0.1, the Hermite slope is off by 8e-6 for 5dp
+            # and rk 4 and by 1.5e-3 for cn, whose steps carry that error themselves.
+            for (alg, tol) in (
+                    (PETScDiffEq.TSRK("5dp"), 2.0e-5), (PETScDiffEq.TSRK("4"), 2.0e-5),
+                    (PETScDiffEq.TSImplicit("cn"), 4.0e-3),
+                )
+                integ = SciMLBase.init(spin, alg; dt = 0.1, adaptive = false)
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                tm = (integ.tprev + integ.t) / 2
+                u = integ(tm)
+                du = integ(tm, Val{1})
+                @test integ(tm, Val{0}) == u
+                @test du isa Vector{Float64} && length(du) == 2
+                for q in (0.25, 0.5, 0.75)
+                    t = integ.tprev + q * integ.dt
+                    @test maximum(abs.(integ(t, Val{1}) .- slope(t))) < tol
+                end
+                @test integ(integ.t, Val{1}) == SciMLBase.get_du(integ)
+                @test integ(integ.tprev, Val{1}) == rhs(integ.uprev, integ.tprev)
+                @test integ(tm; idxs = 1) === u[1]
+                @test integ(tm; idxs = [2, 1]) == u[[2, 1]]
+                @test integ(tm; idxs = 1:2) == u
+                @test integ(tm, Val{1}; idxs = 2) === du[2]
+                ts = [integ.tprev, tm, integ.t]
+                @test integ(ts) == [integ(t) for t in ts]
+                @test integ(ts, Val{1}) == [integ(t, Val{1}) for t in ts]
+                @test integ(ts; idxs = 1) == [integ(t)[1] for t in ts]
+                @test integ((integ.tprev, tm)) isa Vector{Vector{Float64}}
+                out = zeros(2)
+                @test integ(out, tm, Val{1}) === out && out == du
+                @test integ(out, tm, Val{0}) === out && out == u
+                one = zeros(1)
+                @test integ(one, tm; idxs = [2]) === one && one == [u[2]]
+                @test integ(one, tm, Val{1}; idxs = 2) == [du[2]]
+                @test integ(out, ts) == fill(integ(integ.t), 3) && out == integ.u
+                @test_throws ArgumentError integ(tm, Val{2})
+                @test_throws ArgumentError integ(integ.t + 1.0, Val{1})
+                SciMLBase.solve!(integ)
+                tm = (integ.tprev + integ.t) / 2
+                u = integ(tm)
+                du = integ(tm, Val{1})
+                for q in (0.25, 0.5, 0.75)
+                    t = integ.tprev + q * integ.dt
+                    @test maximum(abs.(integ(t, Val{1}) .- slope(t))) < tol
+                end
+                @test integ(integ.t, Val{1}) == SciMLBase.get_du(integ)
+                @test integ(tm; idxs = 2) === u[2]
+                @test integ(tm, Val{1}; idxs = [1]) == [du[1]]
+                @test integ([integ.tprev, tm]) == [integ(integ.tprev), u]
+                @test integ(out, tm, Val{1}) === out && out == du
+            end
+
+            # Where the package interpolates itself, Val{1} is that interpolant's own slope.
+            integ = SciMLBase.init(spin, PETScDiffEq.TSRK("4"); dt = 0.1, adaptive = false)
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            tm, h = (integ.tprev + integ.t) / 2, 1.0e-6
+            @test maximum(abs.(integ(tm, Val{1}) .- (integ(tm + h) .- integ(tm - h)) ./ 2h)) <
+                1.0e-9
+            SciMLBase.terminate!(integ)
+
+            back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
+            for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRK("4"))
+                integ = SciMLBase.init(back, alg; dt = 0.1, adaptive = false)
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                for q in (0.25, 0.5, 0.75)
+                    t = integ.tprev + q * integ.dt
+                    @test abs(integ(t, Val{1})[1] + exp(1 - t)) < 6.0e-5
+                end
+                @test integ(integ.t, Val{1}) == SciMLBase.get_du(integ)
+                @test integ(integ.tprev, Val{1}) == -integ.uprev
+                SciMLBase.terminate!(integ)
+            end
+
+            single = SciMLBase.ODEProblem(decay!, Float32[1.0], (0.0f0, 1.0f0))
+            integ = SciMLBase.init(single, PETScDiffEq.TSRK("5dp"); dt = 0.1f0, adaptive = false)
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            tq = integ.tprev + integ.dt / 4
+            if Float32 in PETScDiffEq._loaded_builds()
+                @test integ(tq, Val{1}) isa Vector{Float32}
+                @test integ(tq; idxs = 1) isa Float32
+            end
+            @test abs(integ(tq, Val{1})[1] + exp(-tq)) < 3.0e-5
+            SciMLBase.terminate!(integ)
+
+            massive = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0], (0.0, 1.0),
+            )
+            integ = SciMLBase.init(massive, PETScDiffEq.TSImplicit("bdf"); dt = 0.1)
+            SciMLBase.step!(integ)
+            tm = (integ.tprev + integ.t) / 2
+            @test integ(tm) isa Vector{Float64}
+            @test_throws "no slope" integ(tm, Val{1})
+            @test_throws "no slope" integ(integ.t, Val{1})
+            SciMLBase.terminate!(integ)
+        end
+
         @testset "init, step! and solve! reproduce solve exactly" begin
             for alg in (
                     PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"),
@@ -8453,6 +8579,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 SciMLBase.step!(integ)
                 @test integ.u isa typeof(prob.u0)
                 @test integ(0.005) isa typeof(prob.u0)
+                @test integ(0.005, Val{1}) isa typeof(prob.u0)
+                @test collect(integ(0.005, Val{1})) ≈ [-cos(0.005), -sin(0.005)] atol = 1.0e-4
+                @test integ(0.005; idxs = 2) isa Float64
+                @test integ([0.0, 0.005]) isa Vector{typeof(prob.u0)}
+                @test integ(similar(integ.u), 0.005, Val{1}) isa typeof(prob.u0)
                 @test SciMLBase.get_du(integ) isa typeof(prob.u0)
                 @test collect(SciMLBase.get_du(integ)) ≈ [-integ.u[2], integ.u[1]]
                 SciMLBase.terminate!(integ)
