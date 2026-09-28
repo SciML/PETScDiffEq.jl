@@ -3387,9 +3387,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 for file in ("PETScDiffEq.jl", "adjoint.jl")
         )
         exported = filter(!=(:PETScDiffEq), names(PETScDiffEq))
-        @test length(exported) == 12
+        @test length(exported) == 13
         for n in exported
-            i = findfirst(l -> occursin(Regex("^(mutable )?struct \\Q$(n)\\E\\b"), l), lines)
+            i = findfirst(
+                l -> occursin(Regex("^((mutable )?struct|function) \\Q$(n)\\E\\b"), l), lines,
+            )
             @test i !== nothing
             i === nothing && continue
             @test strip(lines[i - 1]) == "\"\"\""
@@ -5172,6 +5174,154 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 wrong_prob, PETScDiffEq.TSImplicit("cn", ["-ts_max_snes_failures", "1"]); dt = 0.05,
             ).retcode != SciMLBase.ReturnCode.Success
         end
+    end
+
+    @testset "a jac with a DM" begin
+        PETSc = PETScDiffEq.PETSc
+        LibPETSc = PETScDiffEq.LibPETSc
+        pl = PETSc.getlib(; PetscScalar = Float64)
+        PETScDiffEq.PETScCompat.isinitialized(pl) || PETSc.initialize(pl)
+        ghosted = LibPETSc.DM_BOUNDARY_GHOSTED
+        # One rank numbers the grid naturally, dofs innermost.
+        da2 = PETSc.DMDA(
+            pl, MPI.COMM_SELF, (ghosted, ghosted), (5, 4), 2, 1, LibPETSc.DMDA_STENCIL_STAR,
+        )
+        J = LibPETSc.DMCreateMatrix(pl, da2)
+        at(c, i, j) = c + 2 * ((i - 1) + 5 * (j - 1))
+        set_stencil_values!(J, (2, 3, 2), [(1, 3, 2), (2, 2, 2), (2, 3, 3)], [10.0, 20.0, 30.0])
+        set_stencil_values!(J, [(1, 1, 1), (2, 1, 1)], (1, 1, 1), [1.0, 2.0])
+        set_stencil_values!(J, [(1, 4, 3), (2, 4, 3)], [(1, 4, 3), (2, 4, 3)], [1.0 2.0; 3.0 4.0])
+        set_stencil_values!(J, CartesianIndex(1, 5, 4), CartesianIndex(1, 5, 4), 7.0)
+        set_stencil_values!(J, (1, 5, 4), (1, 6, 4), 5.0)
+        PETSc.assemble!(J)
+        set_stencil_values!(J, (1, 5, 4), (1, 5, 4), 1.0; add = true)
+        PETSc.assemble!(J)
+        function entry(r, c)
+            v = Ref(0.0)
+            PETScDiffEq._check_code(
+                ccall(
+                    PETScDiffEq._symbol(pl, :MatGetValues), PETScDiffEq.LibPETSc.PetscErrorCode,
+                    (
+                        Ptr{Cvoid}, PETScDiffEq.LibPETSc.PetscInt,
+                        Ptr{PETScDiffEq.LibPETSc.PetscInt}, PETScDiffEq.LibPETSc.PetscInt,
+                        Ptr{PETScDiffEq.LibPETSc.PetscInt}, Ptr{Float64},
+                    ),
+                    J.ptr, 1, [Int64(r - 1)], 1, [Int64(c - 1)], v,
+                ),
+            )
+            return v[]
+        end
+        @test entry(at(2, 3, 2), at(1, 3, 2)) == 10.0
+        @test entry(at(2, 3, 2), at(2, 2, 2)) == 20.0
+        @test entry(at(2, 3, 2), at(2, 3, 3)) == 30.0
+        @test entry(at(1, 1, 1), at(1, 1, 1)) == 1.0
+        @test entry(at(2, 1, 1), at(1, 1, 1)) == 2.0
+        @test [entry(at(c, 4, 3), at(d, 4, 3)) for c in 1:2, d in 1:2] == [1.0 2.0; 3.0 4.0]
+        @test entry(at(1, 5, 4), at(1, 5, 4)) == 8.0
+        @test_throws "a grid index is" set_stencil_values!(J, (1,), (1,), 1.0)
+        @test_throws "a grid index is" set_stencil_values!(J, 3, 3, 1.0)
+        @test_throws DimensionMismatch set_stencil_values!(
+            J, (1, 1, 1), [(1, 1, 1), (2, 1, 1)], [1.0 2.0; 3.0 4.0],
+        )
+        @test_throws DimensionMismatch set_stencil_values!(
+            J, [(1, 1, 1), (2, 1, 1)], [(1, 1, 1), (2, 1, 1)], [1.0, 2.0, 3.0, 4.0],
+        )
+        @test_throws DimensionMismatch set_stencil_values!(J, (1, 1, 1), [(1, 1, 1), (2, 1, 1)], 1.0)
+        PETScDiffEq.PETScCompat.destroy!(J)
+        PETScDiffEq.PETScCompat.destroy!(da2)
+
+        N = 15
+        dx = 1 / (N + 1)
+        da = PETSc.DMDA(pl, MPI.COMM_SELF, (ghosted,), (N,), 1, 1)
+        function heat_dm!(du, u, da, t)
+            U = PETScDiffEq.reshape_local_array(u, da)
+            D = PETScDiffEq.reshape_local_array(du, da)
+            for i in axes(D, 2)
+                D[1, i] = (U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2
+            end
+            return nothing
+        end
+        seen = Int[]
+        function heat_jac_dm!(J, u, da, t)
+            push!(seen, length(u))
+            for i in 1:N
+                set_stencil_values!(J, (1, i), [(1, i - 1), (1, i), (1, i + 1)], [1, -2, 1] ./ dx^2)
+            end
+            return nothing
+        end
+        function heat!(du, u, p, t)
+            for i in 1:N
+                du[i] = ((i == 1 ? 0.0 : u[i - 1]) - 2u[i] + (i == N ? 0.0 : u[i + 1])) / dx^2
+            end
+            return nothing
+        end
+        function heat_jac!(J, u, p, t)
+            for i in 1:N
+                J[i, i] = -2 / dx^2
+                i > 1 && (J[i, i - 1] = 1 / dx^2)
+                i < N && (J[i, i + 1] = 1 / dx^2)
+            end
+            return nothing
+        end
+        near(i) = max(1, i - 1):min(N, i + 1)
+        proto = sparse(
+            [i for i in 1:N for _ in near(i)], [j for i in 1:N for j in near(i)], ones(3N - 2), N, N,
+        )
+        u0 = sinpi.((1:N) .* dx) .+ 0.5 .* sinpi.(3 .* (1:N) .* dx)
+        tol = (abstol = 1.0e-8, reltol = 1.0e-8)
+        dm_prob(span; kw...) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(heat_dm!; jac = heat_jac_dm!, kw...), u0, span, da,
+        )
+        ref_prob(span) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(heat!; jac = heat_jac!, jac_prototype = proto), u0, span,
+        )
+        for (with_dm, alg) in (
+                (PETScDiffEq.TSImplicit("bdf"; dm = da), PETScDiffEq.TSImplicit("bdf")),
+                (PETScDiffEq.TSRosW(; dm = da), PETScDiffEq.TSRosW()),
+            )
+            empty!(seen)
+            got = SciMLBase.solve(dm_prob((0.0, 0.1)), with_dm; tol...)
+            ref = SciMLBase.solve(ref_prob((0.0, 0.1)), alg; tol...)
+            @test got.retcode == SciMLBase.ReturnCode.Success
+            @test got.t == ref.t
+            @test got.u == ref.u
+            @test got.stats.njacs == ref.stats.njacs == length(seen) > 0
+            @test all(==(N + 2), seen)
+            coloured = SciMLBase.solve(
+                SciMLBase.ODEProblem(heat_dm!, u0, (0.0, 0.1), da), with_dm; tol...,
+            )
+            @test coloured.stats.njacs == 0
+            @test got.stats.nf < coloured.stats.nf
+            # Measured 1.2e-14 for bdf and 4.4e-16 for rosw.
+            @test maximum(abs, got.u[end] - coloured.u[end]) <= 1.0e-13
+        end
+        back = SciMLBase.solve(dm_prob((0.1, 0.0)), PETScDiffEq.TSImplicit("bdf"; dm = da); tol...)
+        ref = SciMLBase.solve(ref_prob((0.1, 0.0)), PETScDiffEq.TSImplicit("bdf"); tol...)
+        @test back.retcode == SciMLBase.ReturnCode.Success
+        @test back.t == ref.t
+        @test back.u == ref.u
+        plain = SciMLBase.solve(dm_prob((0.0, 0.1)), PETScDiffEq.TSImplicit("bdf"; dm = da); tol...)
+        with_ad = SciMLBase.solve(
+            dm_prob((0.0, 0.1)),
+            PETScDiffEq.TSImplicit("bdf"; dm = da, autodiff = PETScDiffEq.AutoForwardDiff());
+            tol...,
+        )
+        @test with_ad.t == plain.t
+        @test with_ad.u == plain.u
+        @test_throws "on an explicit method" SciMLBase.solve(
+            dm_prob((0.0, 0.1)), PETScDiffEq.TSRK(; dm = da); dt = 1.0e-3,
+        )
+        @test_throws "has to be in place" SciMLBase.solve(
+            SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction{false}((u, p, t) -> -u; jac = (u, p, t) -> nothing), u0,
+                (0.0, 0.1), da,
+            ),
+            PETScDiffEq.TSImplicit("bdf"; dm = da),
+        )
+        @test_throws "leave out `jac_prototype`" SciMLBase.solve(
+            dm_prob((0.0, 0.1); jac_prototype = proto), PETScDiffEq.TSImplicit("bdf"; dm = da),
+        )
+        PETScDiffEq.PETScCompat.destroy!(da)
     end
 
     @testset "Adaptive stepping" begin

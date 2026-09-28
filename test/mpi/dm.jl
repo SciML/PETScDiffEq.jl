@@ -20,6 +20,10 @@ const thrower = nranks - 1
 const TOL = (abstol = 1.0e-8, reltol = 1.0e-8)
 const FIXED = (; dt = 1.0e-3, adaptive = false)
 const ROUNDOFF = 5.0e-14
+# Measured at 1 to 3 ranks: a dm jac solve is within 7.1e-14 of a serial bdf jac solve, 4.2e-9
+# of a serial rosw one, whose parallel linear solves no Newton cleans up, and 2.0e-14 of colouring.
+const JAC_SERIAL_TOL = (bdf = 5.0e-13, rosw = 2.0e-8)
+const COLOUR_TOL = 1.0e-13
 
 function uneven(n)
     counts = floor.(Int, n .* (1:nranks) ./ sum(1:nranks))
@@ -511,6 +515,210 @@ end
         @test everywhere(got.u == ref.u)
     end
 
+    @testset "a jac fills the DM's matrix" begin
+        stencil(i) = ([(1, i - 1), (1, i), (1, i + 1)], [1, -2, 1] ./ dx^2)
+        njac = Ref(0)
+        ghosted = Ref(true)
+        function heat_jac_dm!(J, u, da, t)
+            njac[] += 1
+            ghosted[] &= length(u) == length(rows) + 2
+            for i in rows
+                set_stencil_values!(J, (1, i), stencil(i)...)
+            end
+            return nothing
+        end
+        function heat_jac_global!(J, u, da, t)
+            for i in rows
+                J[i, i] = -2 / dx^2
+                i > 1 && (J[i, i - 1] = 1 / dx^2)
+                i < N && (J[i, i + 1] = 1 / dx^2)
+            end
+            return nothing
+        end
+        heat_jac_rows(idx, scale = i -> 1.0) = function (J, u, p, t)
+            for (k, i) in enumerate(idx)
+                J[k, i] = -2scale(i) / dx^2
+                i > 1 && (J[k, i - 1] = scale(i) / dx^2)
+                i < N && (J[k, i + 1] = scale(i) / dx^2)
+            end
+            return nothing
+        end
+        bdf(; kw...) = TSImplicit("bdf"; kw...)
+        rosw(; kw...) = TSRosW(; kw...)
+        for (make, serial_tol) in ((bdf, JAC_SERIAL_TOL.bdf), (rosw, JAC_SERIAL_TOL.rosw))
+            njac[] = 0
+            got = solve(dm_heat(; jac = heat_jac_dm!), make(; dm = da, comm); saveat = 0.01, TOL...)
+            @test got.retcode == ReturnCode.Success
+            @test ghosted[]
+            @test got.stats.njacs == njac[] > 0
+            @test same_everywhere(got.stats.njacs)
+            @test same_everywhere(got.stats.nf)
+            ref = solve(comm_heat(; jac = heat_jac_rows(rows)), make(; comm); saveat = 0.01, TOL...)
+            @test got.t == ref.t
+            @test everywhere(got.u == ref.u)
+            by_index = solve(
+                dm_heat(; jac = heat_jac_global!), make(; dm = da, comm); saveat = 0.01, TOL...,
+            )
+            @test by_index.t == got.t
+            @test everywhere(by_index.u == got.u)
+            coloured = solve(dm_heat(), make(; dm = da, comm); saveat = 0.01, TOL...)
+            @test coloured.stats.njacs == 0
+            @test got.stats.nf < coloured.stats.nf
+            us, cs = natural(got, da, N), natural(coloured, da, N)
+            if rank == 0
+                serial = solve(
+                    serial_heat(; jac = heat_jac_rows(1:N)), make(); saveat = 0.01, TOL...,
+                )
+                @test maxdiff(us, serial.u) <= serial_tol
+                @test maxdiff(us, cs) <= COLOUR_TOL
+            end
+        end
+        with_ad = solve(
+            dm_heat(; jac = heat_jac_dm!), bdf(; dm = da, comm, autodiff = AutoForwardDiff());
+            TOL...,
+        )
+        plain = solve(dm_heat(; jac = heat_jac_dm!), bdf(; dm = da, comm); TOL...)
+        @test with_ad.t == plain.t
+        @test everywhere(with_ad.u == plain.u)
+
+        slab = uneven(NY)
+        along = grid_da((1, nranks), (nothing, LibPETSc.PetscInt.(slab)))
+        across = grid_da((nranks, 1), (LibPETSc.PetscInt.(uneven(NX)), nothing))
+        own = Ref{Any}(nothing)
+        function grid_jac_dm!(J, u, da, t)
+            for I in CartesianIndices(own[])
+                i, j = Tuple(I)
+                cols = [(1, i, j), (1, i - 1, j), (1, i + 1, j), (1, i, j - 1), (1, i, j + 1)]
+                vals = [-2 / hx^2 - 2 / hy^2, 1 / hx^2, 1 / hx^2, 1 / hy^2, 1 / hy^2]
+                set_stencil_values!(J, (1, i, j), cols, vals)
+            end
+            return nothing
+        end
+        point(i, j) = i + (j - 1) * NX
+        function grid_jac_serial!(J, u, p, t)
+            for j in 1:NY, i in 1:NX
+                J[point(i, j), point(i, j)] = -2 / hx^2 - 2 / hy^2
+                for (a, b, w) in ((i - 1, j, hx), (i + 1, j, hx), (i, j - 1, hy), (i, j + 1, hy))
+                    1 <= a <= NX && 1 <= b <= NY && (J[point(i, j), point(a, b)] = 1 / w^2)
+                end
+            end
+            return nothing
+        end
+        span = (0.0, 0.05)
+        serial = ODEProblem(
+            ODEFunction(
+                grid_heat_serial!; jac = grid_jac_serial!, jac_prototype = grid_proto(1:NY),
+            ),
+            vec([grid0(i, j) for i in 1:NX, j in 1:NY]), span,
+        )
+        for (make, serial_tol) in ((bdf, JAC_SERIAL_TOL.bdf), (rosw, JAC_SERIAL_TOL.rosw)),
+                g in (along, across)
+
+            u0 = grid_u0(g)
+            own[] = axes(reshape_local_array(u0, g))[2:end]
+            got = solve(
+                ODEProblem(ODEFunction(grid_heat_dm!; jac = grid_jac_dm!), u0, span, g),
+                make(; dm = g); saveat = 0.01, TOL...,
+            )
+            @test got.retcode == ReturnCode.Success
+            @test got.stats.njacs > 0
+            coloured = solve(
+                ODEProblem(grid_heat_dm!, u0, span, g), make(; dm = g); saveat = 0.01, TOL...,
+            )
+            us, cs = natural(got, g, (NX, NY)), natural(coloured, g, (NX, NY))
+            if rank == 0
+                ref = solve(serial, make(); saveat = 0.01, TOL...)
+                @test maxdiff(us, ref.u) <= serial_tol
+                @test maxdiff(us, cs) <= COLOUR_TOL
+            end
+        end
+        PETScCompat.destroy!(along)
+        PETScCompat.destroy!(across)
+
+        d = 1 .+ (1:N) ./ N
+        scaled(f) = (du, u, p, t) -> (f(du, u, p, t); du .*= d[rows]; nothing)
+        function scaled_jac_dm!(J, u, da, t)
+            for i in rows
+                set_stencil_values!(J, (1, i), stencil(i)[1], [d[i], -2d[i], d[i]] ./ dx^2)
+            end
+            return nothing
+        end
+        mass = Diagonal(d[rows])
+        for make in (bdf, rosw)
+            got = solve(
+                dm_heat(scaled(heat_dm!); mass_matrix = mass, jac = scaled_jac_dm!),
+                make(; dm = da, comm); saveat = 0.01, TOL...,
+            )
+            ref = solve(
+                comm_heat(scaled(heat!); mass_matrix = mass, jac = heat_jac_rows(rows, i -> d[i])),
+                make(; comm); saveat = 0.01, TOL...,
+            )
+            @test got.retcode == ReturnCode.Success
+            @test got.t == ref.t
+            @test everywhere(got.u == ref.u)
+        end
+
+        residual(f) = (r, du, u, p, t) -> (f(r, u, p, t); r .= du .- r; nothing)
+        function dae_jac_dm!(J, du, u, da, gamma, t)
+            for i in rows
+                cols, vals = stencil(i)
+                set_stencil_values!(J, (1, i), cols, gamma .* [0, 1, 0] .- vals)
+            end
+            return nothing
+        end
+        function dae_jac_rows!(J, du, u, p, gamma, t)
+            for (k, i) in enumerate(rows)
+                J[k, i] = gamma + 2 / dx^2
+                i > 1 && (J[k, i - 1] = -1 / dx^2)
+                i < N && (J[k, i + 1] = -1 / dx^2)
+            end
+            return nothing
+        end
+        du0 = similar(heat0(rows))
+        heat!(du0, heat0(rows), nothing, 0.0)
+        got = solve(
+            DAEProblem(
+                DAEFunction(residual(heat_dm!); jac = dae_jac_dm!), du0, heat0(rows), SPAN, da,
+            ),
+            TSDAE("bdf"; dm = da, comm); saveat = 0.01, TOL...,
+        )
+        fn = DAEFunction(residual(heat!); jac = dae_jac_rows!, jac_prototype = heat_proto(rows))
+        ref = solve(
+            DAEProblem(fn, du0, heat0(rows), SPAN), TSDAE("bdf"; comm); saveat = 0.01, TOL...,
+        )
+        @test got.retcode == ReturnCode.Success
+        @test got.stats.njacs > 0
+        @test got.t == ref.t
+        @test everywhere(got.u == ref.u)
+
+        solo = line_da(MPI.COMM_SELF)
+        solo_jac!(J, u, da, t) = (
+            for i in 1:N
+                set_stencil_values!(J, (1, i), stencil(i)...)
+            end; nothing
+        )
+        back = (0.01, 0.0)
+        got = solve(
+            ODEProblem(ODEFunction(heat_dm!; jac = solo_jac!), heat0(1:N), back, solo),
+            bdf(; dm = solo); TOL...,
+        )
+        fn = ODEFunction(heat_serial!; jac = heat_jac_rows(1:N), jac_prototype = heat_proto(1:N))
+        ref = solve(ODEProblem(fn, heat0(1:N), back), bdf(); TOL...)
+        @test got.retcode == ReturnCode.Success
+        @test got.t == ref.t
+        @test got.u == ref.u
+        PETScCompat.destroy!(solo)
+
+        function throwing_jac!(J, u, da, t)
+            heat_jac_dm!(J, u, da, t)
+            rank == thrower && t > 0.02 && error("jac threw on rank $rank")
+            return nothing
+        end
+        e = caught(() -> solve(dm_heat(; jac = throwing_jac!), bdf(; dm = da); TOL...))
+        @test raised(e, "jac threw")
+        @test everywhere(refs(da.ptr) == 1)
+    end
+
     @testset "f throwing on one rank raises on every rank" begin
         after = t -> t > 0.02
         dense = (; FIXED..., saveat = [0.0105], dense = true)
@@ -533,10 +741,19 @@ end
         for alg in (TSIRK(2; dm = da), TSMPRK([1]; dm = da), TSGeneric("alpha"; dm = da))
             @test refused(() -> solve(prob, alg; dt = 1.0e-3), "cannot run")
         end
-        @test refused(() -> solve(prob, TSIRK(2; dm = da); dt = 1.0e-3), "TSIRK needs a `jac`")
         @test refused(
-            () -> solve(dm_heat(; jac = (J, u, p, t) -> nothing), implicit(; dm = da)),
+            () -> solve(dm_heat(; jac = (J, u, p, t) -> nothing), explicit(; dm = da)),
             "does not take a `jac`",
+        )
+        @test refused(
+            () -> solve(
+                ODEProblem(
+                    ODEFunction{false}((u, p, t) -> -u; jac = (u, p, t) -> nothing), heat0(rows),
+                    SPAN, da,
+                ),
+                implicit(; dm = da),
+            ),
+            "has to be in place",
         )
         @test refused(
             () -> solve(dm_heat(; jac_prototype = heat_proto(rows)), implicit(; dm = da)),

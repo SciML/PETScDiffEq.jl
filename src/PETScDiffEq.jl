@@ -19,7 +19,7 @@ using SparseMatrixColorings: SparseMatrixColorings
 include("petsc_compat.jl")
 
 export TSRK, TSRosW, TSImplicit, TSIRK, TSARKIMEX, TSDAE, TSMPRK, TSGeneric,
-    TSBasicSymplectic, TSAlpha2, PETScIntegrator, PETScAdjoint
+    TSBasicSymplectic, TSAlpha2, PETScIntegrator, PETScAdjoint, set_stencil_values!
 
 abstract type PETScTSAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 abstract type PETScTSDAEAlgorithm <: SciMLBase.AbstractDAEAlgorithm end
@@ -96,8 +96,10 @@ within its first two steps and a fixed-step solve diverges.
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
-With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
-`autodiff` defaults to `AutoFiniteDiff()` as well.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
+`jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
+differences `f` into when there is none, with `autodiff` then at its default there,
+`AutoFiniteDiff()`.
 """
 struct TSRosW <: PETScTSAlgorithm
     subtype::String
@@ -144,8 +146,10 @@ under ForwardDiff.
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
-With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
-`autodiff` defaults to `AutoFiniteDiff()` as well.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
+`jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
+differences `f` into when there is none, with `autodiff` then at its default there,
+`AutoFiniteDiff()`.
 """
 struct TSImplicit <: PETScTSAlgorithm
     subtype::String
@@ -230,7 +234,7 @@ A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [
 There it needs a `jac`, filling this rank's rows of a sparse `jac_prototype` whose columns are
 global, and each rank has to hold PETSc's own share of the state, which splits it evenly with
 the first ranks taking one row more; see the MPI section of the documentation. A `dm` is
-refused, since a solve with one takes no `jac`.
+refused.
 """
 struct TSIRK <: PETScTSAlgorithm
     nstages::Int
@@ -271,8 +275,10 @@ derivative itself, so `du0` is used only to check and solve for a consistent sta
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
-With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
-`autodiff` defaults to `AutoFiniteDiff()` as well.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
+`jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
+differences `f` into when there is none, with `autodiff` then at its default there,
+`AutoFiniteDiff()`.
 """
 struct TSDAE <: PETScTSDAEAlgorithm
     subtype::String
@@ -317,8 +323,10 @@ plain `ODEProblem` PETSc does not use its explicit tableau, and it keeps order 3
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
-With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, and
-`autodiff` defaults to `AutoFiniteDiff()` as well.
+With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
+`jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
+differences `f` into when there is none, with `autodiff` then at its default there,
+`AutoFiniteDiff()`.
 """
 struct TSARKIMEX <: PETScTSAlgorithm
     subtype::String
@@ -973,6 +981,7 @@ end
 
 (g::Ghosted)(du, u, p, t) = _ghosted(a -> g.f(du, a, p, t), g, u)
 (g::Ghosted)(r, du, u, p, t) = _ghosted(a -> g.f(r, du, a, p, t), g, u)
+(g::Ghosted)(J, du, u, p, gamma, t) = _ghosted(a -> g.f(J, du, a, p, gamma, t), g, u)
 
 """
     PETScDiffEq.reshape_local_array(x, dm)
@@ -984,6 +993,127 @@ rank owns, such as `du`, `u0` or a saved state, and `a` shares its memory. This 
 `reshape_local_array`, which PETSc.jl 0.4 calls `reshapelocalarray` and pads to three grid axes.
 """
 reshape_local_array(x, dm) = PETScCompat.reshape_local_array(x, dm)
+
+# PETSc's MatStencil, in its field order.
+struct _Stencil
+    k::LibPETSc.PetscInt
+    j::LibPETSc.PetscInt
+    i::LibPETSc.PetscInt
+    c::LibPETSc.PetscInt
+end
+
+const _GRID_INDEX = "a grid index is `(c, i)`, `(c, i, j)` or `(c, i, j, k)`, as " *
+    "`reshape_local_array` indexes the grid"
+
+_stencil(I::CartesianIndex) = _stencil(Tuple(I))
+function _stencil(I::Tuple)
+    2 <= length(I) <= 4 && all(x -> x isa Integer, I) ||
+        throw(ArgumentError("$_GRID_INDEX; got $(repr(I))"))
+    at(d) = LibPETSc.PetscInt(length(I) >= d ? I[d] - 1 : 0)
+    return _Stencil(at(4), at(3), at(2), at(1))
+end
+_stencil(I) = throw(ArgumentError("$_GRID_INDEX; got $(repr(I))"))
+_stencils(I::Union{CartesianIndex, Tuple}) = [_stencil(I)]
+_stencils(Is) = _Stencil[_stencil(I) for I in Is]
+
+# MatSetValuesStencil reads the block row-major.
+function _row_major(S, vals::AbstractMatrix, m, n)
+    size(vals) == (m, n) || throw(
+        DimensionMismatch(
+            "`vals` is $(join(size(vals), " x ")) for $m rows and $n columns",
+        ),
+    )
+    return vec(permutedims(Matrix{S}(vals)))
+end
+function _row_major(S, vals::AbstractVector, m, n)
+    (m == 1 || n == 1) && length(vals) == m * n || throw(
+        DimensionMismatch(
+            "`vals` has $(length(vals)) entries for $m rows and $n columns; give a matrix",
+        ),
+    )
+    return Vector{S}(vals)
+end
+_row_major(S, val::Number, m, n) = m == n == 1 ? S[val] :
+    throw(DimensionMismatch("one value for $m rows and $n columns; give a matrix"))
+
+"""
+    set_stencil_values!(J, rows, cols, vals; add = false)
+
+Write a block of the DM's matrix `J`, as a `jac` gets it in a solve with a `dm`, through
+PETSc's `MatSetValuesStencil`. `rows` and `cols` are grid indices, or vectors of them, in the
+numbering `PETScDiffEq.reshape_local_array` uses: `(c, i)` on a 1-D grid, `(c, i, j)` on a 2-D
+one and `(c, i, j, k)` on a 3-D one, as tuples or `CartesianIndex`es, global and 1-based, with
+`c` the degree of freedom at the point. `vals[r, s]` is the entry at `rows[r]` and `cols[s]`,
+a vector when either side is a single index and a number when both are. The rows are this
+rank's own and the columns lie within its ghost region; PETSc drops an index past a ghosted
+edge, which has no global entry, and refuses an entry outside the DM's stencil. `add = true`
+adds to the entries instead of setting them, and PETSc wants a `PETSc.assemble!(J)` between a
+set and an add.
+"""
+function set_stencil_values!(
+        J::LibPETSc.AbstractPetscMat{L}, rows, cols, vals; add::Bool = false,
+    ) where {L}
+    pl = PETSc.getlib(L)
+    r, c = _stencils(rows), _stencils(cols)
+    v = _row_major(PETSc.scalartype(pl), vals, length(r), length(c))
+    mode = add ? LibPETSc.ADD_VALUES : LibPETSc.INSERT_VALUES
+    _set_stencil!(pl, J, r, c, v, mode)
+    return J
+end
+
+function _set_stencil!(pl, J, r, c, v::Vector{S}, mode) where {S}
+    _check_code(
+        ccall(
+            _symbol(pl, :MatSetValuesStencil), LibPETSc.PetscErrorCode,
+            (
+                Ptr{Cvoid}, LibPETSc.PetscInt, Ptr{_Stencil}, LibPETSc.PetscInt, Ptr{_Stencil},
+                Ptr{S}, Cint,
+            ),
+            J.ptr, length(r), r, length(c), c, v, Cint(mode),
+        ),
+    )
+    return nothing
+end
+
+function _mat_zero!(pl, A)
+    _check_code(
+        ccall(_symbol(pl, :MatZeroEntries), LibPETSc.PetscErrorCode, (Ptr{Cvoid},), A.ptr),
+    )
+    return nothing
+end
+
+for S in (Float32, Float64, ComplexF32, ComplexF64)
+    @eval function _mat_op!(pl, name, A, a::$S)
+        _check_code(
+            ccall(_symbol(pl, name), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, $S), A.ptr, a),
+        )
+        return nothing
+    end
+end
+
+function _mat_add_diagonal!(pl, A, d)
+    v = Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :MatCreateVecs), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}), A.ptr, C_NULL, v,
+        ),
+    )
+    try
+        _writevec!(pl, PETSc.VecPtr(pl, v[], false), d)
+        _check_code(
+            ccall(
+                _symbol(pl, :MatDiagonalSet), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{Cvoid}, Cint), A.ptr, v[], Cint(LibPETSc.ADD_VALUES),
+            ),
+        )
+    finally
+        _check_code(
+            ccall(_symbol(pl, :VecDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},), v),
+        )
+    end
+    return nothing
+end
 
 function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     full = Vector{S}(x)
@@ -1754,6 +1884,8 @@ _as_inplace_jac(j, iip::Bool) = iip ? j :
 _reverse_rhs(f) = (du, u, p, s) -> (f(du, u, p, _user_t(-one(s), s)); du .*= -1; nothing)
 _reverse_jac(j) =
     (J, u, p, s) -> (j(J, u, p, _user_t(-one(s), s)); LinearAlgebra.rmul!(J, -1); nothing)
+# J is PETSc's matrix there, so the dm callback flips its sign from ctx.tdir.
+_reverse_dm_jac(j) = (J, u, p, s) -> (j(J, u, p, _user_t(-one(s), s)); nothing)
 _reverse_residual(g) =
     (r, dv, u, p, s) -> (dv .*= -1; g(r, dv, u, p, _user_t(-one(s), s)); dv .*= -1; nothing)
 _reverse_dae_jac(j) =
@@ -2185,6 +2317,50 @@ function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
+function _dm_ijacobian!(
+        ::LibPETSc.CTS,
+        t,
+        x_ptr::LibPETSc.CVec,
+        xdot_ptr::LibPETSc.CVec,
+        shift,
+        A_ptr::LibPETSc.CMat,
+        B_ptr::LibPETSc.CMat,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    return _dm_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+end
+
+# The user fills J = df/du in the DM's matrix, which becomes `shift * M - J` here.
+function _dm_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+    pl = ctx.petsclib
+    A = LibPETSc.PetscMat(A_ptr, pl)
+    B = LibPETSc.PetscMat(B_ptr, pl)
+    try
+        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _mat_zero!(pl, B)
+        if ctx.dae
+            _readvec!(ctx.mudot, pl, PETSc.VecPtr(pl, xdot_ptr, false))
+            ctx.jac!(B, ctx.mudot, ctx.u, ctx.p, shift, t)
+        else
+            ctx.jac!(B, ctx.u, ctx.p, t)
+        end
+        ctx.njacs += 1
+        PETSc.assemble!(B)
+        if !ctx.dae
+            S = PETSc.scalartype(pl)
+            ctx.tdir > 0 && _mat_op!(pl, :MatScale, B, -one(S))
+            ctx.M === nothing ? _mat_op!(pl, :MatShift, B, S(shift)) :
+                _mat_add_diagonal!(pl, B, S(shift) .* ctx.M.diag)
+        end
+        B.ptr == A.ptr || PETSc.assemble!(A)
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
 function _sparse_ijacobian!(
         ::LibPETSc.CTS,
         t,
@@ -2300,6 +2476,7 @@ struct Callbacks
     ifunction::Ptr{Cvoid}
     ijacobian::Ptr{Cvoid}
     sparse_ijacobian::Ptr{Cvoid}
+    dm_ijacobian::Ptr{Cvoid}
     mprk_slow::Ptr{Cvoid}
     mprk_medium::Ptr{Cvoid}
     mprk_fast::Ptr{Cvoid}
@@ -2349,6 +2526,14 @@ for R in (Float32, Float64)
         ),
         @cfunction(
             _sparse_ijacobian!,
+            LibPETSc.PetscErrorCode,
+            (
+                LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, $R, LibPETSc.CMat,
+                LibPETSc.CMat, Ptr{Cvoid},
+            )
+        ),
+        @cfunction(
+            _dm_ijacobian!,
             LibPETSc.PetscErrorCode,
             (
                 LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, $R, LibPETSc.CMat,
@@ -2946,27 +3131,33 @@ function _check_diagonal_mass(prob, is_dae, where)
 end
 
 function _refuse_dm(prob, alg, is_dae)
-    irk = alg isa TSIRK ? ", and TSIRK needs a `jac`, which a `dm` solve does not take" : ""
     alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX} ||
         alg isa TSGeneric && alg.explicit || throw(
         ArgumentError(
             "PETScDiffEq cannot run " *
                 "$(alg isa TSGeneric ? "an implicit TSGeneric" : nameof(typeof(alg))) " *
                 "$_WITH_DM; TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX and " *
-                "TSGeneric(...; explicit = true) can$irk",
+                "TSGeneric(...; explicit = true) can",
         ),
     )
-    prob.f.jac === nothing || throw(
+    has_jac = prob.f.jac !== nothing
+    has_jac && !_uses_ifunction(alg) && throw(
         ArgumentError(
-            "PETScDiffEq does not take a `jac` $_WITH_DM yet; leave it out, and an implicit " *
-                "method has PETSc colour the DM's matrix and difference `f`",
+            "PETScDiffEq does not take a `jac` $_WITH_DM on an explicit method, which " *
+                "never uses one; leave it out",
+        ),
+    )
+    has_jac && !SciMLBase.isinplace(prob) && throw(
+        ArgumentError(
+            "a `jac` $_WITH_DM has to be in place, filling the DM's matrix it gets as `J`; " *
+                "an out-of-place one has nothing to return",
         ),
     )
     prob.f.jac_prototype === nothing || throw(
         ArgumentError("the `dm` gives the Jacobian's pattern, so leave out `jac_prototype`"),
     )
     _uses_ifunction(alg) || return nothing
-    _petsc_differences(alg) || throw(
+    has_jac || _petsc_differences(alg) || throw(
         ArgumentError(
             "PETScDiffEq cannot use `$(_autodiff(alg))` $_WITH_DM, since `f` then takes " *
                 "the ghosted array PETSc fills; leave `autodiff` at its default there, " *
@@ -3296,6 +3487,7 @@ function _setup(
     end
     builds_jac = _uses_ifunction(alg) && prob.f.jac === nothing && !_petsc_differences(alg)
     has_jac = _uses_ifunction(alg) && (prob.f.jac !== nothing || builds_jac)
+    dm_jac = dm !== nothing && has_jac
     ad_calls = builds_jac ? Ref(0) : nothing
     jac_fn = if !has_jac
         nothing
@@ -3313,6 +3505,8 @@ function _setup(
                 _autodiff(alg), dyn ? f_ad : _as_inplace(f_ad, iip), prob.f.jac_prototype, u0,
                 prob.p, user_t0, ad_calls, advice,
             )
+    elseif dm_jac
+        Ghosted(unwrap(prob.f.jac), petsclib, dm.ptr)
     elseif dyn
         _partitioned_jac(prob.f.jac, prob.u0, iip)
     else
@@ -3325,8 +3519,8 @@ function _setup(
     alg isa TSAlpha2 && (_scalar_tol(abstol); _scalar_tol(reltol))
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
     initialized = _initialize!(
-        u0, prob, initializealg, f1, jac_fn, petsclib, comm, R(prob.tspan[1]),
-        R(prob.tspan[2]), real.(something(abstol, 1.0e-6)), dt, dtmax,
+        u0, prob, initializealg, f1, dm_jac ? nothing : jac_fn, petsclib, comm,
+        R(prob.tspan[1]), R(prob.tspan[2]), real.(something(abstol, 1.0e-6)), dt, dtmax,
     )
     ad_calls === nothing || (ad_calls[] = ad_before)
     user_f1, user_f2 = f1, f2
@@ -3334,11 +3528,12 @@ function _setup(
         f1 = is_dae ? _reverse_residual(f1) : _reverse_rhs(f1)
         f2 = f2 === nothing ? nothing : _reverse_rhs(f2)
         jac_fn = jac_fn === nothing ? nothing :
-            (is_dae ? _reverse_dae_jac(jac_fn) : _reverse_jac(jac_fn))
+            is_dae ? _reverse_dae_jac(jac_fn) :
+            dm_jac ? _reverse_dm_jac(jac_fn) : _reverse_jac(jac_fn)
     end
     jac_prototype = has_jac ? prob.f.jac_prototype : nothing
     uses_sparse_jac = jac_prototype isa SparseMatrixCSC
-    J0 = if !has_jac
+    J0 = if !has_jac || dm_jac
         zeros(S, 0, 0)
     elseif uses_sparse_jac
         _structure(S, jac_prototype)
@@ -3377,8 +3572,8 @@ function _setup(
     missing_diag = uses_sparse_jac ?
         [i for i in 1:n if !_stored(J0, i, i)] : Int[]
     m = alg isa TSAlpha2 ? nv : n
-    W0 = has_jac && !uses_sparse_jac ? zeros(S, m, m) : zeros(S, 0, 0)
-    idx0 = has_jac && !uses_sparse_jac ?
+    W0 = has_jac && !uses_sparse_jac && !dm_jac ? zeros(S, m, m) : zeros(S, 0, 0)
+    idx0 = has_jac && !uses_sparse_jac && !dm_jac ?
         LibPETSc.PetscInt[i - 1 for i in 1:m] : LibPETSc.PetscInt[]
     row_cols0, row_src, row_buf = uses_sparse_jac && comm === nothing ?
         _row_structure(J0, n, M) : (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{S}[])
@@ -3505,8 +3700,14 @@ function _setup(
             if alg isa TSAlpha2
                 has_jac && _second_order_jacobian!(h, nv, ptrs, ctxptr)
             elseif clone !== nothing && _uses_ifunction(alg)
-                h.fd_mat = LibPETSc.DMCreateMatrix(petsclib, clone)
-                _colour_jacobian!(petsclib, ts, h.fd_mat)
+                mat = LibPETSc.DMCreateMatrix(petsclib, clone)
+                if has_jac
+                    h.jac_mat = mat
+                    LibPETSc.TSSetIJacobian(petsclib, ts, mat, mat, ptrs.dm_ijacobian, ctxptr)
+                else
+                    h.fd_mat = mat
+                    _colour_jacobian!(petsclib, ts, mat)
+                end
             elseif comm !== nothing && _uses_ifunction(alg)
                 rstart = first(LibPETSc.VecGetOwnershipRange(petsclib, u))
                 P = has_jac ? J0 : _structure(S, SparseMatrixCSC(prob.f.jac_prototype))
@@ -3556,7 +3757,7 @@ function _setup(
             effective_options = ["-ts_error_if_step_fails", "false"]
             append!(effective_options, _default_options(alg))
             # PETSc's sparse LU does not pivot, and an algebraic row has a zero diagonal.
-            if h.jac_mat !== nothing && uses_sparse_jac || h.fd_mat !== nothing
+            if h.jac_mat !== nothing && (uses_sparse_jac || dm_jac) || h.fd_mat !== nothing
                 append!(effective_options, ["-pc_factor_nonzeros_along_diagonal"])
                 comm === nothing ||
                     append!(effective_options, ["-sub_pc_factor_nonzeros_along_diagonal"])
@@ -3572,7 +3773,7 @@ function _setup(
                     _option(_above(abs(R(dtmax)), forced ? abs(R(dtmin)) : zero(R))),
                 ],
             )
-            clone !== nothing && _uses_ifunction(alg) &&
+            clone !== nothing && _uses_ifunction(alg) && !has_jac &&
                 !_everywhere(comm, _dm_colours(petsclib, clone.ptr)) &&
                 append!(effective_options, ["-snes_fd_color_use_mat"])
             append!(effective_options, alg.petsc_options)

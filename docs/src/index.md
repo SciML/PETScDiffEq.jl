@@ -567,11 +567,39 @@ sol_bdf = solve(prob, TSImplicit("bdf"; dm = da))
 ```
 
 With a `dm` the implicit algorithms need no `jac_prototype`. Their Jacobian is the DM's own
-matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil and which PETSc fills
-by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()` and the
-other backends are refused; the stencil has to cover every point `f` reads. A `jac` is refused
-for now, and with it `TSIRK`, which needs one, as is a `jac_prototype`, since the DM gives the
-pattern. The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
+matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil. Without a `jac` PETSc
+fills it by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()`
+and the other backends are refused; the stencil has to cover every point `f` reads. Colouring
+calls `f` once per colour at every Jacobian, and the colours grow with the stencil width and
+the degrees of freedom at a point, so a `jac(J, u, p, t)` can fill the matrix instead. It gets
+`u` ghosted, as `f` does, and `J` is the DM's matrix as a PETSc.jl `Mat`, zeroed before the
+call and assembled after it, so `jac` writes ``df/du`` into it through PETSc's matrix API,
+each rank its own rows: `set_stencil_values!(J, rows, cols, vals)` writes a block by grid
+index through `MatSetValuesStencil`, in the numbering `reshape_local_array` uses, and
+`J[i, j] = v` writes one entry by global index through `MatSetValues`, for those who have the
+global numbering; `LibPETSc` has the rest. A column at a ghost point past the edge of a
+`DM_BOUNDARY_GHOSTED` grid is dropped, having no global entry, and a set and an add cannot
+follow each other without a `PETSc.assemble!(J)` between them. The package turns the matrix
+into PETSc's `shift * M - J` itself. A `DAEProblem`'s `jac(J, du, u, p, gamma, t)` gets `u`
+ghosted and `du` owned, and writes PETSc's whole `dG/du + gamma dG/du'`. `jac` runs on every
+rank at every Jacobian, so anything collective in it has to be called on all of them in the
+same order, and it has to be in place: an out-of-place one is refused, as is a
+`jac_prototype`, since the DM gives the pattern, and a `jac` on an explicit method, which
+would never use it. `autodiff` is ignored with a `jac`. The heat equation above with its
+Jacobian, whose columns past the ends of the grid are dropped:
+
+```julia
+function heat_jac!(J, u, da, t)
+    for i in (xs + 1):(xs + xm)
+        set_stencil_values!(J, (1, i), [(1, i - 1), (1, i), (1, i + 1)], [1, -2, 1] ./ dx^2)
+    end
+end
+
+fn = ODEFunction(heat!; jac = heat_jac!)
+sol_jac = solve(ODEProblem(fn, sinpi.((xs .+ (1:xm)) .* dx), (0.0, 0.1), da), TSImplicit("bdf"; dm = da))
+```
+
+The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
 `TSARKIMEX` and `TSGeneric(ts_type; explicit = true)`, `saveat`, dense output, callbacks and
 the integrator interface, a `Diagonal` mass matrix, a `SplitODEProblem`, whose `f2` gets `u`
 ghosted as `f` does, and a `DAEProblem`, whose residual `f(r, du, u, p, t)` gets `u` ghosted
@@ -580,8 +608,8 @@ and `du` owned. Everything else the package calls, such as a callback, `unstable
 DM itself stays free for further solves. A DMDA on `MPI.COMM_SELF`, or on a single rank, gives
 a serial solve. Only a DMDA is taken so far.
 
-A solve with a `dm` refuses `TSMPRK`, an implicit `TSGeneric` and `PETScAdjoint` with an
-`ArgumentError`. A distributed solve, with a `dm` or without, is refused inside
+A solve with a `dm` refuses `TSIRK`, `TSMPRK`, an implicit `TSGeneric` and `PETScAdjoint`
+with an `ArgumentError`. A distributed solve, with a `dm` or without, is refused inside
 `Threads.@threads` on more than one thread, as `EnsembleThreads` runs its trajectories:
 nothing there keeps the ranks' solves in the same order, and ranks taking them in different
 orders run different solves as one and can return wrong results without an error.
@@ -623,4 +651,5 @@ TSGeneric
 PETScIntegrator
 PETScAdjoint
 PETScDiffEq.reshape_local_array
+set_stencil_values!
 ```
