@@ -129,7 +129,11 @@ from PETSc's own interpolant for `TSRK("5dp")`, `TSRosW("ra34pw2")`, `TSARKIMEX(
 `"5"`, `TSImplicit("bdf")` and `TSDAE("bdf")`, and from the cubic Hermite interpolant dense
 output uses for everything else, `TSGeneric` and a type `petsc_options` changes included.
 With a mass matrix or a `DAEProblem` only PETSc's is available, and a type that has none
-raises an `ArgumentError` when such a state is needed.
+raises an `ArgumentError` when such a state is needed. `integrator(t, Val{1})` is the slope
+of the cubic Hermite interpolant through the step's ends, the interpolant's own derivative
+where the package interpolates itself, and it raises with a mass matrix or a `DAEProblem`.
+`integrator(t; idxs)`, a vector of times and `integrator(out, t)` take the forms
+OrdinaryDiffEq's integrator does.
 
 `ODEProblem`, `SplitODEProblem`, `DAEProblem`, `DynamicalODEProblem` and
 `SecondOrderODEProblem` are supported, in place or out of place, along with
