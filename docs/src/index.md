@@ -180,7 +180,8 @@ infinite step: below 1 it damps the frequencies the step cannot resolve, which r
 default, carries on undamped. It adapts on PETSc's error estimate with scalar `abstol` and
 `reltol`, or steps at `dt` with `adaptive = false`. Its Jacobian, from a `jac` or from
 `autodiff` as for the other implicit families, is that of the first-order system, `2n` by
-`2n`; it takes no sparse `jac_prototype` yet.
+`2n`, and a sparse `jac_prototype` of that system keeps the `n` by `n` matrix PETSc factors
+sparse, whether the Jacobian comes from a `jac` or is coloured, as for `TSImplicit`.
 
 ```julia
 K, C = [1.0e6 0.0; 0.0 1.0], [200.0 0.0; 0.0 0.02]
