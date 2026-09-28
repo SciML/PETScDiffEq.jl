@@ -8548,6 +8548,122 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test final_err(adaptive, exact) < 5.0e-5
         end
 
+        @testset "TSAlpha2 with a sparse jac_prototype" begin
+            Q = [cos(0.3) -sin(0.3); sin(0.3) cos(0.3)]
+            K = Q * Diagonal([1.0, 1.0e6]) * Q'
+            C = Q * Diagonal([0.02, 200.0]) * Q'
+            damped!(ddu, du, u, p, t) = (mul!(ddu, K, u); mul!(ddu, C, du, -1.0, -1.0); nothing)
+            function damped_jac!(J, x, p, t)
+                fill!(J, 0.0)
+                J[1:2, 1:2] .= -C
+                J[1:2, 3:4] .= -K
+                J[3, 1] = J[4, 2] = 1.0
+                return nothing
+            end
+            velocity!(du, v, u, p, t) = (du .= v; nothing)
+            x0 = [0.0, 0.0, 1.0, 1.0]
+            exact = exp([-C -K; I zeros(2, 2)] * 5.0) * x0
+            proto = sparse([ones(2, 2) ones(2, 2); Matrix(I, 2, 2) zeros(2, 2)])
+            second(f = damped!; kw...) = SciMLBase.SecondOrderODEProblem(
+                SciMLBase.DynamicalODEFunction{true}(f, velocity!; kw...), x0[1:2], x0[3:4],
+                (0.0, 5.0),
+            )
+            # DiffEqBase's solve cannot rebuild a DynamicalODEFunction that carries a jac_prototype.
+            solve_at(pr, alg; kw...) = SciMLBase.__solve(pr, alg; dt = 0.1, adaptive = false, kw...)
+            alg = PETScDiffEq.TSAlpha2(; radius = 0.5)
+            fd = PETScDiffEq.TSAlpha2(; radius = 0.5, autodiff = PETScDiffEq.AutoFiniteDiff())
+            dense = solve_at(second(; jac = damped_jac!), alg)
+            user = solve_at(second(; jac = damped_jac!, jac_prototype = proto), alg)
+            ad = solve_at(second(; jac_prototype = proto), alg)
+            coloured = solve_at(second(; jac_prototype = proto), fd)
+            oop = solve_at(
+                SciMLBase.SecondOrderODEProblem(
+                    SciMLBase.DynamicalODEFunction{false}(
+                        (du, u, p, t) -> -K * u - C * du, (v, u, p, t) -> v;
+                        jac = (x, p, t) -> sparse([-C -K; I zeros(2, 2)]), jac_prototype = proto,
+                    ), x0[1:2], x0[3:4], (0.0, 5.0),
+                ), alg,
+            )
+            for sol in (user, ad, coloured, oop)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test final_err(sol, exact) < 7.0e-3
+            end
+            for sol in (user, ad, oop)
+                @test collect(sol.u[end]) ≈ collect(dense.u[end]) rtol = 1.0e-10
+                @test sol.stats.njacs == dense.stats.njacs > 0
+            end
+            @test coloured.stats.njacs == 0
+            @test ad.stats.nf > user.stats.nf == dense.stats.nf
+            @test_throws "of the first-order system `[v; u]' = [f(v, u, p, t); v]`, 4 x 4" solve_at(
+                second(; jac_prototype = sparse(ones(2, 2))), alg,
+            )
+            @test_throws "but this one is 4 x 3" solve_at(
+                second(; jac_prototype = sparse(ones(4, 3))), alg,
+            )
+
+            function wave(N; jac = true, proto = true)
+                h = 1 / (N + 1)
+                x = h .* (1:N)
+                s = 1 / h^2
+                Lap = spdiagm(-1 => fill(s, N - 1), 0 => fill(-2s, N), 1 => fill(s, N - 1))
+                Jc = [spzeros(N, N) Lap; sparse(1.0I, N, N) spzeros(N, N)]
+                f!(ddu, du, u, p, t) = (mul!(ddu, Lap, u); nothing)
+                jac!(J, x, p, t) = (
+                    J isa SparseMatrixCSC ? (nonzeros(J) .= nonzeros(Jc)) : copyto!(J, Jc); nothing
+                )
+                kw = (; (jac ? (:jac => jac!,) : ())..., (proto ? (:jac_prototype => Jc,) : ())...)
+                w = 2 / h * sin(pi * h / 2)
+                standing(t) = vcat(-w .* sin.(pi .* x) .* sin(w * t), sin.(pi .* x) .* cos(w * t))
+                prob = SciMLBase.SecondOrderODEProblem(
+                    SciMLBase.DynamicalODEFunction{true}(f!, velocity!; kw...), zeros(N),
+                    sin.(pi .* x), (0.0, 1.0),
+                )
+                return prob, standing
+            end
+            function wave_errors(sol, standing, N)
+                ev = maximum(
+                    maximum(abs, sol.u[i].x[1] .- standing(sol.t[i])[1:N]) for i in eachindex(sol.t)
+                )
+                eu = maximum(
+                    maximum(abs, sol.u[i].x[2] .- standing(sol.t[i])[(N + 1):end]) for
+                        i in eachindex(sol.t)
+                )
+                return ev, eu
+            end
+            wave_at(pr, alg) = SciMLBase.__solve(pr, alg; dt = 0.005, adaptive = false)
+            small, standing = wave(200)
+            small_dense = wave_at(first(wave(200; proto = false)), PETScDiffEq.TSAlpha2())
+            for (pr, alg, rtol) in (
+                    (small, PETScDiffEq.TSAlpha2(), 1.0e-11),
+                    (first(wave(200; jac = false)), PETScDiffEq.TSAlpha2(), 1.0e-11),
+                    (
+                        first(wave(200; jac = false)),
+                        PETScDiffEq.TSAlpha2(; autodiff = PETScDiffEq.AutoFiniteDiff()), 1.0e-6,
+                    ),
+                )
+                sol = wave_at(pr, alg)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.t == small_dense.t
+                @test collect(sol.u[end]) ≈ collect(small_dense.u[end]) rtol = rtol
+            end
+            # The dense path takes about 28 s here against 0.05 s.
+            for (pr, alg) in (
+                    (first(wave(2000)), PETScDiffEq.TSAlpha2()),
+                    (first(wave(2000; jac = false)), PETScDiffEq.TSAlpha2()),
+                    (
+                        first(wave(2000; jac = false)),
+                        PETScDiffEq.TSAlpha2(; autodiff = PETScDiffEq.AutoFiniteDiff()),
+                    ),
+                )
+                sol = wave_at(pr, alg)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test length(sol.t) == 201
+                ev, eu = wave_errors(sol, last(wave(2000)), 2000)
+                @test ev < 1.0e-3
+                @test eu < 2.0e-4
+            end
+        end
+
         @testset "TSAlpha2 adapts on PETSc's estimate" begin
             prob = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 10.0))
             steps = map((1.0e-4, 1.0e-6)) do tol
@@ -8777,9 +8893,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     osc!, (du, v, u, p, t) -> (du .= v; nothing); jac_prototype = sparse(ones(2, 2)),
                 ), [0.0], [1.0], (0.0, 1.0),
             )
-            sparse_proto.f.jac_prototype isa SparseArrays.AbstractSparseMatrix &&
-                @test_throws "no sparse `jac_prototype`" SciMLBase.__solve(
-                sparse_proto, PETScDiffEq.TSAlpha2(); dt = 0.1,
+            @test SciMLBase.__solve(sparse_proto, PETScDiffEq.TSAlpha2(); dt = 0.1).retcode ==
+                SciMLBase.ReturnCode.Success
+            @test_throws "TSAlpha2 takes a `jac_prototype` of the first-order system" SciMLBase.__solve(
+                SciMLBase.SecondOrderODEProblem(
+                    SciMLBase.DynamicalODEFunction{true}(
+                        osc!, (du, v, u, p, t) -> (du .= v; nothing); jac_prototype = sparse(ones(1, 1)),
+                    ), [0.0], [1.0], (0.0, 1.0),
+                ), PETScDiffEq.TSAlpha2(); dt = 0.1,
             )
             scalars = SciMLBase.SecondOrderODEProblem((du, u, p, t) -> -u, 0.0, 1.0, (0.0, 1.0))
             @test_throws "are both vectors" SciMLBase.solve(

@@ -489,7 +489,13 @@ position's tolerances. `adaptive = false` steps at the `dt` you give.
 Each step solves for the acceleration, with the Jacobian of `f` in `u` and `u'`. That comes
 from a `jac`, which is the Jacobian of the first-order system `[v; u]' = [f(v, u, p, t); v]`,
 `2n` by `2n` in the order of the state, as OrdinaryDiffEq's implicit methods take it, or
-without one from `autodiff`, as for [`TSImplicit`](@ref). A mass matrix is refused.
+without one from `autodiff`, as for [`TSImplicit`](@ref). A sparse `jac_prototype` of that
+system keeps the `n` by `n` matrix PETSc factors sparse: a `jac` fills the prototype's
+structure, and without one the Jacobian is coloured, by SparseMatrixColorings under AD or by
+PETSc under `AutoFiniteDiff`, as for `TSImplicit`. A mass matrix is refused. Until
+SciMLBase's `DynamicalODEFunction` can be rebuilt with a `jac_prototype`, `solve` and `init`
+fail on one before reaching this package, so give such a problem to `SciMLBase.__solve` or
+`SciMLBase.__init`.
 
 Distributed partitioned states are not supported yet, so a `comm` other than
 `MPI.COMM_SELF` is refused.
@@ -702,6 +708,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     idx0::Vector{LibPETSc.PetscInt}
     row_cols0::Vector{Vector{LibPETSc.PetscInt}}
     row_src::Vector{Vector{Int}}
+    row_src2::Vector{Vector{Int}}
     row_buf::Vector{Vector{S}}
     J::JBUF
     ts::Vector{R}
@@ -1718,6 +1725,29 @@ function _row_structure(J::SparseMatrixCSC, n, M = nothing, rstart = 0)
     return cols0, src, buf
 end
 
+# (i, j) of df/dv and (i, nv + j) of df/du share a slot, as does the diagonal for shift_a.
+function _second_order_rows(J::SparseMatrixCSC, nv)
+    cv, kv, cu, ku = ([Int[] for _ in 1:nv] for _ in 1:4)
+    for c in axes(J, 2), k in nzrange(J, c)
+        i = J.rowval[k]
+        i <= nv || continue
+        c <= nv ? (push!(cv[i], c); push!(kv[i], k)) : (push!(cu[i], c - nv); push!(ku[i], k))
+    end
+    at(cs, ks, j) = (s = searchsortedfirst(cs, j); s <= length(cs) && cs[s] == j ? ks[s] : 0)
+    cols = [sort!(unique!(vcat(cv[i], cu[i], i))) for i in 1:nv]
+    cols0 = [LibPETSc.PetscInt[j - 1 for j in cols[i]] for i in 1:nv]
+    src_v = [[at(cv[i], kv[i], j) for j in cols[i]] for i in 1:nv]
+    src_u = [[at(cu[i], ku[i], j) for j in cols[i]] for i in 1:nv]
+    buf = [zeros(eltype(J), length(cols[i])) for i in 1:nv]
+    return cols0, src_v, src_u, buf
+end
+
+function _rows_pattern(cols0, n)
+    rows = [i for i in 1:n for _ in cols0[i]]
+    cols = [Int(c) + 1 for i in 1:n for c in cols0[i]]
+    return sparse(rows, cols, ones(length(rows)), n, n)
+end
+
 function _coo_structure(J::SparseMatrixCSC{S}, rstart, M) where {S}
     n = size(J, 1)
     cols0, src, _ = _row_structure(J, n, nothing, rstart)
@@ -2149,6 +2179,27 @@ function _i2jacobian!(
 end
 
 # Rows 1:nv of the flat Jacobian hold df/dv in columns 1:nv and df/du in columns nv+1:end.
+function _set_i2block!(ctx, J::Matrix, B, shift_v, shift_a, nv)
+    @inbounds for j in 1:nv, i in 1:nv
+        ctx.W[j, i] = shift_a * (i == j) - shift_v * J[i, j] - J[i, nv + j]
+    end
+    return _setblock!(ctx, B, nv)
+end
+
+function _set_i2block!(ctx, J::SparseMatrixCSC, B, shift_v, shift_a, nv)
+    vals = J.nzval
+    z = zero(eltype(vals))
+    @inbounds for i in 1:nv
+        cols, sv, su, buf = ctx.row_cols0[i], ctx.row_src[i], ctx.row_src2[i], ctx.row_buf[i]
+        for k in eachindex(cols)
+            jv = sv[k] == 0 ? z : vals[sv[k]]
+            ju = su[k] == 0 ? z : vals[su[k]]
+            buf[k] = shift_a * (Int(cols[k]) + 1 == i) - shift_v * jv - ju
+        end
+    end
+    return _setrows!(ctx, B, nv)
+end
+
 function _i2jacobian_body!(ctx, t, u_ptr, v_ptr, shift_v, shift_a, A_ptr, B_ptr)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
@@ -2156,11 +2207,7 @@ function _i2jacobian_body!(ctx, t, u_ptr, v_ptr, shift_v, shift_a, A_ptr, B_ptr)
         nv = _read_second_order!(ctx, u_ptr, v_ptr)
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
         ctx.njacs += 1
-        J = ctx.J
-        @inbounds for j in 1:nv, i in 1:nv
-            ctx.W[j, i] = shift_a * (i == j) - shift_v * J[i, j] - J[i, nv + j]
-        end
-        _setblock!(ctx, B, nv)
+        _set_i2block!(ctx, ctx.J, B, shift_v, shift_a, nv)
         PETSc.assemble!(B)
         B.ptr == A.ptr || PETSc.assemble!(A)
     catch e
@@ -2931,9 +2978,6 @@ function _check_dynamical(prob, alg, has_mass)
         ),
     )
     alg isa TSAlpha2 || return nothing
-    prob.f.jac_prototype isa SparseArrays.AbstractSparseMatrix && throw(
-        ArgumentError("TSAlpha2 takes no sparse `jac_prototype` yet; it builds a dense Jacobian"),
-    )
     prob.problem_type isa SciMLBase.SecondOrderODEProblem || throw(
         ArgumentError(
             "TSAlpha2 needs a SecondOrderODEProblem, where u' is the velocity; a " *
@@ -2944,6 +2988,13 @@ function _check_dynamical(prob, alg, has_mass)
         ArgumentError(
             "TSAlpha2 needs the initial velocity and position to have the same length, " *
                 "got $(length(parts[1])) and $(length(parts[2]))",
+        ),
+    )
+    proto, n = prob.f.jac_prototype, sum(length, parts)
+    proto isa SparseArrays.AbstractSparseMatrix && size(proto) != (n, n) && throw(
+        ArgumentError(
+            "TSAlpha2 takes a `jac_prototype` of the first-order system `[v; u]' = " *
+                "[f(v, u, p, t); v]`, $n x $n, but this one is $(join(size(proto), " x "))",
         ),
     )
     return nothing
@@ -3159,7 +3210,11 @@ end
 
 function _second_order_jacobian!(h::TSHandles{<:Any, <:Any, <:Any, S}, nv, ptrs, ctxptr) where {S}
     pl = h.petsclib
-    h.jac_mat = PETScCompat.PetscMat(pl, zeros(S, nv, nv))
+    h.jac_mat = h.ctx.J isa SparseMatrixCSC ?
+        PETScCompat.PetscMat(
+            pl, MPI.COMM_SELF, _rows_pattern(h.ctx.row_cols0, nv); with_arrays = true,
+        ) :
+        PETScCompat.PetscMat(pl, zeros(S, nv, nv))
     _check_code(
         ccall(
             _symbol(pl, :TSSetI2Jacobian), LibPETSc.PetscErrorCode,
@@ -3409,8 +3464,14 @@ function _setup(
     W0 = has_jac && !uses_sparse_jac ? zeros(S, m, m) : zeros(S, 0, 0)
     idx0 = has_jac && !uses_sparse_jac ?
         LibPETSc.PetscInt[i - 1 for i in 1:m] : LibPETSc.PetscInt[]
-    row_cols0, row_src, row_buf = uses_sparse_jac && comm === nothing ?
-        _row_structure(J0, n, M) : (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{S}[])
+    row_cols0, row_src, row_src2, row_buf = if !(uses_sparse_jac && comm === nothing)
+        (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Int}[], Vector{S}[])
+    elseif alg isa TSAlpha2
+        _second_order_rows(J0, nv)
+    else
+        cols0, src, buf = _row_structure(J0, n, M)
+        (cols0, src, Vector{Int}[], buf)
+    end
     kept = if save_idxs === nothing
         nothing
     else
@@ -3451,7 +3512,7 @@ function _setup(
         petsclib, f1, f2, jac_fn, prob.p,
         similar(u0), copy(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0,
         idx0,
-        row_cols0, row_src, row_buf, J0,
+        row_cols0, row_src, row_src2, row_buf, J0,
         R[], A[], A[], nothing, nothing,
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
         clone === nothing ? _work_vec(petsclib, comm, uvec, n) :
@@ -3532,7 +3593,15 @@ function _setup(
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, ptrs.split_rhs, ctxptr)
             end
             if alg isa TSAlpha2
-                has_jac && _second_order_jacobian!(h, nv, ptrs, ctxptr)
+                if has_jac
+                    _second_order_jacobian!(h, nv, ptrs, ctxptr)
+                elseif prob.f.jac_prototype isa SparseArrays.AbstractSparseMatrix
+                    cols0, _, _, _ = _second_order_rows(SparseMatrixCSC(prob.f.jac_prototype), nv)
+                    h.fd_mat = PETScCompat.PetscMat(
+                        petsclib, MPI.COMM_SELF, _rows_pattern(cols0, nv); with_arrays = true,
+                    )
+                    _colour_jacobian!(petsclib, ts, h.fd_mat)
+                end
             elseif clone !== nothing && _uses_ifunction(alg)
                 h.fd_mat = LibPETSc.DMCreateMatrix(petsclib, clone)
                 _colour_jacobian!(petsclib, ts, h.fd_mat)
