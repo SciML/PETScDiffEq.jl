@@ -126,8 +126,8 @@ Robertson's, those are far enough off that the solve reports success with an ans
 wrong in its first digit, so keep them for a right-hand side ForwardDiff cannot run.
 
 `DiscreteCallback`, `ContinuousCallback`, `VectorContinuousCallback` and `CallbackSet`
-all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`
-and `terminate!`. After a step the running solution's retcode is `Success`, as
+all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`,
+`terminate!` and `initialize_dae!`. After a step the running solution's retcode is `Success`, as
 OrdinaryDiffEq's is. `check_error` gives `Success` while the integrator can go on and the
 retcode it stopped with after that. In a callback's `finalize` it gives the retcode passed to
 `terminate!`, and `Success` for a solve that ended any other way, where OrdinaryDiffEq's
@@ -233,8 +233,23 @@ communicator other than `MPI.COMM_SELF`, where `CheckInit()` still checks the wh
 
 The default is `CheckInit()` even for a problem carrying ModelingToolkit's initialization
 data, which OrdinaryDiffEq would solve with `OverrideInit()`; this package does not solve that
-system and refuses `OverrideInit()` on such a problem. A callback that leaves the algebraic
-equations unsatisfied is not initialized again after it fires.
+system and refuses `OverrideInit()` on such a problem.
+
+`initialize_dae!(integrator, initializealg)` runs the same on the integrator's current state
+and time, with the `initializealg` the solve was given unless another is passed, and writes
+the result into PETSc. It takes `du0` from the problem for a `DAEProblem`, the current
+`abstol` and, for `ShampineCollocationInit()` on an `ODEProblem`, the current `dt / 5`, as
+OrdinaryDiffEq's does. When SNES fails the integrator finishes where it is with
+`ReturnCode.InitialFailure`, and on an `ODEProblem` without a singular mass matrix it does
+nothing. After a callback's `affect!` runs without calling
+`derivative_discontinuity!(integrator, false)`, or its `initialize` calls
+`derivative_discontinuity!(integrator, true)`, the integrator is initialized again with the
+callback's `initializealg`, or the solve's when the callback has none, as OrdinaryDiffEq does.
+So with the default a callback has to leave the algebraic equations satisfied or the solve
+throws `CheckInitFailureError`, and under `BrownFullBasicInit()` the algebraic variables are
+solved for again. On a `DAEProblem`, whose derivative PETSc keeps to itself, `CheckInit()`
+after a callback takes a state the callback left alone as consistent and checks a changed one
+against the problem's `du0`, which is right at `t0` only.
 
 ## Number types
 
@@ -468,7 +483,7 @@ that throws has to do so after its own communication.
 
 Callbacks and the integrator interface run distributed too, as long as every rank makes the
 same calls with the same arguments in the same order: `init`, `step!`, `solve!`, `reinit!`,
-`terminate!`, `set_u!`, `add_tstop!`, `add_saveat!`, `savevalues!`,
+`terminate!`, `set_u!`, `initialize_dae!`, `add_tstop!`, `add_saveat!`, `savevalues!`,
 `change_t_via_interpolation!`, `set_proposed_dt!`, `set_abstol!`, `set_reltol!`,
 `postamble!`, `auto_dt_reset!`, `integrator(t)` and `get_du` are all collective.
 `integrator.u` holds the rank's own rows, and so

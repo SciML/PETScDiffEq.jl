@@ -2671,6 +2671,8 @@ mutable struct TSHandles{CTX, L, R, S}
     solution::Any
     dms::Vector{Ptr{Cvoid}}
     init_failed::Bool
+    f_init::Any
+    jac_init::Any
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -3330,6 +3332,7 @@ function _setup(
     )
     ad_calls === nothing || (ad_calls[] = ad_before)
     user_f1, user_f2 = f1, f2
+    f_init, jac_init = f1, jac_fn
     if tdir < 0
         f1 = is_dae ? _reverse_residual(f1) : _reverse_rhs(f1)
         f2 = f2 === nothing ? nothing : _reverse_rhs(f2)
@@ -3444,7 +3447,7 @@ function _setup(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, Int(maxiters), save_start, save_end, end_saveat, false, 0, false,
         false,
-        Any[], Vector{S}[], false, nothing, dms, !initialized,
+        Any[], Vector{S}[], false, nothing, dms, !initialized, f_init, jac_init,
     )
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -4215,6 +4218,56 @@ end
 
 SciMLBase.set_u!(integ::PETScIntegrator, u) = _locked(() -> _set_u_unlocked(integ, u))
 
+_initializealg(integ::PETScIntegrator) =
+    get(integ.kwargs, :initializealg, DiffEqBase.DefaultInit())
+
+function _initialize_state!(integ::PETScIntegrator, init)
+    h = integ.h
+    prob = integ.p === integ.prob.p ? integ.prob : SciMLBase.remake(integ.prob; p = integ.p)
+    u = integ.u isa Vector ? integ.u : Vector(integ.u)
+    before = h.ad_calls === nothing ? 0 : h.ad_calls[]
+    ok = _initialize!(
+        u, prob, init, h.f_init, h.jac_init, h.petsclib, h.ctx.comm, integ.t,
+        _user_t(integ.tdir, h.tf), real.(integ.opts.abstol),
+        iszero(integ.dt) ? nothing : integ.dt, integ.opts.dtmax,
+    )
+    h.ad_calls === nothing || (h.ad_calls[] = before)
+    u === integ.u || copyto!(integ.u, u)
+    return ok
+end
+
+function _initial_failure!(integ::PETScIntegrator)
+    code = SciMLBase.ReturnCode.InitialFailure
+    integ.finished ? (integ.sol = SciMLBase.solution_new_retcode(integ.sol, code)) :
+        _finish!(integ, code)
+    return nothing
+end
+
+function _reinitialize!(integ::PETScIntegrator, init, before)
+    ctx = integ.h.ctx
+    ctx.dae || ctx.M !== nothing || return nothing
+    init = something(init, _initializealg(integ))
+    # PETSc keeps a DAEProblem's derivative to itself, so a state left alone passes the check.
+    ctx.dae && init isa Union{SciMLBase.CheckInit, DiffEqBase.DefaultInit} &&
+        _everywhere(ctx.comm, integ.u == before) && return nothing
+    _initialize_state!(integ, init) || _initial_failure!(integ)
+    return nothing
+end
+
+function _initialize_dae_unlocked(integ::PETScIntegrator, init)
+    _initialize_state!(integ, init) || return _initial_failure!(integ)
+    integ.finished && return nothing
+    h = integ.h
+    PETScCompat.with_local_array!(
+        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
+    )
+    LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    return nothing
+end
+
+SciMLBase.initialize_dae!(integ::PETScIntegrator, init = _initializealg(integ)) =
+    _locked(() -> _initialize_dae_unlocked(integ, init))
+
 function _set_t_unlocked(integ::PETScIntegrator, t)
     integ.t = oftype(integ.t, t)
     _end_step_here!(integ)
@@ -4567,11 +4620,15 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     pre = ctx.save_everystep && !saved && !best_cb.save_positions[1] ? copy(integ.u) : nothing
     integ.derivative_discontinuity = true
     _pin_step!(integ)
+    before = ctx.dae ? copy(integ.u) : nothing
     stop = _affect!(integ) do
         _checked_everywhere(() -> _fire!(integ, best_cb, best_crossing), ctx.comm)
     end
     integ.finished && return true
     stop === nothing || (_stop!(integ, best_cb, stop, pre); return true)
+    _anywhere(ctx.comm, integ.derivative_discontinuity) &&
+        _reinitialize!(integ, best_cb.initializealg, before)
+    integ.finished && return true
     _rollback!(integ, integ.t, dt, false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
     best_cb.save_positions[2] && _save_here!(integ)
@@ -4588,10 +4645,13 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
         saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
+        before = ctx.dae ? copy(integ.u) : nothing
         stop = _affect!(() -> _checked_everywhere(() -> cb.affect!(integ), ctx.comm), integ)
         integ.finished && return nothing
         stop === nothing || (_stop!(integ, cb, stop, nothing); return nothing)
         if _anywhere(ctx.comm, integ.derivative_discontinuity)
+            _reinitialize!(integ, cb.initializealg, before)
+            integ.finished && return nothing
             PETScCompat.with_local_array!(
                 ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
             )
@@ -4607,12 +4667,17 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     h = integ.h
     cbs = (integ.callbacks..., integ.continuous...)
     before = copy(integ.u)
+    modified = false
     _checked_everywhere(h.ctx.comm) do
         for cb in cbs
+            integ.derivative_discontinuity = false
             cb.initialize(cb, integ.u, integ.t, integ)
+            modified |= integ.derivative_discontinuity
         end
     end
     integ.derivative_discontinuity = false
+    _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, before)
+    integ.finished && return nothing
     _everywhere(h.ctx.comm, integ.u == before) && return nothing
     copyto!(integ.uprev, integ.u)
     PETScCompat.with_local_array!(
@@ -4730,6 +4795,7 @@ _times(R, ts) = ts isa Number ? [R(ts)] : collect(R, ts)
 
 # d_discontinuities are right-continuous, so the next step starts an ulp past one.
 function _past_discontinuity!(integ::PETScIntegrator)
+    integ.finished && return nothing
     integ.t in integ.d_discontinuities || return nothing
     h = integ.h
     s = nextfloat(integ.tdir * integ.t)
