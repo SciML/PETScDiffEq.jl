@@ -4771,6 +4771,9 @@ function _reinit_unlocked(
     )
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
     reinit_dae || (setup_kwargs = merge(setup_kwargs, (initializealg = SciMLBase.NoInit(),)))
+    if !erase_sol && !old.ctx.dense && old.ctx.save_idxs !== nothing && !isempty(old.ctx.ts)
+        setup_kwargs = merge(setup_kwargs, (dense = false,))
+    end
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
     try
         LibPETSc.TSSetUp(h.petsclib, h.ts)
