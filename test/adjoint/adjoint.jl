@@ -23,7 +23,20 @@ function paramjac!(pJ, u, p, t)
     return nothing
 end
 dg!(out, u, p, t, i) = (out .= u; nothing)
+g(u, p, t) = sum(abs2, u) / 2 + p[2] * u[1] * u[2] + p[1]^2 * t
+function gu!(out, u, p, t)
+    out[1] = u[1] + p[2] * u[2]
+    out[2] = u[2] + p[2] * u[1]
+    return nothing
+end
+function gp!(out, u, p, t)
+    fill!(out, 0.0)
+    out[1] = 2 * p[1] * t
+    out[2] = u[1] * u[2]
+    return nothing
+end
 relerr(a, b) = norm(a - b) / norm(b)
+flat(r) = vcat(r[1], vec(r[2]))
 
 const U0 = [1.0, 0.5]
 const P0 = [0.7, 0.3, 0.4, 0.2]
@@ -85,21 +98,68 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
         end
     end
 
+    @testset "integral costs agree with QuadratureAdjoint and InterpolatingAdjoint" begin
+        tight = (abstol = 1.0e-13, reltol = 1.0e-13)
+        dense = solve(prob, Tsit5(); tight...)
+        references = map((QuadratureAdjoint(), InterpolatingAdjoint())) do sensealg
+            flat(
+                adjoint_sensitivities(
+                    dense, Tsit5(); sensealg, g, dgdu_continuous = gu!, dgdp_continuous = gp!,
+                    tight...,
+                ),
+            )
+        end
+        @test relerr(references[1], references[2]) < 1.0e-12
+        for (alg, bound, lo, hi) in (
+                (TSRK("4"), 2.0e-10, 13.0, 19.0),
+                (TSImplicit("beuler", EXACT), 2.0e-2, 1.9, 2.1),
+                (TSImplicit("cn", EXACT), 1.0e-4, 3.8, 4.2),
+            )
+            gaps = map((0.01, 0.005)) do dt
+                sol = solve(prob, alg; dt, adaptive = false)
+                mine = flat(
+                    adjoint_sensitivities(
+                        sol, alg; sensealg = PETScAdjoint(), g, dgdu_continuous = gu!,
+                        dgdp_continuous = gp!, dt, adaptive = false,
+                    ),
+                )
+                maximum(r -> relerr(mine, r), references)
+            end
+            @test gaps[1] < bound
+            @test lo < gaps[1] / gaps[2] < hi
+        end
+        sol = solve(prob, TSRK("4"); dt = 0.01, adaptive = false)
+        via = adjoint_sensitivities(
+            sol, TSRK("4"); sensealg = PETScAdjoint(), g, dt = 0.01, adaptive = false,
+        )
+        @test via == PETScDiffEq._discrete_adjoint(
+            prob, TSRK("4"), PETScAdjoint(); g, dt = 0.01, adaptive = false,
+        )
+        differentiated = adjoint_sensitivities(
+            dense, Tsit5(); sensealg = InterpolatingAdjoint(), g, tight...,
+        )
+        @test relerr(flat(via), flat(differentiated)) < 2.0e-10
+        mixed = adjoint_sensitivities(
+            dense, Tsit5(); sensealg = QuadratureAdjoint(), t = TS, dgdu_discrete = dg!,
+            dgdu_continuous = gu!, dgdp_continuous = gp!, tight...,
+        )
+        both = adjoint_sensitivities(
+            sol, TSRK("4"); sensealg = PETScAdjoint(), t = TS, dgdu_discrete = dg!, g,
+            dt = 0.01, adaptive = false,
+        )
+        @test relerr(flat(both), flat(mixed)) < 2.0e-10
+    end
+
     @testset "what it refuses" begin
         sol = solve(prob, TSRK("4"); dt = 0.01, adaptive = false, saveat = TS)
         tsit = solve(prob, Tsit5(); saveat = TS)
         @test_throws "ArgumentError: PETScAdjoint runs PETSc's own adjoint" adjoint_sensitivities(
             tsit, Tsit5(); sensealg = PETScAdjoint(), t = TS, dgdu_discrete = dg!,
         )
-        for cost in (
-                (g = (u, p, t) -> sum(u),),
-                (dgdu_continuous = (out, u, p, t) -> (out .= 1),),
-                (t = TS, dgdu_discrete = dg!, dgdp_continuous = (out, u, p, t) -> (out .= 0)),
-            )
-            @test_throws "ArgumentError: PETScAdjoint supports discrete costs only" adjoint_sensitivities(
-                sol, TSRK("4"); sensealg = PETScAdjoint(), dt = 0.01, adaptive = false, cost...,
-            )
-        end
+        @test_throws "ArgumentError: `dgdp_continuous` was given without `g` or `dgdu_continuous`" adjoint_sensitivities(
+            sol, TSRK("4"); sensealg = PETScAdjoint(), dt = 0.01, adaptive = false,
+            t = TS, dgdu_discrete = dg!, dgdp_continuous = gp!,
+        )
         @test_throws "ArgumentError: PETScAdjoint is reached through" Zygote.gradient(
             p -> sum(
                 Array(

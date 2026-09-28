@@ -259,6 +259,10 @@ const METHODS = (
             () -> gradient(heat_with(jac_prototype = nothing), rk, times, rows),
             "sparse `jac_prototype`",
         )
+        @test refused(
+            () -> gradient(heat_with(), rk, times, rows; g = (u, p, t) -> sum(abs2, u)),
+            "integral cost on MPI.COMM_SELF only",
+        )
         wrong = rank == thrower ? [heat_proto(rows); spzeros(1, N)] : heat_proto(rows)
         e = caught(() -> gradient(heat_with(jac_prototype = wrong), rk, times, rows))
         @test rank == thrower ? e isa ArgumentError && occursin("must be", e.msg) : remote(e)

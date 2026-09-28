@@ -9,15 +9,10 @@ function SciMLSensitivity._adjoint_sensitivities(
         dgdu_continuous = nothing, dgdp_continuous = nothing, g = nothing,
         no_start = false, callback = nothing, kwargs...,
     )
-    (g === nothing && dgdu_continuous === nothing && dgdp_continuous === nothing) || throw(
-        ArgumentError(
-            "PETScAdjoint supports discrete costs only, `t` with `dgdu_discrete`; an " *
-                "integral cost needs PETSc's quadrature, which this package does not drive",
-        ),
-    )
     return PETScDiffEq._discrete_adjoint(
         sol.prob, alg, sensealg;
-        t, dgdu_discrete, dgdp_discrete, no_start, callback, kwargs...,
+        t, dgdu_discrete, dgdp_discrete, dgdu_continuous, dgdp_continuous, g, no_start,
+        callback, kwargs...,
     )
 end
 

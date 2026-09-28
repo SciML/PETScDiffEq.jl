@@ -364,6 +364,44 @@ function _ad_paramjacobian(backend, f!, u0, p, t, advice)
     return ADParamJacobian(f!, b, prep, du, advice)
 end
 
+struct ADCostGradient{G, B, P, W}
+    g::G
+    backend::B
+    prep::P
+    wrt::W
+end
+
+_g_of_u(u, g, p, t) = g(u, p, t)
+_g_of_p(p, g, u, t) = g(u, p, t)
+
+function (c::ADCostGradient)(out, u, p, t)
+    x, other = c.wrt === _g_of_u ? (u, p) : (p, u)
+    try
+        DI.gradient!(
+            c.wrt, out, c.prep, c.backend, x, DI.Constant(c.g), DI.Constant(other),
+            DI.Constant(t),
+        )
+    catch e
+        _dual_failure(e) && throw(_dual_error(e, c.backend, _ADJOINT_COST_ADVICE))
+        rethrow()
+    end
+    all(isfinite, out) || !isfinite(c.g(u, p, t)) || throw(
+        ArgumentError(
+            "the derivative of the integral cost `g` from automatic differentiation has a " *
+                "non-finite entry at t = $t where `g` itself is finite, as the derivative " *
+                "of `sqrt` or `norm` at zero is. " * _ADJOINT_COST_ADVICE,
+        ),
+    )
+    return nothing
+end
+
+function _ad_cost_gradient(backend, g, u0, p, t, wrt)
+    x, other = wrt === _g_of_u ? (copy(u0), p) : (p, copy(u0))
+    b = _param_backend(ADTypes.dense_ad(backend), length(x))
+    prep = DI.prepare_gradient(wrt, b, x, DI.Constant(g), DI.Constant(other), DI.Constant(t))
+    return ADCostGradient(g, b, prep, wrt)
+end
+
 _has_dual(x) = _is_dual(x) || (x isa Type && _is_dual_type(x)) ||
     (x isa AbstractArray && _is_dual_type(eltype(x)))
 _is_dual(x) = x isa Union{ForwardDiff.Dual, Complex{<:ForwardDiff.Dual}}
@@ -403,3 +441,5 @@ const _ADJOINT_JAC_ADVICE = "PETScAdjoint has no finite-difference fallback, so 
     "ODEFunction a `jac`"
 const _ADJOINT_PARAMJAC_ADVICE = "PETScAdjoint has no finite-difference fallback, so give " *
     "the ODEFunction a `paramjac`"
+const _ADJOINT_COST_ADVICE = "PETScAdjoint has no finite-difference fallback, so give " *
+    "`dgdu_continuous` and `dgdp_continuous`"

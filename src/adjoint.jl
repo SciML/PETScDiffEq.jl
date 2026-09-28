@@ -40,13 +40,26 @@ The adjoint runs in PETSc's double real build. A `Float32` problem is solved the
 the steps at single precision, so the times its own `solve` saved are accepted with `dt`
 repeated as that `solve` was given it. A complex state is refused.
 
-Costs are discrete: at each `t[i]`, `dgdu_discrete(out, u, p, t, i)` writes the cost's
-derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`, if given, its
-direct derivative with respect to `p`; `no_start = true` leaves out `t[1]`. PETSc's
-adjoint has no derivative of interpolation, so with fixed steps every cost time must be a
-time the solve steps to, such as `tspan[1]` plus a multiple of `dt`. An adaptive solve
+Costs are discrete, integral or both. At each `t[i]`, `dgdu_discrete(out, u, p, t, i)`
+writes the cost's derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`,
+if given, its direct derivative with respect to `p`; `no_start = true` leaves out `t[1]`.
+PETSc's adjoint has no derivative of interpolation, so with fixed steps every cost time must
+be a time the solve steps to, such as `tspan[1]` plus a multiple of `dt`. An adaptive solve
 lands only on the ends of `tspan`, so its costs are limited to those, and its gradient
 treats the accepted step sizes as constants rather than differentiating the controller.
+
+An integral cost, the integral of `g(u, p, t)` from `tspan[1]` to `tspan[2]`, is given as
+`g` or as its derivatives `dgdu_continuous(out, u, p, t)` and `dgdp_continuous(out, u, p, t)`.
+PETSc sums it with the method's own quadrature, through a quadrature `TS` whose right-hand
+side Jacobians are the derivatives of `g`, so the gradient is that of the sum of
+`dt * b[i] * g` over the stages of a `TSRK`, of `dt * g` at the end of each backward Euler
+step, and of the trapezoidal sum for Crank-Nicolson. Where `dgdu_continuous` is left out,
+`g` is differentiated with respect to `u` and `p` as a missing `jac` is, with ForwardDiff
+or the algorithm's `autodiff`; where it is given and `dgdp_continuous` is not, the direct
+derivative with respect to `p` is taken as zero, as SciMLSensitivity's adjoints take it.
+Under `AutoFiniteDiff()` the derivatives have to be given. Given together with discrete
+terms, the two gradients are added. An integral cost is refused on a communicator other
+than `MPI.COMM_SELF`.
 
 `petsc_options` apply to this adjoint's own run and are parsed after the algorithm's. The
 trajectory is kept in memory, every stage of every step; `-ts_trajectory_solution_only 1`
@@ -71,8 +84,8 @@ is the whole gradient on every rank. The cost times, `no_start`, the length of `
 `dgdp_discrete` is given must agree across the ranks.
 
 Returns `(du0, dp')`, where `dp` is `nothing` when `p` is `nothing` or
-`SciMLBase.NullParameters()`. Integral costs, and differentiating `solve` itself with a
-reverse-mode AD package, are not supported.
+`SciMLBase.NullParameters()`. Differentiating `solve` itself with a reverse-mode AD package
+is not supported.
 """
 struct PETScAdjoint <: SciMLBase.AbstractAdjointSensitivityAlgorithm{0, false, Val{:central}}
     petsc_options::Vector{String}
@@ -306,7 +319,98 @@ end
 
 const ADJ_JUMP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
+mutable struct IntegralContext{T, P, DGU, DGP}
+    petsclib::T
+    tdir::Float64
+    p::P
+    dgdu!::DGU
+    dgdp!::DGP
+    u::Vector{Float64}
+    gu::Vector{Float64}
+    gp::Vector{Float64}
+    gu_col::Matrix{Float64}
+    gp_col::Matrix{Float64}
+    gu_mat::Any
+    gp_mat::Any
+    err::Any
+end
+
+# Only the integral's gradient is returned, so the integrand PETSc sums can be zero.
+function _integral_rhs!(
+        ::LibPETSc.CTS,
+        ::Float64,
+        ::LibPETSc.CVec,
+        f_ptr::LibPETSc.CVec,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    q = unsafe_pointer_to_objref(ctx_ptr)::IntegralContext
+    return ccall(
+        _symbol(q.petsclib, :VecZeroEntries), LibPETSc.PetscErrorCode, (LibPETSc.CVec,), f_ptr,
+    )
+end
+
+function _integral_rhsjacobian!(
+        ::LibPETSc.CTS,
+        s::Float64,
+        x_ptr::LibPETSc.CVec,
+        A_ptr::LibPETSc.CMat,
+        ::LibPETSc.CMat,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    q = unsafe_pointer_to_objref(ctx_ptr)::IntegralContext
+    return _integral_body!(q, s, x_ptr, A_ptr, q.dgdu!, q.gu)
+end
+
+function _integral_rhsjacobianp!(
+        ::LibPETSc.CTS,
+        s::Float64,
+        x_ptr::LibPETSc.CVec,
+        A_ptr::LibPETSc.CMat,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    q = unsafe_pointer_to_objref(ctx_ptr)::IntegralContext
+    return _integral_body!(q, s, x_ptr, A_ptr, q.dgdp!, q.gp)
+end
+
+# The integral is oriented from tspan[1] to tspan[2], so a reversed span flips its sign.
+function _integral_body!(q, s, x_ptr, A_ptr, dg!, out)
+    pl = q.petsclib
+    try
+        _readvec!(q.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        fill!(out, 0.0)
+        dg! === nothing || dg!(out, q.u, q.p, _user_t(q.tdir, s))
+        LinearAlgebra.rmul!(out, q.tdir)
+        PETSc.assemble!(LibPETSc.PetscMat(A_ptr, pl))
+    catch e
+        q.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+const INTEGRAL_RHS_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+const INTEGRAL_RHSJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+const INTEGRAL_RHSJACOBIANP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
 function _init_adjoint_pointers!()
+    INTEGRAL_RHS_PTR[] = @cfunction(
+        _integral_rhs!,
+        LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Float64, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+    )
+    INTEGRAL_RHSJACOBIAN_PTR[] = @cfunction(
+        _integral_rhsjacobian!,
+        LibPETSc.PetscErrorCode,
+        (
+            LibPETSc.CTS, Float64, LibPETSc.CVec, LibPETSc.CMat,
+            LibPETSc.CMat, Ptr{Cvoid},
+        )
+    )
+    INTEGRAL_RHSJACOBIANP_PTR[] = @cfunction(
+        _integral_rhsjacobianp!,
+        LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Float64, LibPETSc.CVec, LibPETSc.CMat, Ptr{Cvoid})
+    )
     ADJ_RHSJACOBIAN_PTR[] = @cfunction(
         _adjoint_rhsjacobian!,
         LibPETSc.PetscErrorCode,
@@ -430,7 +534,10 @@ function _adjoint_solve_kwargs(prob, kwargs)
     return Base.structdiff(merged, NamedTuple{dropped})
 end
 
-function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, comm)
+function _check_adjoint_problem(
+        prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, g, dgdu_continuous,
+        dgdp_continuous, comm,
+    )
     prob.f isa SciMLBase.DynamicalODEFunction && throw(
         ArgumentError(
             "PETScAdjoint does not support a DynamicalODEProblem or SecondOrderODEProblem",
@@ -502,18 +609,48 @@ function _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_disc
                 "number of times on each rank",
         ),
     )
-    !has_p && dgdp_discrete !== nothing && throw(
+    for (name, given) in (("dgdp_discrete", dgdp_discrete), ("dgdp_continuous", dgdp_continuous))
+        !has_p && given !== nothing && throw(
+            ArgumentError(
+                "`$name` was given, but the problem has no parameters to " *
+                    "differentiate with respect to; leave it out",
+            ),
+        )
+    end
+    discrete = !_unset(t) && dgdu_discrete !== nothing
+    integral = g !== nothing || dgdu_continuous !== nothing
+    discrete || integral || throw(
         ArgumentError(
-            "`dgdp_discrete` was given, but the problem has no parameters to " *
-                "differentiate with respect to; leave it out",
+            "PETScAdjoint needs cost times `t` with `dgdu_discrete(out, u, p, t, i)`, an " *
+                "integral cost as `g(u, p, t)` or `dgdu_continuous(out, u, p, t)`, or both",
         ),
     )
-    (_unset(t) || dgdu_discrete === nothing) && throw(
+    discrete || (_unset(t) && dgdu_discrete === nothing) || throw(
         ArgumentError(
-            "PETScAdjoint needs cost times `t` and `dgdu_discrete(out, u, p, t, i)`; " *
-                "integral costs are not supported",
+            "PETScAdjoint needs cost times `t` and `dgdu_discrete(out, u, p, t, i)` " *
+                "together; one was given without the other",
         ),
     )
+    integral || dgdp_continuous === nothing || throw(
+        ArgumentError(
+            "`dgdp_continuous` was given without `g` or `dgdu_continuous`; an integral " *
+                "cost needs its derivative with respect to the state, so give one of those",
+        ),
+    )
+    integral && comm !== nothing && throw(
+        ArgumentError(
+            "PETScAdjoint supports an integral cost on MPI.COMM_SELF only; $_NOT_SELF " *
+                "give discrete costs, `t` with `dgdu_discrete`",
+        ),
+    )
+    integral && differences && dgdu_continuous === nothing && throw(
+        ArgumentError(
+            "PETScAdjoint needs `dgdu_continuous` under `autodiff = AutoFiniteDiff()`, " *
+                "and `dgdp_continuous` when the problem has parameters: it has no " *
+                "finite-difference fallback for the integral cost `g`",
+        ),
+    )
+    discrete || return has_p
     t isa AbstractVector{<:Real} || throw(
         ArgumentError(
             "PETScAdjoint needs the cost times `t` as a vector of real numbers; got $(typeof(t))",
@@ -574,8 +711,11 @@ function _check_adjoint_ts(h::TSHandles, alg, cost_s)
     return implicit
 end
 
-_throw_callback_error(ctx, adj, comm = nothing) =
-    _throw_anywhere(comm, ctx.err === nothing ? adj.err : ctx.err)
+_throw_callback_error(ctx, adj, comm = nothing, q = nothing) = _throw_anywhere(
+    comm,
+    ctx.err !== nothing ? ctx.err : adj.err !== nothing ? adj.err :
+        q === nothing ? nothing : q.err,
+)
 
 function _check_agreement(comm, args)
     _everywhere(comm, MPI.bcast(args, 0, comm) == args) && return nothing
@@ -602,24 +742,76 @@ function _destroy_adjoint!(adj::AdjointContext)
     return nothing
 end
 
+# The quadrature TS itself is freed by TSDestroy of the TS it belongs to.
+function _destroy_integral!(q::IntegralContext)
+    (PETScCompat.isfinalized(q.petsclib) || MPI.Finalized()) && return nothing
+    for obj in (q.gu_mat, q.gp_mat)
+        obj === nothing || PETScCompat.destroy!(obj)
+    end
+    return nothing
+end
+
+function _quadrature_ts(pl, ts)
+    quad = Ref{LibPETSc.CTS}(C_NULL)
+    code = ccall(
+        _symbol(pl, :TSCreateQuadratureTS), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, LibPETSc.PetscBool, Ptr{LibPETSc.CTS}), ts, LibPETSc.PETSC_FALSE, quad,
+    )
+    _check_code(code, "TSCreateQuadratureTS")
+    return quad[]
+end
+
+function _set_integral!(q::IntegralContext, ts, np)
+    pl = q.petsclib
+    qptr = pointer_from_objref(q)
+    quad = _quadrature_ts(pl, ts)
+    code = ccall(
+        _symbol(pl, :TSSetRHSFunction), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, LibPETSc.CVec, Ptr{Cvoid}, Ptr{Cvoid}),
+        quad, C_NULL, INTEGRAL_RHS_PTR[], qptr,
+    )
+    _check_code(code, "TSSetRHSFunction")
+    q.gu_mat = PETScCompat.PetscMat(pl, q.gu_col)
+    code = ccall(
+        _symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
+        quad, q.gu_mat.ptr, q.gu_mat.ptr, INTEGRAL_RHSJACOBIAN_PTR[], qptr,
+    )
+    _check_code(code, "TSSetRHSJacobian")
+    np == 0 && return nothing
+    # PETSc's RK adjoint reads this matrix whenever mu is asked for, zero or not.
+    q.gp_mat = PETScCompat.PetscMat(pl, q.gp_col)
+    code = ccall(
+        _symbol(pl, :TSSetRHSJacobianP), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
+        quad, q.gp_mat.ptr, INTEGRAL_RHSJACOBIANP_PTR[], qptr,
+    )
+    _check_code(code, "TSSetRHSJacobianP")
+    return nothing
+end
+
 const _ADJOINT_TRAJECTORY = ["-ts_save_trajectory", "1", "-ts_trajectory_type", "memory"]
 
 function _discrete_adjoint_unlocked(
         prob, alg::AnyPETScTS, sensealg::PETScAdjoint;
         t = nothing, dgdu_discrete = nothing, dgdp_discrete = nothing, no_start = false,
-        kwargs...,
+        g = nothing, dgdu_continuous = nothing, dgdp_continuous = nothing, kwargs...,
     )
     _alg_dm(alg) === nothing ||
         throw(ArgumentError("PETScAdjoint does not support a solve $_WITH_DM yet"))
     comm = _distributed(alg) ? alg.comm : nothing
     solve_kwargs, has_p, skip_start = _checked_everywhere(comm) do
         given = _adjoint_solve_kwargs(prob, kwargs)
-        checked = _check_adjoint_problem(prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, comm)
+        checked = _check_adjoint_problem(
+            prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, g, dgdu_continuous,
+            dgdp_continuous, comm,
+        )
         given, checked, Bool(no_start)
     end
     p = prob.p
     np = has_p ? length(p) : 0
-    cost_t = collect(Float64, t)
+    cost_t = _unset(t) ? Float64[] : collect(Float64, t)
+    integral = g !== nothing || dgdu_continuous !== nothing
     comm === nothing ||
         _check_agreement(comm, (cost_t, skip_start, np, dgdp_discrete === nothing))
 
@@ -632,7 +824,7 @@ function _discrete_adjoint_unlocked(
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
     n = length(h.u0)
     N = comm === nothing ? n : MPI.Allreduce(n, +, comm)
-    adj = nothing
+    adj, q = nothing, nothing
     local du0, dp
     try
         cost_s = h.tdir .* cost_t
@@ -673,8 +865,21 @@ function _discrete_adjoint_unlocked(
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
             coo, comm,
         )
+        if integral
+            gu, gp = zeros(n), zeros(np)
+            q = IntegralContext(
+                pl, h.tdir, p,
+                dgdu_continuous === nothing ?
+                    _ad_cost_gradient(backend, g, h.u0, p, user_t0, _g_of_u) : dgdu_continuous,
+                np > 0 && dgdu_continuous === nothing && dgdp_continuous === nothing ?
+                    _ad_cost_gradient(backend, g, h.u0, p, user_t0, _g_of_p) : dgdp_continuous,
+                zeros(n), gu, gp, reshape(gu, n, 1), reshape(gp, np, 1), nothing, nothing,
+                nothing,
+            )
+        end
         adjptr = pointer_from_objref(adj)
-        GC.@preserve ctx adj begin
+        GC.@preserve ctx adj q begin
+            integral && _set_integral!(q, ts, np)
             if !implicit && comm !== nothing
                 adj.jac_mat = LibPETSc.MatCreate(pl, comm)
                 _coo_matrix!(adj.jac_mat, pl, n, N, coo_rows, coo_cols)
@@ -798,9 +1003,10 @@ function _discrete_adjoint_unlocked(
                     LibPETSc.TSAdjointSolve(pl, ts)
                 end
             catch
-                ctx.err === nothing && adj.err === nothing && rethrow()
+                ctx.err === nothing && adj.err === nothing &&
+                    (q === nothing || q.err === nothing) && rethrow()
             end
-            _throw_callback_error(ctx, adj, comm)
+            _throw_callback_error(ctx, adj, comm, q)
             reason = LibPETSc.TSGetConvergedReason(pl, ts)
             reason == LibPETSc.TS_CONVERGED_ITS || throw(
                 ArgumentError(
@@ -817,6 +1023,7 @@ function _discrete_adjoint_unlocked(
     finally
         _destroy!(h)
         adj === nothing || _destroy_adjoint!(adj)
+        q === nothing || _destroy_integral!(q)
     end
     if dgdp_discrete !== nothing
         gp = zeros(np)

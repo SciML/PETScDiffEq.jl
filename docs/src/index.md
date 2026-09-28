@@ -345,6 +345,23 @@ has no derivative of interpolation. An adaptive solve can take costs only at the
 `tspan`, and its gradient holds the accepted step sizes fixed rather than differentiating
 the step-size controller.
 
+An integral cost, the integral of `g(u, p, t)` over `tspan`, goes through PETSc's
+quadrature `TS`, which sums it with the method's own stages: `dt * b[i] * g` at each stage
+of a `TSRK`, `dt * g` at the end of each backward Euler step and the trapezoidal sum for
+Crank-Nicolson. Its gradient is exact for that sum and differs from `QuadratureAdjoint`'s
+or `InterpolatingAdjoint`'s by the discretization error, again shrinking at the method's
+order. Give `g`, whose derivatives are then taken with ForwardDiff or the algorithm's
+`autodiff`, or `dgdu_continuous(out, u, p, t)` with `dgdp_continuous(out, u, p, t)`; with
+`dgdu_continuous` alone the direct dependence on `p` is taken as zero, as SciMLSensitivity
+takes it. Discrete and integral costs can be given together, and the gradients add:
+
+```julia
+g(u, p, t) = sum(abs2, u) / 2 + p[2] * u[1] * u[2]
+du0, dp = adjoint_sensitivities(
+    sol, TSRK("4"); sensealg = PETScAdjoint(), g, dt = 0.01, adaptive = false,
+)
+```
+
 `TSImplicit` solves transposed linear systems with the Krylov solver its Newton steps use,
 by default GMRES with ILU(0) stopping at a relative residual of 1e-5, so the gradient can be
 off by up to about that tolerance while the forward states are far more accurate. With
@@ -357,8 +374,8 @@ solve. A 1-D heat equation with 50 unknowns gave the same gradient as a direct s
 difference in every case. For a problem too large to factor, tighten `-ksp_rtol` instead;
 `1e-10` brought the two larger grids to 1e-11 and 5e-11.
 
-Callbacks, `tstops`, integral costs, mass matrices, `DAEProblem` and `SplitODEProblem` are
-refused, and so is differentiating `solve` with a reverse-mode AD package. Passing
+Callbacks, `tstops`, mass matrices, `DAEProblem` and `SplitODEProblem` are refused, and so
+is differentiating `solve` with a reverse-mode AD package. Passing
 `sensealg = PETScAdjoint()` to `solve` itself does nothing.
 
 `jac` and `paramjac` go into the gradient unchecked, so a wrong entry gives a wrong

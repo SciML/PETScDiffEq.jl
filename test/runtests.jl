@@ -7507,6 +7507,121 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 4.0e-10
         end
 
+        function quadrature(θ, alg, tspan, cost; dt = 0.01, kwargs...)
+            aug!(dz, z, p, t) = (
+                adj_f!(view(dz, 1:2), view(z, 1:2), p, t); dz[3] = cost(view(z, 1:2), p, t); nothing
+            )
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(aug!, vcat(θ[1:2], 0.0), tspan, θ[3:6]), alg;
+                dt, adaptive = false, kwargs...,
+            )
+            return sol.u[end][3]
+        end
+        integrand_du!(out, u, p, t) = coupled_du!(out, u, p, t, 0)
+        integrand_dp!(out, u, p, t) = coupled_dp!(out, u, p, t, 0)
+        integral(prob, alg; kwargs...) =
+            grad(prob, alg; t = nothing, dgdu_discrete = nothing, kwargs...)
+
+        @testset "an integral cost matches finite differences of the same fixed-step quadrature: $name" for (
+                name, alg, tspan, opts,
+            ) in (
+                ("RK4", TSRK("4"), (0.0, 1.0), (;)),
+                ("RK4 backward in time", TSRK("4"), (1.0, 0.0), (;)),
+                ("5dp at a fixed step", TSRK("5dp"), (0.0, 1.0), (;)),
+                ("backward Euler", TSImplicit("beuler", exact), (0.0, 1.0), (;)),
+                (
+                    "backward Euler backward in time", TSImplicit("beuler", exact), (1.0, 0.0),
+                    (;),
+                ),
+                (
+                    "backward Euler with PETSc's differences",
+                    TSImplicit("beuler", exact; autodiff = PETScDiffEq.AutoFiniteDiff()),
+                    (0.0, 1.0), (;),
+                ),
+                ("Crank-Nicolson", TSImplicit("cn", exact), (0.0, 1.0), (;)),
+                (
+                    "Crank-Nicolson backward in time", TSImplicit("cn", exact), (1.0, 0.0),
+                    (;),
+                ),
+                ("out of place", TSRK("4"), (0.0, 1.0), (oop = true,)),
+                (
+                    "a trajectory of states only", TSRK("4"), (0.0, 1.0),
+                    (sensealg = ["-ts_trajectory_solution_only", "1"],),
+                ),
+                ("g differentiated for both", TSImplicit("cn", exact), (0.0, 1.0), (ad = true,)),
+                ("dgdu_continuous alone takes dgdp as zero", TSRK("4"), (0.0, 1.0), (frozen = true,)),
+                ("with discrete costs", TSRK("4"), (0.0, 1.0), (discrete = true,)),
+                (
+                    "with discrete costs, Crank-Nicolson backward in time",
+                    TSImplicit("cn", exact), (1.0, 0.0), (discrete = true,),
+                ),
+            )
+            prob = adj_prob(copy(u0), copy(p0), tspan; oop = get(opts, :oop, false))
+            ts = tspan[1] < tspan[2] ? forward_t : backward_t
+            frozen = get(opts, :frozen, false)
+            discrete = get(opts, :discrete, false)
+            costs = get(opts, :ad, false) ? (g = coupled,) :
+                frozen ? (dgdu_continuous = integrand_du!,) :
+                (g = coupled, dgdu_continuous = integrand_du!, dgdp_continuous = integrand_dp!)
+            du0, dp = grad(
+                prob, alg; t = discrete ? ts : nothing,
+                dgdu_discrete = discrete ? half_norm_du! : nothing,
+                sensealg = PETScAdjoint(petsc_options = get(opts, :sensealg, String[])),
+                costs...,
+            )
+            cost = frozen ? (u, p, t) -> coupled(u, p0, t) : coupled
+            function loss(θ)
+                summed = quadrature(θ, alg, tspan, cost)
+                discrete || return summed
+                sol = SciMLBase.solve(
+                    adj_prob(θ[1:2], θ[3:6], tspan), alg; dt = 0.01, adaptive = false, saveat = ts,
+                )
+                return summed + sum(half_norm(v, nothing, 0.0) for v in sol.u)
+            end
+            @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-9
+        end
+
+        @testset "g is differentiated where its derivatives are not given" begin
+            for alg in (TSRK("4"), TSImplicit("beuler", exact), TSImplicit("cn", exact))
+                prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+                given = integral(
+                    prob, alg; g = coupled, dgdu_continuous = integrand_du!,
+                    dgdp_continuous = integrand_dp!,
+                )
+                only_g = integral(prob, alg; g = coupled)
+                plain = integral(
+                    SciMLBase.ODEProblem(adj_f!, copy(u0), (0.0, 1.0), copy(p0)), alg; g = coupled,
+                )
+                for r in (only_g, plain)
+                    @test r[1] ≈ given[1] rtol = 1.0e-12
+                    @test r[2] ≈ given[2] rtol = 1.0e-12
+                end
+            end
+        end
+
+        @testset "discrete and integral costs add" begin
+            prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+            discrete = grad(prob, TSRK("4"))
+            summed = integral(prob, TSRK("4"); g = coupled)
+            both = grad(prob, TSRK("4"); g = coupled)
+            @test both[1] ≈ discrete[1] + summed[1] rtol = 1.0e-13
+            @test both[2] ≈ discrete[2] + summed[2] rtol = 1.0e-13
+        end
+
+        @testset "an adaptive solve with an integral cost holds its accepted steps fixed" begin
+            prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+            tolerances = (abstol = 1.0e-8, reltol = 1.0e-8, dt = 0.01)
+            du0, dp = PETScDiffEq._discrete_adjoint(
+                prob, TSRK("5dp"), PETScAdjoint(); g = coupled, tolerances...,
+            )
+            steps = SciMLBase.solve(prob, TSRK("5dp"); tolerances...).t
+            loss(θ) = quadrature(
+                θ, TSRK("5dp"), (0.0, 1.0), coupled; dt = 1.0, tstops = steps[2:(end - 1)],
+            )
+            @test length(steps) > 3
+            @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-10
+        end
+
         @testset "inputs are left alone and a repeated call gives the same numbers" begin
             alg = TSImplicit("cn", copy(exact))
             options = ["-ts_trajectory_solution_only", "1"]
@@ -7613,6 +7728,13 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test_throws KeyError(:paramjac) grad(with(paramjac = thrower(:paramjac)), alg)
             end
             @test_throws KeyError(:jac) grad(with(jac = thrower(:jac)), TSRK("4"))
+            for (key, cost) in (
+                    (:g, (g = thrower(:g),)),
+                    (:gu, (dgdu_continuous = thrower(:gu),)),
+                    (:gp, (dgdu_continuous = integrand_du!, dgdp_continuous = thrower(:gp))),
+                )
+                @test_throws KeyError(key) integral(prob, TSImplicit("cn", exact); cost...)
+            end
             @test grad(prob, TSRK("4")) == reference
             @test live() <= before
         end
@@ -7644,6 +7766,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     @test relerr(vec(single[2]), vec(double[2])) < 5.0e-7
                 end
             end
+            single = integral(adj_prob(u32, p32, (0.0f0, 1.0f0)), TSRK("4"); g = coupled, dt = 0.01f0)
+            double = integral(adj_prob(Float64.(u32), Float64.(p32), (0.0, 1.0)), TSRK("4"); g = coupled)
+            @test single[1] isa Vector{Float32}
+            @test eltype(single[2]) === Float32
+            @test relerr(single[1], double[1]) < 5.0e-7
+            @test relerr(vec(single[2]), vec(double[2])) < 5.0e-7
         end
 
         @testset "what it refuses, and why" begin
@@ -7819,6 +7947,33 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     (
                         "PETScAdjoint needs the cost times `t` as a vector of real numbers",
                         () -> grad(prob, TSRK("4"); t = 1.0),
+                    ),
+                    (
+                        "PETScAdjoint needs cost times `t` and `dgdu_discrete(out, u, p, t, i)` together",
+                        () -> grad(prob, TSRK("4"); dgdu_discrete = nothing, g = coupled),
+                    ),
+                    (
+                        "`dgdp_continuous` was given without `g` or `dgdu_continuous`",
+                        () -> grad(prob, TSRK("4"); dgdp_continuous = integrand_dp!),
+                    ),
+                    (
+                        "`dgdp_continuous` was given, but the problem has no parameters",
+                        () -> integral(
+                            solely_states, TSRK("4"); g = (u, p, t) -> sum(u),
+                            dgdp_continuous = integrand_dp!,
+                        ),
+                    ),
+                    (
+                        "PETScAdjoint needs `dgdu_continuous` under `autodiff = AutoFiniteDiff()`",
+                        () -> integral(
+                            prob, TSImplicit("beuler", exact; autodiff = PETScDiffEq.AutoFiniteDiff());
+                            g = coupled,
+                        ),
+                    ),
+                    (
+                        "the derivative of the integral cost `g` from automatic differentiation " *
+                            "has a non-finite entry",
+                        () -> integral(prob, TSRK("4"); g = (u, p, t) -> sqrt(abs(u[1] - 1))),
                     ),
                     (
                         "cost time 1.5 lies outside tspan = (0.0, 1.0)",
