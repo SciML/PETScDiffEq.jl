@@ -6187,8 +6187,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.step!(integ)
             SciMLBase.step!(integ)
             tq = integ.tprev + integ.dt / 4
-            @test integ(tq, Val{1}) isa Vector{Float32}
-            @test integ(tq; idxs = 1) isa Float32
+            if Float32 in PETScDiffEq._loaded_builds()
+                @test integ(tq, Val{1}) isa Vector{Float32}
+                @test integ(tq; idxs = 1) isa Float32
+            end
             @test abs(integ(tq, Val{1})[1] + exp(-tq)) < 3.0e-5
             SciMLBase.terminate!(integ)
 
