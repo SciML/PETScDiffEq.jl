@@ -1164,14 +1164,27 @@ _saved(ctx::TSContext{R, S, A}, u) where {R, S, A} = ctx.save_idxs === nothing ?
 _interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, dus) :
     SciMLBase.LinearInterpolation(ts, ctx.us)
 
-function _hermite!(out, ctx, s, s0, u0, s1, u1)
+function _hermite!(out, ctx, s, s0, u0, s1, u1, ::Type{Val{N}} = Val{0}) where {N}
     ctx.fstart === nothing && (ctx.fstart = _derivative(ctx, s0, u0))
     ctx.fend === nothing && (ctx.fend = _derivative(ctx, s1, u1))
     f0, f1 = ctx.fstart, ctx.fend
     dt = s1 - s0
     Θ = (s - s0) / dt
-    @. out = (1 - Θ) * u0 + Θ * u1 +
-        Θ * (Θ - 1) * ((1 - 2Θ) * (u1 - u0) + (Θ - 1) * dt * f0 + Θ * dt * f1)
+    tdir = ctx.tdir
+    if N == 0
+        @. out = (1 - Θ) * u0 + Θ * u1 +
+            Θ * (Θ - 1) * ((1 - 2Θ) * (u1 - u0) + (Θ - 1) * dt * f0 + Θ * dt * f1)
+    elseif s == s0
+        @. out = tdir * f0
+    elseif s == s1
+        @. out = tdir * f1
+    else
+        @. out = tdir * (
+            f0 + Θ * (
+                -4dt * f0 - 2dt * f1 - 6u0 + Θ * (3dt * f0 + 3dt * f1 + 6u0 - 6u1) + 6u1
+            ) / dt
+        )
+    end
     return out
 end
 
@@ -1180,6 +1193,16 @@ _no_interpolant(ctx) = ArgumentError(
         "gives no derivative to build one from, so it has no state between step ends for " *
         "saveat, a ContinuousCallback or integrator(t); use a type that interpolates, such " *
         "as BDF, or keep saveat times on step ends and pass `rootfind = NoRootFind`",
+)
+
+_no_slope(ctx) = ArgumentError(
+    "a mass matrix or a DAEProblem gives no derivative to build a Hermite interpolant " *
+        "from, so `$(ctx.alg_name)` has no slope for integrator(t, Val{1})",
+)
+
+_unsupported_deriv(deriv) = ArgumentError(
+    "PETScDiffEq's interpolant gives the state and its first derivative, Val{0} and " *
+        "Val{1}, but $deriv was asked for",
 )
 
 const PETSC_ERR_SUP = 56
@@ -3996,7 +4019,9 @@ Base.setproperty!(o::PETScIntegratorOpts, name::Symbol, v) =
 The integrator `SciMLBase.init` returns for a PETSc TS algorithm. Step it with
 `step!`, run it to the end with `solve!`, stop it early with `terminate!` and
 restart it with `reinit!`. Between steps `u`, `uprev`, `t`, `tprev` and `dt`
-are readable, and `add_tstop!` schedules a time to land on exactly.
+are readable, `integ(t)`, `integ(t, Val{1})`, `integ(t; idxs)` and `integ(out, t)` give the
+state or its slope inside the step just taken, and `add_tstop!` schedules a time to land on
+exactly.
 
 These are in the types PETSc steps in. The clock, and so `t`, `dt` and the saved times, is
 `Float32` for a `Float32` or `ComplexF32` state with a `Float32` span and `Float64`
@@ -4116,11 +4141,21 @@ _make_opts(h::TSHandles{<:Any, <:Any, R}, kwargs) where {R} = PETScIntegratorOpt
 SciMLBase.isadaptive(integ::PETScIntegrator) =
     getfield(integ.opts, :adaptive) && _adapts(integ.alg) !== false
 
-(integ::PETScIntegrator)(t::Number) = copy(_checked_state(integ, t))
-(integ::PETScIntegrator)(t::Number, ::Type{Val{0}}) = copy(_checked_state(integ, t))
-(integ::PETScIntegrator)(out::AbstractArray, t) = copyto!(out, _checked_state(integ, t))
-(integ::PETScIntegrator)(out::AbstractArray, t, ::Type{Val{0}}) =
-    copyto!(out, _checked_state(integ, t))
+function (integ::PETScIntegrator)(t, ::Type{deriv} = Val{0}; idxs = nothing) where {deriv}
+    t isa Number || return [integ(ti, deriv; idxs) for ti in t]
+    u = _checked_state(integ, t, deriv)
+    return idxs === nothing ? copy(u) : u[idxs]
+end
+
+function (integ::PETScIntegrator)(
+        out::AbstractArray, t::Union{Number, AbstractArray}, ::Type{deriv} = Val{0};
+        idxs = nothing,
+    ) where {deriv}
+    t isa Number || return [integ(out, ti, deriv; idxs) for ti in t]
+    u = _checked_state(integ, t, deriv)
+    idxs === nothing ? copyto!(out, u) : (out .= view(u, idxs))
+    return out
+end
 
 function _raise_threw!(integ::PETScIntegrator)
     ctx = integ.h.ctx
@@ -4262,46 +4297,55 @@ function SciMLBase.step!(integ::PETScIntegrator, dt, stop_at_tdt = false)
     return nothing
 end
 
-function _state_at_unlocked(integ::PETScIntegrator, t)
+function _state_at_unlocked(integ::PETScIntegrator, t, deriv::Type = Val{0})
     # Snap only from outside the step: Float32 root-finder probes can round onto an end.
     s, s0, s1 = integ.tdir * t, integ.tdir * integ.tprev, integ.tdir * integ.t
-    (s == s1 || s1 < s <= s1 + _near(integ.t)) && return integ.u
-    (s == s0 || s0 - _near(integ.tprev) <= s < s0) && return integ.uprev
+    if s == s1 || s1 < s <= s1 + _near(integ.t)
+        return deriv === Val{0} ? integ.u : _interpolate!(integ, s1, deriv)
+    elseif s == s0 || s0 - _near(integ.tprev) <= s < s0
+        return deriv === Val{0} ? integ.uprev : _interpolate!(integ, s0, deriv)
+    end
     s0 <= s <= s1 || throw(
         ArgumentError(
             "PETScDiffEq can only interpolate inside the step just taken, " *
                 "$(integ.tprev) to $(integ.t), but $t was asked for",
         ),
     )
-    return _interpolate!(integ, s)
+    return _interpolate!(integ, s, deriv)
 end
 
-_state_at(integ::PETScIntegrator, t) =
-    _locked(() -> _state_at_unlocked(integ, oftype(integ.t, t)))
+function _state_at(integ::PETScIntegrator, t, deriv::Type = Val{0})
+    deriv === Val{0} || deriv === Val{1} || throw(_unsupported_deriv(deriv))
+    return _locked(() -> _state_at_unlocked(integ, oftype(integ.t, t), deriv))
+end
 
-function _checked_state(integ::PETScIntegrator, t)
-    u = _state_at(integ, t)
+function _checked_state(integ::PETScIntegrator, t, deriv::Type = Val{0})
+    u = _state_at(integ, t, deriv)
     _raise_threw!(integ)
     return u
 end
 
 # `s` is PETSc's time. Returns `integ.ucache`, which the next call overwrites.
-function _interpolate!(integ::PETScIntegrator, s)
+function _interpolate!(integ::PETScIntegrator, s, deriv::Type = Val{0})
     s = oftype(integ.t, s)
     h = integ.h
     ctx = h.ctx
     if !ctx.hermite
-        integ.finished && return _interpolate_finished!(integ, s)
-        v = _petsc_interpolate!(ctx, h.ts, s)
-        v === nothing && throw(_no_interpolant(ctx))
-        return _readvec!(integ.ucache, h.petsclib, v)
+        integ.finished && return _interpolate_finished!(integ, s, deriv)
+        if deriv === Val{0}
+            v = _petsc_interpolate!(ctx, h.ts, s)
+            v === nothing && throw(_no_interpolant(ctx))
+            return _readvec!(integ.ucache, h.petsclib, v)
+        end
+        (ctx.M === nothing && !ctx.dae) || throw(_no_slope(ctx))
     end
     return _hermite!(
         integ.ucache, ctx, s, integ.tdir * integ.tprev, integ.uprev, ctx.end_s, ctx.end_u,
+        deriv,
     )
 end
 
-function _interpolate_finished!(integ::PETScIntegrator, s)
+function _interpolate_finished!(integ::PETScIntegrator, s, deriv::Type = Val{0})
     ctx = integ.h.ctx
     (ctx.M === nothing && !ctx.dae) || throw(
         ArgumentError(
@@ -4312,7 +4356,7 @@ function _interpolate_finished!(integ::PETScIntegrator, s)
     )
     return _hermite!(
         integ.ucache, ctx, s, integ.tdir * integ.tprev, integ.uprev,
-        integ.tdir * integ.t, integ.u,
+        integ.tdir * integ.t, integ.u, deriv,
     )
 end
 
@@ -4327,7 +4371,6 @@ end
 
 function _end_step_here!(integ::PETScIntegrator)
     ctx = integ.h.ctx
-    ctx.hermite || return nothing
     ctx.end_s = integ.tdir * integ.t
     copyto!(ctx.end_u, integ.u)
     ctx.fend = nothing
