@@ -6963,7 +6963,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test o.d_discontinuities == [0.35]
             @test o.save_idxs == [1]
             @test !o.dense && !o.save_everystep
-            @test o.callback.discrete_callbacks == (never,)
+            @test collect(o.callback.discrete_callbacks) == [never]
             @test o.unstable_check === blow && o.isoutofdomain === neg
             SciMLBase.add_tstop!(integ, 0.7)
             SciMLBase.add_saveat!(integ, 0.6)
