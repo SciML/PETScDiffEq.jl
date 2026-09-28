@@ -2636,7 +2636,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     breaks, alg; callback = never, kw...,
                 )
                 @test plain.retcode == SciMLBase.ReturnCode.Unstable
-                @test 0.5 - plain.t[end] < 1.0e-12
+                @test isempty(kw) ? 0.5 - plain.t[end] < 1.0e-12 :
+                    all(in(0.0:0.05:0.5), plain.t) && plain.t[end] >= 0.45
                 @test maximum(abs(u[1] - exp(-t)) for (t, u) in zip(plain.t, plain.u)) < 2.0e-4
                 @test plain.stats.nreject > 10
                 @test plain.t == stepped.t
@@ -4108,6 +4109,63 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.retcode == SciMLBase.ReturnCode.Terminated
             @test abs(sol.t[end] - log(2.0)) < 1.0e-9
             @test abs(sol.u[end][1] - 0.5) < 1.0e-8
+        end
+
+        @testset "a terminating event saves as OrdinaryDiffEq does" begin
+            decay = SciMLBase.ODEProblem((du, u, p, t) -> (du .= -u; nothing), [1.0], (0.0, 1.0))
+            stop(sp) = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> t - 0.55, SciMLBase.terminate!; save_positions = sp,
+            )
+            disc(sp, at) = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> t == at, SciMLBase.terminate!; save_positions = sp,
+            )
+            near(a, b) = length(a) == length(b) && all(abs.(a .- b) .< 1.0e-9)
+            at = [0.0, 0.5, 1.0]
+            for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRK("3bs"))
+                kw = (dt = 0.1, abstol = 1.0e-10, reltol = 1.0e-10)
+                ended(cb; extra...) = SciMLBase.solve(decay, alg; kw..., callback = cb, extra...)
+                sol = ended(stop((true, true)); saveat = at)
+                @test sol.retcode == SciMLBase.ReturnCode.Terminated
+                @test near(sol.t, [0.0, 0.5, 0.55, 0.55])
+                @test sol.u[3] == sol.u[4]
+                @test abs(sol.u[4][1] - exp(-0.55)) < 1.0e-8
+                @test near(ended(stop((false, false)); saveat = at).t, [0.0, 0.5])
+                @test near(ended(stop((false, false)); saveat = at, save_end = true).t, [0.0, 0.5, 0.55])
+                @test ended(stop((true, true)); saveat = at, save_on = false).t == [0.0]
+                @test near(
+                    ended(stop((true, true)); saveat = at, save_on = false, save_end = true).t,
+                    [0.0, 0.55],
+                )
+                @test near(
+                    ended(stop((true, true)); saveat = [0.0, 0.55, 1.0], save_on = false).t,
+                    [0.0, 0.55],
+                )
+                every = ended(stop((false, false)); save_end = false)
+                @test length(every.t) > 3 && abs(every.t[end] - 0.55) < 1.0e-9
+                post = ended(stop((false, true)))
+                @test near(post.t[(end - 1):end], [0.55, 0.55]) && post.u[end - 1] == post.u[end]
+                bump = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> t - 0.55,
+                    integ -> (integ.u[1] += 1.0; SciMLBase.terminate!(integ));
+                    save_positions = (true, false),
+                )
+                @test abs(ended(bump).u[end][1] - exp(-0.55)) < 1.0e-8
+                vec = SciMLBase.VectorContinuousCallback(
+                    (out, u, t, integ) -> (out[1] = t - 0.55; nothing),
+                    (integ, mask) -> SciMLBase.terminate!(integ), 1,
+                )
+                @test near(ended(vec; saveat = at).t, [0.0, 0.5, 0.55, 0.55])
+                @test ended(disc((true, true), 0.55); saveat = at, tstops = [0.55]).t ==
+                    [0.0, 0.5, 0.55, 0.55]
+                @test ended(disc((false, false), 0.55); saveat = at, tstops = [0.55]).t == [0.0, 0.5]
+                @test SciMLBase.solve(decay, alg; kw..., saveat = at, maxiters = 5).t == [0.0]
+                @test SciMLBase.solve(
+                    decay, alg; kw..., saveat = at, unstable_check = (dt, u, p, t) -> t > 0.55,
+                ).t == [0.0, 0.5]
+                off = (save_on = false, tstops = [0.5])
+                @test ended(disc((true, true), 0.5); off..., saveat = 0.25).t == [0.0]
+                @test ended(disc((true, true), 0.5); off..., saveat = 0.5).t == [0.0, 0.5]
+            end
         end
 
         @testset "initialize and finalize run" begin
