@@ -7,7 +7,11 @@ using SparseArrays
 using DiffEqCallbacks
 using DiffEqCallbacks: PresetTimeCallback
 using MPI
+using OrdinaryDiffEqTsit5: Tsit5
+using RecipesBase: RecipesBase
 using Test
+
+RecipesBase.is_key_supported(::Symbol) = true
 
 decay!(du, u, p, t) = (
     @inbounds for i in eachindex(du)
@@ -6926,6 +6930,130 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test sol.t == [0.15, 0.5]
                 @test abs(sol.u[1][1] - 2exp(-0.15)) < 1.0e-7
             end
+        end
+
+        @testset "iter and opts read as OrdinaryDiffEq's do" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            @test integ.iter == 0
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            @test integ.iter == 2
+            o = integ.opts
+            @test o.maxiters == 1000000
+            @test o.save_everystep && o.save_start && o.save_end && o.dense && o.calck
+            @test o.save_idxs === nothing
+            @test o.internalnorm === DiffEqBase.ODE_DEFAULT_NORM
+            @test o.unstable_check === nothing && o.isoutofdomain === nothing
+            @test o.callback isa SciMLBase.CallbackSet && isempty(o.callback.discrete_callbacks)
+            @test o.tstops === integ.tstops && o.tstops == [1.0]
+            @test o.saveat === integ.h.ctx.saveat && isempty(o.saveat)
+            @test isempty(o.d_discontinuities)
+
+            never = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            blow(dt, u, p, t) = false
+            neg(u, p, t) = false
+            integ = SciMLBase.init(
+                prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, tstops = [0.5], saveat = [0.25],
+                d_discontinuities = [0.35], save_idxs = 1, callback = never,
+                unstable_check = blow, isoutofdomain = neg,
+            )
+            o = integ.opts
+            @test o.tstops == [0.35, 0.5, 1.0]
+            @test o.saveat == [0.25]
+            @test o.d_discontinuities == [0.35]
+            @test o.save_idxs == [1]
+            @test !o.dense && !o.save_everystep
+            @test o.callback.discrete_callbacks == (never,)
+            @test o.unstable_check === blow && o.isoutofdomain === neg
+            SciMLBase.add_tstop!(integ, 0.7)
+            SciMLBase.add_saveat!(integ, 0.6)
+            @test o.tstops == [0.35, 0.5, 0.7, 1.0]
+            @test o.saveat == [0.25, 0.6]
+            @test_throws ArgumentError integ.opts.dense = true
+            @test_throws ArgumentError integ.opts.tstops = [0.9]
+            SciMLBase.reinit!(integ; tstops = [0.4])
+            @test integ.iter == 0
+            @test integ.opts.tstops === integ.tstops && integ.opts.tstops == [0.35, 0.4, 1.0]
+
+            stiff!(du, u, p, t) = (du[1] = -1000u[1]; nothing)
+            quick = SciMLBase.ODEProblem(stiff!, [1.0], (0.0, 0.01))
+            integ = SciMLBase.init(quick, PETScDiffEq.TSRK("5dp"); dt = 0.5)
+            for _ in 1:3
+                SciMLBase.step!(integ)
+                @test integ.iter == integ.sol.stats.naccept + integ.sol.stats.nreject
+            end
+            @test integ.sol.stats.nreject > 0
+        end
+
+        @testset "assigning an opts field takes effect" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            integ.opts.maxiters = 3
+            sol = SciMLBase.solve!(integ)
+            @test sol.retcode == SciMLBase.ReturnCode.MaxIters
+            @test sol.stats.naccept == 3 && integ.iter == 3
+            @test integ.t ≈ 0.3
+
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            SciMLBase.step!(integ)
+            integ.opts.save_everystep = false
+            @test SciMLBase.solve!(integ).t ≈ [0.0, 0.1, 1.0]
+
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            integ.opts.save_start = false
+            @test SciMLBase.solve!(integ).t[1] ≈ 0.1
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            integ.opts.save_end = false
+            @test SciMLBase.solve!(integ).t[end] ≈ 0.9
+
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            SciMLBase.step!(integ)
+            integ.opts.unstable_check = (dt, u, p, t) -> t > 0.45
+            sol = SciMLBase.solve!(integ)
+            @test sol.retcode == SciMLBase.ReturnCode.Unstable
+            @test sol.t[end] ≈ 0.5
+
+            asked = Ref(0)
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            SciMLBase.step!(integ)
+            integ.opts.isoutofdomain = (u, p, t) -> (asked[] += 1; false)
+            SciMLBase.step!(integ)
+            @test asked[] == 1
+        end
+
+        @testset "the integrator plot recipe and DiffEqCallbacks agree with Tsit5" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+            series = RecipesBase.apply_recipe(Dict{Symbol, Any}(), integ)
+            @test length(series) == 1 && series[1].plotattributes[:denseplot] == false
+            @test size.(series[1].args) == ((1, 1), (1, 1))
+            @test (series[1].args[1][1], series[1].args[2][1]) == (0.0, 1.0)
+            SciMLBase.step!(integ)
+            series = RecipesBase.apply_recipe(Dict{Symbol, Any}(:denseplot => false), integ)
+            @test (series[1].args[1][1], series[1].args[2][1]) == (integ.t, integ.u[1])
+
+            function saved(alg; kw...)
+                v = DiffEqCallbacks.SavedValues(Float64, Float64)
+                cb = DiffEqCallbacks.SavingCallback((u, t, integ) -> u[1], v; saveat = 0.0:0.25:1.0)
+                SciMLBase.solve(prob, alg; kw..., callback = cb)
+                return v
+            end
+            ref, mine = saved(Tsit5()), saved(PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            @test mine.t == ref.t
+            @test maximum(abs.(mine.saveval .- ref.saveval)) < 1.0e-3
+
+            function fired(alg; kw...)
+                ts = Float64[]
+                cb = PresetTimeCallback([0.3, 0.6], integ -> push!(ts, integ.t))
+                SciMLBase.solve(prob, alg; kw..., callback = cb)
+                return ts
+            end
+            @test fired(PETScDiffEq.TSRK("5dp"); dt = 0.1) == fired(Tsit5()) == [0.3, 0.6]
+
+            faster = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = -2u[1]; nothing), [1.0], (0.0, 100.0))
+            steady = DiffEqCallbacks.TerminateSteadyState(1.0e-6, 1.0e-6)
+            ref = SciMLBase.solve(faster, Tsit5(); callback = steady)
+            sol = SciMLBase.solve(faster, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = steady)
+            @test sol.retcode == ref.retcode == SciMLBase.ReturnCode.Terminated
+            @test sol.t[end] < 100 && abs(sol.u[end][1]) < 1.0e-6 && abs(ref.u[end][1]) < 1.0e-6
         end
     end
 

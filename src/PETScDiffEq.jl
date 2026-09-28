@@ -2815,6 +2815,9 @@ function _set_first_step!(h::TSHandles{<:Any, <:Any, R}, dt, dtmin, force_dtmin)
     return nothing
 end
 
+_internalnorm(::Nothing) = DiffEqBase.ODE_DEFAULT_NORM
+_internalnorm(comm::MPI.Comm) = (u, t) -> _global_norm(comm, u, t)
+
 # Takes the user's `f` and time, not the reversed ones the context holds.
 function _initial_dt(
         f1, f2, u0, p, t0::R, tdir, order, abstol, reltol, dtmin, dtmax, comm = nothing,
@@ -2822,7 +2825,7 @@ function _initial_dt(
     dtmin_floor = max(nextfloat(max(dtmin, eps(t0))), _min_step(t0))
     smalldt = max(dtmin_floor, R(1.0e-6))
     _everywhere(comm, isempty(u0)) && return smalldt
-    norm = comm === nothing ? DiffEqBase.ODE_DEFAULT_NORM : (u, t) -> _global_norm(comm, u, t)
+    norm = _internalnorm(comm)
     function rhs(u, t)
         du = similar(u)
         f1(du, u, p, t)
@@ -3722,12 +3725,15 @@ end
 function _read_stats(h::TSHandles)
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
     fails = Int(LibPETSc.TSGetSNESFailures(pl, ts))
+    nsteps = Int(LibPETSc.TSGetStepNumber(pl, ts))
+    rejects = Int(LibPETSc.TSGetStepRejections(pl, ts))
     return (
         reason = LibPETSc.TSGetConvergedReason(pl, ts),
-        nsteps = Int(LibPETSc.TSGetStepNumber(pl, ts)),
-        nreject = Int(LibPETSc.TSGetStepRejections(pl, ts)) - fails + ctx.nreject,
+        nsteps = nsteps,
+        nreject = rejects - fails + ctx.nreject,
         nnonliniter = Int(LibPETSc.TSGetSNESIterations(pl, ts)) + ctx.nits,
         nnonlinfail = fails + ctx.nfail,
+        iter = nsteps + rejects + ctx.nreject + ctx.nfail,
     )
 end
 
@@ -4012,18 +4018,52 @@ mutable struct PETScIntegratorOpts{H, R}
     verbose::Any
     force_dtmin::Bool
     save_on::Bool
+    maxiters::Int
+    save_everystep::Bool
+    save_start::Bool
+    save_end::Bool
+    dense::Bool
+    save_idxs::Union{Nothing, Vector{Int}}
+    calck::Bool
+    internalnorm::Any
+    unstable_check::Any
+    isoutofdomain::Any
+    callback::Any
+    tstops::Vector{R}
+    saveat::Vector{R}
+    d_discontinuities::Vector{R}
 end
+
+const FIXED_OPTS = (
+    :dense, :save_idxs, :calck, :internalnorm, :callback, :tstops, :saveat, :d_discontinuities,
+)
 
 function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {H, R}
     h = getfield(o, :h)
+    name in FIXED_OPTS && throw(
+        ArgumentError("`$name` cannot change on a live integrator; pass it to `init`"),
+    )
     name in (:abstol, :reltol) &&
         _checked_everywhere(() -> _check_tol(v, length(h.u0), name), h.ctx.comm)
     name in (:abstol, :reltol) && h.solution !== nothing && _scalar_tol(v)
-    setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : v)
+    setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : name === :maxiters ? Int(v) : v)
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib
     if name === :abstol || name === :reltol
         _set_tolerances!(h, getfield(o, :abstol), getfield(o, :reltol))
+    elseif name === :maxiters
+        h.maxiters = getfield(o, :maxiters)
+        LibPETSc.TSSetMaxSteps(pl, h.ts, _maxsteps(h.maxiters))
+    elseif name === :save_everystep
+        h.ctx.save_everystep = v
+    elseif name === :save_start
+        h.save_start = v
+    elseif name === :save_end
+        h.save_end = v
+    elseif name === :unstable_check
+        h.ctx.unstable = v
+    elseif name === :isoutofdomain
+        h.ctx.domain = v
     elseif name === :dtmin && getfield(o, :force_dtmin)
         adapt = LibPETSc.TSGetAdapt(pl, h.ts)
         _, hi = LibPETSc.TSAdaptGetStepLimits(pl, adapt)
@@ -4061,6 +4101,13 @@ whole-number one is stepped in `Float64` and a single-precision one with a `Floa
 double precision, while the solution it saves stays in single. For a `DynamicalODEProblem` or
 `SecondOrderODEProblem` the state is an `ArrayPartition` of the velocity and the position, as
 in OrdinaryDiffEq.
+
+`iter` counts the steps attempted, accepted or rejected, as OrdinaryDiffEq's does. `opts`
+carries the options OrdinaryDiffEq's integrator exposes where PETSc has them. Assigning
+`maxiters`, `save_everystep`, `save_start`, `save_end`, `unstable_check` or `isoutofdomain`
+takes effect at once; `tstops` and `saveat` are the live queues keyed by `tdir * t`, with
+`saveat` keeping the times already passed; `unstable_check` and `isoutofdomain` are `nothing`
+unless given; `dense`, `save_idxs`, `calck`, `internalnorm` and `callback` are fixed at `init`.
 """
 mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractVector{S}} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, UT, R}
@@ -4093,6 +4140,7 @@ mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractVector
     finished::Bool
     derivative_discontinuity::Bool
     stop::Union{Nothing, SciMLBase.ReturnCode.T}
+    iter::Int
 end
 
 _no_callback(cb) = cb === nothing || (
@@ -4161,14 +4209,25 @@ SciMLBase.set_proposed_dt!(integ::PETScIntegrator, dt) =
     _locked(() -> _set_proposed_dt_unlocked(integ, dt))
 SciMLBase.set_proposed_dt!(integ::PETScIntegrator, other::SciMLBase.DEIntegrator) =
     SciMLBase.set_proposed_dt!(integ, SciMLBase.get_proposed_dt(other))
-_make_opts(h::TSHandles{<:Any, <:Any, R}, kwargs) where {R} = PETScIntegratorOpts(
-    h, get(kwargs, :adaptive, true) === true,
-    get(kwargs, :abstol, 1.0e-6), get(kwargs, :reltol, 1.0e-3),
-    R(something(get(kwargs, :dtmin, nothing), 0.0)),
-    R(something(get(kwargs, :dtmax, nothing), Inf)),
-    get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
-    get(kwargs, :save_on, true) === true,
-)
+function _make_opts(
+        h::TSHandles{<:Any, <:Any, R}, kwargs;
+        tstops = R[], d_discontinuities = R[], callback = nothing,
+    ) where {R}
+    ctx = h.ctx
+    return PETScIntegratorOpts(
+        h, get(kwargs, :adaptive, true) === true,
+        get(kwargs, :abstol, 1.0e-6), get(kwargs, :reltol, 1.0e-3),
+        R(something(get(kwargs, :dtmin, nothing), 0.0)),
+        R(something(get(kwargs, :dtmax, nothing), Inf)),
+        get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
+        get(kwargs, :save_on, true) === true,
+        h.maxiters, ctx.save_everystep, h.save_start, h.save_end, ctx.dense, ctx.save_idxs,
+        ctx.hermite || ctx.interpolates === true, _internalnorm(ctx.comm),
+        ctx.unstable, ctx.domain,
+        callback isa SciMLBase.CallbackSet ? callback : SciMLBase.CallbackSet(callback),
+        tstops, ctx.saveat, d_discontinuities,
+    )
+end
 
 SciMLBase.isadaptive(integ::PETScIntegrator) =
     getfield(integ.opts, :adaptive) && _adapts(integ.h.ctx.alg_name) !== false
@@ -4708,13 +4767,17 @@ function _init_unlocked(
         alg, _integ_state(prob, h.u0), _integ_state(prob, h.u0), _user_t(h.tdir, h.t0),
         _user_t(h.tdir, h.t0),
         dt0, h.tdir,
-        prob.p, h, prob, callbacks, continuous, prob.f, _make_opts(h, kwargs),
+        prob.p, h, prob, callbacks, continuous, prob.f,
+        _make_opts(
+            h, kwargs; tstops = stops, d_discontinuities = d_discontinuities,
+            callback = callback,
+        ),
         _integ_state(prob, h.u0), _integ_state(prob, h.u0, similar),
         _integ_state(prob, h.u0, similar),
         Vector{R}[fill(R(NaN), _ncond(cb)) for cb in continuous],
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
         stops, tstops, d_discontinuities, d_discontinuities, dt0,
-        _initial_solution(prob, alg, h), false, false, nothing,
+        _initial_solution(prob, alg, h), false, false, nothing, 0,
     )
     if h.init_failed
         integ.sol = _initial_failure(prob, alg, h, kwargs)
@@ -4863,9 +4926,10 @@ function _initial_solution(prob, alg, h::TSHandles)
 end
 
 function _live_stats!(integ::PETScIntegrator)
+    ctx, st = integ.h.ctx, _read_stats(integ.h)
+    integ.iter = st.iter
     stats = integ.sol.stats
     stats isa SciMLBase.DEStats || return nothing
-    ctx, st = integ.h.ctx, _read_stats(integ.h)
     stats.nf, stats.nf2, stats.njacs = _nf(integ.h), ctx.nf2, ctx.njacs
     stats.nnonliniter, stats.nnonlinconvfail = st.nnonliniter, st.nnonlinfail
     stats.naccept, stats.nreject = st.nsteps, st.nreject
@@ -4931,7 +4995,6 @@ function _reinit_unlocked(
     integ.u = _integ_state(integ.prob, h.u0)
     integ.uprev = _integ_state(integ.prob, h.u0)
     integ.f = integ.prob.f
-    integ.opts = _make_opts(h, integ.kwargs)
     integ.ucache = _integ_state(integ.prob, h.u0)
     integ.tmp1 = _integ_state(integ.prob, h.u0, similar)
     integ.tmp2 = _integ_state(integ.prob, h.u0, similar)
@@ -4942,7 +5005,12 @@ function _reinit_unlocked(
     integ.dtcache = integ.dt
     integ.tstops = _tstops(vcat(tstops, d_discontinuities), h)
     integ.d_discontinuities = d_discontinuities
+    integ.opts = _make_opts(
+        h, integ.kwargs; tstops = integ.tstops, d_discontinuities = d_discontinuities,
+        callback = getfield(integ.opts, :callback),
+    )
     integ.finished = false
+    integ.iter = 0
     dt === nothing || _use_dt!(integ, dt, reset_dt === true)
     for ev in integ.event_t
         fill!(ev, NaN)
@@ -4978,6 +5046,7 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
         end
     end
     st = _read_stats(h)
+    integ.iter = st.iter
     sol = _assemble(
         integ.prob, integ.alg, h, integ.tdir * integ.t, copy(integ.u), st, integ.kwargs,
     )
