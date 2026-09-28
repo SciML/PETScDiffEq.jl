@@ -2676,6 +2676,7 @@ mutable struct TSHandles{CTX, L, R, S}
     maxiters::Int
     save_start::Bool
     save_end::Bool
+    end_saveat::Union{Nothing, Vector{R}}
     pivot_raises::Bool
     stopped::Int
     matches::Bool
@@ -3406,6 +3407,9 @@ function _setup(
         save_start, save_everystep || no_saveat || saveat isa Number ||
             any(at_start, saveat_times),
     )
+    # OrdinaryDiffEq tests `t in saveat` on the argument as given, so a number is one time.
+    end_saveat = save_end === true || no_saveat ? nothing :
+        saveat isa Number ? [tdir * R(saveat)] : copy(saveat_times)
     save_end = something(
         save_end, save_everystep || no_saveat || saveat isa Number || any(at_end, saveat_times),
     )
@@ -3494,7 +3498,8 @@ function _setup(
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
-        t0, tf, tdir, u0, Int(maxiters), save_start, save_end, false, 0, false, false,
+        t0, tf, tdir, u0, Int(maxiters), save_start, save_end, end_saveat, false, 0, false,
+        false,
         Any[], Vector{S}[], false, nothing, dms, !initialized,
     )
     if comm !== nothing && MPI.Comm_size(comm) > 1
@@ -3765,6 +3770,9 @@ _underflows(h::TSHandles{<:Any, <:Any, Float32}, alg, uend, retcode) =
     _uses_ifunction(alg) && _tiny(uend, h.ctx.comm) &&
     (_tiny(h.u0, h.ctx.comm) || retcode != SciMLBase.ReturnCode.Success)
 
+_saves_early_end(h::TSHandles, tend, tol) =
+    h.end_saveat === nothing || any(s -> abs(s - tend) <= tol, h.end_saveat)
+
 function _assemble(prob, alg, h::TSHandles, tend, uend, st, kwargs)
     ctx = h.ctx
     tf, t0, tol = h.tf, h.t0, _near(h.tf)
@@ -3775,8 +3783,11 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st, kwargs)
         ctx.us = ctx.us[keep]
         ctx.dense && (ctx.dus = ctx.dus[keep])
     end
+    early = tend < tf - tol
     if h.save_end && (
-            isempty(ctx.ts) || ctx.ts[end] < tend - tol ||
+            isempty(ctx.ts) ||
+                ctx.ts[end] < tend - tol && (!early || _saves_early_end(h, tend, tol)) ||
+                !early &&
                 _anywhere(ctx.comm, ctx.ts[end] <= tend + tol && ctx.us[end] != _saved(ctx, uend))
         )
         if !isempty(ctx.ts) && abs(ctx.ts[end] - tend) <= tol
@@ -4105,6 +4116,7 @@ mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractVector
     sol::Any
     finished::Bool
     derivative_discontinuity::Bool
+    stop::Union{Nothing, SciMLBase.ReturnCode.T}
 end
 
 _no_callback(cb) = cb === nothing || (
@@ -4579,10 +4591,14 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     best_cb.rootfind === SciMLBase.NoRootFind ? fill!(residual, 0.0) :
         _fill_conditions!(residual, integ, best_cb, integ.t)
     best_cb.save_positions[1] && !saved && _save_here!(integ)
+    pre = ctx.save_everystep && !saved && !best_cb.save_positions[1] ? copy(integ.u) : nothing
     integ.derivative_discontinuity = true
     _pin_step!(integ)
-    _checked_everywhere(() -> _fire!(integ, best_cb, best_crossing), ctx.comm)
+    stop = _affect!(integ) do
+        _checked_everywhere(() -> _fire!(integ, best_cb, best_crossing), ctx.comm)
+    end
     integ.finished && return true
+    stop === nothing || (_stop!(integ, best_cb, stop, pre); return true)
     _rollback!(integ, integ.t, dt, false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
     best_cb.save_positions[2] && _save_here!(integ)
@@ -4599,8 +4615,9 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
         saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
-        _checked_everywhere(() -> cb.affect!(integ), ctx.comm)
+        stop = _affect!(() -> _checked_everywhere(() -> cb.affect!(integ), ctx.comm), integ)
         integ.finished && return nothing
+        stop === nothing || (_stop!(integ, cb, stop, nothing); return nothing)
         if _anywhere(ctx.comm, integ.derivative_discontinuity)
             PETScCompat.with_local_array!(
                 ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
@@ -4659,7 +4676,7 @@ function _init_unlocked(
         Vector{R}[fill(R(NaN), _ncond(cb)) for cb in continuous],
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
         stops, tstops, d_discontinuities, d_discontinuities, dt0,
-        _initial_solution(prob, alg, h), false, false,
+        _initial_solution(prob, alg, h), false, false, nothing,
     )
     if h.init_failed
         integ.sol = _initial_failure(prob, alg, h, kwargs)
@@ -4937,6 +4954,31 @@ function _terminate_unlocked(
         integ::PETScIntegrator, retcode = SciMLBase.ReturnCode.Terminated,
     )
     empty!(integ.tstops)
+    if integ.stop === nothing
+        _finish!(integ, retcode)
+    else
+        integ.stop = retcode
+        integ.sol = SciMLBase.solution_new_retcode(integ.sol, retcode)
+    end
+    return nothing
+end
+
+# Runs an affect!, holding a terminate! it makes until the callback's own saves are done.
+function _affect!(f, integ::PETScIntegrator)
+    integ.stop = SciMLBase.ReturnCode.Default
+    stop = nothing
+    try
+        f()
+    finally
+        integ.stop == SciMLBase.ReturnCode.Default || (stop = integ.stop)
+        integ.stop = nothing
+    end
+    return stop
+end
+
+function _stop!(integ::PETScIntegrator, cb, retcode, pre)
+    pre === nothing || _record!(integ.h.ctx, integ.tdir * integ.t, pre)
+    cb.save_positions[2] && _save_here!(integ)
     _finish!(integ, retcode)
     return nothing
 end
