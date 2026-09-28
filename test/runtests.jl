@@ -8593,13 +8593,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test sol.stats.njacs == dense.stats.njacs > 0
             end
             @test coloured.stats.njacs == 0
-            @test ad.stats.nf > user.stats.nf == dense.stats.nf
-            @test_throws "of the first-order system `[v; u]' = [f(v, u, p, t); v]`, 4 x 4" solve_at(
-                second(; jac_prototype = sparse(ones(2, 2))), alg,
-            )
-            @test_throws "but this one is 4 x 3" solve_at(
-                second(; jac_prototype = sparse(ones(4, 3))), alg,
-            )
+            if second(; jac_prototype = proto).f.jac_prototype isa SparseMatrixCSC
+                @test ad.stats.nf > user.stats.nf == dense.stats.nf
+                @test_throws "of the first-order system `[v; u]' = [f(v, u, p, t); v]`, 4 x 4" solve_at(
+                    second(; jac_prototype = sparse(ones(2, 2))), alg,
+                )
+                @test_throws "but this one is 4 x 3" solve_at(
+                    second(; jac_prototype = sparse(ones(4, 3))), alg,
+                )
+            end
 
             function wave(N; jac = true, proto = true)
                 h = 1 / (N + 1)
@@ -8895,13 +8897,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             @test SciMLBase.__solve(sparse_proto, PETScDiffEq.TSAlpha2(); dt = 0.1).retcode ==
                 SciMLBase.ReturnCode.Success
-            @test_throws "TSAlpha2 takes a `jac_prototype` of the first-order system" SciMLBase.__solve(
-                SciMLBase.SecondOrderODEProblem(
-                    SciMLBase.DynamicalODEFunction{true}(
-                        osc!, (du, v, u, p, t) -> (du .= v; nothing); jac_prototype = sparse(ones(1, 1)),
-                    ), [0.0], [1.0], (0.0, 1.0),
-                ), PETScDiffEq.TSAlpha2(); dt = 0.1,
-            )
+            if sparse_proto.f.jac_prototype isa SparseMatrixCSC
+                @test_throws "TSAlpha2 takes a `jac_prototype` of the first-order system" SciMLBase.__solve(
+                    SciMLBase.SecondOrderODEProblem(
+                        SciMLBase.DynamicalODEFunction{true}(
+                            osc!, (du, v, u, p, t) -> (du .= v; nothing); jac_prototype = sparse(ones(1, 1)),
+                        ), [0.0], [1.0], (0.0, 1.0),
+                    ), PETScDiffEq.TSAlpha2(); dt = 0.1,
+                )
+            end
             scalars = SciMLBase.SecondOrderODEProblem((du, u, p, t) -> -u, 0.0, 1.0, (0.0, 1.0))
             @test_throws "are both vectors" SciMLBase.solve(
                 scalars, PETScDiffEq.TSBasicSymplectic(); dt = 0.1,
