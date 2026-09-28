@@ -3164,8 +3164,10 @@ function _setup(
     is_split && !(alg isa TSARKIMEX) &&
         throw(ArgumentError("PETScDiffEq only supports SplitODEProblem with TSARKIMEX"))
     is_dae = prob isa SciMLBase.AbstractDAEProblem
+    comm = _distributed(alg) ? alg.comm : nothing
     mass_matrix = is_dae ? nothing : prob.f.mass_matrix
-    has_mass = !(mass_matrix === nothing || mass_matrix == LinearAlgebra.I)
+    own_mass = !(mass_matrix === nothing || mass_matrix == LinearAlgebra.I)
+    has_mass = _anywhere(comm, own_mass)
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
     if dyn
         _check_dynamical(prob, alg, has_mass)
@@ -3188,7 +3190,6 @@ function _setup(
     if has_mass && is_split
         throw(ArgumentError("PETScDiffEq does not support a mass matrix on a SplitODEProblem"))
     end
-    comm = _distributed(alg) ? alg.comm : nothing
     dm = _alg_dm(alg)
     N, looped = comm === nothing ? (length(prob.u0), 0) :
         MPI.Allreduce([length(prob.u0), Int(_in_threads_loop())], +, comm)
@@ -3365,7 +3366,8 @@ function _setup(
     elseif comm === nothing && dm === nothing
         Matrix{S}(mass_matrix)
     else
-        LinearAlgebra.Diagonal(Vector{S}(mass_matrix.diag))
+        # `ctx.M === nothing` steers collectives, so an identity block still gets a Diagonal.
+        LinearAlgebra.Diagonal(own_mass ? Vector{S}(mass_matrix.diag) : ones(S, n))
     end
     missing_diag = uses_sparse_jac ?
         [i for i in 1:n if !_stored(J0, i, i)] : Int[]
@@ -4786,6 +4788,9 @@ function _reinit_unlocked(
     )
     setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
     reinit_dae || (setup_kwargs = merge(setup_kwargs, (initializealg = SciMLBase.NoInit(),)))
+    if !erase_sol && !old.ctx.dense && old.ctx.save_idxs !== nothing && !isempty(old.ctx.ts)
+        setup_kwargs = merge(setup_kwargs, (dense = false,))
+    end
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
     try
         LibPETSc.TSSetUp(h.petsclib, h.ts)
