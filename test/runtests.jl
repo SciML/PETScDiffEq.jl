@@ -7150,7 +7150,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
             series = RecipesBase.apply_recipe(Dict{Symbol, Any}(), integ)
             @test length(series) == 1 && series[1].plotattributes[:denseplot] == false
-            @test size.(series[1].args) == ((1, 1), (1, 1))
+            @test length.(series[1].args) == (1, 1)
             @test (series[1].args[1][1], series[1].args[2][1]) == (0.0, 1.0)
             SciMLBase.step!(integ)
             series = RecipesBase.apply_recipe(Dict{Symbol, Any}(:denseplot => false), integ)
