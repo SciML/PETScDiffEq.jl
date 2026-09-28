@@ -143,10 +143,13 @@ integrator goes on at its fixed size through both, as OrdinaryDiffEq's does, and
 shows the estimate. `get_proposed_dt` is signed, negative on a reversed span, and
 `set_proposed_dt!` also takes another integrator whose proposed step it copies. `set_abstol!`
 and `set_reltol!` hold for the steps after, until `reinit!` goes back to the tolerances `init`
-was given, where OrdinaryDiffEq's `reinit!` keeps them. `change_t_via_interpolation!` with
-`Val{true}` drops what was saved past the new time, and saves the new end when
-`save_everystep` asks for every step. `resize!`, `deleteat!` and `addat!` raise an
-`ArgumentError`, since PETSc sizes its vectors and solvers when the integrator is made.
+was given, where OrdinaryDiffEq's `reinit!` keeps them. With `erase_sol = false`, a solution
+saved under `save_idxs` without dense output stays without it when the new `saveat` would
+otherwise turn it on, since a partial state gives no derivative to interpolate with.
+`change_t_via_interpolation!` with `Val{true}` drops what was saved past the new time, and
+saves the new end when `save_everystep` asks for every step. `resize!`, `deleteat!` and
+`addat!` raise an `ArgumentError`, since PETSc sizes its vectors and solvers when the
+integrator is made.
 
 ## Second-order and partitioned problems
 

@@ -290,23 +290,47 @@ const METHODS = (
     end
 
     @testset "a rank whose own mass block is the identity" begin
-        algebraic = rank > 0
-        function pair!(du, u, p, t)
-            du[1] = -u[1]
-            du[2] = algebraic ? u[2] - u[1] : -u[2]
+        function pairs!(du, u, ks)
+            for (i, k) in enumerate(ks)
+                a = 2i - 1
+                du[a] = -u[a]
+                du[a + 1] = k > 0 ? u[a + 1] - u[a] : -u[a + 1]
+            end
             return nothing
         end
-        proto = sparse([1, 2, 2], 2rank .+ [1, 1, 2], ones(3), 2, 2nranks)
-        M = Diagonal([1.0, algebraic ? 0.0 : 1.0])
-        pair(y0) = ODEProblem(
-            ODEFunction(pair!; jac_prototype = proto, mass_matrix = M), [1.0, y0], (0.0, 1.0),
-        )
+        function pairs_jac!(Jm, u, ks)
+            for (i, k) in enumerate(ks)
+                a, c = 2i - 1, 2k + 1
+                Jm[a, c] = -1.0
+                Jm[a + 1, c] = k > 0 ? -1.0 : 0.0
+                Jm[a + 1, c + 1] = k > 0 ? 1.0 : -1.0
+            end
+            return nothing
+        end
+        function pairs(ks, y0; jac)
+            I = [2i - 1 + d for i in 1:length(ks) for d in (0, 1, 1)]
+            J = [2k + 1 + d for k in ks for d in (0, 0, 1)]
+            proto = sparse(I, J, ones(length(I)), 2length(ks), 2nranks)
+            M = Diagonal([k > 0 && d == 1 ? 0.0 : 1.0 for k in ks for d in (0, 1)])
+            f = (du, u, p, t) -> pairs!(du, u, ks)
+            jac_f = (Jm, u, p, t) -> pairs_jac!(Jm, u, ks)
+            fn = jac ? ODEFunction(f; jac = jac_f, jac_prototype = proto, mass_matrix = M) :
+                ODEFunction(f; jac_prototype = proto, mass_matrix = M)
+            return ODEProblem(fn, repeat([1.0, y0], length(ks)), (0.0, 1.0))
+        end
         bdf = TSImplicit("bdf"; comm)
-        sol = solve(pair(1.0), bdf; dt = 1.0e-3, TOL...)
+        sol = solve(pairs([rank], 1.0; jac = false), bdf; dt = 1.0e-3, TOL...)
         @test sol.retcode == ReturnCode.Success
         @test maximum(abs, sol.u[end] .- exp(-1)) <= 3.0e-6
-        off = caught(() -> solve(pair(2.0), bdf; dt = 1.0e-3, TOL...))
+        off = caught(() -> solve(pairs([rank], 2.0; jac = false), bdf; dt = 1.0e-3, TOL...))
         @test nranks == 1 ? off === nothing : off isa SciMLBase.CheckInitFailureError
+        for (jac, ad) in SOURCES
+            compare(
+                pairs([rank], 1.0; jac), bdf, pairs(0:(nranks - 1), 1.0; jac),
+                TSImplicit("bdf"; autodiff = ad), fill(exp(-1), 2nranks), 3.0e-6;
+                layout = fill(2, nranks), TOL...,
+            )
+        end
     end
 
     @testset "SplitODEProblem with an explicit f2" begin
