@@ -1580,6 +1580,48 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test abs(sol(1.5)[1] - kept.u[end][1] * exp(-0.5)) < 1.0e-5
         end
 
+        @testset "erase_sol = false after save_idxs stays non-dense" begin
+            rot!(du, u, p, t) = (du[1] = -u[2]; du[2] = u[1]; nothing)
+            rot = SciMLBase.ODEProblem(rot!, [1.0, 0.0], (0.0, 1.0))
+            for idxs in ([1], 1)
+                integ = SciMLBase.init(
+                    rot, PETScDiffEq.TSRK("4"); dt = 0.1, adaptive = false, saveat = 0.5,
+                    save_idxs = idxs,
+                )
+                kept = SciMLBase.solve!(integ)
+                SciMLBase.reinit!(
+                    integ, [cos(1.0), sin(1.0)]; t0 = 1.0, tf = 2.0, erase_sol = false,
+                    saveat = Float64[],
+                )
+                sol = SciMLBase.solve!(integ)
+                fresh = SciMLBase.solve(
+                    SciMLBase.remake(rot; u0 = [cos(1.0), sin(1.0)], tspan = (1.0, 2.0)),
+                    PETScDiffEq.TSRK("4"); dt = 0.1, adaptive = false, save_idxs = idxs,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test !sol.dense
+                @test sol.t[1:3] == kept.t
+                @test sol.u[1:3] == kept.u
+                @test sol.t[4:end] == fresh.t
+                @test sol.u[4:end] == fresh.u
+                @test sol(0.25) == (sol.u[1] + sol.u[2]) / 2
+            end
+            osc!(dv, v, u, p, t) = (dv .= -u; nothing)
+            osc = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
+            integ = SciMLBase.init(
+                osc, PETScDiffEq.TSBasicSymplectic("1"); dt = 0.1, saveat = 0.5,
+                save_idxs = [2],
+            )
+            kept = SciMLBase.solve!(integ)
+            SciMLBase.reinit!(integ; erase_sol = false, saveat = Float64[])
+            sol = SciMLBase.solve!(integ)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test !sol.dense
+            @test length(sol.t) == length(kept.t) + 11
+            @test sol.u[1:3] == kept.u
+            @test all(u -> length(u) == 1, sol.u)
+        end
+
         @testset "saveat can be replaced" begin
             alg = PETScDiffEq.TSRK("5dp")
             integ = SciMLBase.init(prob, alg; dt = 0.1, saveat = 0.5)
