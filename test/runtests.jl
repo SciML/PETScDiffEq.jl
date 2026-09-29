@@ -3628,7 +3628,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test length(exported) == 13
         for n in exported
             i = findfirst(
-                l -> occursin(Regex("^((mutable )?struct|function) \\Q$(n)\\E\\b"), l), lines,
+                l -> occursin(Regex("^((mutable )?struct|function) \\Q$(n)\\E(?!\\w)"), l), lines,
             )
             @test i !== nothing
             i === nothing && continue
