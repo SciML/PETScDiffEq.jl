@@ -390,7 +390,16 @@ const METHODS = (
             @test sol.retcode == ReturnCode.Unstable
             @test same_everywhere(sol.t)
             @test 0.05 - sol.t[end] < 1.0e-12
-            @test sol.stats.nnonlinconvfail > 10
+            failed = make(comm) isa TSRosW ? sol.stats.nreject : sol.stats.nnonlinconvfail
+            @test failed > 10
+            budget = sol.stats.naccept + 10
+            capped = @test_logs solve(
+                ODEProblem(fn, heat0(rows), SPAN), make(comm); TOL..., maxiters = budget,
+            )
+            @test capped.retcode == ReturnCode.MaxIters
+            stats = capped.stats
+            @test same_everywhere((capped.t, stats.naccept, stats.nreject, stats.nnonlinconvfail))
+            @test stats.naccept + stats.nreject + stats.nnonlinconvfail == budget
         end
         irk_counts = even(N)
         idx = owned(irk_counts)

@@ -1243,8 +1243,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         alternate = (u, p, t) -> (every_other[] += 1; isodd(every_other[]))
         capped = SciMLBase.solve(prob, alg; dt = 1.0e-3, maxiters = 10, isoutofdomain = alternate)
         @test capped.retcode == SciMLBase.ReturnCode.MaxIters
-        @test every_other[] == 20
-        @test capped.stats.naccept == 10 == length(capped.t) - 1
+        @test every_other[] == 10
+        @test capped.stats.naccept == 5 == length(capped.t) - 1
+        @test capped.stats.nreject == 5
 
         floored = SciMLBase.solve(prob, alg; dt = 0.1, dtmin = 0.01, isoutofdomain = below(0.6))
         @test floored.retcode == SciMLBase.ReturnCode.DtLessThanMin
@@ -1360,6 +1361,32 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test sol.retcode == SciMLBase.ReturnCode.MaxIters
         @test sol.t[end] ≈ 0.05
         @test sol.stats.naccept == 5
+    end
+
+    @testset "maxiters counts rejected and failed attempts, as OrdinaryDiffEq's does" begin
+        breaks = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
+        )
+        vdp = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = u[2]; du[2] = 1000 * (1 - u[1]^2) * u[2] - u[1]; nothing),
+            [2.0, 0.0], (0.0, 3000.0),
+        )
+        counts(sol) = (sol.stats.naccept, sol.stats.nreject, sol.stats.nnonlinconvfail)
+        for prob in (breaks, vdp), alg in (
+                    PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW(), PETScDiffEq.TSImplicit("bdf"),
+                    PETScDiffEq.TSARKIMEX(),
+                )
+            sol = @test_logs SciMLBase.solve(prob, alg; maxiters = 60)
+            @test sol.retcode == SciMLBase.ReturnCode.MaxIters
+            @test sum(counts(sol)) == 60
+            @test sol.stats.naccept < 60
+            integ = SciMLBase.init(prob, alg; maxiters = 60)
+            @test_logs SciMLBase.solve!(integ)
+            @test integ.iter == 60
+            @test integ.sol.retcode == SciMLBase.ReturnCode.MaxIters
+            @test counts(integ.sol) == counts(sol)
+            @test integ.sol.t == sol.t && integ.sol.u == sol.u
+        end
     end
 
     @testset "the nonlinear counters come from the solver, not the stepper" begin
@@ -2967,7 +2994,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test (@allocated post(100)) == 0
             @test !h.ctx.stalled
             @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
-            @test isempty(PETScDiffEq.POST_STEP_CTX)
+            @test !haskey(PETScDiffEq.POST_STEP_CTX, ptr)
         end
 
         @testset "verbose silences the warning for a solve that ends early" begin
@@ -3113,7 +3140,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test plain.retcode == SciMLBase.ReturnCode.Unstable
                 @test 0.5 - plain.t[end] < 1.0e-12
                 @test maximum(abs(u[1] - exp(-t)) for (t, u) in zip(plain.t, plain.u)) < 2.0e-3
-                @test plain.stats.nnonlinconvfail > 10
+                newton = !(alg isa PETScDiffEq.TSRosW)
+                @test (newton ? plain.stats.nnonlinconvfail : plain.stats.nreject) > 10
+                @test (newton ? plain.stats.nreject : plain.stats.nnonlinconvfail) == 0
                 @test same(plain, stepped)
             end
             for (prob, alg) in adaptive[1:3]
@@ -3150,7 +3179,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             sol = SciMLBase.solve(positive, PETScDiffEq.TSRosW("assp3p3s1c"); dt = 1.0)
             @test sol.retcode == SciMLBase.ReturnCode.Success
-            @test sol.stats.nnonlinconvfail > 0
+            @test sol.stats.nreject > 1
+            @test sol.stats.nnonlinconvfail == 0
             @test maximum(abs(u[1] - exp(-1000t)) for (t, u) in zip(sol.t, sol.u)) < 1.0e-3
         end
 
@@ -3185,7 +3215,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
                 sol = SciMLBase.solve(linear(λ), alg; dt = 1.0)
                 @test sol.retcode == SciMLBase.ReturnCode.Success
-                @test sol.stats.nnonlinconvfail >= 1
+                if alg isa PETScDiffEq.TSRosW
+                    @test sol.stats.nreject >= 2
+                    @test sol.stats.nnonlinconvfail == 0
+                else
+                    @test sol.stats.nnonlinconvfail >= 1
+                end
                 @test abs(sol.u[end][1] / exp(2λ) - 1) < 0.05
                 @test same(sol, SciMLBase.solve(linear(λ), alg; dt = 1.0, callback = never))
             end
@@ -3245,7 +3280,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 plain = SciMLBase.solve(breaks, alg; kw...)
                 @test plain.retcode == SciMLBase.ReturnCode.ConvergenceFailure
                 @test plain.t[end] == 0.5
-                @test counts(plain) == (5, 0, 1)
+                @test counts(plain) == (alg isa PETScDiffEq.TSRosW ? (5, 1, 0) : (5, 0, 1))
                 @test all(u -> all(isfinite, u), plain.u)
                 @test same(plain, SciMLBase.solve(breaks, alg; callback = never, kw...))
             end
