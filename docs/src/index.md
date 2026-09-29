@@ -108,7 +108,11 @@ from PETSc's own interpolant for `TSRK("5dp")`, `TSRosW("ra34pw2")`, `TSARKIMEX(
 `"5"`, `TSImplicit("bdf")` and `TSDAE("bdf")`, and from the cubic Hermite interpolant dense
 output uses for everything else, `TSGeneric` and a type `petsc_options` changes included.
 With a mass matrix or a `DAEProblem` only PETSc's is available, and a type that has none
-raises an `ArgumentError` when such a state is needed.
+raises an `ArgumentError` when such a state is needed. `integrator(t, Val{1})` is the slope
+of the cubic Hermite interpolant through the step's ends, the interpolant's own derivative
+where the package interpolates itself, and it raises with a mass matrix or a `DAEProblem`.
+`integrator(t; idxs)`, a vector of times and `integrator(out, t)` take the forms
+OrdinaryDiffEq's integrator does.
 
 `ODEProblem`, `SplitODEProblem`, `DAEProblem`, `DynamicalODEProblem` and
 `SecondOrderODEProblem` are supported, in place or out of place, along with
@@ -183,7 +187,8 @@ infinite step: below 1 it damps the frequencies the step cannot resolve, which r
 default, carries on undamped. It adapts on PETSc's error estimate with scalar `abstol` and
 `reltol`, or steps at `dt` with `adaptive = false`. Its Jacobian, from a `jac` or from
 `autodiff` as for the other implicit families, is that of the first-order system, `2n` by
-`2n`; it takes no sparse `jac_prototype` yet.
+`2n`, and a sparse `jac_prototype` of that system keeps the `n` by `n` matrix PETSc factors
+sparse, whether the Jacobian comes from a `jac` or is coloured, as for `TSImplicit`.
 
 ```julia
 K, C = [1.0e6 0.0; 0.0 1.0], [200.0 0.0; 0.0 0.02]
