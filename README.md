@@ -109,19 +109,22 @@ method's right-hand side returns NaN or the state overflows, is taken again smal
 way, and both kinds of retry count in `stats.nreject`. An adaptive implicit step whose Newton
 or linear solve fails, as when its right-hand side returns NaN, or whose Newton matrix has a
 zero pivot, is taken again at PETSc's `-ts_adapt_scale_solve_failed` share of its size, a
-quarter by default, as many times as it takes, and counts in `stats.nnonlinconvfail` rather
-than `stats.nreject`. OrdinaryDiffEq counts a failed Newton solve the same way, but counts a
-zero pivot, and a Rosenbrock step that turns NaN, in `stats.nreject`. A fixed-step solve ends
-at its first failed Newton or linear solve with `ConvergenceFailure`, as OrdinaryDiffEq's
-Newton-based methods do with `adaptive = false`.
+quarter by default, as many times as `maxiters` allows, and counts in
+`stats.nnonlinconvfail` rather than `stats.nreject`, as OrdinaryDiffEq counts a failed Newton
+solve. A method that runs no Newton iteration, which is `TSRosW` or any type given
+`-snes_type ksponly`, counts these failures in `stats.nreject` instead, as OrdinaryDiffEq's
+Rosenbrock methods do. A zero pivot in a Newton method still counts in
+`stats.nnonlinconvfail`, where OrdinaryDiffEq counts it in `stats.nreject`. A fixed-step
+solve ends at its first failed Newton or linear solve with `ConvergenceFailure`, as
+OrdinaryDiffEq's Newton-based methods do with `adaptive = false`.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
 state stops being finite, a step overflows, turns NaN or fails its Newton or linear solve at
 every size tried, with a warning, an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
 returns true, which is asked before each step with the step about to be taken, as
 OrdinaryDiffEq asks it, `ConvergenceFailure` when a fixed-step nonlinear
-solve fails, `DtLessThanMin` as above, `MaxIters` when `maxiters` steps are accepted, where
-OrdinaryDiffEq counts rejected and failed attempts too, and
+solve fails, `DtLessThanMin` as above, `MaxIters` after `maxiters` step attempts, accepted,
+rejected or failed, as OrdinaryDiffEq counts them, and
 `Failure` for a zero pivot in a fixed-step solve, with a warning, or another step PETSc cannot
 take. Where
 `petsc_options` asks PETSc to raise, with `-ksp_error_if_not_converged`,
