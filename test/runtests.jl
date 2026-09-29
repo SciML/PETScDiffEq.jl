@@ -5430,6 +5430,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         set_stencil_values!(J, [(1, 1, 1), (2, 1, 1)], (1, 1, 1), [1.0, 2.0])
         set_stencil_values!(J, [(1, 4, 3), (2, 4, 3)], [(1, 4, 3), (2, 4, 3)], [1.0 2.0; 3.0 4.0])
         set_stencil_values!(J, CartesianIndex(1, 5, 4), CartesianIndex(1, 5, 4), 7.0)
+        set_stencil_values!(J, (2, 2, 2), ((1, 2, 2), (2, 2, 3)), (40.0, 50.0))
         set_stencil_values!(J, (1, 5, 4), (1, 6, 4), 5.0)
         PETSc.assemble!(J)
         set_stencil_values!(J, (1, 5, 4), (1, 5, 4), 1.0; add = true)
@@ -5455,6 +5456,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test entry(at(1, 1, 1), at(1, 1, 1)) == 1.0
         @test entry(at(2, 1, 1), at(1, 1, 1)) == 2.0
         @test [entry(at(c, 4, 3), at(d, 4, 3)) for c in 1:2, d in 1:2] == [1.0 2.0; 3.0 4.0]
+        @test entry(at(2, 2, 2), at(1, 2, 2)) == 40.0
+        @test entry(at(2, 2, 2), at(2, 2, 3)) == 50.0
         @test entry(at(1, 5, 4), at(1, 5, 4)) == 8.0
         @test_throws "a grid index is" set_stencil_values!(J, (1,), (1,), 1.0)
         @test_throws "a grid index is" set_stencil_values!(J, 3, 3, 1.0)
@@ -5483,7 +5486,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         function heat_jac_dm!(J, u, da, t)
             push!(seen, length(u))
             for i in 1:N
-                set_stencil_values!(J, (1, i), [(1, i - 1), (1, i), (1, i + 1)], [1, -2, 1] ./ dx^2)
+                set_stencil_values!(J, (1, i), ((1, i - 1), (1, i), (1, i + 1)), (1, -2, 1) ./ dx^2)
             end
             return nothing
         end

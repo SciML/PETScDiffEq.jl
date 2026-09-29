@@ -533,7 +533,7 @@ Jacobian, whose columns past the ends of the grid are dropped:
 ```julia
 function heat_jac!(J, u, da, t)
     for i in (xs + 1):(xs + xm)
-        set_stencil_values!(J, (1, i), [(1, i - 1), (1, i), (1, i + 1)], [1, -2, 1] ./ dx^2)
+        set_stencil_values!(J, (1, i), ((1, i - 1), (1, i), (1, i + 1)), (1, -2, 1) ./ dx^2)
     end
 end
 

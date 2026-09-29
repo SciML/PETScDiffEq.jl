@@ -1001,12 +1001,15 @@ rank owns, such as `du`, `u0` or a saved state, and `a` shares its memory. This 
 """
 reshape_local_array(x, dm) = PETScCompat.reshape_local_array(x, dm)
 
+# LibPETSc.PetscInt is a non-constant global, slow to convert to in a hot ccall.
+const _PetscInt = LibPETSc.PetscInt
+
 # PETSc's MatStencil, in its field order.
 struct _Stencil
-    k::LibPETSc.PetscInt
-    j::LibPETSc.PetscInt
-    i::LibPETSc.PetscInt
-    c::LibPETSc.PetscInt
+    k::_PetscInt
+    j::_PetscInt
+    i::_PetscInt
+    c::_PetscInt
 end
 
 const _GRID_INDEX = "a grid index is `(c, i)`, `(c, i, j)` or `(c, i, j, k)`, as " *
@@ -1016,55 +1019,96 @@ _stencil(I::CartesianIndex) = _stencil(Tuple(I))
 function _stencil(I::Tuple)
     2 <= length(I) <= 4 && all(x -> x isa Integer, I) ||
         throw(ArgumentError("$_GRID_INDEX; got $(repr(I))"))
-    at(d) = LibPETSc.PetscInt(length(I) >= d ? I[d] - 1 : 0)
-    return _Stencil(at(4), at(3), at(2), at(1))
+    c, i, j, k = (I..., 1, 1)
+    return _Stencil(k - 1, j - 1, i - 1, c - 1)
 end
 _stencil(I) = throw(ArgumentError("$_GRID_INDEX; got $(repr(I))"))
-_stencils(I::Union{CartesianIndex, Tuple}) = [_stencil(I)]
-_stencils(Is) = _Stencil[_stencil(I) for I in Is]
+
+struct _StencilBuffers{S}
+    rows::Vector{_Stencil}
+    cols::Vector{_Stencil}
+    vals::Vector{S}
+end
+
+function _stencil_buffers(::Type{S}) where {S}
+    tls = task_local_storage()
+    b = get(tls, _StencilBuffers{S}, nothing)
+    b === nothing || return b::_StencilBuffers{S}
+    return tls[_StencilBuffers{S}] = _StencilBuffers{S}(_Stencil[], _Stencil[], S[])
+end
+
+function _stencils!(buf, I::Union{CartesianIndex, Tuple{Vararg{Integer}}})
+    resize!(buf, 1)
+    buf[1] = _stencil(I)
+    return 1
+end
+function _stencils!(buf, Is)
+    n = length(Is)
+    resize!(buf, n)
+    for (k, I) in enumerate(Is)
+        buf[k] = _stencil(I)
+    end
+    return n
+end
 
 # MatSetValuesStencil reads the block row-major.
-function _row_major(S, vals::AbstractMatrix, m, n)
+function _row_major!(buf, vals::AbstractMatrix, m, n)
     size(vals) == (m, n) || throw(
         DimensionMismatch(
             "`vals` is $(join(size(vals), " x ")) for $m rows and $n columns",
         ),
     )
-    return vec(permutedims(Matrix{S}(vals)))
+    resize!(buf, m * n)
+    k = 0
+    for r in axes(vals, 1), s in axes(vals, 2)
+        buf[k += 1] = vals[r, s]
+    end
+    return buf
 end
-function _row_major(S, vals::AbstractVector, m, n)
+function _row_major!(buf, vals::Union{AbstractVector, Tuple}, m, n)
     (m == 1 || n == 1) && length(vals) == m * n || throw(
         DimensionMismatch(
             "`vals` has $(length(vals)) entries for $m rows and $n columns; give a matrix",
         ),
     )
-    return Vector{S}(vals)
+    resize!(buf, m * n)
+    for (k, v) in enumerate(vals)
+        buf[k] = v
+    end
+    return buf
 end
-_row_major(S, val::Number, m, n) = m == n == 1 ? S[val] :
-    throw(DimensionMismatch("one value for $m rows and $n columns; give a matrix"))
+function _row_major!(buf, val::Number, m, n)
+    m == n == 1 ||
+        throw(DimensionMismatch("one value for $m rows and $n columns; give a matrix"))
+    resize!(buf, 1)
+    buf[1] = val
+    return buf
+end
 
 """
     set_stencil_values!(J, rows, cols, vals; add = false)
 
 Write a block of the DM's matrix `J`, as a `jac` gets it in a solve with a `dm`, through
-PETSc's `MatSetValuesStencil`. `rows` and `cols` are grid indices, or vectors of them, in the
-numbering `PETScDiffEq.reshape_local_array` uses: `(c, i)` on a 1-D grid, `(c, i, j)` on a 2-D
-one and `(c, i, j, k)` on a 3-D one, as tuples or `CartesianIndex`es, global and 1-based, with
-`c` the degree of freedom at the point. `vals[r, s]` is the entry at `rows[r]` and `cols[s]`,
-a vector when either side is a single index and a number when both are. The rows are this
-rank's own and the columns lie within its ghost region; PETSc drops an index past a ghosted
-edge, which has no global entry, and refuses an entry outside the DM's stencil. `add = true`
-adds to the entries instead of setting them, and PETSc wants a `PETSc.assemble!(J)` between a
-set and an add.
+PETSc's `MatSetValuesStencil`. `rows` and `cols` are grid indices, or vectors or tuples of
+them, in the numbering `PETScDiffEq.reshape_local_array` uses: `(c, i)` on a 1-D grid,
+`(c, i, j)` on a 2-D one and `(c, i, j, k)` on a 3-D one, as tuples or `CartesianIndex`es,
+global and 1-based, with `c` the degree of freedom at the point. `vals[r, s]` is the entry at
+`rows[r]` and `cols[s]`, a vector or tuple when either side is a single index and a number when
+both are. The rows are this rank's own and the columns lie within its ghost region; PETSc
+drops an index past a ghosted edge, which has no global entry, and refuses an entry outside
+the DM's stencil. `add = true` adds to the entries instead of setting them, and PETSc wants a
+`PETSc.assemble!(J)` between a set and an add. It allocates nothing once warm, so with tuples
+for `cols` and `vals` a `jac` can call it at every grid point without allocating.
 """
 function set_stencil_values!(
         J::LibPETSc.AbstractPetscMat{L}, rows, cols, vals; add::Bool = false,
     ) where {L}
     pl = PETSc.getlib(L)
-    r, c = _stencils(rows), _stencils(cols)
-    v = _row_major(PETSc.scalartype(pl), vals, length(r), length(c))
+    b = _stencil_buffers(PETSc.scalartype(pl))
+    m, n = _stencils!(b.rows, rows), _stencils!(b.cols, cols)
+    _row_major!(b.vals, vals, m, n)
     mode = add ? LibPETSc.ADD_VALUES : LibPETSc.INSERT_VALUES
-    _set_stencil!(pl, J, r, c, v, mode)
+    _set_stencil!(pl, J, b.rows, b.cols, b.vals, mode)
     return J
 end
 
@@ -1072,10 +1116,7 @@ function _set_stencil!(pl, J, r, c, v::Vector{S}, mode) where {S}
     _check_code(
         ccall(
             _symbol(pl, :MatSetValuesStencil), LibPETSc.PetscErrorCode,
-            (
-                Ptr{Cvoid}, LibPETSc.PetscInt, Ptr{_Stencil}, LibPETSc.PetscInt, Ptr{_Stencil},
-                Ptr{S}, Cint,
-            ),
+            (Ptr{Cvoid}, _PetscInt, Ptr{_Stencil}, _PetscInt, Ptr{_Stencil}, Ptr{S}, Cint),
             J.ptr, length(r), r, length(c), c, v, Cint(mode),
         ),
     )
