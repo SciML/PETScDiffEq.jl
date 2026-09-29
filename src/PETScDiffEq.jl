@@ -2450,11 +2450,22 @@ function _dm_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
         _mat_zero!(pl, B)
-        if ctx.dae
-            _readvec!(ctx.mudot, pl, PETSc.VecPtr(pl, xdot_ptr, false))
-            ctx.jac!(B, ctx.mudot, ctx.u, ctx.p, shift, t)
-        else
-            ctx.jac!(B, ctx.u, ctx.p, t)
+        err = nothing
+        try
+            if ctx.dae
+                _readvec!(ctx.mudot, pl, PETSc.VecPtr(pl, xdot_ptr, false))
+                ctx.jac!(B, ctx.mudot, ctx.u, ctx.p, shift, t)
+            else
+                ctx.jac!(B, ctx.u, ctx.p, t)
+            end
+        catch e
+            ctx.comm === nothing && rethrow()
+            err = e
+        end
+        # Assembly is collective, so every rank skips it once any rank's jac threw.
+        if _anywhere(ctx.comm, err !== nothing)
+            ctx.err = something(err, _remote_error())
+            return LibPETSc.PetscErrorCode(CALLBACK_THREW)
         end
         ctx.njacs += 1
         PETSc.assemble!(B)
