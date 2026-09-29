@@ -108,7 +108,11 @@ from PETSc's own interpolant for `TSRK("5dp")`, `TSRosW("ra34pw2")`, `TSARKIMEX(
 `"5"`, `TSImplicit("bdf")` and `TSDAE("bdf")`, and from the cubic Hermite interpolant dense
 output uses for everything else, `TSGeneric` and a type `petsc_options` changes included.
 With a mass matrix or a `DAEProblem` only PETSc's is available, and a type that has none
-raises an `ArgumentError` when such a state is needed.
+raises an `ArgumentError` when such a state is needed. `integrator(t, Val{1})` is the slope
+of the cubic Hermite interpolant through the step's ends, the interpolant's own derivative
+where the package interpolates itself, and it raises with a mass matrix or a `DAEProblem`.
+`integrator(t; idxs)`, a vector of times and `integrator(out, t)` take the forms
+OrdinaryDiffEq's integrator does.
 
 `ODEProblem`, `SplitODEProblem`, `DAEProblem`, `DynamicalODEProblem` and
 `SecondOrderODEProblem` are supported, in place or out of place, along with
@@ -126,8 +130,8 @@ Robertson's, those are far enough off that the solve reports success with an ans
 wrong in its first digit, so keep them for a right-hand side ForwardDiff cannot run.
 
 `DiscreteCallback`, `ContinuousCallback`, `VectorContinuousCallback` and `CallbackSet`
-all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`
-and `terminate!`. After a step the running solution's retcode is `Success`, as
+all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`,
+`terminate!` and `initialize_dae!`. After a step the running solution's retcode is `Success`, as
 OrdinaryDiffEq's is. `check_error` gives `Success` while the integrator can go on and the
 retcode it stopped with after that. In a callback's `finalize` it gives the retcode passed to
 `terminate!`, and `Success` for a solve that ended any other way, where OrdinaryDiffEq's
@@ -183,7 +187,8 @@ infinite step: below 1 it damps the frequencies the step cannot resolve, which r
 default, carries on undamped. It adapts on PETSc's error estimate with scalar `abstol` and
 `reltol`, or steps at `dt` with `adaptive = false`. Its Jacobian, from a `jac` or from
 `autodiff` as for the other implicit families, is that of the first-order system, `2n` by
-`2n`; it takes no sparse `jac_prototype` yet.
+`2n`, and a sparse `jac_prototype` of that system keeps the `n` by `n` matrix PETSc factors
+sparse, whether the Jacobian comes from a `jac` or is coloured, as for `TSImplicit`.
 
 ```julia
 K, C = [1.0e6 0.0; 0.0 1.0], [200.0 0.0; 0.0 0.02]
@@ -233,8 +238,23 @@ communicator other than `MPI.COMM_SELF`, where `CheckInit()` still checks the wh
 
 The default is `CheckInit()` even for a problem carrying ModelingToolkit's initialization
 data, which OrdinaryDiffEq would solve with `OverrideInit()`; this package does not solve that
-system and refuses `OverrideInit()` on such a problem. A callback that leaves the algebraic
-equations unsatisfied is not initialized again after it fires.
+system and refuses `OverrideInit()` on such a problem.
+
+`initialize_dae!(integrator, initializealg)` runs the same on the integrator's current state
+and time, with the `initializealg` the solve was given unless another is passed, and writes
+the result into PETSc. It takes `du0` from the problem for a `DAEProblem`, the current
+`abstol` and, for `ShampineCollocationInit()` on an `ODEProblem`, the current `dt / 5`, as
+OrdinaryDiffEq's does. When SNES fails the integrator finishes where it is with
+`ReturnCode.InitialFailure`, and on an `ODEProblem` without a singular mass matrix it does
+nothing. After a callback's `affect!` runs without calling
+`derivative_discontinuity!(integrator, false)`, or its `initialize` calls
+`derivative_discontinuity!(integrator, true)`, the integrator is initialized again with the
+callback's `initializealg`, or the solve's when the callback has none, as OrdinaryDiffEq does.
+So with the default a callback has to leave the algebraic equations satisfied or the solve
+throws `CheckInitFailureError`, and under `BrownFullBasicInit()` the algebraic variables are
+solved for again. On a `DAEProblem`, whose derivative PETSc keeps to itself, `CheckInit()`
+after a callback takes a state the callback left alone as consistent and checks a changed one
+against the problem's `du0`, which is right at `t0` only.
 
 ## Number types
 
@@ -348,6 +368,23 @@ has no derivative of interpolation. An adaptive solve can take costs only at the
 `tspan`, and its gradient holds the accepted step sizes fixed rather than differentiating
 the step-size controller.
 
+An integral cost, the integral of `g(u, p, t)` over `tspan`, goes through PETSc's
+quadrature `TS`, which sums it with the method's own stages: `dt * b[i] * g` at each stage
+of a `TSRK`, `dt * g` at the end of each backward Euler step and the trapezoidal sum for
+Crank-Nicolson. Its gradient is exact for that sum and differs from `QuadratureAdjoint`'s
+or `InterpolatingAdjoint`'s by the discretization error, again shrinking at the method's
+order. Give `g`, whose derivatives are then taken with ForwardDiff or the algorithm's
+`autodiff`, or `dgdu_continuous(out, u, p, t)` with `dgdp_continuous(out, u, p, t)`; with
+`dgdu_continuous` alone the direct dependence on `p` is taken as zero, as SciMLSensitivity
+takes it. Discrete and integral costs can be given together, and the gradients add:
+
+```julia
+g(u, p, t) = sum(abs2, u) / 2 + p[2] * u[1] * u[2]
+du0, dp = adjoint_sensitivities(
+    sol, TSRK("4"); sensealg = PETScAdjoint(), g, dt = 0.01, adaptive = false,
+)
+```
+
 `TSImplicit` solves transposed linear systems with the Krylov solver its Newton steps use,
 by default GMRES with ILU(0) stopping at a relative residual of 1e-5, so the gradient can be
 off by up to about that tolerance while the forward states are far more accurate. With
@@ -360,8 +397,8 @@ solve. A 1-D heat equation with 50 unknowns gave the same gradient as a direct s
 difference in every case. For a problem too large to factor, tighten `-ksp_rtol` instead;
 `1e-10` brought the two larger grids to 1e-11 and 5e-11.
 
-Callbacks, `tstops`, integral costs, mass matrices, `DAEProblem` and `SplitODEProblem` are
-refused, and so is differentiating `solve` with a reverse-mode AD package. Passing
+Callbacks, `tstops`, mass matrices, `DAEProblem` and `SplitODEProblem` are refused, and so
+is differentiating `solve` with a reverse-mode AD package. Passing
 `sensealg = PETScAdjoint()` to `solve` itself does nothing.
 
 `jac` and `paramjac` go into the gradient unchecked, so a wrong entry gives a wrong
@@ -451,7 +488,7 @@ that throws has to do so after its own communication.
 
 Callbacks and the integrator interface run distributed too, as long as every rank makes the
 same calls with the same arguments in the same order: `init`, `step!`, `solve!`, `reinit!`,
-`terminate!`, `set_u!`, `add_tstop!`, `add_saveat!`, `savevalues!`,
+`terminate!`, `set_u!`, `initialize_dae!`, `add_tstop!`, `add_saveat!`, `savevalues!`,
 `change_t_via_interpolation!`, `set_proposed_dt!`, `set_abstol!`, `set_reltol!`,
 `postamble!`, `auto_dt_reset!`, `integrator(t)` and `get_du` are all collective.
 `integrator.u` holds the rank's own rows, and so
