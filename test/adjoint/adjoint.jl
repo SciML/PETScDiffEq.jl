@@ -71,6 +71,18 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
         )
         @test via32[1] isa Vector{Float32}
         @test eltype(via32[2]) === Float32
+        accel!(ddu, du, u, p, t) = (ddu .= -p[1] .* u .- p[2] .* du; nothing)
+        second = SecondOrderODEProblem(accel!, [0.5], [1.0], (0.0, 1.0), [2.0, 0.3])
+        sol2 = solve(second, TSImplicit("cn", EXACT); dt = 0.01, adaptive = false, saveat = TS)
+        via2 = adjoint_sensitivities(
+            sol2, TSImplicit("cn", EXACT); sensealg = PETScAdjoint(),
+            t = TS, dgdu_discrete = dg!, dt = 0.01, adaptive = false,
+        )
+        @test via2 == PETScDiffEq._discrete_adjoint(
+            second, TSImplicit("cn", EXACT), PETScAdjoint();
+            t = TS, dgdu_discrete = dg!, dt = 0.01, adaptive = false,
+        )
+        @test via2[1] isa typeof(second.u0)
     end
 
     @testset "agrees with GaussAdjoint, closer at the method's order" begin
