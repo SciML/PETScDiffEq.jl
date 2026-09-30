@@ -245,6 +245,51 @@ const METHODS = (
         end
     end
 
+    @testset "a sparse mass matrix of this rank's rows" begin
+        # The consistent mass matrix of linear elements shares the Laplacian's eigenvectors.
+        mu(k) = 2 / 3 + cospi(k * dx) / 3
+        exact = exp(eigval(1) / mu(1) * SPAN[2]) .* sinpi.((1:N) .* dx) .+
+            0.5 * exp(eigval(3) / mu(3) * SPAN[2]) .* sinpi.(3 .* (1:N) .* dx)
+        function fem_mass(idx)
+            I = [k for (k, i) in enumerate(idx) for _ in neighbours(i)]
+            J = [j for i in idx for j in neighbours(i)]
+            V = [i == j ? 2 / 3 : 1 / 6 for i in idx for j in neighbours(i)]
+            return sparse(I, J, V, length(idx), N)
+        end
+        fem(idx, f; jac) =
+            ODEProblem(heat_function(f, idx; jac, mass_matrix = fem_mass(idx)), heat0(idx), SPAN)
+        for (make, err) in METHODS[1:2], (jac, ad) in SOURCES
+            sol = compare(
+                fem(rows, heat!; jac), make(comm), fem(1:N, heat_serial!; jac),
+                make(MPI.COMM_SELF; autodiff = ad), exact, err; TOL...,
+            )
+            @test (sol.stats.njacs > 0) == jac
+        end
+        # A rank may give its rows as a Diagonal, while another gives them sparse.
+        d = 1 .+ (1:N) ./ N
+        scaled(f) = (du, u, p, t) -> (f(du, u, p, t); du .*= p; nothing)
+        mixed(idx, f, mass; jac) = ODEProblem(
+            heat_function(scaled(f), idx; jac, scale = d, mass_matrix = mass), heat0(idx), SPAN,
+            d[idx],
+        )
+        n = length(rows)
+        mass = rank == thrower ? sparse(1:n, rows, d[rows], n, N) : Diagonal(d[rows])
+        for (jac, ad) in SOURCES
+            compare(
+                mixed(rows, heat!, mass; jac), TSImplicit("bdf"; comm),
+                mixed(1:N, heat_serial!, Diagonal(d); jac), TSImplicit("bdf"; autodiff = ad),
+                heat_exact(SPAN[2]), 1.5e-6; TOL...,
+            )
+        end
+        wrong = rank == thrower ? sparse(1:n, rows, ones(n), n, N + 1) : fem_mass(rows)
+        prob = ODEProblem(
+            heat_function(heat!, rows; jac = true, mass_matrix = wrong), heat0(rows), SPAN,
+        )
+        e = caught(() -> solve(prob, TSImplicit("bdf"; comm)))
+        @test rank == thrower ? e isa ArgumentError && occursin("must be $n x $N", e.msg) :
+            remote(e)
+    end
+
     @testset "algebraic rows with a zero on the diagonal" begin
         cell_counts = uneven(8)
         cells = owned(cell_counts)
@@ -256,32 +301,36 @@ const METHODS = (
             return nothing
         end
         entries = ((1, 2, 1.0), (1, 3, -1.0), (2, 1, 1.0), (2, 3, -2.0), (3, 1, -1.0), (3, 2, 1.0))
-        function cell_problem(cells; jac)
+        function cell_problem(cells; jac, sparse_mass = false)
             n, offset = 3length(cells), 3(first(cells) - 1)
             I = [3(c - 1) + i for c in 1:length(cells) for (i, _, _) in entries]
             J = [offset + 3(c - 1) + j for c in 1:length(cells) for (_, j, _) in entries]
             V = [v for _ in cells for (_, _, v) in entries]
             proto = sparse(I, J, ones(length(I)), n, 3sum(cell_counts))
             cell_jac!(Jm, u, p, t) = (foreach((i, j, v) -> Jm[i, j] = v, I, J, V); nothing)
-            M = Diagonal(repeat([0.0, 0.0, 1.0], length(cells)))
+            m = repeat([0.0, 0.0, 1.0], length(cells))
+            M = sparse_mass ? sparse(1:n, offset .+ (1:n), m, n, 3sum(cell_counts)) : Diagonal(m)
             fn = jac ?
                 ODEFunction(cell!; jac = cell_jac!, jac_prototype = proto, mass_matrix = M) :
                 ODEFunction(cell!; jac_prototype = proto, mass_matrix = M)
             return ODEProblem(fn, repeat([2.0, 1.0, 1.0], length(cells)), (0.0, 1.0))
         end
         exact = repeat(exp(-1) .* [2.0, 1.0, 1.0], sum(cell_counts))
-        for (jac, ad) in SOURCES
+        for sparse_mass in (false, true), (jac, ad) in SOURCES
             compare(
-                cell_problem(cells; jac), TSImplicit("bdf"; comm),
-                cell_problem(1:sum(cell_counts); jac), TSImplicit("bdf"; autodiff = ad), exact,
-                6.0e-6; layout = 3 .* cell_counts, TOL...,
+                cell_problem(cells; jac, sparse_mass), TSImplicit("bdf"; comm),
+                cell_problem(1:sum(cell_counts); jac, sparse_mass),
+                TSImplicit("bdf"; autodiff = ad), exact, 6.0e-6; layout = 3 .* cell_counts, TOL...,
             )
         end
         u0 = repeat([2.0, 1.0, 1.0], length(cells))
         rank == thrower && (u0[1] += 1)
+        for sparse_mass in (false, true)
+            off = SciMLBase.remake(cell_problem(cells; jac = true, sparse_mass); u0)
+            @test caught(() -> solve(off, TSImplicit("bdf"; comm); TOL...)) isa
+                SciMLBase.CheckInitFailureError
+        end
         off = SciMLBase.remake(cell_problem(cells; jac = true); u0)
-        @test caught(() -> solve(off, TSImplicit("bdf"; comm); TOL...)) isa
-            SciMLBase.CheckInitFailureError
         brown = DiffEqBase.BrownFullBasicInit()
         @test refused(
             () -> solve(off, TSImplicit("bdf"; comm); initializealg = brown, TOL...),

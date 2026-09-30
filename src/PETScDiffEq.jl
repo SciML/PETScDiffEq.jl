@@ -709,7 +709,9 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     u::Vector{S}
     mudot::Vector{S}
     resid::Vector{S}
-    M::Union{Nothing, Matrix{S}, LinearAlgebra.Diagonal{S, Vector{S}}}
+    M::Union{
+        Nothing, Matrix{S}, LinearAlgebra.Diagonal{S, Vector{S}}, SparseMatrixCSC{S, Int},
+    }
     dae::Bool
     missing_diag::Vector{Int}
     W::Matrix{S}
@@ -774,6 +776,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     stalled::Bool
     maxiters::Int
     linear::Bool
+    mass_mat::Any
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -1139,6 +1142,16 @@ for S in (Float32, Float64, ComplexF32, ComplexF64)
         )
         return nothing
     end
+end
+
+function _mat_mult!(pl, A, x, y)
+    _check_code(
+        ccall(
+            _symbol(pl, :MatMult), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), A.ptr, x, y,
+        ),
+    )
+    return nothing
 end
 
 function _mat_add_diagonal!(pl, A, d)
@@ -1900,6 +1913,15 @@ function _fill_rows!(ctx, shift, n)
     return nothing
 end
 
+# This rank's rows of M, with global columns; a Diagonal or identity block sits on its own.
+function _distributed_mass(::Type{S}, mass, n, N, comm) where {S}
+    # Collective, so every rank takes part whatever it gives.
+    rstart = MPI.Scan(n, +, comm) - n
+    mass isa SparseArrays.AbstractSparseMatrix && return SparseMatrixCSC{S, Int}(mass)
+    d = mass === nothing ? ones(S, n) : Vector{S}(mass.diag)
+    return sparse(1:n, rstart .+ (1:n), d, n, N)
+end
+
 # Relies on SeqAIJ storing rows by ascending column, the order `_row_structure` builds.
 function _setrows!(ctx, A, n)
     vals = LibPETSc.MatSeqAIJGetArray(ctx.petsclib, A)
@@ -1968,17 +1990,31 @@ function _rows_pattern(cols0, n)
     return sparse(rows, cols, ones(length(rows)), n, n)
 end
 
+# A sparse M holds this rank's rows with global columns, as J does; `c` is 0-based.
+_mass_entry(::Type{S}, M::SparseMatrixCSC, i, c, rstart) where {S} = S(M[i, c + 1])
+_mass_entry(::Type{S}, M, i, c, rstart) where {S} =
+    c == rstart + i - 1 ? (M === nothing ? one(S) : S(M.diag[i])) : zero(S)
+
 function _coo_structure(J::SparseMatrixCSC{S}, rstart, M) where {S}
     n = size(J, 1)
-    cols0, src, _ = _row_structure(J, n, nothing, rstart)
+    cols0, src, _ = _row_structure(J, n, M isa SparseMatrixCSC ? M : nothing, rstart)
     rows = LibPETSc.PetscInt[rstart + i - 1 for i in 1:n for _ in cols0[i]]
     cols = LibPETSc.PetscInt[c for i in 1:n for c in cols0[i]]
-    mass = S[
-        c == rstart + i - 1 ? (M === nothing ? one(S) : M.diag[i]) : zero(S)
-            for i in 1:n for c in cols0[i]
-    ]
+    mass = S[_mass_entry(S, M, i, c, rstart) for i in 1:n for c in cols0[i]]
     coo = COOJacobian(Int[k for i in 1:n for k in src[i]], mass, zeros(S, length(rows)))
     return rows, cols, coo
+end
+
+function _mass_matrix!(ctx, petsclib, comm, M, rstart, N)
+    I, J, V = findnz(M)
+    ctx.mass_mat = LibPETSc.MatCreate(petsclib, comm)
+    _coo_matrix!(
+        ctx.mass_mat, petsclib, size(M, 1), N, LibPETSc.PetscInt.(rstart .+ I .- 1),
+        LibPETSc.PetscInt.(J .- 1),
+    )
+    LibPETSc.MatSetValuesCOO(petsclib, ctx.mass_mat, V, LibPETSc.INSERT_VALUES)
+    PETSc.assemble!(ctx.mass_mat)
+    return nothing
 end
 
 function _coo_matrix!(A, petsclib, n, N, rows, cols)
@@ -2232,8 +2268,13 @@ function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
             _call_f!(ctx, ctx.du, ctx.u, t)
             if ctx.M === nothing
                 @. ctx.resid = udot - ctx.du
-            else
+            elseif ctx.mass_mat === nothing
                 mul!(ctx.resid, ctx.M, udot)
+                @. ctx.resid = ctx.resid - ctx.du
+            else
+                # This rank's rows of M reach other ranks' entries of udot.
+                _mat_mult!(pl, ctx.mass_mat, xdot_ptr, f_ptr)
+                _readvec!(ctx.resid, pl, PETSc.VecPtr(pl, f_ptr, false))
                 @. ctx.resid = ctx.resid - ctx.du
             end
         end
@@ -3086,6 +3127,7 @@ function _destroy!(h::TSHandles)
     h.opts === nothing || PETScCompat.destroy!(h.opts)
     h.jac_mat === nothing || PETScCompat.destroy!(h.jac_mat)
     h.fd_mat === nothing || PETScCompat.destroy!(h.fd_mat)
+    h.ctx.mass_mat === nothing || PETScCompat.destroy!(h.ctx.mass_mat)
     for v in h.tolvecs
         v.ptr == C_NULL || PETScCompat.destroy!(v)
     end
@@ -3296,13 +3338,13 @@ const _DISTRIBUTED_IMPLICIT =
 const _DM_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex")
 const _WITH_DM = "with a `dm`"
 
-function _check_diagonal_mass(prob, is_dae, where)
+function _check_diagonal_mass(prob, is_dae, where, or = "")
     n = length(prob.u0)
     mass = is_dae ? nothing : prob.f.mass_matrix
     (mass === nothing || mass == LinearAlgebra.I) && return nothing
     mass isa LinearAlgebra.Diagonal || throw(
         ArgumentError(
-            "PETScDiffEq takes only a `Diagonal` mass matrix $where, not a " *
+            "PETScDiffEq takes only a `Diagonal` mass matrix$or $where, not a " *
                 "$(nameof(typeof(mass)))",
         ),
     )
@@ -3310,6 +3352,22 @@ function _check_diagonal_mass(prob, is_dae, where)
         ArgumentError(
             "the mass matrix is $(join(size(mass), " x ")), but this rank's block of " *
                 "the state has $n rows",
+        ),
+    )
+    return nothing
+end
+
+# Like the `jac_prototype`, a sparse mass matrix holds this rank's rows, with global columns.
+function _check_local_mass(prob, is_dae, N)
+    n = length(prob.u0)
+    mass = is_dae ? nothing : prob.f.mass_matrix
+    (mass === nothing || mass == LinearAlgebra.I) && return nothing
+    mass isa SparseArrays.AbstractSparseMatrix ||
+        return _check_diagonal_mass(prob, is_dae, _NOT_SELF, " or a sparse one")
+    size(mass) == (n, N) || throw(
+        ArgumentError(
+            "the sparse mass matrix is $(join(size(mass), " x ")), but $_NOT_SELF it " *
+                "holds this rank's rows, with global column indices, so it must be $n x $N",
         ),
     )
     return nothing
@@ -3398,7 +3456,7 @@ function _refuse_distributed(prob, alg, is_dae, N)
         )
     end
     n = length(prob.u0)
-    _check_diagonal_mass(prob, is_dae, _NOT_SELF)
+    _check_local_mass(prob, is_dae, N)
     proto = prob.f.jac_prototype
     if has_jac
         proto isa SparseMatrixCSC || throw(
@@ -3751,10 +3809,14 @@ function _setup(
     save_on || empty!(saveat_times)
     save_start || filter!(!at_start, saveat_times)
     save_end || filter!(!at_end, saveat_times)
+    sparse_mass = has_mass && dm === nothing && comm !== nothing &&
+        _anywhere(comm, own_mass && mass_matrix isa SparseArrays.AbstractSparseMatrix)
     M = if !has_mass
         nothing
     elseif comm === nothing && dm === nothing
         Matrix{S}(mass_matrix)
+    elseif sparse_mass
+        _distributed_mass(S, own_mass ? mass_matrix : nothing, n, N, comm)
     else
         # `ctx.M === nothing` steers collectives, so an identity block still gets a Diagonal.
         LinearAlgebra.Diagonal(own_mass ? Vector{S}(mass_matrix.diag) : ones(S, n))
@@ -3829,7 +3891,7 @@ function _setup(
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
-        false, false, Int(maxiters), false,
+        false, false, Int(maxiters), false, nothing,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -3914,6 +3976,7 @@ function _setup(
                 end
             elseif comm !== nothing && _uses_ifunction(alg)
                 rstart = first(LibPETSc.VecGetOwnershipRange(petsclib, u))
+                M isa SparseMatrixCSC && _mass_matrix!(ctx, petsclib, comm, M, rstart, N)
                 P = has_jac ? J0 : _structure(S, SparseMatrixCSC(prob.f.jac_prototype))
                 rows, cols, coo = _coo_structure(P, rstart, M)
                 mat = LibPETSc.MatCreate(petsclib, comm)

@@ -537,7 +537,13 @@ Without a `jac`, `autodiff` defaults to `AutoFiniteDiff()` on such a `comm`: PET
 prototype's pattern and differences `f`, calling it the same number of times on every rank.
 ForwardDiff and the other `autodiff` backends are refused there, since the number of times
 they call `f` differs between ranks. So are a `jac` or colouring without a sparse prototype,
-a mass matrix other than a `Diagonal` of this rank's entries, and `TSIRK` without a `jac`.
+a dense mass matrix, and `TSIRK` without a `jac`.
+
+A mass matrix is a `Diagonal` of this rank's entries, or a sparse matrix holding this rank's
+rows with global column indices, as the prototype does, such as a finite element mass
+matrix. PETSc assembles a sparse one into a distributed matrix, and its pattern joins the
+prototype's in the Jacobian `a*M - J` of the implicit solve. A rank whose rows of the mass
+matrix are the identity can leave it as `I`, whatever the other ranks give.
 `TSIRK` also needs each rank to hold PETSc's own share of the state, split evenly with the
 first ranks taking one row more, since PETSc lays out its stage vector that way.
 
