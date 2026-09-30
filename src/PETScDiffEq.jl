@@ -2041,9 +2041,11 @@ struct Partitioned{F1, F2}
     nv::Int
     kicks::Vector{Float64}
     kick::Base.RefValue{Int}
+    # The last kick's time, state and force, which the next kick reuses if they still hold.
+    last_kick::Base.RefValue{Any}
 end
 
-Partitioned(f1, f2, nv) = Partitioned(f1, f2, nv, Float64[], Ref(0))
+Partitioned(f1, f2, nv) = Partitioned(f1, f2, nv, Float64[], Ref(0), Ref{Any}(nothing))
 
 function (d::Partitioned)(dx, x, p, t)
     n = length(x)
@@ -2062,7 +2064,7 @@ _partitioned(f, iip, nv) = Partitioned(
 
 _reverse_part(f) = (d, v, u, p, s) -> (f(d, v, u, p, _user_t(-one(s), s)); d .*= -1; nothing)
 _reverse_rhs(d::Partitioned) =
-    Partitioned(_reverse_part(d.f1), _reverse_part(d.f2), d.nv, d.kicks, d.kick)
+    Partitioned(_reverse_part(d.f1), _reverse_part(d.f2), d.nv, d.kicks, d.kick, d.last_kick)
 
 const _CBRT2 = cbrt(2.0)
 const _FR = 1 / (2 - _CBRT2)
@@ -2085,8 +2087,31 @@ function _set_kicks!(d::Partitioned, type)
         iszero(k[i]) || push!(d.kicks, sum(c[1:i]) / sum(k[1:i]))
     end
     d.kick[] = 0
+    d.last_kick[] = nothing
     return nothing
 end
+
+# Velocity Verlet ends a step with the kick that starts the next, as OrdinaryDiffEq's
+# VelocityVerlet reuses, so a kick at the time and state of the last one takes its force.
+function _kick!(d::Partitioned, out, v, u, p, t, x)
+    last = d.last_kick[]
+    # PETSc sums the step's end time differently from the next step's start, by an ulp.
+    if last !== nothing && abs(t - last[1]) <= 4 * eps(max(abs(t), abs(last[1]))) &&
+            last[2] == x
+        copyto!(out, last[3])
+        return false
+    end
+    d.f1(out, v, u, p, t)
+    d.last_kick[] = last === nothing || length(last[2]) != length(x) ?
+        (t, copy(x), copy(out)) : (t, copyto!(last[2], x), copyto!(last[3], out))
+    return true
+end
+
+_forget_kick!(d::Partitioned) = (d.last_kick[] = nothing; nothing)
+_forget_kick!(d) = nothing
+
+# Anything that sets `pdirty` may have changed `p` or the state behind the solver's back.
+_dirty!(ctx) = (ctx.pdirty = true; _forget_kick!(ctx.f!); nothing)
 
 function _kick_time(d::Partitioned, sub_ts, pl, t)
     isempty(d.kicks) && return t
@@ -2315,8 +2340,12 @@ function _symplectic_part!(ctx, sub_ts, t, x_ptr, f_ptr, momentum::Bool)
         v, u = view(ctx.u, 1:d.nv), view(ctx.u, (d.nv + 1):n)
         _readvec!(momentum ? u : v, pl, PETSc.VecPtr(pl, x_ptr, false))
         out = momentum ? view(ctx.du, 1:d.nv) : view(ctx.du, (d.nv + 1):n)
-        (momentum ? d.f1 : d.f2)(out, v, u, ctx.p, t)
-        momentum ? (ctx.nf += 1) : (ctx.nf2 += 1)
+        if momentum
+            _kick!(d, out, v, u, ctx.p, t, ctx.u) && (ctx.nf += 1)
+        else
+            d.f2(out, v, u, ctx.p, t)
+            ctx.nf2 += 1
+        end
         _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), out)
     catch e
         ctx.err = e
@@ -4580,7 +4609,7 @@ _check_continuous(cb) = throw(
 
 function _discontinuity_unlocked(integ::PETScIntegrator, bool::Bool)
     integ.derivative_discontinuity = bool
-    bool && (integ.h.ctx.pdirty = true)
+    bool && _dirty!(integ.h.ctx)
     return nothing
 end
 
@@ -4591,7 +4620,7 @@ function _set_p_unlocked(integ::PETScIntegrator, v)
     setfield!(integ, :p, convert(fieldtype(typeof(integ), :p), v))
     h = integ.h
     h.ctx.p = integ.p
-    h.ctx.pdirty = true
+    _dirty!(h.ctx)
     # An FSAL method reuses its last stage's slope, taken with the old p, unless restarted.
     # BDF keeps only past states, which stay valid, and a restart drops it to first order.
     h.destroyed || h.ctx.alg_name == "bdf" || LibPETSc.TSRestartStep(h.petsclib, h.ts)
@@ -5074,7 +5103,7 @@ function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
         _end_step_here!(integ)
     end
     integ.t = t
-    h.ctx.pdirty = true
+    _dirty!(h.ctx)
     PETScCompat.with_local_array!(
         ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
     )
@@ -5144,7 +5173,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
                 ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
             )
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
-            ctx.pdirty = true
+            _dirty!(ctx)
         end
         cb.save_positions[2] && _save_here!(integ)
     end
@@ -5279,7 +5308,7 @@ function _take_written_state!(integ::PETScIntegrator)
         ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
     )
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
-    h.ctx.pdirty = true
+    _dirty!(h.ctx)
     return nothing
 end
 
@@ -5294,7 +5323,7 @@ function _past_discontinuity!(integ::PETScIntegrator)
     integ.t = _user_t(integ.tdir, s)
     LibPETSc.TSSetTime(h.petsclib, h.ts, s)
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
-    h.ctx.pdirty = true
+    _dirty!(h.ctx)
     return nothing
 end
 
