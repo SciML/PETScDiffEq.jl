@@ -9,6 +9,30 @@ _zero_rows(M::LinearAlgebra.Diagonal) = iszero.(M.diag)
 _zero_rows(M) = [all(iszero, r) for r in eachrow(M)]
 _zero_cols(M::LinearAlgebra.Diagonal) = iszero.(M.diag)
 _zero_cols(M) = [all(iszero, c) for c in eachcol(M)]
+function _zero_lines(M, dim)
+    z = trues(size(M, dim))
+    for (i, j, v) in zip(findnz(M)...)
+        iszero(v) || (z[dim == 1 ? i : j] = false)
+    end
+    return z
+end
+_zero_rows(M::SparseArrays.AbstractSparseMatrix) = _zero_lines(M, 1)
+_zero_cols(M::SparseArrays.AbstractSparseMatrix) = _zero_lines(M, 2)
+
+_any_zero_col(vars, mass, n, ::Nothing) = any(vars)
+# On a communicator a column is zero only if it is in every rank's rows.
+function _any_zero_col(vars, mass, n, comm::MPI.Comm)
+    _anywhere(comm, mass isa SparseArrays.AbstractSparseMatrix) ||
+        return _anywhere(comm, any(vars))
+    N, rstart = MPI.Allreduce(n, +, comm), MPI.Scan(n, +, comm) - n
+    used = zeros(Bool, N)
+    if mass isa SparseArrays.AbstractSparseMatrix
+        used .= .!vars
+    else
+        used[rstart .+ (1:n)] .= .!vars
+    end
+    return !all(MPI.Allreduce(used, |, comm))
+end
 
 const _INIT_ALGS = Union{
     SciMLBase.CheckInit, DiffEqBase.BrownFullBasicInit, DiffEqBase.ShampineCollocationInit,
@@ -38,7 +62,8 @@ function _initialize!(
         # A rank whose own block is the identity still joins the collectives below.
         eqs = plain ? falses(length(u0)) : _zero_rows(mass)
         vars = plain ? falses(length(u0)) : _zero_cols(mass)
-        _anywhere(comm, any(eqs)) && _anywhere(comm, any(vars)) || return true
+        _anywhere(comm, any(eqs)) && _any_zero_col(vars, mass, length(u0), comm) ||
+            return true
     end
     init isa _INIT_ALGS || throw(
         ArgumentError("PETScDiffEq does not support `initializealg = $(repr(init))`"),
