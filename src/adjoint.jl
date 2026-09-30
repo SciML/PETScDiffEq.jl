@@ -34,6 +34,13 @@ which therefore has to be a vector of real numbers. A hand-written `jac` or `par
 goes into the gradient unchecked, so a wrong one gives a wrong gradient without an error;
 compare it against a gradient computed without it.
 
+A `DynamicalODEProblem` or `SecondOrderODEProblem` is differentiated as the first-order
+system on the flat `[v; u]` that these methods step. Its `jac` and `paramjac`, when given,
+are that system's, taking the state as an `ArrayPartition(v, u)` as the forward solve's
+`jac` does, and are otherwise built from `f1` and `f2`. The cost functions are handed the
+state as an `ArrayPartition` and write its derivative into one, and `du0` comes back as
+one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused.
+
 The adjoint runs in PETSc's double real build. A `Float32` problem is solved there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
 `du0` and `dp` come back as `Float32` where `u0` and `p` are. Its cost times are matched to
@@ -538,11 +545,6 @@ function _check_adjoint_problem(
         prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, g, dgdu_continuous,
         dgdp_continuous, comm,
     )
-    prob.f isa SciMLBase.DynamicalODEFunction && throw(
-        ArgumentError(
-            "PETScAdjoint does not support a DynamicalODEProblem or SecondOrderODEProblem",
-        ),
-    )
     (prob isa SciMLBase.AbstractODEProblem && !(prob.f isa SciMLBase.SplitFunction)) ||
         throw(
         ArgumentError(
@@ -808,6 +810,7 @@ function _discrete_adjoint_unlocked(
         )
         given, checked, Bool(no_start)
     end
+    dyn = prob.f isa SciMLBase.DynamicalODEFunction
     p = prob.p
     np = has_p ? length(p) : 0
     cost_t = _unset(t) ? Float64[] : collect(Float64, t)
@@ -831,7 +834,9 @@ function _discrete_adjoint_unlocked(
         implicit = _check_adjoint_ts(h, alg, cost_s)
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
-        f_ad = _as_inplace(SciMLBase.unwrapped_f(prob.f.f), iip)
+        f_ad = dyn ? _partitioned(prob.f, iip, length(prob.u0.x[1])) :
+            _as_inplace(SciMLBase.unwrapped_f(prob.f.f), iip)
+        user_jac(j) = dyn ? _partitioned_jac(j, prob.u0, iip) : _as_inplace_jac(j, iip)
         user_t0 = Float64(prob.tspan[1])
         jac, J = nothing, zeros(0, 0)
         if !implicit
@@ -840,7 +845,7 @@ function _discrete_adjoint_unlocked(
                     backend, f_ad, prob.f.jac_prototype, h.u0, p, user_t0, Ref(0),
                     _ADJOINT_JAC_ADVICE,
                 ) :
-                _as_inplace_jac(prob.f.jac, iip)
+                user_jac(prob.f.jac)
             h.tdir < 0 && (jac = _reverse_jac(jac))
             proto = prob.f.jac_prototype
             J = proto isa SparseMatrixCSC ? SparseMatrixCSC{Float64, Int}(proto) : zeros(n, n)
@@ -856,7 +861,7 @@ function _discrete_adjoint_unlocked(
             pl, h.tdir, p, jac, J, rows...,
             np == 0 ? nothing : prob.f.paramjac === nothing ?
                 _ad_paramjacobian(backend, f_ad, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE) :
-                _as_inplace_jac(prob.f.paramjac, iip),
+                user_jac(prob.f.paramjac),
             zeros(n, np),
             implicit ? -h.tdir : h.tdir, dgdu_discrete, skip_start,
             cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),
@@ -1038,13 +1043,41 @@ function _discrete_adjoint_unlocked(
         end
         comm === nothing || (dp .+= MPI.Allreduce(mine, +, comm))
     end
-    return _like(prob.u0, du0), has_p ? _like(p, dp)' : nothing
+    du0 = _like(prob.u0, du0)
+    return dyn ? _partition(prob.u0, du0) : du0, has_p ? _like(p, dp)' : nothing
 end
 
 _like(x, g) = eltype(x) === Float32 ? Float32.(g) : g
 
-_discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...) =
-    _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; kwargs...))
+# A DynamicalODEProblem's costs see the flat [v; u] as the ArrayPartition `solve` saves.
+_partitioned_cost(::Nothing, template, of_u) = nothing
+function _partitioned_cost(dg, template, of_u)
+    of_u || return (out, u, args...) -> dg(out, _partition(template, u), args...)
+    part = similar(template, Float64)
+    return function (out, u, args...)
+        dg(copyto!(part, out), _partition(template, u), args...)
+        copyto!(out, part)
+        return nothing
+    end
+end
+
+_partitioned_costs(
+    template; dgdu_discrete = nothing, dgdp_discrete = nothing, dgdu_continuous = nothing,
+    dgdp_continuous = nothing, g = nothing, kwargs...,
+) = (;
+    kwargs...,
+    dgdu_discrete = _partitioned_cost(dgdu_discrete, template, true),
+    dgdp_discrete = _partitioned_cost(dgdp_discrete, template, false),
+    dgdu_continuous = _partitioned_cost(dgdu_continuous, template, true),
+    dgdp_continuous = _partitioned_cost(dgdp_continuous, template, false),
+    g = g === nothing ? nothing : (u, p, t) -> g(_partition(template, u), p, t),
+)
+
+function _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...)
+    costs = prob.f isa SciMLBase.DynamicalODEFunction ?
+        _partitioned_costs(prob.u0; kwargs...) : kwargs
+    return _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; costs...))
+end
 
 function SciMLBase._concrete_solve_adjoint(
         ::SupportedProblem, ::AnyPETScTS, ::PETScAdjoint, u0, p,
