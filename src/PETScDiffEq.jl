@@ -491,8 +491,9 @@ spectral radius at an infinite step, from 0 to 1: PETSc's default, 1, damps noth
 smaller one damps the highest frequencies more.
 
 Adapts on PETSc's error estimate for the method, which PETSc leaves off unless asked, so
-`reltol` and `abstol` apply. They have to be scalars, since PETSc weighs the velocity with the
-position's tolerances. `adaptive = false` steps at the `dt` you give.
+`reltol` and `abstol` apply. PETSc weighs the velocity and the position with one tolerance
+per component of the position, so a vector tolerance on the state `[v; u]` takes the smaller
+of each velocity and position pair. `adaptive = false` steps at the `dt` you give.
 
 Each step solves for the acceleration, with the Jacobian of `f` in `u` and `u'`. That comes
 from a `jac`, which is the Jacobian of the first-order system `[v; u]' = [f(v, u, p, t); v]`,
@@ -3128,6 +3129,10 @@ end
 
 function _set_tolerances!(h::TSHandles{<:Any, <:Any, R}, abstol, reltol) where {R}
     pl, n = h.petsclib, length(h.u0)
+    if h.solution !== nothing
+        n ÷= 2
+        abstol, reltol = _fold_second_order(abstol, n), _fold_second_order(reltol, n)
+    end
     novec = LibPETSc.PetscVec{typeof(pl)}()
     avec = _tolvec(h, pl, abstol, n, "abstol")
     rvec = _tolvec(h, pl, reltol, n, "reltol")
@@ -3705,7 +3710,6 @@ function _setup(
         _check_tol(abstol, n, "abstol")
         _check_tol(reltol, n, "reltol")
     end
-    alg isa TSAlpha2 && (_scalar_tol(abstol); _scalar_tol(reltol))
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
     initialized = _initialize!(
         u0, prob, initializealg, f1, dm_jac ? nothing : jac_fn, petsclib, comm,
@@ -4326,12 +4330,13 @@ end
 
 _solution_vec(h::TSHandles) = something(h.solution, h.u)
 
-_scalar_tol(tol) = tol isa AbstractVector && throw(
-    ArgumentError(
-        "TSAlpha2 takes a scalar `abstol` and `reltol`, since PETSc weighs the position and " *
-            "the velocity with the same tolerances",
-    ),
-)
+# PETSc's alpha2 weighs the velocity and the position with one tolerance vector of the
+# position's length, so a tolerance on `[v; u]` takes the tighter of each pair.
+function _fold_second_order(tol, nv)
+    tol isa AbstractVector || return tol
+    t = collect(tol)
+    return min.(view(t, 1:nv), view(t, (nv + 1):(2nv)))
+end
 
 function _symplectic_type(pl, ts)
     name = Ref{Ptr{Cchar}}(C_NULL)
@@ -4454,7 +4459,6 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
     )
     name in (:abstol, :reltol) &&
         _checked_everywhere(() -> _check_tol(v, length(h.u0), name), h.ctx.comm)
-    name in (:abstol, :reltol) && h.solution !== nothing && _scalar_tol(v)
     setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : name === :maxiters ? Int(v) : v)
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib
