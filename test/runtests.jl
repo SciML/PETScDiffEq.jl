@@ -9363,8 +9363,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws "are both vectors" SciMLBase.solve(
                 scalars, PETScDiffEq.TSBasicSymplectic(); dt = 0.1,
             )
-            @test_throws "PETScAdjoint does not support a DynamicalODEProblem" PETScDiffEq._discrete_adjoint(
-                osc, PETScDiffEq.TSRK("4"), PETScAdjoint(); t = [0.0, 1.0],
+            @test_throws "PETSc has no adjoint for TSBasicSymplectic" PETScDiffEq._discrete_adjoint(
+                osc, PETScDiffEq.TSBasicSymplectic(), PETScAdjoint(); t = [0.0, 1.0],
                 dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing), dt = 0.1, adaptive = false,
             )
         end
