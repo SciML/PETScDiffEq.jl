@@ -2901,7 +2901,8 @@ function _check_inttype(petsclib)
     return nothing
 end
 
-_maxsteps(maxiters) = LibPETSc.PetscInt(min(maxiters, typemax(LibPETSc.PetscInt)))
+# TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
+_maxsteps(maxiters) = LibPETSc.PetscInt(clamp(maxiters, 0, typemax(LibPETSc.PetscInt)))
 
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothing)
     rows, cols, _ = findnz(jac_prototype)
@@ -3210,6 +3211,8 @@ _check_real_tol(tol, name) = _check_real(tol, name; accept = isreal)
 
 function _check_tol(tol, n, name)
     _check_real_tol(tol, name)
+    # TSSetTolerances reads -1 and -2 as PETSC_DETERMINE and PETSC_CURRENT.
+    tol isa Number && real(tol) < 0 && throw(ArgumentError("`$name` is negative"))
     tol isa AbstractVector || return nothing
     length(tol) == n ||
         throw(ArgumentError("`$name` has length $(length(tol)), but the state has $n"))
