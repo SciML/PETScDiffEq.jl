@@ -8081,6 +8081,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         exact = [
             "-snes_rtol", "1e-13", "-snes_atol", "1e-15", "-ksp_type", "preonly", "-pc_type", "lu",
         ]
+        endpoint = [exact; "-ts_theta_endpoint"]
         half_norm(u, p, t) = sum(abs2, u) / 2
         half_norm_du!(out, u, p, t, i) = (out .= u; nothing)
         coupled(u, p, t) = sum(abs2, u) / 2 + p[2] * u[1] * u[2] + p[1]^2 * t
@@ -8123,9 +8124,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     "Crank-Nicolson backward in time", TSImplicit("cn", exact),
                     (1.0, 0.0), backward_t, (;),
                 ),
+                ("theta 0.7", TSImplicit("theta", 0.7, exact), (0.0, 1.0), forward_t, (;)),
+                (
+                    "theta 0.7 backward in time", TSImplicit("theta", 0.7, exact),
+                    (1.0, 0.0), backward_t, (;),
+                ),
+                (
+                    "theta at its default, the implicit midpoint rule", TSImplicit("theta", exact),
+                    (0.0, 1.0), forward_t, (;),
+                ),
+                (
+                    "theta 0.7 in its endpoint form", TSImplicit("theta", 0.7, endpoint),
+                    (0.0, 1.0), forward_t, (;),
+                ),
+                (
+                    "theta 0.7 in its endpoint form backward in time",
+                    TSImplicit("theta", 0.7, endpoint), (1.0, 0.0), backward_t, (coupled = true,),
+                ),
                 (
                     "a trajectory of states only", TSRK("4"), (0.0, 1.0), forward_t,
                     (sensealg = ["-ts_trajectory_solution_only", "1"],),
+                ),
+                (
+                    "a trajectory of states only, theta 0.7", TSImplicit("theta", 0.7, exact),
+                    (0.0, 1.0), forward_t, (sensealg = ["-ts_trajectory_solution_only", "1"],),
                 ),
                 # PETSc's 32-bit build fails trajectory file I/O intermittently.
                 (
@@ -8154,6 +8176,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 (
                     "out of place, backward Euler backward in time", TSImplicit("beuler", exact),
                     (1.0, 0.0), backward_t, (oop = true,),
+                ),
+                (
+                    "out of place with a cost that depends on p, theta 0.3 backward in time",
+                    TSImplicit("theta", 0.3, exact), (1.0, 0.0), backward_t,
+                    (oop = true, coupled = true),
+                ),
+                (
+                    "a sparse jac_prototype, theta 0.7", TSImplicit("theta", 0.7, exact),
+                    (0.0, 1.0), forward_t, (sparse_jac = true,),
                 ),
             )
             prob = adj_prob(
@@ -8197,14 +8228,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 J[2, 2] = -0.4 * u[2]
                 return nothing
             end
-            for p in (nothing, SciMLBase.NullParameters(), Float64[])
+            for p in (nothing, SciMLBase.NullParameters(), Float64[]),
+                    alg in (TSRK("4"), TSImplicit("theta", 0.7, exact))
                 prob = SciMLBase.ODEProblem(
                     SciMLBase.ODEFunction(g!; jac = g_jac!), copy(u0), (0.0, 1.0), p,
                 )
-                du0, dp = grad(prob, TSRK("4"))
+                du0, dp = grad(prob, alg)
                 function loss(u)
                     sol = SciMLBase.solve(
-                        SciMLBase.remake(prob; u0 = u), TSRK("4");
+                        SciMLBase.remake(prob; u0 = u), alg;
                         dt = 0.01, adaptive = false, saveat = forward_t,
                     )
                     return sum(half_norm(v, p, 0.0) for v in sol.u)
@@ -8275,12 +8307,32 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     "Crank-Nicolson backward in time", TSImplicit("cn", exact), (1.0, 0.0),
                     (;),
                 ),
+                ("theta 0.7", TSImplicit("theta", 0.7, exact), (0.0, 1.0), (;)),
+                ("theta 0.7 backward in time", TSImplicit("theta", 0.7, exact), (1.0, 0.0), (;)),
+                (
+                    "theta at its default, the implicit midpoint rule", TSImplicit("theta", exact),
+                    (0.0, 1.0), (;),
+                ),
+                ("theta 0.7 in its endpoint form", TSImplicit("theta", 0.7, endpoint), (0.0, 1.0), (;)),
+                (
+                    "theta 0.7 in its endpoint form backward in time",
+                    TSImplicit("theta", 0.7, endpoint), (1.0, 0.0), (discrete = true,),
+                ),
+                (
+                    "theta 0.7 with PETSc's differences",
+                    TSImplicit("theta", 0.7, exact; autodiff = PETScDiffEq.AutoFiniteDiff()),
+                    (0.0, 1.0), (;),
+                ),
                 ("out of place", TSRK("4"), (0.0, 1.0), (oop = true,)),
                 (
                     "a trajectory of states only", TSRK("4"), (0.0, 1.0),
                     (sensealg = ["-ts_trajectory_solution_only", "1"],),
                 ),
                 ("g differentiated for both", TSImplicit("cn", exact), (0.0, 1.0), (ad = true,)),
+                (
+                    "g differentiated for both, theta 0.7 backward in time",
+                    TSImplicit("theta", 0.7, exact), (1.0, 0.0), (ad = true,),
+                ),
                 ("dgdu_continuous alone takes dgdp as zero", TSRK("4"), (0.0, 1.0), (frozen = true,)),
                 ("with discrete costs", TSRK("4"), (0.0, 1.0), (discrete = true,)),
                 (
@@ -8314,7 +8366,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
 
         @testset "g is differentiated where its derivatives are not given" begin
-            for alg in (TSRK("4"), TSImplicit("beuler", exact), TSImplicit("cn", exact))
+            for alg in (
+                    TSRK("4"), TSImplicit("beuler", exact), TSImplicit("cn", exact),
+                    TSImplicit("theta", 0.7, exact),
+                )
                 prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
                 given = integral(
                     prob, alg; g = coupled, dgdu_continuous = integrand_du!,
@@ -8424,7 +8479,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
 
         @testset "without jac or paramjac both are differentiated" begin
             for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t)),
-                    alg in (TSRK("4"), TSImplicit("beuler", exact), TSImplicit("cn", exact))
+                    alg in (
+                        TSRK("4"), TSImplicit("beuler", exact), TSImplicit("cn", exact),
+                        TSImplicit("theta", 0.7, exact),
+                    )
                 given = grad(adj_prob(copy(u0), copy(p0), tspan), alg; t)
                 plain = grad(SciMLBase.ODEProblem(adj_f!, copy(u0), tspan, copy(p0)), alg; t)
                 @test plain[1] ≈ given[1] rtol = 1.0e-12
@@ -8509,6 +8567,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @testset "a partitioned problem runs on its flat [v; u]: $name" for (name, alg) in (
                 ("RK4", TSRK("4")), ("backward Euler", TSImplicit("beuler", exact)),
                 ("Crank-Nicolson", TSImplicit("cn", exact)),
+                ("theta 0.7", TSImplicit("theta", 0.7, exact)),
             )
             kick!(dv, v, u, p, t) = (
                 dv[1] = -p[1] * u[1] - p[2] * v[1] + u[2] * v[2];
@@ -8623,8 +8682,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             second = SciMLBase.SecondOrderODEProblem(
                 (ddu, du, u, p, t) -> (ddu .= -p[1] .* u; nothing), [0.0], [1.0], (0.0, 1.0), [1.0],
             )
-            runs(type) = "PETScAdjoint supports PETSc's rk, beuler and cn as this package " *
-                "drives them, but this solve runs `$type`"
+            runs(type) = "PETScAdjoint supports PETSc's rk, beuler, cn and theta as this " *
+                "package drives them, but this solve runs `$type`"
             trajectory(type) = "PETScAdjoint keeps its trajectory in memory, or on disk " *
                 "with `-ts_trajectory_type basic`, but this solve's is `$type`"
             no_ksp = [
@@ -8646,10 +8705,6 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         () -> grad(prob, TSImplicit("bdf")),
                     ),
                     ("PETScAdjoint does not support TSARKIMEX", () -> grad(prob, TSARKIMEX())),
-                    (
-                        "PETScAdjoint has not been verified on TSImplicit(\"theta\")",
-                        () -> grad(prob, TSImplicit("theta", 0.7)),
-                    ),
                     (runs("euler"), () -> grad(prob, TSGeneric("euler"; explicit = true))),
                     (runs("bdf"), () -> grad(prob, TSImplicit("beuler", ["-ts_type", "bdf"]))),
                     (

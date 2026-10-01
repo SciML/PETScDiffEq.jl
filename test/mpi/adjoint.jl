@@ -156,6 +156,7 @@ const METHODS = (
     ("TSRK", c -> TSRK("4"; comm = c)),
     ("backward Euler", c -> TSImplicit("beuler", exact(c); comm = c)),
     ("Crank-Nicolson", c -> TSImplicit("cn", exact(c); comm = c)),
+    ("theta 0.7", c -> TSImplicit("theta", 0.7, exact(c); comm = c)),
 )
 
 @testset "MPI adjoint, $nranks ranks" begin

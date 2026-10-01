@@ -230,7 +230,7 @@ and `stats.nf2` those of `f2` alone.
 
 These problems run on `MPI.COMM_SELF` only and take no mass matrix, and `TSAlpha2` does not
 integrate backward in time. `PETScAdjoint` differentiates them through the first-order form
-with `TSRK`, `TSImplicit("beuler")` or `TSImplicit("cn")`; PETSc has no adjoint for
+with `TSRK` or `TSImplicit`'s `"beuler"`, `"cn"` or `"theta"`; PETSc has no adjoint for
 `TSBasicSymplectic` or `TSAlpha2`.
 
 ## DAE initialization
@@ -337,8 +337,8 @@ checked. The explicit methods take any `f`.
 ## Adjoint sensitivities
 
 With SciMLSensitivity loaded, `adjoint_sensitivities(sol, alg; sensealg = PETScAdjoint(), ...)`
-runs PETSc's own discrete adjoint for `TSRK`, `TSImplicit("beuler")` and `TSImplicit("cn")`,
-for discrete costs, integral costs through PETSc's quadrature `TS`, or both. The keywords
+runs PETSc's own discrete adjoint for `TSRK` and `TSImplicit`'s `"beuler"`, `"cn"` and
+`"theta"`, for discrete costs, integral costs through PETSc's quadrature `TS`, or both. The keywords
 that set the steps have to be repeated from `solve`. It runs in PETSc's double
 real build, so a `Float32` problem is differentiated in `Float64` and its gradients come
 back as `Float32`, and a complex one is refused. `?PETScAdjoint` and the documentation cover
@@ -466,18 +466,18 @@ implicit `TSGeneric` runs distributed for `"beuler"`, `"cn"`, `"theta"`, `"bdf"`
 refused: `"glle"`'s step control follows the round-off of the distributed linear solve, so it
 takes other steps than a serial solve and ends with another error, larger or smaller.
 
-`PETScAdjoint` runs distributed too, for `TSRK`, `TSImplicit("beuler")` and
-`TSImplicit("cn")`. It needs the problem's `jac`, filling this rank's rows of a sparse
-prototype as above, and when there are parameters a `paramjac` filling this rank's rows,
-since automatic differentiation would call `f` a different number of times on each rank; both
-are collective like `f`. An explicit method takes such a `jac` in its own solve too, and
-ignores it there. `dgdu_discrete` gets this rank's rows of the state and writes their
-gradient, and `dgdp_discrete` gives this rank's share of the cost's direct derivative with
-respect to `p`, which the ranks add up. `du0` comes back as this rank's rows and `dp` as the
-whole gradient, the same on every rank. The cost times, `no_start`, the length of `p` and
-whether `dgdp_discrete` is given have to agree across the ranks. A `jac`, `paramjac`, cost
-function or `f` that throws on some ranks makes every rank throw, as in a solve. The
-transposed linear solves of `TSImplicit` use the solver above;
+`PETScAdjoint` runs distributed too, for `TSRK` and `TSImplicit`'s `"beuler"`, `"cn"` and
+`"theta"`. It needs the problem's `jac`, filling this rank's rows of a sparse prototype as
+above, and when there are parameters a `paramjac` filling this rank's rows, since automatic
+differentiation would call `f` a different number of times on each rank; both are collective
+like `f`. An explicit method takes such a `jac` in its own solve too, and ignores it there.
+`dgdu_discrete` gets this rank's rows of the state and writes their gradient, and
+`dgdp_discrete` gives this rank's share of the cost's direct derivative with respect to `p`,
+which the ranks add up. `du0` comes back as this rank's rows and `dp` as the whole gradient,
+the same on every rank. The cost times, `no_start`, the length of `p` and whether
+`dgdp_discrete` is given have to agree across the ranks. A `jac`, `paramjac`, cost function
+or `f` that throws on some ranks makes every rank throw, as in a solve. The transposed
+linear solves of `TSImplicit` use the solver above;
 `["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,

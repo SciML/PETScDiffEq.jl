@@ -96,6 +96,8 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
                 (TSRK("4"), 1.0e-10, 13.0, 19.0),
                 (TSImplicit("beuler", EXACT), 1.0e-2, 1.9, 2.1),
                 (TSImplicit("cn", EXACT), 2.0e-5, 3.8, 4.2),
+                (TSImplicit("theta", 0.7, EXACT), 2.0e-3, 1.9, 2.1),
+                (TSImplicit("theta", EXACT), 5.0e-6, 3.8, 4.2),
             )
             gaps = map((0.01, 0.005)) do dt
                 sol = solve(prob, alg; dt, adaptive = false, saveat = TS)
@@ -126,6 +128,9 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
                 (TSRK("4"), 2.0e-10, 13.0, 19.0),
                 (TSImplicit("beuler", EXACT), 2.0e-2, 1.9, 2.1),
                 (TSImplicit("cn", EXACT), 1.0e-4, 3.8, 4.2),
+                (TSImplicit("theta", 0.7, EXACT), 3.0e-3, 1.9, 2.1),
+                (TSImplicit("theta", EXACT), 2.0e-5, 3.8, 4.2),
+                (TSImplicit("theta", 0.7, [EXACT; "-ts_theta_endpoint"]), 3.0e-3, 1.9, 2.1),
             )
             gaps = map((0.01, 0.005)) do dt
                 sol = solve(prob, alg; dt, adaptive = false)

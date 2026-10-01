@@ -23,7 +23,8 @@ Saving keywords are ignored, and `callback`, `tstops`, `d_discontinuities` and
 `save_idxs` are refused, whether given here or to the problem.
 
 Supported: an `ODEProblem` without a mass matrix, in place or out of place, solved with
-`TSRK` of any subtype, `TSImplicit("beuler")` or `TSImplicit("cn")`, in either time
+`TSRK` of any subtype, `TSImplicit("beuler")`, `TSImplicit("cn")` or `TSImplicit("theta")`
+with its `theta`, in its midpoint form or with `-ts_theta_endpoint`, in either time
 direction. The `ODEFunction`'s `jac` and `paramjac` are used when given, and otherwise
 built as the forward solve builds a missing `jac`: with the algorithm's `autodiff`, and
 with ForwardDiff for a `TSRK`. Under `AutoFiniteDiff()` both have to be given, since
@@ -60,7 +61,9 @@ An integral cost, the integral of `g(u, p, t)` from `tspan[1]` to `tspan[2]`, is
 PETSc sums it with the method's own quadrature, through a quadrature `TS` whose right-hand
 side Jacobians are the derivatives of `g`, so the gradient is that of the sum of
 `dt * b[i] * g` over the stages of a `TSRK`, of `dt * g` at the end of each backward Euler
-step, and of the trapezoidal sum for Crank-Nicolson. Where `dgdu_continuous` is left out,
+step, of the trapezoidal sum for Crank-Nicolson, and for the theta method of `dt * g` at
+its stage, at `t + theta * dt`, or in its endpoint form of
+`dt * ((1 - theta) * g(t) + theta * g(t + dt))`. Where `dgdu_continuous` is left out,
 `g` is differentiated with respect to `u` and `p` as a missing `jac` is, with ForwardDiff
 or the algorithm's `autodiff`; where it is given and `dgdp_continuous` is not, the direct
 derivative with respect to `p` is taken as zero, as SciMLSensitivity's adjoints take it.
@@ -488,15 +491,12 @@ function _trajectory_type(petsclib, ts)
     return name[] == C_NULL ? "none" : unsafe_string(name[])
 end
 
-const _ADJOINT_TYPES = "TSRK, TSImplicit(\"beuler\") or TSImplicit(\"cn\")"
+const _ADJOINT_TYPES = "TSRK or TSImplicit's \"beuler\", \"cn\" or \"theta\""
 
 _adjoint_unsupported(::TSRK) = nothing
 _adjoint_unsupported(::TSGeneric) = nothing
 function _adjoint_unsupported(alg::TSImplicit)
-    alg.subtype in ("beuler", "cn") && return nothing
-    alg.subtype == "theta" && return "PETScAdjoint has not been verified on " *
-        "TSImplicit(\"theta\"); use TSImplicit(\"cn\") for theta = 0.5 or " *
-        "TSImplicit(\"beuler\") for theta = 1"
+    alg.subtype in ("beuler", "cn", "theta") && return nothing
     return "PETSc has no adjoint for TSImplicit(\"$(alg.subtype)\"); use $_ADJOINT_TYPES"
 end
 _adjoint_unsupported(::TSARKIMEX) = "PETScAdjoint does not support TSARKIMEX: PETSc " *
@@ -672,11 +672,11 @@ function _check_adjoint_ts(h::TSHandles, alg, cost_s)
     pl, ts = h.petsclib, h.ts
     implicit = _uses_ifunction(alg)
     ts_type = LibPETSc.TSGetType(pl, ts)
-    ts_type in (implicit ? ("beuler", "cn") : ("rk",)) || throw(
+    ts_type in (implicit ? ("beuler", "cn", "theta") : ("rk",)) || throw(
         ArgumentError(
-            "PETScAdjoint supports PETSc's rk, beuler and cn as this package drives them, " *
-                "but this solve runs `$ts_type`; use $_ADJOINT_TYPES and leave " *
-                "`-ts_type` out of petsc_options",
+            "PETScAdjoint supports PETSc's rk, beuler, cn and theta as this package " *
+                "drives them, but this solve runs `$ts_type`; use $_ADJOINT_TYPES and " *
+                "leave `-ts_type` out of petsc_options",
         ),
     )
     if ts_type == "rk" && LibPETSc.TSRKGetMultirate(pl, ts) == LibPETSc.PETSC_TRUE
