@@ -8811,6 +8811,43 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test collect(sol.u[end]) ≈ [v, u] rtol = 1.0e-12
         end
 
+        @testset "velverlet reuses the kick that ended the last step" begin
+            kick!(dv, v, u, p, t) = (dv .= -p[1] .* u .+ 0.3cos(t); nothing)
+            prob = SciMLBase.SecondOrderODEProblem(kick!, [0.0], [1.0], (0.0, 1.0), [1.0])
+            sol = SciMLBase.solve(prob, PETScDiffEq.TSBasicSymplectic(); dt = 0.1, dense = false)
+            @test (sol.stats.nf, sol.stats.nf2) == (11, 10)
+            v, u = 0.0, 1.0
+            for n in 0:9
+                v += 0.05 * (-u + 0.3cos(0.1n))
+                u += 0.1v
+                v += 0.05 * (-u + 0.3cos(0.1(n + 1)))
+            end
+            @test collect(sol.u[end]) ≈ [v, u] rtol = 1.0e-12
+            # A changed p or state takes a fresh kick.
+            flip = PresetTimeCallback([0.5], integ -> (integ.p[1] = 4.0))
+            cb = SciMLBase.solve(
+                SciMLBase.remake(prob; p = [1.0]), PETScDiffEq.TSBasicSymplectic();
+                dt = 0.1, callback = flip, dense = false,
+            )
+            v, u = 0.0, 1.0
+            for n in 0:9
+                k = n < 5 ? 1.0 : 4.0
+                v += 0.05 * (-k * u + 0.3cos(0.1n))
+                u += 0.1v
+                v += 0.05 * (-k * u + 0.3cos(0.1(n + 1)))
+            end
+            @test collect(cb.u[end]) ≈ [v, u] rtol = 1.0e-12
+            integ = SciMLBase.init(prob, PETScDiffEq.TSBasicSymplectic(); dt = 0.1)
+            SciMLBase.step!(integ)
+            SciMLBase.set_u!(integ, 2 .* integ.u)
+            SciMLBase.solve!(integ)
+            fresh = SciMLBase.solve(
+                SciMLBase.remake(prob; u0 = 2 .* sol(0.1), tspan = (0.1, 1.0)),
+                PETScDiffEq.TSBasicSymplectic(); dt = 0.1,
+            )
+            @test collect(integ.sol.u[end]) ≈ collect(fresh.u[end]) rtol = 1.0e-12
+        end
+
         # PETSc's absolute-eps step check fails a span this long on 32-bit x86.
         Sys.WORD_SIZE == 64 && @testset "the energy error stays bounded" begin
             energy(s) = s.x[1][1]^2 / 2 - cos(s.x[2][1])
@@ -9081,7 +9118,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.u[end] isa typeof(p32.u0)
             @test final_err(sol, Float32.(osc_exact(1.0))) < 2.0f-5
             quiet = SciMLBase.solve(prob, PETScDiffEq.TSBasicSymplectic(); dt = 0.1, dense = false)
-            @test (quiet.stats.nf, quiet.stats.nf2) == (20, 10)
+            @test (quiet.stats.nf, quiet.stats.nf2) == (11, 10)
         end
 
         @testset "a reversed span" begin
