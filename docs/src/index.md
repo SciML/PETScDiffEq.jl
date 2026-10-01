@@ -207,8 +207,10 @@ cubic Hermite interpolant of the velocity and the position, which is also what O
 gives for `VelocityVerlet`. `stats.nf` counts evaluations of `f1`, or of the whole system,
 and `stats.nf2` those of `f2` alone.
 
-These problems run on `MPI.COMM_SELF` only, take no mass matrix and no `PETScAdjoint`, and
-`TSAlpha2` does not integrate backward in time.
+These problems run on `MPI.COMM_SELF` only and take no mass matrix, and `TSAlpha2` does not
+integrate backward in time. `PETScAdjoint` differentiates them through the first-order form
+with `TSRK`, `TSImplicit("beuler")` or `TSImplicit("cn")`; PETSc has no adjoint for
+`TSBasicSymplectic` or `TSAlpha2`.
 
 ## DAE initialization
 
@@ -352,8 +354,10 @@ du0, dp = adjoint_sensitivities(
 ```
 
 It works with `TSRK` of any subtype, `TSImplicit("beuler")` and `TSImplicit("cn")`. PETSc
-has no adjoint for `TSRosW`, `TSIRK`, `TSMPRK` or BDF, and `TSARKIMEX` and the general
-theta method are refused as well.
+has no adjoint for `TSRosW`, `TSIRK`, `TSMPRK`, BDF, `TSBasicSymplectic` or `TSAlpha2`, and
+`TSARKIMEX` and the general theta method are refused as well. A `DynamicalODEProblem` or
+`SecondOrderODEProblem` is differentiated on its flat `[v; u]`, with the costs handed
+`ArrayPartition(v, u)` states as `solve` saves them and `du0` returned as one.
 
 It runs in PETSc's double real build. A `Float32` problem is differentiated there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and the
