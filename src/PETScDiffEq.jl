@@ -506,6 +506,10 @@ SciMLBase's `DynamicalODEFunction` can be rebuilt with a `jac_prototype`, `solve
 fail on one before reaching this package, so give such a problem to `SciMLBase.__solve` or
 `SciMLBase.__init`.
 
+A reversed `tspan` is supported. PETSc only steps forward, so the solve runs in `s = -t` on
+`w(s) = u(-s)`, whose velocity is `-u'` and whose acceleration is `f(-w', w, p, -s)`. The
+states, the saved velocities, `jac` and the callbacks stay those of the problem as written.
+
 Distributed partitioned states are not supported yet, so a `comm` other than
 `MPI.COMM_SELF` is refused.
 """
@@ -1245,7 +1249,7 @@ function _post_step_serial!(ctx, ts)
                 (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts, x,
             )
             flat = ctx.flat_vec === nothing ? PETSc.VecPtr(pl, x[], false) : ctx.flat_vec
-            u = _readvec!(ctx.u, pl, flat)
+            u = _read_state!(ctx.u, ctx, flat)
             ctx.partitioned_u === nothing || (u = copyto!(ctx.partitioned_u, u))
             ctx.unstable !== nothing &&
                 ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s)) &&
@@ -2064,7 +2068,7 @@ _as_inplace_jac(j, iip::Bool) = iip ? j :
 _reverse_rhs(f) = (du, u, p, s) -> (f(du, u, p, _user_t(-one(s), s)); du .*= -1; nothing)
 _reverse_jac(j) =
     (J, u, p, s) -> (j(J, u, p, _user_t(-one(s), s)); LinearAlgebra.rmul!(J, -1); nothing)
-# J is PETSc's matrix there, so the dm callback flips its sign from ctx.tdir.
+# The dm and alpha2 Jacobian callbacks apply ctx.tdir themselves.
 _reverse_dm_jac(j) = (J, u, p, s) -> (j(J, u, p, _user_t(-one(s), s)); nothing)
 _reverse_residual(g) =
     (r, dv, u, p, s) -> (dv .*= -1; g(r, dv, u, p, _user_t(-one(s), s)); dv .*= -1; nothing)
@@ -2422,8 +2426,21 @@ function _read_second_order!(ctx, u_ptr, v_ptr)
     pl, nv = ctx.petsclib, ctx.f!.nv
     _readvec!(view(ctx.u, 1:nv), pl, PETSc.VecPtr(pl, v_ptr, false))
     _readvec!(view(ctx.u, (nv + 1):length(ctx.u)), pl, PETSc.VecPtr(pl, u_ptr, false))
+    _flip_velocity!(ctx, ctx.u)
     return nv
 end
+
+# Reversed, alpha2 steps w(s) = u(-s), so PETSc's velocity, the first half of `h.u`, is -v.
+function _flip_velocity!(ctx, x)
+    ctx.flat_vec === nothing || ctx.tdir > 0 || LinearAlgebra.rmul!(view(x, 1:ctx.f!.nv), -1)
+    return x
+end
+
+_read_state!(dest, ctx, x) = _flip_velocity!(ctx, _readvec!(dest, ctx.petsclib, x))
+
+_write_state!(h, x) = PETScCompat.with_local_array!(
+    ua -> _flip_velocity!(h.ctx, copyto!(ua, x)), h.u; read = false, write = true,
+)
 
 function _i2function!(
         ::LibPETSc.CTS,
@@ -2445,7 +2462,9 @@ function _i2function_body!(ctx, t, u_ptr, v_ptr, a_ptr, f_ptr)
         a = _readvec!(view(ctx.mudot, 1:nv), pl, PETSc.VecPtr(pl, a_ptr, false))
         acc, r = view(ctx.du, 1:nv), view(ctx.resid, 1:nv)
         ctx.f!.f1(acc, view(ctx.u, 1:nv), view(ctx.u, (nv + 1):length(ctx.u)), ctx.p, t)
-        @. r = a - acc
+        # Reversed, f1 returns -f, while w'' = f(-w', w, p, -s) keeps its sign.
+        tdir = ctx.tdir
+        @. r = a - tdir * acc
         _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), r)
         ctx.nf += 1
     catch e
@@ -2500,7 +2519,7 @@ function _i2jacobian_body!(ctx, t, u_ptr, v_ptr, shift_v, shift_a, A_ptr, B_ptr)
         nv = _read_second_order!(ctx, u_ptr, v_ptr)
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
         ctx.njacs += 1
-        _set_i2block!(ctx, ctx.J, B, shift_v, shift_a, nv)
+        _set_i2block!(ctx, ctx.J, B, ctx.tdir * shift_v, shift_a, nv)
         PETSc.assemble!(B)
         B.ptr == A.ptr || PETSc.assemble!(A)
     catch e
@@ -2666,13 +2685,13 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
         while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= t + tol
             want = ctx.saveat[ctx.saveat_idx]
             if step == 0 || abs(want - t) <= tol
-                _record_end!(ctx, want, _readvec!(ctx.u, ctx.petsclib, x))
+                _record_end!(ctx, want, _read_state!(ctx.u, ctx, x))
                 landed = true
             elseif ctx.hermite
                 # -ts_exact_final_time interpolate steps past tf and reports tf later.
                 tmax = LibPETSc.TSGetMaxTime(ctx.petsclib, ts)
                 want >= tmax - tol && t > tmax + tol && break
-                u1 = _readvec!(ctx.u, ctx.petsclib, x)
+                u1 = _read_state!(ctx.u, ctx, x)
                 _record!(
                     ctx, want, _hermite!(similar(u1), ctx, want, ctx.step_t, ctx.step_u, t, u1),
                 )
@@ -2689,11 +2708,11 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
         # A failed step calls the monitor again at the last reported time.
         if (step == 0 ? ctx.save_start : ctx.save_everystep) && !landed &&
                 !_last_recorded(ctx, t)
-            _record!(ctx, t, _readvec!(ctx.u, ctx.petsclib, x))
+            _record!(ctx, t, _read_state!(ctx.u, ctx, x))
         end
         if ctx.hermite && ctx.saveat_idx <= length(ctx.saveat)
             ctx.step_t = t
-            _readvec!(ctx.step_u, ctx.petsclib, x)
+            _read_state!(ctx.step_u, ctx, x)
             ctx.fstart = ctx.pdirty ? nothing : ctx.fend
             ctx.fend = nothing
             ctx.pdirty = false
@@ -2701,7 +2720,7 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
         # Steps below the spacing of t still change the state, so keep the first one at t.
         if step == 0 || t != ctx.end_s
             ctx.end_s = t
-            _readvec!(ctx.end_u, ctx.petsclib, x)
+            _read_state!(ctx.end_u, ctx, x)
         end
 
     catch e
@@ -3594,6 +3613,7 @@ function _set_second_order_solution!(h::TSHandles{<:Any, <:Any, <:Any, S}, nv) w
         ),
     )
     h.ctx.flat_vec = h.u
+    h.tdir < 0 && _write_state!(h, h.u0)
     return nothing
 end
 
@@ -3717,8 +3737,6 @@ function _setup(
     # From here on, times are PETSc's forward-running s = tdir * t.
     tdir = t0 < tf ? one(R) : -one(R)
     t0, tf = tdir * t0, tdir * tf
-    alg isa TSAlpha2 && tdir < 0 &&
-        throw(ArgumentError("TSAlpha2 cannot integrate backward in time"))
 
     u0 = Vector{S}(vec(prob.u0))
     n = length(u0)
@@ -3810,7 +3828,7 @@ function _setup(
         f2 = f2 === nothing ? nothing : _reverse_rhs(f2)
         jac_fn = jac_fn === nothing ? nothing :
             is_dae ? _reverse_dae_jac(jac_fn) :
-            dm_jac ? _reverse_dm_jac(jac_fn) : _reverse_jac(jac_fn)
+            dm_jac || alg isa TSAlpha2 ? _reverse_dm_jac(jac_fn) : _reverse_jac(jac_fn)
     end
     jac_prototype = has_jac ? prob.f.jac_prototype : nothing
     uses_sparse_jac = jac_prototype isa SparseMatrixCSC
@@ -4410,7 +4428,7 @@ function _solve_unlocked(
         # PETSc sets the solve time only when TSSolve returns normally, and a step that
         # raises leaves its rejected trial in the solution vector.
         tend, uend = raised || ctx.stalled ? (ctx.end_s, copy(ctx.end_u)) :
-            (LibPETSc.TSGetSolveTime(pl, h.ts), _readvec!(similar(h.u0), pl, h.u))
+            (LibPETSc.TSGetSolveTime(pl, h.ts), _read_state!(similar(h.u0), ctx, h.u))
         st = _read_stats(h)
     finally
         _destroy!(h)
@@ -4499,7 +4517,7 @@ function _retry_solve!(h, alg, floor, forced, verbose)
         st = _read_stats(h)
         ctx.nreject, ctx.nits, ctx.nfail = st.nreject, st.nnonliniter, st.nnonlinfail
     end
-    PETScCompat.with_local_array!(ua -> copyto!(ua, ctx.end_u), h.u; read = false, write = true)
+    _write_state!(h, ctx.end_u)
     ctx.hermite && (ctx.fend = ctx.fstart)
     LibPETSc.TSSetTimeStep(pl, h.ts, dt)
     LibPETSc.TSRestartStep(pl, h.ts)
@@ -4785,9 +4803,7 @@ DiffEqBase.get_tstops_max(integ::PETScIntegrator) = last(integ.tstops)
 function _set_u_unlocked(integ::PETScIntegrator, u)
     copyto!(integ.u, u)
     integ.finished && return nothing
-    PETScCompat.with_local_array!(
-        ua -> copyto!(ua, integ.u), integ.h.u; read = false, write = true,
-    )
+    _write_state!(integ.h, integ.u)
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
     return nothing
 end
@@ -4834,9 +4850,7 @@ function _initialize_dae_unlocked(integ::PETScIntegrator, init)
     _initialize_state!(integ, init) || return _initial_failure!(integ)
     integ.finished && return nothing
     h = integ.h
-    PETScCompat.with_local_array!(
-        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
-    )
+    _write_state!(h, integ.u)
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
     return nothing
 end
@@ -4874,9 +4888,7 @@ function _change_t_unlocked(
     integ.t = t
     integ.dt = integ.t - integ.tprev
     _end_step_here!(integ)
-    PETScCompat.with_local_array!(
-        ua -> copyto!(ua, integ.u), integ.h.u; read = false, write = true,
-    )
+    _write_state!(integ.h, integ.u)
     LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * t)
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
     T && _rewind_saves!(integ)
@@ -5171,9 +5183,7 @@ function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
     end
     integ.t = t
     _dirty!(h.ctx)
-    PETScCompat.with_local_array!(
-        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
-    )
+    _write_state!(h, integ.u)
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * t)
     LibPETSc.TSSetTimeStep(pl, h.ts, integ.tdir * dt)
     LibPETSc.TSRestartStep(pl, h.ts)
@@ -5236,9 +5246,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
         if _anywhere(ctx.comm, integ.derivative_discontinuity)
             _reinitialize!(integ, cb.initializealg, before)
             integ.finished && return nothing
-            PETScCompat.with_local_array!(
-                ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
-            )
+            _write_state!(h, integ.u)
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
             _dirty!(ctx)
         end
@@ -5264,9 +5272,7 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     integ.finished && return nothing
     _everywhere(h.ctx.comm, integ.u == before) && return nothing
     copyto!(integ.uprev, integ.u)
-    PETScCompat.with_local_array!(
-        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
-    )
+    _write_state!(h, integ.u)
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
     initialize_save && any(cb -> cb.save_positions[2], cbs) && _save_here!(integ)
     return nothing
@@ -5338,9 +5344,7 @@ function _reject_step!(integ::PETScIntegrator, before, taken)
         integ.t = integ.tprev
         copyto!(integ.u, integ.uprev)
     end
-    PETScCompat.with_local_array!(
-        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
-    )
+    _write_state!(h, integ.u)
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
     floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
@@ -5369,11 +5373,9 @@ _above(hi, lo) = hi > lo ? hi : nextfloat(lo)
 
 function _take_written_state!(integ::PETScIntegrator)
     h = integ.h
-    _everywhere(h.ctx.comm, _readvec!(integ.ucache, h.petsclib, h.u) == integ.u) &&
+    _everywhere(h.ctx.comm, _read_state!(integ.ucache, h.ctx, h.u) == integ.u) &&
         return nothing
-    PETScCompat.with_local_array!(
-        ua -> copyto!(ua, integ.u), h.u; read = false, write = true,
-    )
+    _write_state!(h, integ.u)
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
     _dirty!(h.ctx)
     return nothing
@@ -5746,7 +5748,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         LibPETSc.TSSetTimeStep(pl, h.ts, _resumed_step(integ, stop))
     end
     integ.dt = integ.t - integ.tprev
-    _readvec!(integ.u, pl, h.u)
+    _read_state!(integ.u, ctx, h.u)
     if ctx.domain !== nothing && SciMLBase.isadaptive(integ) &&
             _predicate(() -> ctx.domain(integ.u, ctx.p, integ.t), ctx)
         return _reject_step!(integ, before, abs(integ.t - integ.tprev))

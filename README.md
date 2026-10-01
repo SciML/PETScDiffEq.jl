@@ -228,8 +228,10 @@ cubic Hermite interpolant of the velocity and the position, which is also what O
 gives for `VelocityVerlet`. `stats.nf` counts evaluations of `f1`, or of the whole system,
 and `stats.nf2` those of `f2` alone.
 
-These problems run on `MPI.COMM_SELF` only and take no mass matrix, and `TSAlpha2` does not
-integrate backward in time. `PETScAdjoint` differentiates them through the first-order form
+These problems run on `MPI.COMM_SELF` only and take no mass matrix. Both algorithms take a
+reversed `tspan`. PETSc only steps forward, so `TSAlpha2` then integrates `w(s) = u(-s)`,
+whose velocity is `-u'`, and gives back `u'`: the states, `jac` and callbacks are those of the
+problem as written. `PETScAdjoint` differentiates them through the first-order form
 with `TSRK`, `TSImplicit("beuler")` or `TSImplicit("cn")`; PETSc has no adjoint for
 `TSBasicSymplectic` or `TSAlpha2`.
 

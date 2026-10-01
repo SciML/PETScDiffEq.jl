@@ -9236,9 +9236,171 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             sol = SciMLBase.solve(prob, PETScDiffEq.TSBasicSymplectic("4"); dt = 0.01)
             @test sol.t[end] == 0.0
             @test final_err(sol, [0.0, 1.0]) < 1.0e-9
-            @test_throws "cannot integrate backward" SciMLBase.solve(
-                prob, PETScDiffEq.TSAlpha2(); dt = 0.01,
+        end
+
+        @testset "TSAlpha2 on a reversed span" begin
+            alpha, damping = PETScDiffEq.TSAlpha2(), PETScDiffEq.TSAlpha2(; radius = 0.5)
+            back(f!, x, t0 = 10.0) = SciMLBase.SecondOrderODEProblem(f!, [x[1]], [x[2]], (t0, 0.0))
+            for alg in (alpha, damping)
+                @test all(
+                    o -> isapprox(o, 2; atol = 0.1),
+                    orders(back(osc!, osc_exact(10.0)), alg, osc_exact(0.0)),
+                )
+                @test all(
+                    o -> isapprox(o, 2; atol = 0.1),
+                    orders(back(forced!, forced_exact(10.0)), alg, forced_exact(0.0)),
+                )
+            end
+            pend = SciMLBase.SecondOrderODEProblem(pend!, [0.0], [2.0], (0.0, 10.0))
+            ref = SciMLBase.solve(pend, PETScDiffEq.TSRK("8vr"); abstol = 1.0e-13, reltol = 1.0e-13)
+            @test all(
+                o -> isapprox(o, 2; atol = 0.1),
+                orders(back(pend!, collect(ref.u[end])), alpha, [0.0, 2.0]),
             )
+            adaptive = SciMLBase.solve(
+                back(pend!, collect(ref.u[end])), alpha; abstol = 1.0e-6, reltol = 1.0e-6,
+            )
+            @test adaptive.retcode == SciMLBase.ReturnCode.Success
+            @test issorted(adaptive.t; rev = true) && adaptive.t[end] == 0.0
+            @test final_err(adaptive, [0.0, 2.0]) < 2.0e-5
+            for (f!, x0, bound) in ((osc!, [0.0, 1.0], 1.0e-12), (pend!, [0.0, 2.0], 2.0e-7))
+                there = SciMLBase.solve(
+                    SciMLBase.SecondOrderODEProblem(f!, x0[1:1], x0[2:2], (0.0, 10.0)), alpha;
+                    dt = 0.01, adaptive = false,
+                )
+                home = SciMLBase.solve(
+                    back(f!, collect(there.u[end])), alpha; dt = 0.01, adaptive = false,
+                )
+                @test final_err(home, x0) < bound
+            end
+
+            # s = -t turns u'' = f(u', u, t) into w'' = f(-w', w, -s), which runs forward.
+            drag!(ddu, du, u, p, t) = (@. ddu = -sin(u) - 0.3 * du + cos(2t); nothing)
+            mirror!(ddu, du, u, p, t) = (@. ddu = -sin(u) + 0.3 * du + cos(2t); nothing)
+            reversed = SciMLBase.SecondOrderODEProblem(drag!, [0.3], [1.2], (10.0, 0.0))
+            mirrored = SciMLBase.SecondOrderODEProblem(mirror!, [-0.3], [1.2], (-10.0, 0.0))
+            flip(x) = [-x.x[1]; x.x[2]]
+            for (kw, mkw) in (
+                    ((; dt = 0.1, adaptive = false), (; dt = 0.1, adaptive = false)),
+                    ((; abstol = 1.0e-6, reltol = 1.0e-6), (; abstol = 1.0e-6, reltol = 1.0e-6)),
+                    (
+                        (; dt = 0.1, adaptive = false, saveat = [9.0, 7.55, 0.0], tstops = [5.55]),
+                        (; dt = 0.1, adaptive = false, saveat = [-9.0, -7.55, 0.0], tstops = [-5.55]),
+                    ),
+                )
+                b = SciMLBase.solve(reversed, damping; kw...)
+                m = SciMLBase.solve(mirrored, damping; mkw...)
+                @test b.retcode == SciMLBase.ReturnCode.Success
+                @test b.t ≈ -m.t rtol = 1.0e-12
+                @test all(i -> isapprox(flip(b.u[i]), collect(m.u[i]); rtol = 1.0e-10), eachindex(b.u))
+                @test b.stats.naccept == m.stats.naccept
+            end
+            b = SciMLBase.solve(reversed, damping; dt = 0.1, adaptive = false)
+            m = SciMLBase.solve(mirrored, damping; dt = 0.1, adaptive = false)
+            @test b.t[1:3] ≈ [10.0, 9.9, 9.8]
+            @test flip(b(4.44)) ≈ collect(m(-4.44)) rtol = 1.0e-10
+            @test collect(b(4.44, Val{1})) ≈ [1.0, -1.0] .* collect(m(-4.44, Val{1})) rtol = 1.0e-10
+
+            K, C = [2.0 -1.0; -1.0 2.0], [0.2 -0.1; -0.1 0.2]
+            linear!(ddu, du, u, p, t) = (ddu .= .-(K * u) .- C * du .+ cos(2t); nothing)
+            velocity!(du, v, u, p, t) = (du .= v; nothing)
+            function linear_jac!(J, x, p, t)
+                @test hasproperty(x, :x)
+                fill!(J, 0.0)
+                J[1:2, 1:2] .= -C
+                J[1:2, 3:4] .= -K
+                J[3, 1] = J[4, 2] = 1.0
+                return nothing
+            end
+            proto = sparse([ones(2, 2) ones(2, 2); Matrix(I, 2, 2) zeros(2, 2)])
+            x3 = [0.3, -0.2, 1.0, 0.5]
+            second(span; kw...) = SciMLBase.SecondOrderODEProblem(
+                SciMLBase.DynamicalODEFunction{true}(linear!, velocity!; kw...), x3[1:2], x3[3:4], span,
+            )
+            stepped(pr, alg = alpha) = SciMLBase.__solve(pr, alg; dt = 0.05, adaptive = false)
+            first_order!(dx, x, p, t) = (
+                dx[1:2] .= .-(K * x[3:4]) .- C * x[1:2] .+ cos(2t); dx[3:4] .= x[1:2]; nothing
+            )
+            exact = SciMLBase.solve(
+                SciMLBase.ODEProblem(first_order!, x3, (3.0, 0.0)), Tsit5();
+                abstol = 1.0e-12, reltol = 1.0e-12,
+            ).u[end]
+            forward = stepped(second((0.0, 3.0); jac = linear_jac!))
+            fd = PETScDiffEq.TSAlpha2(; autodiff = PETScDiffEq.AutoFiniteDiff())
+            dense = stepped(second((3.0, 0.0)))
+            for (sol, exact_jac) in (
+                    (dense, true), (stepped(second((3.0, 0.0); jac = linear_jac!)), true),
+                    (stepped(second((3.0, 0.0); jac = linear_jac!, jac_prototype = proto)), true),
+                    (stepped(second((3.0, 0.0); jac_prototype = proto)), true),
+                    (stepped(second((3.0, 0.0)), fd), false),
+                    (stepped(second((3.0, 0.0); jac_prototype = proto), fd), false),
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test final_err(sol, exact) < 5.0e-3
+                @test collect(sol.u[end]) ≈ collect(dense.u[end]) rtol = exact_jac ? 1.0e-10 : 1.0e-6
+                # A linear system takes one Newton iteration a solve only with the right Jacobian.
+                @test sol.stats.nnonliniter == forward.stats.nnonliniter
+                @test (sol.stats.njacs > 0) == exact_jac
+            end
+
+            prob = back(osc!, osc_exact(2.0), 2.0)
+            integ = SciMLBase.init(prob, alpha; dt = 0.1, adaptive = false)
+            SciMLBase.step!(integ)
+            @test integ.t ≈ 1.9 && integ.dt ≈ -0.1
+            @test integ.u isa typeof(prob.u0)
+            @test collect(integ.u) ≈ osc_exact(1.9) atol = 2.0e-4
+            @test collect(integ(1.95)) ≈ osc_exact(1.95) atol = 1.0e-4
+            @test collect(integ(1.95, Val{1})) ≈ [-cos(1.95), -sin(1.95)] atol = 3.0e-3
+            @test collect(SciMLBase.get_du(integ)) ≈ [-integ.u[2], integ.u[1]]
+            SciMLBase.step!(integ, -0.35, true)
+            @test integ.t ≈ 1.55
+            @test collect(integ.u) ≈ osc_exact(1.55) atol = 1.0e-3
+            SciMLBase.set_u!(integ, 2 .* integ.u)
+            SciMLBase.solve!(integ)
+            @test integ.sol.t[end] == 0.0
+            @test collect(integ.sol.u[end]) ≈ 2 .* osc_exact(0.0) atol = 1.0e-2
+            twice = SciMLBase.solve(prob, alpha; dt = 0.1, adaptive = false)
+            SciMLBase.reinit!(integ)
+            @test integ.t == 2.0 && integ.u == prob.u0
+            SciMLBase.solve!(integ)
+            @test collect(integ.sol.u[end]) ≈ collect(twice.u[end]) rtol = 1.0e-14
+            saved = SciMLBase.solve(
+                prob, alpha; dt = 0.1, adaptive = false, saveat = [1.55, 0.7], tstops = [1.23],
+            )
+            @test saved.t == [1.55, 0.7]
+            @test maximum(abs, collect(saved.u[1]) .- osc_exact(1.55)) < 1.0e-3
+            @test maximum(abs, collect(saved.u[2]) .- osc_exact(0.7)) < 2.0e-3
+            stops = SciMLBase.solve(prob, alpha; dt = 0.1, adaptive = false, tstops = [1.23])
+            @test 1.23 in stops.t && issorted(stops.t; rev = true)
+            bounce = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u.x[2][1] - 0.5, integ -> (integ.u.x[1] .*= -1; nothing),
+            )
+            sol = SciMLBase.solve(prob, alpha; dt = 0.01, adaptive = false, callback = bounce)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test maximum(u -> u.x[2][1], sol.u) ≈ 0.5 atol = 1.0e-12
+            hit = sol.t[argmax([u.x[2][1] for u in sol.u])]
+            @test hit ≈ pi / 3 atol = 1.0e-4
+            kick = SciMLBase.DiscreteCallback(
+                (u, t, integ) -> t == 1.25, integ -> (integ.u.x[1] .+= 1.0; nothing),
+            )
+            kicked = SciMLBase.solve(
+                prob, alpha; dt = 0.1, adaptive = false, callback = kick, tstops = [1.25],
+            )
+            at = findall(==(1.25), kicked.t)
+            @test length(at) == 2
+            @test kicked.u[at[2]].x[1][1] - kicked.u[at[1]].x[1][1] == 1.0
+            rest = SciMLBase.solve(
+                SciMLBase.remake(prob; u0 = kicked.u[at[2]], tspan = (1.25, 0.0)), alpha;
+                dt = 0.1, adaptive = false,
+            )
+            @test collect(kicked.u[end]) ≈ collect(rest.u[end]) rtol = 1.0e-12
+            seen = []
+            sol = SciMLBase.solve(
+                prob, alpha; dt = 0.01, adaptive = false,
+                unstable_check = (dt, u, p, t) -> (push!(seen, copy(u)); u.x[2][1] > 0.5),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Unstable
+            @test seen == sol.u[2:end]
         end
 
         @testset "callbacks and the integrator: $(nameof(typeof(alg)))" for alg in (
