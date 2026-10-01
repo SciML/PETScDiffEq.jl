@@ -8231,6 +8231,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         exact = [
             "-snes_rtol", "1e-13", "-snes_atol", "1e-15", "-ksp_type", "preonly", "-pc_type", "lu",
         ]
+        endpoint = [exact; "-ts_theta_endpoint"]
         half_norm(u, p, t) = sum(abs2, u) / 2
         half_norm_du!(out, u, p, t, i) = (out .= u; nothing)
         coupled(u, p, t) = sum(abs2, u) / 2 + p[2] * u[1] * u[2] + p[1]^2 * t
@@ -8273,9 +8274,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     "Crank-Nicolson backward in time", TSImplicit("cn", exact),
                     (1.0, 0.0), backward_t, (;),
                 ),
+                ("theta 0.7", TSImplicit("theta", 0.7, exact), (0.0, 1.0), forward_t, (;)),
+                (
+                    "theta 0.7 backward in time", TSImplicit("theta", 0.7, exact),
+                    (1.0, 0.0), backward_t, (;),
+                ),
+                (
+                    "theta at its default, the implicit midpoint rule", TSImplicit("theta", exact),
+                    (0.0, 1.0), forward_t, (;),
+                ),
+                (
+                    "theta 0.7 in its endpoint form", TSImplicit("theta", 0.7, endpoint),
+                    (0.0, 1.0), forward_t, (;),
+                ),
+                (
+                    "theta 0.7 in its endpoint form backward in time",
+                    TSImplicit("theta", 0.7, endpoint), (1.0, 0.0), backward_t, (coupled = true,),
+                ),
                 (
                     "a trajectory of states only", TSRK("4"), (0.0, 1.0), forward_t,
                     (sensealg = ["-ts_trajectory_solution_only", "1"],),
+                ),
+                (
+                    "a trajectory of states only, theta 0.7", TSImplicit("theta", 0.7, exact),
+                    (0.0, 1.0), forward_t, (sensealg = ["-ts_trajectory_solution_only", "1"],),
                 ),
                 # PETSc's 32-bit build fails trajectory file I/O intermittently.
                 (
@@ -8304,6 +8326,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 (
                     "out of place, backward Euler backward in time", TSImplicit("beuler", exact),
                     (1.0, 0.0), backward_t, (oop = true,),
+                ),
+                (
+                    "out of place with a cost that depends on p, theta 0.3 backward in time",
+                    TSImplicit("theta", 0.3, exact), (1.0, 0.0), backward_t,
+                    (oop = true, coupled = true),
+                ),
+                (
+                    "a sparse jac_prototype, theta 0.7", TSImplicit("theta", 0.7, exact),
+                    (0.0, 1.0), forward_t, (sparse_jac = true,),
                 ),
             )
             prob = adj_prob(
@@ -8347,14 +8378,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 J[2, 2] = -0.4 * u[2]
                 return nothing
             end
-            for p in (nothing, SciMLBase.NullParameters(), Float64[])
+            for p in (nothing, SciMLBase.NullParameters(), Float64[]),
+                    alg in (TSRK("4"), TSImplicit("theta", 0.7, exact), TSARKIMEX("3", exact))
                 prob = SciMLBase.ODEProblem(
                     SciMLBase.ODEFunction(g!; jac = g_jac!), copy(u0), (0.0, 1.0), p,
                 )
-                du0, dp = grad(prob, TSRK("4"))
+                du0, dp = grad(prob, alg)
                 function loss(u)
                     sol = SciMLBase.solve(
-                        SciMLBase.remake(prob; u0 = u), TSRK("4");
+                        SciMLBase.remake(prob; u0 = u), alg;
                         dt = 0.01, adaptive = false, saveat = forward_t,
                     )
                     return sum(half_norm(v, p, 0.0) for v in sol.u)
@@ -8425,12 +8457,32 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     "Crank-Nicolson backward in time", TSImplicit("cn", exact), (1.0, 0.0),
                     (;),
                 ),
+                ("theta 0.7", TSImplicit("theta", 0.7, exact), (0.0, 1.0), (;)),
+                ("theta 0.7 backward in time", TSImplicit("theta", 0.7, exact), (1.0, 0.0), (;)),
+                (
+                    "theta at its default, the implicit midpoint rule", TSImplicit("theta", exact),
+                    (0.0, 1.0), (;),
+                ),
+                ("theta 0.7 in its endpoint form", TSImplicit("theta", 0.7, endpoint), (0.0, 1.0), (;)),
+                (
+                    "theta 0.7 in its endpoint form backward in time",
+                    TSImplicit("theta", 0.7, endpoint), (1.0, 0.0), (discrete = true,),
+                ),
+                (
+                    "theta 0.7 with PETSc's differences",
+                    TSImplicit("theta", 0.7, exact; autodiff = PETScDiffEq.AutoFiniteDiff()),
+                    (0.0, 1.0), (;),
+                ),
                 ("out of place", TSRK("4"), (0.0, 1.0), (oop = true,)),
                 (
                     "a trajectory of states only", TSRK("4"), (0.0, 1.0),
                     (sensealg = ["-ts_trajectory_solution_only", "1"],),
                 ),
                 ("g differentiated for both", TSImplicit("cn", exact), (0.0, 1.0), (ad = true,)),
+                (
+                    "g differentiated for both, theta 0.7 backward in time",
+                    TSImplicit("theta", 0.7, exact), (1.0, 0.0), (ad = true,),
+                ),
                 ("dgdu_continuous alone takes dgdp as zero", TSRK("4"), (0.0, 1.0), (frozen = true,)),
                 ("with discrete costs", TSRK("4"), (0.0, 1.0), (discrete = true,)),
                 (
@@ -8464,7 +8516,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
 
         @testset "g is differentiated where its derivatives are not given" begin
-            for alg in (TSRK("4"), TSImplicit("beuler", exact), TSImplicit("cn", exact))
+            for alg in (
+                    TSRK("4"), TSImplicit("beuler", exact), TSImplicit("cn", exact),
+                    TSImplicit("theta", 0.7, exact),
+                )
                 prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
                 given = integral(
                     prob, alg; g = coupled, dgdu_continuous = integrand_du!,
@@ -8502,6 +8557,227 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             @test length(steps) > 3
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-10
+        end
+
+        function implicit_part!(du, u, p, t)
+            du[1] = -p[1] * u[1]
+            du[2] = -p[4] * u[2]^2 + p[1] * sin(t)
+            return nothing
+        end
+        function explicit_part!(du, u, p, t)
+            du[1] = p[2] * u[1] * u[2]
+            du[2] = p[3] * u[1]
+            return nothing
+        end
+        function implicit_jac!(J, u, p, t)
+            J[1, 1] = -p[1]
+            J[1, 2] = 0.0
+            J[2, 1] = 0.0
+            J[2, 2] = -2 * p[4] * u[2]
+            return nothing
+        end
+        function explicit_jac!(J, u, p, t)
+            J[1, 1] = p[2] * u[2]
+            J[1, 2] = p[2] * u[1]
+            J[2, 1] = p[3]
+            J[2, 2] = 0.0
+            return nothing
+        end
+        function implicit_paramjac!(pJ, u, p, t)
+            fill!(pJ, 0.0)
+            pJ[1, 1] = -u[1]
+            pJ[2, 1] = sin(t)
+            pJ[2, 4] = -u[2]^2
+            return nothing
+        end
+        function explicit_paramjac!(pJ, u, p, t)
+            fill!(pJ, 0.0)
+            pJ[1, 2] = u[1] * u[2]
+            pJ[2, 3] = u[1]
+            return nothing
+        end
+        function split_prob(
+                u0, p, tspan; kind = :given, f2_jac = explicit_jac!,
+                f2_paramjac = explicit_paramjac!,
+            )
+            kind === :plain &&
+                return SciMLBase.SplitODEProblem(implicit_part!, explicit_part!, u0, tspan, p)
+            if kind === :oop
+                part(f!) = function (u, p, t)
+                    du = similar(u, promote_type(eltype(u), eltype(p)))
+                    f!(du, u, p, t)
+                    return du
+                end
+                return SciMLBase.SplitODEProblem{false}(
+                    part(implicit_part!), part(explicit_part!), u0, tspan, p,
+                )
+            end
+            jac_prototype = kind === :sparse ? sparse(ones(2, 2)) : nothing
+            return SciMLBase.SplitODEProblem(
+                SciMLBase.ODEFunction(
+                    implicit_part!; jac = implicit_jac!, paramjac = implicit_paramjac!,
+                    jac_prototype,
+                ),
+                SciMLBase.ODEFunction(
+                    explicit_part!; jac = f2_jac, paramjac = f2_paramjac, jac_prototype,
+                ),
+                u0, tspan, p,
+            )
+        end
+        states_only = ["-ts_trajectory_solution_only", "1"]
+
+        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX matches finite differences of the same fixed-step solve: $name" for (
+                name, subtype, tspan, ts, opts,
+            ) in (
+                ("3", "3", (0.0, 1.0), forward_t, (;)),
+                ("3 backward from 0", "3", (0.0, -1.0), -forward_t, (;)),
+                (
+                    "4 with a sparse jac_prototype and a cost that depends on p", "4",
+                    (0.0, 1.0), forward_t, (sparse_jac = true, coupled = true),
+                ),
+                ("2e out of place", "2e", (0.0, 1.0), forward_t, (oop = true,)),
+                ("l2 backward in time", "l2", (1.0, 0.0), backward_t, (;)),
+                (
+                    "1bee backward in time with a trajectory of states only", "1bee",
+                    (1.0, 0.0), backward_t, (sensealg = states_only,),
+                ),
+                ("prssp2 backward in time with no_start", "prssp2", (1.0, 0.0), backward_t, (no_start = true,)),
+                ("a split problem, 3", "3", (0.0, 1.0), forward_t, (split = :given,)),
+                (
+                    "a split problem, 3 backward in time with a cost that depends on p", "3",
+                    (1.0, 0.0), backward_t, (split = :given, coupled = true),
+                ),
+                (
+                    "a split problem, 4 backward in time, differentiated", "4", (1.0, 0.0),
+                    backward_t, (split = :plain,),
+                ),
+                (
+                    "a split problem, ars122 out of place", "ars122", (0.0, 1.0), forward_t,
+                    (split = :oop,),
+                ),
+                (
+                    "a split problem, 2e backward in time with sparse jac_prototypes", "2e",
+                    (1.0, 0.0), backward_t, (split = :sparse,),
+                ),
+                (
+                    "a split problem, 3 backward in time with a trajectory of states only", "3",
+                    (1.0, 0.0), backward_t, (split = :given, sensealg = states_only),
+                ),
+                # PETSc's 32-bit build fails trajectory file I/O intermittently.
+                (
+                    Sys.WORD_SIZE == 64 ? (
+                            (
+                                "a split problem, 3 with a trajectory on disk", "3", (0.0, 1.0),
+                                forward_t,
+                                (split = :given, sensealg = ["-ts_trajectory_type", "basic"]),
+                            ),
+                        ) : ()
+                )...,
+            )
+            alg = TSARKIMEX(subtype, exact)
+            kind = get(opts, :split, nothing)
+            make(u, p; kw...) = kind === nothing ? adj_prob(u, p, tspan; kw...) :
+                split_prob(u, p, tspan; kw...)
+            prob = kind === nothing ?
+                make(
+                    copy(u0), copy(p0);
+                    oop = get(opts, :oop, false), sparse_jac = get(opts, :sparse_jac, false),
+                ) : make(copy(u0), copy(p0); kind)
+            is_coupled = get(opts, :coupled, false)
+            no_start = get(opts, :no_start, false)
+            du0, dp = cd(mktempdir()) do
+                grad(
+                    prob, alg; t = ts, no_start,
+                    sensealg = PETScAdjoint(petsc_options = get(opts, :sensealg, String[])),
+                    dgdu_discrete = is_coupled ? coupled_du! : half_norm_du!,
+                    dgdp_discrete = is_coupled ? coupled_dp! : nothing,
+                )
+            end
+            cost = is_coupled ? coupled : half_norm
+            function loss(θ)
+                sol = SciMLBase.solve(
+                    make(θ[1:2], θ[3:6]), alg; dt = 0.01, adaptive = false, saveat = ts,
+                )
+                return sum(
+                    cost(sol.u[i], θ[3:6], sol.t[i]) for i in eachindex(sol.t)
+                        if !(no_start && i == 1)
+                )
+            end
+            @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 1.0e-8
+        end
+
+        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX on a split problem reads f2's jac and paramjac" begin
+            alg = TSARKIMEX("3", exact)
+            for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t))
+                given = grad(split_prob(copy(u0), copy(p0), tspan), alg; t)
+                for kind in (:plain, :oop, :sparse)
+                    r = grad(split_prob(copy(u0), copy(p0), tspan; kind), alg; t)
+                    @test r[1] ≈ given[1] rtol = 1.0e-12
+                    @test r[2] ≈ given[2] rtol = 1.0e-12
+                end
+            end
+            given = grad(split_prob(copy(u0), copy(p0), (0.0, 1.0)), alg)
+            doubled(f!) = (out, args...) -> (f!(out, args...); out .*= 2; nothing)
+            for wrong in (
+                    (f2_jac = doubled(explicit_jac!),), (f2_paramjac = doubled(explicit_paramjac!),),
+                )
+                r = grad(split_prob(copy(u0), copy(p0), (0.0, 1.0); wrong...), alg)
+                @test relerr(vcat(r[1], vec(r[2])), vcat(given[1], vec(given[2]))) > 0.2
+            end
+            differenced = TSARKIMEX("3", exact; autodiff = PETScDiffEq.AutoFiniteDiff())
+            @test grad(split_prob(copy(u0), copy(p0), (0.0, 1.0)), differenced) == given
+            thrower(key) = (args...) -> throw(KeyError(key))
+            for key in (:f2_jac, :f2_paramjac)
+                @test_throws KeyError(key) grad(
+                    split_prob(copy(u0), copy(p0), (0.0, 1.0); NamedTuple{(key,)}((thrower(key),))...),
+                    alg,
+                )
+            end
+            @test grad(split_prob(copy(u0), copy(p0), (0.0, 1.0)), alg) == given
+            unsplit = grad(adj_prob(copy(u0), copy(p0), (0.0, 1.0)), alg)
+            @test grad(adj_prob(copy(u0), copy(p0), (0.0, 1.0)), TSGeneric("arkimex", exact)) == unsplit
+            none = SciMLBase.SplitODEProblem(
+                (du, u, p, t) -> (du .= -u; nothing), (du, u, p, t) -> (du .= 0.3 .* u .^ 2; nothing),
+                copy(u0), (0.0, 1.0),
+            )
+            du0, dp = grad(none, alg)
+            @test dp === nothing
+            function loss(u)
+                sol = SciMLBase.solve(
+                    SciMLBase.remake(none; u0 = u), alg; dt = 0.01, adaptive = false,
+                    saveat = forward_t,
+                )
+                return sum(half_norm(v, nothing, 0.0) for v in sol.u)
+            end
+            @test relerr(du0, central_differences(loss, u0)) < 1.0e-8
+        end
+
+        Sys.WORD_SIZE == 64 && @testset "an adaptive TSARKIMEX holds its accepted steps fixed: $name" for (
+                name, subtype, make, tspan,
+            ) in (
+                ("3", "3", adj_prob, (0.0, 1.0)),
+                ("a split problem, 3", "3", split_prob, (0.0, 1.0)),
+                ("a split problem, 4 backward in time", "4", split_prob, (1.0, 0.0)),
+            )
+            alg = TSARKIMEX(subtype, exact)
+            prob = make(copy(u0), copy(p0), tspan)
+            tolerances = (abstol = 1.0e-8, reltol = 1.0e-8, dt = 0.01)
+            du0, dp = PETScDiffEq._discrete_adjoint(
+                prob, alg, PETScAdjoint();
+                t = collect(tspan), dgdu_discrete = half_norm_du!, tolerances...,
+            )
+            steps = SciMLBase.solve(prob, alg; tolerances...).t
+            stepped(θ) = SciMLBase.solve(
+                make(θ[1:2], θ[3:6], tspan), alg;
+                dt = 1.0, adaptive = false, tstops = steps[2:(end - 1)],
+            )
+            @test length(steps) > 3
+            @test stepped(vcat(u0, p0)).t == steps
+            function loss(θ)
+                sol = stepped(θ)
+                return half_norm(sol.u[1], nothing, 0.0) + half_norm(sol.u[end], nothing, 1.0)
+            end
+            @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-9
         end
 
         @testset "inputs are left alone and a repeated call gives the same numbers" begin
@@ -8574,7 +8850,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
 
         @testset "without jac or paramjac both are differentiated" begin
             for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t)),
-                    alg in (TSRK("4"), TSImplicit("beuler", exact), TSImplicit("cn", exact))
+                    alg in (
+                        TSRK("4"), TSImplicit("beuler", exact), TSImplicit("cn", exact),
+                        TSImplicit("theta", 0.7, exact), TSARKIMEX("l2", exact),
+                    )
                 given = grad(adj_prob(copy(u0), copy(p0), tspan), alg; t)
                 plain = grad(SciMLBase.ODEProblem(adj_f!, copy(u0), tspan, copy(p0)), alg; t)
                 @test plain[1] ≈ given[1] rtol = 1.0e-12
@@ -8659,6 +8938,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @testset "a partitioned problem runs on its flat [v; u]: $name" for (name, alg) in (
                 ("RK4", TSRK("4")), ("backward Euler", TSImplicit("beuler", exact)),
                 ("Crank-Nicolson", TSImplicit("cn", exact)),
+                ("theta 0.7", TSImplicit("theta", 0.7, exact)),
             )
             kick!(dv, v, u, p, t) = (
                 dv[1] = -p[1] * u[1] - p[2] * v[1] + u[2] * v[2];
@@ -8773,8 +9053,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             second = SciMLBase.SecondOrderODEProblem(
                 (ddu, du, u, p, t) -> (ddu .= -p[1] .* u; nothing), [0.0], [1.0], (0.0, 1.0), [1.0],
             )
-            runs(type) = "PETScAdjoint supports PETSc's rk, beuler and cn as this package " *
-                "drives them, but this solve runs `$type`"
+            runs(type) = "PETScAdjoint supports PETSc's rk, beuler, cn, theta and arkimex as " *
+                "this package drives them, but this solve runs `$type`"
+            parts = split_prob(copy(u0), copy(p0), (0.0, 1.0))
+            differenced = PETScDiffEq.AutoFiniteDiff()
             trajectory(type) = "PETScAdjoint keeps its trajectory in memory, or on disk " *
                 "with `-ts_trajectory_type basic`, but this solve's is `$type`"
             no_ksp = [
@@ -8795,10 +9077,66 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         "PETSc has no adjoint for TSImplicit(\"bdf\")",
                         () -> grad(prob, TSImplicit("bdf")),
                     ),
-                    ("PETScAdjoint does not support TSARKIMEX", () -> grad(prob, TSARKIMEX())),
                     (
-                        "PETScAdjoint has not been verified on TSImplicit(\"theta\")",
-                        () -> grad(prob, TSImplicit("theta", 0.7)),
+                        "PETScAdjoint cannot take an integral cost with TSARKIMEX",
+                        () -> integral(prob, TSARKIMEX(); g = coupled),
+                    ),
+                    (
+                        "PETScAdjoint cannot take an integral cost with TSARKIMEX",
+                        () -> grad(parts, TSARKIMEX(); g = coupled),
+                    ),
+                    (
+                        "PETScAdjoint does not support TSARKIMEX(\"3\") on an ODEProblem whose " *
+                            "tspan starts away from 0",
+                        () -> grad(adj_prob(copy(u0), copy(p0), (1.0, 0.0)), TSARKIMEX(); t = backward_t),
+                    ),
+                    (
+                        "PETScAdjoint does not support TSARKIMEX(\"4\") on an ODEProblem whose " *
+                            "tspan starts away from 0",
+                        () -> grad(
+                            adj_prob(copy(u0), copy(p0), (1.0, 2.0)),
+                            TSImplicit("beuler", ["-ts_type", "arkimex", "-ts_arkimex_type", "4"]);
+                            t = [2.0],
+                        ),
+                    ),
+                    (
+                        "PETScAdjoint does not support `-ts_trajectory_solution_only` with " *
+                            "TSARKIMEX(\"3\") on an ODEProblem",
+                        () -> grad(
+                            prob, TSARKIMEX(); sensealg = PETScAdjoint(petsc_options = states_only),
+                        ),
+                    ),
+                    (
+                        "PETScAdjoint does not support `-ts_arkimex_fully_implicit` on a " *
+                            "SplitODEProblem",
+                        () -> grad(parts, TSARKIMEX("3", ["-ts_arkimex_fully_implicit"])),
+                    ),
+                    (
+                        "PETScAdjoint supports a SplitODEProblem with TSARKIMEX only",
+                        () -> grad(parts, TSRK("4")),
+                    ),
+                    (
+                        "PETScAdjoint differentiates a SplitODEProblem with PETSc's arkimex " *
+                            "only, but this solve runs `beuler`",
+                        () -> grad(parts, TSARKIMEX("3", ["-ts_type", "beuler"])),
+                    ),
+                    (
+                        "PETScAdjoint needs `f2`'s `jac` under `autodiff = AutoFiniteDiff()`",
+                        () -> grad(
+                            split_prob(copy(u0), copy(p0), (0.0, 1.0); f2_jac = nothing),
+                            TSARKIMEX("3"; autodiff = differenced),
+                        ),
+                    ),
+                    (
+                        "PETScAdjoint needs `f2`'s `paramjac` under `autodiff = AutoFiniteDiff()`",
+                        () -> grad(
+                            split_prob(copy(u0), copy(p0), (0.0, 1.0); f2_paramjac = nothing),
+                            TSARKIMEX("3"; autodiff = differenced),
+                        ),
+                    ),
+                    (
+                        "PETScAdjoint does not support a mass matrix",
+                        () -> grad(without(mass_matrix = [2.0 0.0; 0.0 1.0]), TSARKIMEX()),
                     ),
                     (runs("euler"), () -> grad(prob, TSGeneric("euler"; explicit = true))),
                     (runs("bdf"), () -> grad(prob, TSImplicit("beuler", ["-ts_type", "bdf"]))),
@@ -8854,16 +9192,6 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         () -> grad(
                             SciMLBase.DAEProblem(residual!, zeros(2), ones(2), (0.0, 1.0), p0),
                             TSDAE("beuler"),
-                        ),
-                    ),
-                    (
-                        "PETScAdjoint supports an ODEProblem, not a DAEProblem or SplitODEProblem",
-                        () -> grad(
-                            SciMLBase.SplitODEProblem(
-                                SciMLBase.ODEFunction(adj_f!; jac = adj_jac!),
-                                SciMLBase.ODEFunction(adj_f!), copy(u0), (0.0, 1.0), p0,
-                            ),
-                            TSARKIMEX(),
                         ),
                     ),
                     (

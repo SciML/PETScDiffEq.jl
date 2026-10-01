@@ -23,8 +23,9 @@ Saving keywords are ignored, and `callback`, `tstops`, `d_discontinuities` and
 `save_idxs` are refused, whether given here or to the problem.
 
 Supported: an `ODEProblem` without a mass matrix, in place or out of place, solved with
-`TSRK` of any subtype, `TSImplicit("beuler")` or `TSImplicit("cn")`, in either time
-direction. The `ODEFunction`'s `jac` and `paramjac` are used when given, and otherwise
+`TSRK` of any subtype, `TSImplicit("beuler")`, `TSImplicit("cn")`, `TSImplicit("theta")`
+with its `theta`, in its midpoint form or with `-ts_theta_endpoint`, or `TSARKIMEX`, in
+either time direction. The `ODEFunction`'s `jac` and `paramjac` are used when given, and otherwise
 built as the forward solve builds a missing `jac`: with the algorithm's `autodiff`, and
 with ForwardDiff for a `TSRK`. Under `AutoFiniteDiff()` both have to be given, since
 PETSc's own differences never reach its adjoint. A sparse `jac_prototype` is used.
@@ -33,6 +34,17 @@ PETSc's own differences never reach its adjoint. A sparse `jac_prototype` is use
 which therefore has to be a vector of real numbers. A hand-written `jac` or `paramjac`
 goes into the gradient unchecked, so a wrong one gives a wrong gradient without an error;
 compare it against a gradient computed without it.
+
+`TSARKIMEX` takes a `SplitODEProblem` as well, on `MPI.COMM_SELF`. The implicit part's
+`jac` and `paramjac` are the problem's, which a `SplitODEProblem` takes from `f1`, and the
+explicit part's are those of `f2`'s own `ODEFunction`; each is built by automatic
+differentiation when missing. PETSc's ARKIMEX adjoint has no quadrature, so an integral
+cost is refused, and `-ts_arkimex_fully_implicit` is refused on a `SplitODEProblem`, since
+the adjoint would still take `f2` explicitly. On a plain `ODEProblem`, every type but
+`"1bee"`, `"l2"` and `"prssp2"` has an explicit first stage, which PETSc evaluates at a
+stale time on the first step after a restart without its adjoint seeing that. Such a type
+therefore needs `tspan` to start at 0 and the stages kept in the trajectory, and is
+refused otherwise; a `SplitODEProblem` has no such limit.
 
 A `DynamicalODEProblem` or `SecondOrderODEProblem` is differentiated as the first-order
 system on the flat `[v; u]` that these methods step. Its `jac` and `paramjac`, when given,
@@ -60,7 +72,9 @@ An integral cost, the integral of `g(u, p, t)` from `tspan[1]` to `tspan[2]`, is
 PETSc sums it with the method's own quadrature, through a quadrature `TS` whose right-hand
 side Jacobians are the derivatives of `g`, so the gradient is that of the sum of
 `dt * b[i] * g` over the stages of a `TSRK`, of `dt * g` at the end of each backward Euler
-step, and of the trapezoidal sum for Crank-Nicolson. Where `dgdu_continuous` is left out,
+step, of the trapezoidal sum for Crank-Nicolson, and for the theta method of `dt * g` at
+its stage, at `t + theta * dt`, or in its endpoint form of
+`dt * ((1 - theta) * g(t) + theta * g(t + dt))`. Where `dgdu_continuous` is left out,
 `g` is differentiated with respect to `u` and `p` as a missing `jac` is, with ForwardDiff
 or the algorithm's `autodiff`; where it is given and `dgdp_continuous` is not, the direct
 derivative with respect to `p` is taken as zero, as SciMLSensitivity's adjoints take it.
@@ -71,24 +85,26 @@ than `MPI.COMM_SELF`.
 `petsc_options` apply to this adjoint's own run and are parsed after the algorithm's. The
 trajectory is kept in memory, every stage of every step; `-ts_trajectory_solution_only 1`
 keeps only the states and recomputes each step during the adjoint, and
-`-ts_trajectory_type basic` writes one file per step to the working directory instead.
-For an adaptive solve the memory trajectory reserves 8 bytes for each of `maxiters` steps
-before starting, 8 MB at the default and 8 GB at `maxiters = 10^9`. `TSImplicit` solves
-transposed linear systems with the same Krylov solver and tolerances as its Newton steps,
-so with default options the gradient can be off by up to about their relative tolerance
-of 1e-5 while the forward states are far closer; pass `-ksp_type preonly -pc_type lu`, or
-a tighter `-ksp_rtol`, when that matters. Options PETSc reads only while the adjoint
-runs, such as `-ts_trajectory_view` and `-ts_adjoint_view_solution`, have no effect in
-`petsc_options`, though they do when set globally, for example through `PETSC_OPTIONS`.
+`-ts_trajectory_type basic` writes one file per step to the working directory instead. For
+an adaptive solve the memory trajectory reserves 8 bytes for each of `maxiters` steps before
+starting, 8 MB at the default and 8 GB at `maxiters = 10^9`. `TSImplicit` and `TSARKIMEX`
+solve transposed linear systems with the same Krylov solver and tolerances as their Newton
+steps, so with default options the gradient can be off by up to about their relative
+tolerance of 1e-5 while the forward states are far closer; pass
+`-ksp_type preonly -pc_type lu`, or a tighter `-ksp_rtol`, when that matters. Options PETSc
+reads only while the adjoint runs, such as `-ts_trajectory_view` and
+`-ts_adjoint_view_solution`, have no effect in `petsc_options`, though they do when set
+globally, for example through `PETSC_OPTIONS`.
 
 With an algorithm whose `comm` is not `MPI.COMM_SELF`, the adjoint runs distributed as the
-solve does, for the same three families. The `ODEFunction` then needs `jac`, filling this
-rank's rows of a sparse `jac_prototype` with global columns, and `paramjac` when there are
-parameters, filling this rank's rows; both are collective like `f`. `dgdu_discrete` gets this
-rank's rows of the state and writes their derivative, and `dgdp_discrete` gives this rank's
-share of the direct derivative, which the ranks add up. `du0` holds this rank's rows, and `dp`
-is the whole gradient on every rank. The cost times, `no_start`, the length of `p` and whether
-`dgdp_discrete` is given must agree across the ranks.
+solve does, for the same methods on an `ODEProblem`. The `ODEFunction` then needs `jac`,
+filling this rank's rows of a sparse `jac_prototype` with global columns, and `paramjac`
+when there are parameters, filling this rank's rows; both are collective like `f`.
+`dgdu_discrete` gets this rank's rows of the state and writes their derivative, and
+`dgdp_discrete` gives this rank's share of the direct derivative, which the ranks add up.
+`du0` holds this rank's rows, and `dp` is the whole gradient on every rank. The cost times,
+`no_start`, the length of `p` and whether `dgdp_discrete` is given must agree across the
+ranks.
 
 Returns `(du0, dp')`, where `dp` is `nothing` when `p` is `nothing` or
 `SciMLBase.NullParameters()`. Differentiating `solve` itself with a reverse-mode AD package
@@ -471,37 +487,47 @@ function _exact_final_time(petsclib, ts)
     return opt[]
 end
 
-function _trajectory_type(petsclib, ts)
+function _trajectory(petsclib, ts)
     tj = Ref{Ptr{Cvoid}}(C_NULL)
     code = ccall(
         _symbol(petsclib, :TSGetTrajectory), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Ptr{Ptr{Cvoid}}), ts, tj,
     )
     _check_code(code, "TSGetTrajectory")
-    tj[] == C_NULL && return "none"
+    return tj[]
+end
+
+function _trajectory_type(petsclib, ts)
+    tj = _trajectory(petsclib, ts)
+    tj == C_NULL && return "none"
     name = Ref{Ptr{Cchar}}(C_NULL)
     code = ccall(
         _symbol(petsclib, :TSTrajectoryGetType), LibPETSc.PetscErrorCode,
-        (Ptr{Cvoid}, LibPETSc.CTS, Ptr{Ptr{Cchar}}), tj[], ts, name,
+        (Ptr{Cvoid}, LibPETSc.CTS, Ptr{Ptr{Cchar}}), tj, ts, name,
     )
     _check_code(code, "TSTrajectoryGetType")
     return name[] == C_NULL ? "none" : unsafe_string(name[])
 end
 
-const _ADJOINT_TYPES = "TSRK, TSImplicit(\"beuler\") or TSImplicit(\"cn\")"
+function _petsc_flag(petsclib, name, obj)
+    flg = Ref(LibPETSc.PETSC_FALSE)
+    code = ccall(
+        _symbol(petsclib, name), LibPETSc.PetscErrorCode,
+        (Ptr{Cvoid}, Ptr{LibPETSc.PetscBool}), obj, flg,
+    )
+    _check_code(code, String(name))
+    return flg[] == LibPETSc.PETSC_TRUE
+end
+
+const _ADJOINT_TYPES = "TSRK, TSARKIMEX or TSImplicit's \"beuler\", \"cn\" or \"theta\""
 
 _adjoint_unsupported(::TSRK) = nothing
 _adjoint_unsupported(::TSGeneric) = nothing
+_adjoint_unsupported(::TSARKIMEX) = nothing
 function _adjoint_unsupported(alg::TSImplicit)
-    alg.subtype in ("beuler", "cn") && return nothing
-    alg.subtype == "theta" && return "PETScAdjoint has not been verified on " *
-        "TSImplicit(\"theta\"); use TSImplicit(\"cn\") for theta = 0.5 or " *
-        "TSImplicit(\"beuler\") for theta = 1"
+    alg.subtype in ("beuler", "cn", "theta") && return nothing
     return "PETSc has no adjoint for TSImplicit(\"$(alg.subtype)\"); use $_ADJOINT_TYPES"
 end
-_adjoint_unsupported(::TSARKIMEX) = "PETScAdjoint does not support TSARKIMEX: PETSc " *
-    "checks its adjoint's identity mass matrix only in debug builds and leaves the " *
-    "explicit part's Jacobian out of a split problem; use $_ADJOINT_TYPES"
 _adjoint_unsupported(alg::AnyPETScTS) =
     "PETSc has no adjoint for $(nameof(typeof(alg))); use $_ADJOINT_TYPES"
 
@@ -545,10 +571,19 @@ function _check_adjoint_problem(
         prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, g, dgdu_continuous,
         dgdp_continuous, comm,
     )
-    (prob isa SciMLBase.AbstractODEProblem && !(prob.f isa SciMLBase.SplitFunction)) ||
-        throw(
+    prob isa SciMLBase.AbstractODEProblem ||
+        throw(ArgumentError("PETScAdjoint supports an ODEProblem, not a DAEProblem"))
+    is_split = prob.f isa SciMLBase.SplitFunction
+    is_split && !(alg isa TSARKIMEX) && throw(
         ArgumentError(
-            "PETScAdjoint supports an ODEProblem, not a DAEProblem or SplitODEProblem",
+            "PETScAdjoint supports a SplitODEProblem with TSARKIMEX only, the one method " *
+                "here that integrates its two parts differently",
+        ),
+    )
+    is_split && comm !== nothing && throw(
+        ArgumentError(
+            "PETScAdjoint supports a SplitODEProblem on MPI.COMM_SELF only; $_NOT_SELF " *
+                "solve the summed problem as an ODEProblem",
         ),
     )
     eltype(prob.u0) <: Real || throw(
@@ -571,18 +606,23 @@ function _check_adjoint_problem(
     mm = prob.f.mass_matrix
     mm === nothing || mm == LinearAlgebra.I || throw(
         ArgumentError(
-            "PETScAdjoint does not support a mass matrix; PETSc's Crank-Nicolson adjoint " *
-                "assumes a constant one and none of these methods has been verified with one",
+            "PETScAdjoint does not support a mass matrix; PETSc's ARKIMEX adjoint assumes " *
+                "the identity and checks it only in debug builds, its Crank-Nicolson " *
+                "adjoint assumes a constant one, and none of these methods has been " *
+                "verified with one",
         ),
     )
     differences = _petsc_differences(alg)
-    differences && prob.f.jac === nothing && throw(
-        ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `jac` under `autodiff = AutoFiniteDiff()`: " *
-                "PETSc's adjoint step multiplies by the Jacobian it is given and has no " *
-                "other source for it",
-        ),
-    )
+    parts = (("the ODEFunction's", prob.f), (is_split ? (("`f2`'s", prob.f.f2),) : ())...)
+    for (whose, fun) in parts
+        differences && fun.jac === nothing && throw(
+            ArgumentError(
+                "PETScAdjoint needs $whose `jac` under `autodiff = AutoFiniteDiff()`: " *
+                    "PETSc's adjoint step multiplies by the Jacobian it is given and has no " *
+                    "other source for it",
+            ),
+        )
+    end
     comm === nothing || prob.f.jac !== nothing || throw(
         ArgumentError(
             "PETScAdjoint needs the ODEFunction's `jac` $_NOT_SELF, since automatic " *
@@ -597,13 +637,15 @@ function _check_adjoint_problem(
                 "`paramjac` fills a matrix with a column per entry of `p`; got $(typeof(p))",
         ),
     )
-    has_p && !isempty(p) && differences && prob.f.paramjac === nothing && throw(
-        ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `paramjac` under " *
-                "`autodiff = AutoFiniteDiff()` when the problem has parameters: PETSc " *
-                "builds the parameter gradient from it",
-        ),
-    )
+    for (whose, fun) in parts
+        has_p && !isempty(p) && differences && fun.paramjac === nothing && throw(
+            ArgumentError(
+                "PETScAdjoint needs $whose `paramjac` under " *
+                    "`autodiff = AutoFiniteDiff()` when the problem has parameters: PETSc " *
+                    "builds the parameter gradient from it",
+            ),
+        )
+    end
     has_p && !isempty(p) && comm !== nothing && prob.f.paramjac === nothing && throw(
         ArgumentError(
             "PETScAdjoint needs the ODEFunction's `paramjac` $_NOT_SELF when the problem has " *
@@ -668,17 +710,63 @@ function _check_adjoint_problem(
     return has_p
 end
 
-function _check_adjoint_ts(h::TSHandles, alg, cost_s)
+const _ARKIMEX_IMPLICIT_FIRST_STAGE = ("1bee", "l2", "prssp2")
+
+function _check_adjoint_ts(h::TSHandles, alg, cost_s, integral, is_split)
     pl, ts = h.petsclib, h.ts
     implicit = _uses_ifunction(alg)
     ts_type = LibPETSc.TSGetType(pl, ts)
-    ts_type in (implicit ? ("beuler", "cn") : ("rk",)) || throw(
+    ts_type in (implicit ? ("beuler", "cn", "theta", "arkimex") : ("rk",)) || throw(
         ArgumentError(
-            "PETScAdjoint supports PETSc's rk, beuler and cn as this package drives them, " *
-                "but this solve runs `$ts_type`; use $_ADJOINT_TYPES and leave " *
-                "`-ts_type` out of petsc_options",
+            "PETScAdjoint supports PETSc's rk, beuler, cn, theta and arkimex as this " *
+                "package drives them, but this solve runs `$ts_type`; use " *
+                "$_ADJOINT_TYPES and leave `-ts_type` out of petsc_options",
         ),
     )
+    is_split && ts_type != "arkimex" && throw(
+        ArgumentError(
+            "PETScAdjoint differentiates a SplitODEProblem with PETSc's arkimex only, but " *
+                "this solve runs `$ts_type`; leave `-ts_type` out of petsc_options",
+        ),
+    )
+    ts_type == "arkimex" && integral && throw(
+        ArgumentError(
+            "PETScAdjoint cannot take an integral cost with TSARKIMEX: PETSc has no " *
+                "adjoint of its quadrature for arkimex, and stops with \"No method " *
+                "adjointintegral\"; give the cost at discrete times, or use TSRK or TSImplicit",
+        ),
+    )
+    if ts_type == "arkimex" && !is_split
+        sub = LibPETSc.TSARKIMEXGetType(pl, ts)
+        stale = "PETSc's arkimex evaluates this type's explicit first stage at a stale " *
+            "time on the first step after a restart, which its adjoint does not see; " *
+            "give a SplitODEProblem, or use \"1bee\", \"l2\" or \"prssp2\", whose " *
+            "first stage is implicit"
+        sub in _ARKIMEX_IMPLICIT_FIRST_STAGE || h.t0 == 0 || throw(
+            ArgumentError(
+                "PETScAdjoint does not support TSARKIMEX(\"$sub\") on an ODEProblem whose " *
+                    "tspan starts away from 0: $stale, or start tspan at 0",
+            ),
+        )
+        tj = _trajectory(pl, ts)
+        sub in _ARKIMEX_IMPLICIT_FIRST_STAGE || tj == C_NULL ||
+            !_petsc_flag(pl, :TSTrajectoryGetSolutionOnly, tj) || throw(
+            ArgumentError(
+                "PETScAdjoint does not support `-ts_trajectory_solution_only` with " *
+                    "TSARKIMEX(\"$sub\") on an ODEProblem, where every step is taken " *
+                    "again from a restart: $stale, or keep the stages in the trajectory",
+            ),
+        )
+    end
+    if is_split && _petsc_flag(pl, :TSARKIMEXGetFullyImplicit, ts)
+        throw(
+            ArgumentError(
+                "PETScAdjoint does not support `-ts_arkimex_fully_implicit` on a " *
+                    "SplitODEProblem: the solve then takes `f2` implicitly, while PETSc's " *
+                    "ARKIMEX adjoint still takes it explicitly; remove the option",
+            ),
+        )
+    end
     if ts_type == "rk" && LibPETSc.TSRKGetMultirate(pl, ts) == LibPETSc.PETSC_TRUE
         throw(
             ArgumentError(
@@ -710,13 +798,13 @@ function _check_adjoint_ts(h::TSHandles, alg, cost_s)
             ),
         )
     end
-    return implicit
+    return implicit, ts_type == "arkimex"
 end
 
-_throw_callback_error(ctx, adj, comm = nothing, q = nothing) = _throw_anywhere(
+_throw_callback_error(ctx, adj, comm = nothing, q = nothing, ex = nothing) = _throw_anywhere(
     comm,
     ctx.err !== nothing ? ctx.err : adj.err !== nothing ? adj.err :
-        q === nothing ? nothing : q.err,
+        q !== nothing && q.err !== nothing ? q.err : ex === nothing ? nothing : ex.err,
 )
 
 function _check_agreement(comm, args)
@@ -792,6 +880,46 @@ function _set_integral!(q::IntegralContext, ts, np)
     return nothing
 end
 
+_zero_paramjac(pJ, u, p, t) = fill!(pJ, 0.0)
+
+function _set_rhs_jacobian!(adj::AdjointContext, ts, n, N, coo_rows, coo_cols)
+    pl, J = adj.petsclib, adj.J
+    if adj.comm !== nothing
+        adj.jac_mat = LibPETSc.MatCreate(pl, adj.comm)
+        _coo_matrix!(adj.jac_mat, pl, n, N, coo_rows, coo_cols)
+    else
+        adj.jac_mat = J isa SparseMatrixCSC ?
+            PETScCompat.PetscMat(
+                pl, MPI.COMM_SELF, _jacobian_pattern(J, n); with_arrays = true,
+            ) :
+            PETScCompat.PetscMat(pl, J)
+    end
+    code = ccall(
+        _symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
+        ts, adj.jac_mat.ptr, adj.jac_mat.ptr, ADJ_RHSJACOBIAN_PTR[], pointer_from_objref(adj),
+    )
+    _check_code(code, "TSSetRHSJacobian")
+    return nothing
+end
+
+function _set_jacobianp!(adj::AdjointContext, ts, n, N, name, callback)
+    pl, np = adj.petsclib, size(adj.pJ, 2)
+    # MPIDENSE stores this rank's rows of every column, column-major, which is adj.pJ.
+    adj.pmat = adj.comm === nothing ? PETScCompat.PetscMat(pl, adj.pJ) :
+        LibPETSc.MatCreateDense(
+            pl, adj.comm, LibPETSc.PetscInt(n), LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE),
+            LibPETSc.PetscInt(N), LibPETSc.PetscInt(np), pointer(adj.pJ),
+        )
+    code = ccall(
+        _symbol(pl, name), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
+        ts, adj.pmat.ptr, callback, pointer_from_objref(adj),
+    )
+    _check_code(code, String(name))
+    return nothing
+end
+
 const _ADJOINT_TRAJECTORY = ["-ts_save_trajectory", "1", "-ts_trajectory_type", "memory"]
 
 function _discrete_adjoint_unlocked(
@@ -811,6 +939,7 @@ function _discrete_adjoint_unlocked(
         given, checked, Bool(no_start)
     end
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
+    is_split = prob.f isa SciMLBase.SplitFunction
     p = prob.p
     np = has_p ? length(p) : 0
     cost_t = _unset(t) ? Float64[] : collect(Float64, t)
@@ -827,49 +956,58 @@ function _discrete_adjoint_unlocked(
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
     n = length(h.u0)
     N = comm === nothing ? n : MPI.Allreduce(n, +, comm)
-    adj, q = nothing, nothing
+    adj, q, ex = nothing, nothing, nothing
     local du0, dp
     try
         cost_s = h.tdir .* cost_t
-        implicit = _check_adjoint_ts(h, alg, cost_s)
+        implicit, arkimex = _check_adjoint_ts(h, alg, cost_s, integral, is_split)
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
+        inplace(fun) = _as_inplace(SciMLBase.unwrapped_f(fun.f), iip)
         f_ad = dyn ? _partitioned(prob.f, iip, length(prob.u0.x[1])) :
-            _as_inplace(SciMLBase.unwrapped_f(prob.f.f), iip)
+            inplace(is_split ? prob.f.f1 : prob.f)
         user_jac(j) = dyn ? _partitioned_jac(j, prob.u0, iip) : _as_inplace_jac(j, iip)
         user_t0 = Float64(prob.tspan[1])
+        rhs, f_rhs = is_split ? (prob.f.f2, inplace(prob.f.f2)) : (prob.f, f_ad)
         jac, J = nothing, zeros(0, 0)
-        if !implicit
-            jac = prob.f.jac === nothing ?
+        if !implicit || is_split
+            jac = rhs.jac === nothing ?
                 _ad_jacobian(
-                    backend, f_ad, prob.f.jac_prototype, h.u0, p, user_t0, Ref(0),
+                    backend, f_rhs, rhs.jac_prototype, h.u0, p, user_t0, Ref(0),
                     _ADJOINT_JAC_ADVICE,
                 ) :
-                user_jac(prob.f.jac)
+                user_jac(rhs.jac)
             h.tdir < 0 && (jac = _reverse_jac(jac))
-            proto = prob.f.jac_prototype
+            proto = rhs.jac_prototype
             J = proto isa SparseMatrixCSC ? SparseMatrixCSC{Float64, Int}(proto) : zeros(n, n)
         end
-        rows = J isa SparseMatrixCSC && comm === nothing ? _row_structure(J, n) :
-            (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
+        no_rows = (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
+        rows = J isa SparseMatrixCSC && comm === nothing ? _row_structure(J, n) : no_rows
         coo_rows, coo_cols, coo = if comm === nothing || implicit
             nothing, nothing, nothing
         else
             _coo_structure(J, first(LibPETSc.VecGetOwnershipRange(pl, h.u)), nothing)
         end
-        adj = AdjointContext(
-            pl, h.tdir, p, jac, J, rows...,
-            np == 0 ? nothing : prob.f.paramjac === nothing ?
-                _ad_paramjacobian(backend, f_ad, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE) :
-                user_jac(prob.f.paramjac),
-            zeros(n, np),
-            implicit ? -h.tdir : h.tdir, dgdu_discrete, skip_start,
-            cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),
+        paramjac(fun, f) = np == 0 ? nothing : fun.paramjac === nothing ?
+            _ad_paramjacobian(backend, f, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE) :
+            user_jac(fun.paramjac)
+        context(jac, J, rows, paramjac, pscale, coo) = AdjointContext(
+            pl, h.tdir, p, jac, J, rows..., paramjac, zeros(n, np), pscale, dgdu_discrete,
+            skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
             coo, comm,
         )
+        adj = implicit ?
+            context(nothing, zeros(0, 0), no_rows, paramjac(prob.f, f_ad), -h.tdir, nothing) :
+            context(jac, J, rows, paramjac(prob.f, f_ad), h.tdir, coo)
+        # PETSc's ARKIMEX adjoint segfaults without an explicit part's parameter Jacobian.
+        if is_split
+            ex = context(jac, J, rows, paramjac(rhs, f_rhs), h.tdir, nothing)
+        elseif arkimex && np > 0
+            ex = context(nothing, zeros(0, 0), no_rows, _zero_paramjac, h.tdir, nothing)
+        end
         if integral
             gu, gp = zeros(n), zeros(np)
             q = IntegralContext(
@@ -883,41 +1021,16 @@ function _discrete_adjoint_unlocked(
             )
         end
         adjptr = pointer_from_objref(adj)
-        GC.@preserve ctx adj q begin
+        GC.@preserve ctx adj q ex begin
             integral && _set_integral!(q, ts, np)
-            if !implicit && comm !== nothing
-                adj.jac_mat = LibPETSc.MatCreate(pl, comm)
-                _coo_matrix!(adj.jac_mat, pl, n, N, coo_rows, coo_cols)
-            elseif !implicit
-                adj.jac_mat = J isa SparseMatrixCSC ?
-                    PETScCompat.PetscMat(
-                        pl, MPI.COMM_SELF, _jacobian_pattern(J, n); with_arrays = true,
-                    ) :
-                    PETScCompat.PetscMat(pl, J)
-            end
-            if !implicit
-                code = ccall(
-                    _symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
-                    (LibPETSc.CTS, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
-                    ts, adj.jac_mat.ptr, adj.jac_mat.ptr, ADJ_RHSJACOBIAN_PTR[], adjptr,
-                )
-                _check_code(code, "TSSetRHSJacobian")
-            end
+            implicit || _set_rhs_jacobian!(adj, ts, n, N, coo_rows, coo_cols)
+            is_split && _set_rhs_jacobian!(ex, ts, n, N, nothing, nothing)
             if np > 0
-                # MPIDENSE stores this rank's rows of every column, column-major, which is adj.pJ.
-                adj.pmat = comm === nothing ? PETScCompat.PetscMat(pl, adj.pJ) :
-                    LibPETSc.MatCreateDense(
-                        pl, comm, LibPETSc.PetscInt(n), LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE),
-                        LibPETSc.PetscInt(N), LibPETSc.PetscInt(np), pointer(adj.pJ),
-                    )
-                name = implicit ? :TSSetIJacobianP : :TSSetRHSJacobianP
-                code = ccall(
-                    _symbol(pl, name), LibPETSc.PetscErrorCode,
-                    (LibPETSc.CTS, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
-                    ts, adj.pmat.ptr,
-                    implicit ? ADJ_IJACOBIANP_PTR[] : ADJ_RHSJACOBIANP_PTR[], adjptr,
-                )
-                _check_code(code, String(name))
+                implicit ?
+                    _set_jacobianp!(adj, ts, n, N, :TSSetIJacobianP, ADJ_IJACOBIANP_PTR[]) :
+                    _set_jacobianp!(adj, ts, n, N, :TSSetRHSJacobianP, ADJ_RHSJACOBIANP_PTR[])
+                ex === nothing ||
+                    _set_jacobianp!(ex, ts, n, N, :TSSetRHSJacobianP, ADJ_RHSJACOBIANP_PTR[])
                 if comm === nothing
                     adj.mu = PETScCompat.PetscVec(pl, adj.mu_buf)
                 else
@@ -1009,15 +1122,16 @@ function _discrete_adjoint_unlocked(
                 end
             catch
                 ctx.err === nothing && adj.err === nothing &&
-                    (q === nothing || q.err === nothing) && rethrow()
+                    (q === nothing || q.err === nothing) &&
+                    (ex === nothing || ex.err === nothing) && rethrow()
             end
-            _throw_callback_error(ctx, adj, comm, q)
+            _throw_callback_error(ctx, adj, comm, q, ex)
             reason = LibPETSc.TSGetConvergedReason(pl, ts)
             reason == LibPETSc.TS_CONVERGED_ITS || throw(
                 ArgumentError(
-                    "PETSc's adjoint solve stopped with $reason; for TSImplicit that is " *
-                        "the transposed linear solve, so pass a solver that converges on " *
-                        "it, such as `-ksp_type preonly -pc_type lu`, through " *
+                    "PETSc's adjoint solve stopped with $reason; for an implicit method " *
+                        "that is the transposed linear solve, so pass a solver that " *
+                        "converges on it, such as `-ksp_type preonly -pc_type lu`, through " *
                         "PETScAdjoint's petsc_options",
                 ),
             )
@@ -1028,6 +1142,7 @@ function _discrete_adjoint_unlocked(
     finally
         _destroy!(h)
         adj === nothing || _destroy_adjoint!(adj)
+        ex === nothing || _destroy_adjoint!(ex)
         q === nothing || _destroy_integral!(q)
     end
     if dgdp_discrete !== nothing

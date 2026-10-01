@@ -211,8 +211,8 @@ These problems run on `MPI.COMM_SELF` only and take no mass matrix. Both algorit
 reversed `tspan`. PETSc only steps forward, so `TSAlpha2` then integrates `w(s) = u(-s)`,
 whose velocity is `-u'`, and gives back `u'`: the states, `jac` and callbacks are those of the
 problem as written. `PETScAdjoint` differentiates them through the first-order form
-with `TSRK`, `TSImplicit("beuler")` or `TSImplicit("cn")`; PETSc has no adjoint for
-`TSBasicSymplectic` or `TSAlpha2`.
+with `TSRK`, `TSARKIMEX` or `TSImplicit`'s `"beuler"`, `"cn"` or `"theta"`; PETSc has no
+adjoint for `TSBasicSymplectic` or `TSAlpha2`.
 
 ## DAE initialization
 
@@ -355,9 +355,10 @@ du0, dp = adjoint_sensitivities(
 )
 ```
 
-It works with `TSRK` of any subtype, `TSImplicit("beuler")` and `TSImplicit("cn")`. PETSc
-has no adjoint for `TSRosW`, `TSIRK`, `TSMPRK`, BDF, `TSBasicSymplectic` or `TSAlpha2`, and
-`TSARKIMEX` and the general theta method are refused as well. A `DynamicalODEProblem` or
+It works with `TSRK` of any subtype, `TSImplicit("beuler")`, `TSImplicit("cn")`,
+`TSImplicit("theta")` with its `theta`, in its midpoint form or with `-ts_theta_endpoint`,
+and `TSARKIMEX`. PETSc has no adjoint for `TSRosW`, `TSIRK`, `TSMPRK`, BDF,
+`TSBasicSymplectic` or `TSAlpha2`. A `DynamicalODEProblem` or
 `SecondOrderODEProblem` is differentiated on its flat `[v; u]`, with the costs handed
 `ArrayPartition(v, u)` states as `solve` saves them and `du0` returned as one.
 
@@ -377,15 +378,32 @@ has no derivative of interpolation. An adaptive solve can take costs only at the
 `tspan`, and its gradient holds the accepted step sizes fixed rather than differentiating
 the step-size controller.
 
-An integral cost, the integral of `g(u, p, t)` over `tspan`, goes through PETSc's
-quadrature `TS`, which sums it with the method's own stages: `dt * b[i] * g` at each stage
-of a `TSRK`, `dt * g` at the end of each backward Euler step and the trapezoidal sum for
-Crank-Nicolson. Its gradient is exact for that sum and differs from `QuadratureAdjoint`'s
-or `InterpolatingAdjoint`'s by the discretization error, again shrinking at the method's
-order. Give `g`, whose derivatives are then taken with ForwardDiff or the algorithm's
-`autodiff`, or `dgdu_continuous(out, u, p, t)` with `dgdp_continuous(out, u, p, t)`; with
-`dgdu_continuous` alone the direct dependence on `p` is taken as zero, as SciMLSensitivity
-takes it. Discrete and integral costs can be given together, and the gradients add:
+`TSARKIMEX` is the one stiff family `PETScAdjoint` takes that has an error estimate, so the
+one stiff method whose adaptive solve it differentiates. It takes a `SplitODEProblem` as
+well, on `MPI.COMM_SELF`: the implicit part's `jac` and `paramjac` are the problem's, which
+a `SplitODEProblem` takes from `f1`, and the explicit part's are those of `f2`'s own
+`ODEFunction`, each built by automatic differentiation when missing. Three things are
+refused, because PETSc's ARKIMEX adjoint cannot do them. It has no quadrature, so an
+integral cost stops with "No method adjointintegral". With `-ts_arkimex_fully_implicit` on a
+`SplitODEProblem` the solve takes `f2` implicitly while the adjoint still takes it
+explicitly, which put the gradient 24% off in the test problem. And on a plain `ODEProblem`,
+every type but `"1bee"`, `"l2"` and `"prssp2"` has an explicit first stage that PETSc
+evaluates at a stale time on the first step after a restart, at 0 on the first step of the
+solve, without the adjoint seeing it; such a type needs `tspan` to start at 0 and the stages
+kept in the trajectory, without `-ts_trajectory_solution_only`. Starting at `t = 1` put the
+gradient 2e-4 off for an `f` that depends on `t`. A `SplitODEProblem` has no such limit.
+
+An integral cost, the integral of `g(u, p, t)` over `tspan`, goes through PETSc's quadrature
+`TS`, which sums it with the method's own stages: `dt * b[i] * g` at each stage of a `TSRK`,
+`dt * g` at the end of each backward Euler step, the trapezoidal sum for Crank-Nicolson, and
+for the theta method `dt * g` at its stage, at `t + theta * dt`, or
+`dt * ((1 - theta) * g(t) + theta * g(t + dt))` in its endpoint form. Its gradient is exact
+for that sum and differs from `QuadratureAdjoint`'s or `InterpolatingAdjoint`'s by the
+discretization error, again shrinking at the method's order. Give `g`, whose derivatives are
+then taken with ForwardDiff or the algorithm's `autodiff`, or
+`dgdu_continuous(out, u, p, t)` with `dgdp_continuous(out, u, p, t)`; with `dgdu_continuous`
+alone the direct dependence on `p` is taken as zero, as SciMLSensitivity takes it. Discrete
+and integral costs can be given together, and the gradients add:
 
 ```julia
 g(u, p, t) = sum(abs2, u) / 2 + p[2] * u[1] * u[2]
@@ -394,20 +412,20 @@ du0, dp = adjoint_sensitivities(
 )
 ```
 
-`TSImplicit` solves transposed linear systems with the Krylov solver its Newton steps use,
-by default GMRES with ILU(0) stopping at a relative residual of 1e-5, so the gradient can be
-off by up to about that tolerance while the forward states are far more accurate. With
-Crank-Nicolson and default options, the gradient's relative error was 4e-8 for a 2-D heat
-equation on a 7 by 7 grid, 2.5e-6 on a 24 by 24 grid and 1.1e-5 for advection-diffusion on
-a 16 by 16 grid, while the forward states were within 8e-12, 5e-10 and 1e-9 of a direct
-solve. A 1-D heat equation with 50 unknowns gave the same gradient as a direct solve to
-2e-15, since ILU(0) of a tridiagonal matrix is exact. Passing
+`TSImplicit` and `TSARKIMEX` solve transposed linear systems with the Krylov solver their
+Newton steps use, by default GMRES with ILU(0) stopping at a relative residual of 1e-5, so
+the gradient can be off by up to about that tolerance while the forward states are far more
+accurate. With Crank-Nicolson and default options, the gradient's relative error was 4e-8
+for a 2-D heat equation on a 7 by 7 grid, 2.5e-6 on a 24 by 24 grid and 1.1e-5 for
+advection-diffusion on a 16 by 16 grid, while the forward states were within 8e-12, 5e-10
+and 1e-9 of a direct solve. A 1-D heat equation with 50 unknowns gave the same gradient as a
+direct solve to 2e-15, since ILU(0) of a tridiagonal matrix is exact. Passing
 `PETScAdjoint(petsc_options = ["-ksp_type", "preonly", "-pc_type", "lu"])` removed the
 difference in every case. For a problem too large to factor, tighten `-ksp_rtol` instead;
 `1e-10` brought the two larger grids to 1e-11 and 5e-11.
 
-Callbacks, `tstops`, mass matrices, `DAEProblem` and `SplitODEProblem` are refused, and so
-is differentiating `solve` with a reverse-mode AD package. Passing
+Callbacks, `tstops`, mass matrices and `DAEProblem` are refused, and so is differentiating
+`solve` with a reverse-mode AD package. Passing
 `sensealg = PETScAdjoint()` to `solve` itself does nothing.
 
 `jac` and `paramjac` go into the gradient unchecked, so a wrong entry gives a wrong
@@ -565,19 +583,20 @@ implicit `TSGeneric` runs distributed for `"beuler"`, `"cn"`, `"theta"`, `"bdf"`
 refused: `"glle"`'s step control follows the round-off of the distributed linear solve, so it
 takes other steps than a serial solve and ends with another error, larger or smaller.
 
-`PETScAdjoint` runs distributed too, for `TSRK`, `TSImplicit("beuler")` and
-`TSImplicit("cn")`. It needs the problem's `jac`, filling this rank's rows of a sparse
-prototype as above, and when there are parameters a `paramjac` filling this rank's rows,
-since automatic differentiation would call `f` a different number of times on each rank; both
-are collective like `f`. An explicit method takes such a `jac` in its own solve too, and
-ignores it there. `dgdu_discrete` gets this rank's rows of the state and writes their
-gradient, and `dgdp_discrete` gives this rank's share of the cost's direct derivative with
-respect to `p`, which the ranks add up. `du0` comes back as this rank's rows and `dp` as the
-whole gradient, the same on every rank. The cost times, `no_start`, the length of `p` and
-whether `dgdp_discrete` is given have to agree across the ranks. A `jac`, `paramjac`, cost
-function or `f` that throws on some ranks makes every rank throw, as in a solve. The
-transposed linear solves of `TSImplicit` use the solver above;
-`["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
+`PETScAdjoint` runs distributed too, for `TSRK`, `TSARKIMEX` on an `ODEProblem` and
+`TSImplicit`'s `"beuler"`, `"cn"` and `"theta"`. It needs the problem's `jac`, filling this
+rank's rows of a sparse prototype as above, and when there are parameters a `paramjac`
+filling this rank's rows, since automatic differentiation would call `f` a different number
+of times on each rank; both are collective like `f`. An explicit method takes such a `jac`
+in its own solve too, and ignores it there. `dgdu_discrete` gets this rank's rows of the
+state and writes their gradient, and `dgdp_discrete` gives this rank's share of the cost's
+direct derivative with respect to `p`, which the ranks add up. `du0` comes back as this
+rank's rows and `dp` as the whole gradient, the same on every rank. The cost times,
+`no_start`, the length of `p` and whether `dgdp_discrete` is given have to agree across the
+ranks. A `jac`, `paramjac`, cost function or `f` that throws on some ranks makes every rank
+throw, as in a solve. The transposed linear solves of `TSImplicit` and `TSARKIMEX` use the
+solver above; `["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves
+them directly.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
 which every algorithm that takes `comm` takes as well. The solve then runs on the DM's
