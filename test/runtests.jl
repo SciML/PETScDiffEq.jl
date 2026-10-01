@@ -9057,6 +9057,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test 9 < steps[2] / steps[1] < 11
             fixed = SciMLBase.solve(prob, PETScDiffEq.TSAlpha2(); dt = 0.01, adaptive = false)
             @test fixed.stats.naccept == 1000
+            # PETSc weighs the velocity and the position alike, so each pair takes the tighter.
+            two = SciMLBase.SecondOrderODEProblem(osc!, [0.0, 0.0], [1.0, 2.0], (0.0, 10.0))
+            scalar = SciMLBase.solve(two, PETScDiffEq.TSAlpha2(); abstol = 1.0e-6, reltol = 1.0e-6)
+            for tol in (fill(1.0e-6, 4), [1.0e-2, 1.0e-2, 1.0e-6, 1.0e-6], [1.0e-6, 1.0e-2, 1.0e-2, 1.0e-6])
+                sol = SciMLBase.solve(two, PETScDiffEq.TSAlpha2(); abstol = tol, reltol = tol)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.u[end] ≈ scalar.u[end] rtol = 1.0e-8
+                @test abs(sol.stats.naccept - scalar.stats.naccept) <= 1
+            end
+            integ = SciMLBase.init(two, PETScDiffEq.TSAlpha2(); abstol = 1.0e-2, reltol = 1.0e-2)
+            integ.opts.abstol = [1.0e-2, 1.0e-2, 1.0e-6, 1.0e-6]
+            integ.opts.reltol = [1.0e-6, 1.0e-6, 1.0e-2, 1.0e-2]
+            SciMLBase.solve!(integ)
+            @test integ.sol.u[end] ≈ scalar.u[end] rtol = 1.0e-5
+            @test abs(integ.sol.stats.naccept - scalar.stats.naccept) <= 5
             @test_throws "needs `dt`" SciMLBase.solve(prob, PETScDiffEq.TSBasicSymplectic())
         end
 
@@ -9253,12 +9268,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws "an option cannot change it to `rk`" SciMLBase.solve(
                 osc, PETScDiffEq.TSBasicSymplectic("velverlet", ["-ts_type", "rk"]); dt = 0.1,
             )
-            @test_throws "TSAlpha2 takes a scalar" SciMLBase.solve(
-                osc, PETScDiffEq.TSAlpha2(); abstol = [1.0e-6, 1.0e-6],
+            @test_throws "`abstol` has length 3, but the state has 2" SciMLBase.solve(
+                osc, PETScDiffEq.TSAlpha2(); abstol = [1.0e-6, 1.0e-6, 1.0e-6],
             )
-            integ = SciMLBase.init(osc, PETScDiffEq.TSAlpha2())
-            @test_throws "TSAlpha2 takes a scalar" integ.opts.reltol = [1.0e-3, 1.0e-3]
-            SciMLBase.terminate!(integ)
             mass = SciMLBase.SecondOrderODEProblem(
                 SciMLBase.DynamicalODEFunction{true}(
                     osc!, (du, v, u, p, t) -> (du .= v; nothing); mass_matrix = Diagonal([2.0, 1.0]),
