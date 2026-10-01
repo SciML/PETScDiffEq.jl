@@ -157,6 +157,7 @@ const METHODS = (
     ("backward Euler", c -> TSImplicit("beuler", exact(c); comm = c)),
     ("Crank-Nicolson", c -> TSImplicit("cn", exact(c); comm = c)),
     ("theta 0.7", c -> TSImplicit("theta", 0.7, exact(c); comm = c)),
+    ("ARKIMEX l2", c -> TSARKIMEX("l2", exact(c); comm = c)),
 )
 
 @testset "MPI adjoint, $nranks ranks" begin
@@ -263,6 +264,13 @@ const METHODS = (
         @test refused(
             () -> gradient(heat_with(), rk, times, rows; g = (u, p, t) -> sum(abs2, u)),
             "integral cost on MPI.COMM_SELF only",
+        )
+        halves = SciMLBase.SplitODEProblem(
+            heat(rows, halo), (du, u, p, t) -> (du .= 0; nothing), heat0(rows), first(FORWARD), copy(P),
+        )
+        @test refused(
+            () -> gradient(halves, TSARKIMEX("l2"; comm), times, rows),
+            "SplitODEProblem on MPI.COMM_SELF only",
         )
         wrong = rank == thrower ? [heat_proto(rows); spzeros(1, N)] : heat_proto(rows)
         e = caught(() -> gradient(heat_with(jac_prototype = wrong), rk, times, rows))

@@ -44,6 +44,18 @@ const TS = collect(0.0:0.1:1.0)
 const EXACT = ["-snes_rtol", "1e-13", "-snes_atol", "1e-15", "-ksp_type", "preonly", "-pc_type", "lu"]
 prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1.0), P0)
 
+function stiff!(du, u, p, t)
+    du[1] = -p[1] * u[1]
+    du[2] = -p[4] * u[2]^2 + p[1] * sin(t)
+    return nothing
+end
+function rest!(du, u, p, t)
+    du[1] = p[2] * u[1] * u[2]
+    du[2] = p[3] * u[1]
+    return nothing
+end
+parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
+
 @testset "PETScAdjoint through SciMLSensitivity" begin
     @test Base.get_extension(PETScDiffEq, :PETScDiffEqSciMLSensitivityExt) !== nothing
 
@@ -92,15 +104,19 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
             abstol = 1.0e-13, reltol = 1.0e-13,
         )
         reference = vcat(gdu0, vec(gdp))
-        for (alg, bound, lo, hi) in (
-                (TSRK("4"), 1.0e-10, 13.0, 19.0),
-                (TSImplicit("beuler", EXACT), 1.0e-2, 1.9, 2.1),
-                (TSImplicit("cn", EXACT), 2.0e-5, 3.8, 4.2),
-                (TSImplicit("theta", 0.7, EXACT), 2.0e-3, 1.9, 2.1),
-                (TSImplicit("theta", EXACT), 5.0e-6, 3.8, 4.2),
+        for (problem, alg, bound, lo, hi) in (
+                (prob, TSRK("4"), 1.0e-10, 13.0, 19.0),
+                (prob, TSImplicit("beuler", EXACT), 1.0e-2, 1.9, 2.1),
+                (prob, TSImplicit("cn", EXACT), 2.0e-5, 3.8, 4.2),
+                (prob, TSImplicit("theta", 0.7, EXACT), 2.0e-3, 1.9, 2.1),
+                (prob, TSImplicit("theta", EXACT), 5.0e-6, 3.8, 4.2),
+                (prob, TSARKIMEX("3", EXACT), 1.0e-8, 7.6, 8.4),
+                (prob, TSARKIMEX("l2", EXACT), 3.0e-6, 3.8, 4.2),
+                (parts, TSARKIMEX("3", EXACT), 2.0e-8, 7.6, 8.4),
+                (parts, TSARKIMEX("2e", EXACT), 3.0e-6, 3.8, 4.2),
             )
             gaps = map((0.01, 0.005)) do dt
-                sol = solve(prob, alg; dt, adaptive = false, saveat = TS)
+                sol = solve(problem, alg; dt, adaptive = false, saveat = TS)
                 du0, dp = adjoint_sensitivities(
                     sol, alg; sensealg = PETScAdjoint(),
                     t = TS, dgdu_discrete = dg!, dt, adaptive = false,
@@ -109,6 +125,27 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
             end
             @test gaps[1] < bound
             @test lo < gaps[1] / gaps[2] < hi
+        end
+        ends = [0.0, 1.0]
+        esol = solve(prob, Tsit5(); abstol = 1.0e-13, reltol = 1.0e-13, saveat = ends)
+        at_ends = flat(
+            adjoint_sensitivities(
+                esol, Tsit5(); t = ends, dgdu_discrete = dg!, sensealg = GaussAdjoint(),
+                abstol = 1.0e-13, reltol = 1.0e-13,
+            ),
+        )
+        for problem in (prob, parts)
+            alg = TSARKIMEX("3", EXACT)
+            gaps = map((1.0e-6, 1.0e-8)) do tol
+                sol = solve(problem, alg; abstol = tol, reltol = tol)
+                mine = adjoint_sensitivities(
+                    sol, alg; sensealg = PETScAdjoint(), t = ends, dgdu_discrete = dg!,
+                    abstol = tol, reltol = tol,
+                )
+                relerr(flat(mine), at_ends)
+            end
+            @test gaps[1] < 1.0e-5
+            @test gaps[2] < 1.0e-7
         end
     end
 
@@ -172,6 +209,10 @@ prob = ODEProblem(ODEFunction(f!; jac = jac!, paramjac = paramjac!), U0, (0.0, 1
         tsit = solve(prob, Tsit5(); saveat = TS)
         @test_throws "ArgumentError: PETScAdjoint runs PETSc's own adjoint" adjoint_sensitivities(
             tsit, Tsit5(); sensealg = PETScAdjoint(), t = TS, dgdu_discrete = dg!,
+        )
+        imex = solve(parts, TSARKIMEX(); dt = 0.01, adaptive = false)
+        @test_throws "ArgumentError: PETScAdjoint cannot take an integral cost with TSARKIMEX" adjoint_sensitivities(
+            imex, TSARKIMEX(); sensealg = PETScAdjoint(), g, dt = 0.01, adaptive = false,
         )
         @test_throws "ArgumentError: `dgdp_continuous` was given without `g` or `dgdu_continuous`" adjoint_sensitivities(
             sol, TSRK("4"); sensealg = PETScAdjoint(), dt = 0.01, adaptive = false,
