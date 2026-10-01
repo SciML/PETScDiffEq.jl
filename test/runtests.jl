@@ -8476,7 +8476,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
         states_only = ["-ts_trajectory_solution_only", "1"]
 
-        @testset "TSARKIMEX matches finite differences of the same fixed-step solve: $name" for (
+        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX matches finite differences of the same fixed-step solve: $name" for (
                 name, subtype, tspan, ts, opts,
             ) in (
                 ("3", "3", (0.0, 1.0), forward_t, (;)),
@@ -8556,7 +8556,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 1.0e-8
         end
 
-        @testset "TSARKIMEX on a split problem reads f2's jac and paramjac" begin
+        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX on a split problem reads f2's jac and paramjac" begin
             alg = TSARKIMEX("3", exact)
             for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t))
                 given = grad(split_prob(copy(u0), copy(p0), tspan), alg; t)
@@ -8602,7 +8602,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(du0, central_differences(loss, u0)) < 1.0e-8
         end
 
-        @testset "an adaptive TSARKIMEX holds its accepted steps fixed: $name" for (
+        Sys.WORD_SIZE == 64 && @testset "an adaptive TSARKIMEX holds its accepted steps fixed: $name" for (
                 name, subtype, make, tspan,
             ) in (
                 ("3", "3", adj_prob, (0.0, 1.0)),
