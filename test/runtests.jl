@@ -7786,6 +7786,156 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "times PETSc reads as PETSC_DETERMINE, PETSC_CURRENT or PETSC_UNLIMITED" begin
+        # Those are -1, -2 and -3 on PETSc's clock, which runs on -t for a reversed span.
+        Success, MaxIters = SciMLBase.ReturnCode.Success, SciMLBase.ReturnCode.MaxIters
+        osc!(ddu, du, u, p, t) = (ddu .= .-u; nothing)
+        algs(R) = (
+            (PETScDiffEq.TSRK("4"), (dt = R(0.1), adaptive = false)),
+            (PETScDiffEq.TSRK("3bs"), (;)),
+            (PETScDiffEq.TSImplicit("bdf"), (dt = R(0.01),)),
+        )
+        decaying(R, span) = SciMLBase.ODEProblem(decay!, R[1], R.(span))
+        swinging(R, span) = SciMLBase.SecondOrderODEProblem(osc!, R[0], R[1], R.(span))
+        swung(span) = [-sin(span[2] - span[1]), cos(span[2] - span[1])]
+        # An autonomous problem takes the same steps ten later, where no time is a sentinel.
+        same_steps(sol, twin, shift) = length(sol.t) == length(twin.t) &&
+            isapprox(sol.t .+ shift, twin.t; rtol = 1.0e-10) &&
+            isapprox(first.(sol.u), first.(twin.u); rtol = 1.0e-9)
+
+        @testset "a span ending on one: $R" for R in (Float64, Float32)
+            for s in 1:3, span in ((-s - 2, -s), (s + 2, s))
+                for (alg, kw) in algs(R)
+                    sol = SciMLBase.solve(decaying(R, span), alg; kw...)
+                    @test sol.retcode == Success
+                    @test sol.t[end] === R(span[2])
+                    @test isapprox(sol.u[end][1], exp(span[1] - span[2]); rtol = 0.05)
+                end
+                for alg in (PETScDiffEq.TSBasicSymplectic(), PETScDiffEq.TSAlpha2())
+                    sol = SciMLBase.solve(swinging(R, span), alg; dt = R(0.01))
+                    @test sol.retcode == Success
+                    @test sol.t[end] === R(span[2])
+                    @test isapprox(collect(sol.u[end]), swung(span); atol = 1.0e-3)
+                end
+            end
+        end
+
+        @testset "the steps are those of a span that ends elsewhere" begin
+            for s in 1:3, dir in (1, -1), (alg, kw) in algs(Float64)
+                span, shift = (-dir * (s + 2.0), -dir * float(s)), -10.0 * dir
+                for stops in (Float64[], [(span[1] + span[2]) / 2])
+                    sol = SciMLBase.solve(decaying(Float64, span), alg; tstops = stops, kw...)
+                    twin = SciMLBase.solve(
+                        decaying(Float64, span .+ shift), alg; tstops = stops .+ shift, kw...,
+                    )
+                    @test same_steps(sol, twin, shift)
+                end
+            end
+        end
+
+        @testset "a tstop or a saveat on one: $R" for R in (Float64, Float32)
+            for s in 1:3, dir in (1, -1), (alg, kw) in algs(R)
+                span, stop = (-dir * (s + 2), 0), -dir * s
+                sol = SciMLBase.solve(decaying(R, span), alg; tstops = R[stop], kw...)
+                @test sol.retcode == Success
+                @test R(stop) in sol.t
+                @test sol.t[end] === R(0)
+                if R === Float64
+                    shift = -10.0 * dir
+                    twin = SciMLBase.solve(
+                        decaying(R, span .+ shift), alg; tstops = [stop + shift], kw...,
+                    )
+                    @test same_steps(sol, twin, shift)
+                end
+                sol = SciMLBase.solve(decaying(R, span), alg; saveat = R[stop], kw...)
+                @test sol.t == R[stop]
+                @test isapprox(sol.u[1][1], exp(span[1] - stop); rtol = 0.05)
+                saves = R[(span[1] + stop) / 2, stop]
+                sol = SciMLBase.solve(decaying(R, (span[1], stop)), alg; saveat = saves, kw...)
+                @test sol.retcode == Success
+                @test sol.t == saves
+                @test isapprox(sol.u[end][1], exp(span[1] - stop); rtol = 0.05)
+            end
+        end
+
+        @testset "dtmin ends a solve before a tstop on one" begin
+            alg = PETScDiffEq.TSRK("3bs")
+            for (span, stop, shift) in (((-3.0, 0.0), -1.0, -10.0), ((3.0, 0.0), 1.0, 10.0))
+                sol = SciMLBase.solve(
+                    decaying(Float64, span), alg; tstops = [stop], dtmin = 0.3,
+                )
+                twin = SciMLBase.solve(
+                    decaying(Float64, span .+ shift), alg; tstops = [stop + shift], dtmin = 0.3,
+                )
+                @test sol.retcode == twin.retcode == SciMLBase.ReturnCode.DtLessThanMin
+                @test same_steps(sol, twin, shift)
+            end
+        end
+
+        @testset "the integrator steps onto one: $R" for R in (Float64, Float32)
+            for s in 1:3, dir in (1, -1), (alg, kw) in algs(R)
+                span, stop = (-dir * (s + 2), 0), R(-dir * s)
+                integ = SciMLBase.init(decaying(R, span), alg; kw...)
+                SciMLBase.step!(integ, R(2dir), true)
+                @test integ.t === stop
+                @test isapprox(integ.u[1], exp(-2dir); rtol = 0.05)
+                @test SciMLBase.solve!(integ).retcode == Success
+                integ = SciMLBase.init(decaying(R, span), alg; kw...)
+                SciMLBase.add_tstop!(integ, stop)
+                while dir * integ.t < dir * stop
+                    SciMLBase.step!(integ)
+                end
+                @test integ.t === stop
+                integ = SciMLBase.init(decaying(R, (span[1], stop)), alg; kw...)
+                sol = SciMLBase.solve!(integ)
+                @test sol.retcode == Success
+                @test integ.t === stop
+                @test sol.t[end] === stop
+            end
+        end
+
+        @testset "a span starting on one: $R" for R in (Float64, Float32)
+            for s in 1:3, span in ((-s, 1), (s, -1)), (alg, kw) in algs(R)
+                sol = SciMLBase.solve(decaying(R, span), alg; kw...)
+                @test sol.retcode == Success
+                @test sol.t[1] === R(span[1])
+                @test sol.t[end] === R(span[2])
+            end
+        end
+
+        @testset "the adjoint of a span ending on one" begin
+            ones!(out, u, p, t, i) = (out .= 1; nothing)
+            cn = (PETScDiffEq.TSImplicit("cn"), (dt = 0.05, adaptive = false))
+            for s in 1:3, span in ((-s - 2.0, -float(s)), (s + 2.0, float(s)), (-float(s), 1.0))
+                for (alg, kw) in (algs(Float64)[1:2]..., cn)
+                    du0, _ = PETScDiffEq._discrete_adjoint(
+                        decaying(Float64, span), alg, PETScAdjoint();
+                        t = [span[2]], dgdu_discrete = ones!, kw...,
+                    )
+                    sol = SciMLBase.solve(decaying(Float64, span), alg; kw...)
+                    @test isapprox(du0[1], sol.u[end][1]; rtol = 1.0e-8)
+                    @test isapprox(du0[1], exp(span[1] - span[2]); rtol = 0.05)
+                end
+            end
+        end
+
+        @testset "a negative tolerance or maxiters" begin
+            prob, alg = decaying(Float64, (0, 1)), PETScDiffEq.TSRK("3bs")
+            for tol in (-1.0, -2.0, -3.0)
+                @test_throws ArgumentError SciMLBase.solve(prob, alg; abstol = tol)
+                @test_throws ArgumentError SciMLBase.solve(prob, alg; reltol = tol)
+                integ = SciMLBase.init(prob, alg)
+                @test_throws ArgumentError (integ.opts.abstol = tol)
+                @test_throws ArgumentError SciMLBase.set_reltol!(integ, tol)
+            end
+            for maxiters in (-1, -2, -3), (alg, kw) in algs(Float64)
+                sol = SciMLBase.solve(prob, alg; maxiters, kw...)
+                @test sol.retcode == MaxIters
+                @test sol.t == [0.0]
+            end
+        end
+    end
+
     @testset "alg_order is the order PETSc registers" begin
         @test SciMLBase.alg_order(PETScDiffEq.TSRK("5dp")) == 5
         @test SciMLBase.alg_order(PETScDiffEq.TSRK("3bs")) == 3
