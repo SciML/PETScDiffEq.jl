@@ -1,6 +1,7 @@
 Manifest.toml
 /docs/build/
 /docs/Manifest.toml
+/docs/src/assets/Project.toml
 *.jl.cov
 *.jl.*.cov
 *.jl.mem
