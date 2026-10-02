@@ -301,7 +301,7 @@ const METHODS = (
             return nothing
         end
         entries = ((1, 2, 1.0), (1, 3, -1.0), (2, 1, 1.0), (2, 3, -2.0), (3, 1, -1.0), (3, 2, 1.0))
-        function cell_problem(cells; jac, sparse_mass = false)
+        function cell_problem(cells; jac, sparse_mass = false, kw...)
             n, offset = 3length(cells), 3(first(cells) - 1)
             I = [3(c - 1) + i for c in 1:length(cells) for (i, _, _) in entries]
             J = [offset + 3(c - 1) + j for c in 1:length(cells) for (_, j, _) in entries]
@@ -311,8 +311,8 @@ const METHODS = (
             m = repeat([0.0, 0.0, 1.0], length(cells))
             M = sparse_mass ? sparse(1:n, offset .+ (1:n), m, n, 3sum(cell_counts)) : Diagonal(m)
             fn = jac ?
-                ODEFunction(cell!; jac = cell_jac!, jac_prototype = proto, mass_matrix = M) :
-                ODEFunction(cell!; jac_prototype = proto, mass_matrix = M)
+                ODEFunction(cell!; jac = cell_jac!, jac_prototype = proto, mass_matrix = M, kw...) :
+                ODEFunction(cell!; jac_prototype = proto, mass_matrix = M, kw...)
             return ODEProblem(fn, repeat([2.0, 1.0, 1.0], length(cells)), (0.0, 1.0))
         end
         exact = repeat(exp(-1) .* [2.0, 1.0, 1.0], sum(cell_counts))
@@ -336,6 +336,19 @@ const METHODS = (
             () -> solve(off, TSImplicit("bdf"; comm); initializealg = brown, TOL...),
             "BrownFullBasicInit",
         )
+        data = SciMLBase.OverrideInitData(
+            SciMLBase.NonlinearProblem((u, p) -> u .- 1, [0.0]), nothing, nothing, nothing,
+        )
+        own = cell_problem(cells; jac = true, initialization_data = data)
+        for init in (DiffEqBase.DefaultInit(), SciMLBase.OverrideInit())
+            @test refused(
+                () -> solve(own, TSImplicit("bdf"; comm); initializealg = init, TOL...),
+                "OverrideInit",
+            )
+        end
+        @test solve(
+            own, TSImplicit("bdf"; comm); initializealg = SciMLBase.CheckInit(), TOL...,
+        ).retcode == ReturnCode.Success
     end
 
     @testset "a rank whose own mass block is the identity" begin

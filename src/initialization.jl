@@ -38,21 +38,119 @@ const _INIT_ALGS = Union{
     SciMLBase.CheckInit, DiffEqBase.BrownFullBasicInit, DiffEqBase.ShampineCollocationInit,
 }
 
-# `f` and `jac` are the user's in-place functions, in user time.
+_resolve_init(init, f) = init isa DiffEqBase.DefaultInit ?
+    (SciMLBase.has_initialization_data(f) ? SciMLBase.OverrideInit() : SciMLBase.CheckInit()) :
+    init
+
+_overrides(init, f) = SciMLBase.has_initialization_data(f) &&
+    _resolve_init(init, f) isa SciMLBase.OverrideInit
+
+# `valp` is what the problem's initialization hooks read: the problem, or the integrator.
 function _initialize!(
-        u0::Vector{S}, prob, init, f, jac, pl, comm, t0, tf, abstol, dt, dtmax,
-    ) where {S}
-    init isa SciMLBase.NoInit && return true
-    if init isa SciMLBase.OverrideInit
-        SciMLBase.has_initialization_data(prob.f) && throw(
+        u0, prob, valp, init, f, jac, pl, comm, t0, tf, abstol, reltol, dt, dtmax,
+    )
+    init = _resolve_init(init, prob.f)
+    init isa SciMLBase.NoInit && return prob.p, true
+    init isa SciMLBase.OverrideInit &&
+        return _override!(u0, prob, valp, init, pl, comm, abstol, reltol)
+    return prob.p, _consistent!(u0, prob, init, f, jac, pl, comm, t0, tf, abstol, dt, dtmax)
+end
+
+struct PETScSNES{L} <: SciMLBase.AbstractNonlinearAlgorithm
+    petsclib::L
+end
+
+const _SNES_PROBLEMS = Union{
+    SciMLBase.NonlinearProblem, SciMLBase.ImmutableNonlinearProblem,
+    SciMLBase.NonlinearLeastSquaresProblem,
+}
+const _SCC_SOLVER =
+    Base.PkgId(Base.UUID("9dfe8606-65a1-4bb3-9748-cb89d1561431"), "SCCNonlinearSolve")
+const _PASS_NLSOLVE = "pass a solver as `initializealg = OverrideInit(; nlsolve = ...)`"
+
+function _check_snes_problem(iprob)
+    if iprob isa SciMLBase.SCCNonlinearProblem
+        haskey(Base.loaded_modules, _SCC_SOLVER) || throw(
             ArgumentError(
-                "PETScDiffEq does not solve a problem's initialization system, so it " *
-                    "cannot run `OverrideInit`",
+                "the problem's initialization is an SCCNonlinearProblem, which PETSc's SNES " *
+                    "solves block by block through SCCNonlinearSolve; load that package, or " *
+                    _PASS_NLSOLVE,
             ),
         )
-        return true
+        return nothing
     end
-    init isa DiffEqBase.DefaultInit && (init = SciMLBase.CheckInit())
+    iprob isa _SNES_PROBLEMS &&
+        (iprob.u0 === nothing || iprob.u0 isa AbstractVector{<:Number}) || throw(
+        ArgumentError(
+            "PETSc's SNES cannot solve the problem's initialization, a " *
+                "`$(nameof(typeof(iprob)))` with a `$(typeof(iprob.u0))` state; " * _PASS_NLSOLVE,
+        ),
+    )
+    iprob.u0 === nothing && return nothing
+    n, proto = length(iprob.u0), iprob.f.resid_prototype
+    m = proto === nothing ? n : length(proto)
+    m == n || throw(
+        ArgumentError(
+            "the problem's initialization has $m equations for $n unknowns, and PETSc's " *
+                "SNES solves a square system only; $_PASS_NLSOLVE, with a least-squares " *
+                "solver from NonlinearSolve",
+        ),
+    )
+    return nothing
+end
+
+function _override!(u0, prob, valp, init, pl, comm, abstol, reltol)
+    _anywhere(comm, SciMLBase.has_initialization_data(prob.f)) || return prob.p, true
+    comm === nothing || throw(
+        ArgumentError(
+            "PETScDiffEq cannot run `OverrideInit` $_NOT_SELF; start from consistent " *
+                "values and pass `initializealg = CheckInit()`",
+        ),
+    )
+    data = prob.f.initialization_data
+    nlsolve = init.nlsolve
+    if nlsolve === nothing && !SciMLBase.is_trivial_initialization(data)
+        _check_snes_problem(data.initializeprob)
+        nlsolve = PETScSNES(pl)
+    end
+    scalar(tol) = tol isa Number ? tol : minimum(tol)
+    u, p, ok = SciMLBase.get_initial_values(
+        prob, valp, prob.f, init, Val(SciMLBase.isinplace(prob));
+        nlsolve_alg = nlsolve, abstol = scalar(abstol), reltol = scalar(reltol),
+    )
+    copyto!(u0, u)
+    return p, ok
+end
+
+function SciMLBase.solve(prob::_SNES_PROBLEMS, alg::PETScSNES; abstol, kwargs...)
+    f, u0, p = prob.f, prob.u0, prob.p
+    function resid(u)
+        SciMLBase.isinplace(prob) || return f(u, p)
+        proto = f.resid_prototype
+        r = proto === nothing ? (u === nothing ? Float64[] : similar(u)) : similar(proto)
+        f(r, u, p)
+        return r
+    end
+    if u0 === nothing
+        r = resid(nothing)
+        code = LinearAlgebra.norm(r) <= abstol ? SciMLBase.ReturnCode.Success :
+            SciMLBase.ReturnCode.Failure
+        return SciMLBase.build_solution(prob, alg, Float64[], r; retcode = code)
+    end
+    pl = alg.petsclib
+    like(x) = ismutable(u0) ? copyto!(similar(u0), x) : typeof(u0)(x)
+    residual!(out, x) = (copyto!(out, resid(like(x))); nothing)
+    x = Vector{pl.PetscScalar}(u0)
+    code = _snes_solve!(x, residual!, nothing, nothing, pl, abstol) ?
+        SciMLBase.ReturnCode.Success : SciMLBase.ReturnCode.ConvergenceFailure
+    u = like(x)
+    return SciMLBase.build_solution(prob, alg, u, resid(u); retcode = code)
+end
+
+# `f` and `jac` are the user's in-place functions, in user time.
+function _consistent!(
+        u0::Vector{S}, prob, init, f, jac, pl, comm, t0, tf, abstol, dt, dtmax,
+    ) where {S}
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     mass = is_dae ? nothing : prob.f.mass_matrix
     eqs = vars = nothing

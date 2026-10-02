@@ -220,9 +220,12 @@ A `DAEProblem`, or an `ODEProblem` whose mass matrix has zero rows and columns, 
 where its algebraic equations hold. The `initializealg` keyword picks how, with the algorithms
 OrdinaryDiffEq takes, which come from DiffEqBase:
 
-- `CheckInit()`, the default, evaluates the residual at `u0`, and at `du0` for a
-  `DAEProblem`, and throws a `CheckInitFailureError` when its RMS norm exceeds `abstol`,
-  taken per component when `abstol` is a vector.
+- `CheckInit()`, the default for a problem without initialization data, evaluates the
+  residual at `u0`, and at `du0` for a `DAEProblem`, and throws a `CheckInitFailureError`
+  when its RMS norm exceeds `abstol`, taken per component when `abstol` is a vector.
+- `OverrideInit()`, the default for a problem that carries initialization data, as
+  ModelingToolkit's do, solves the problem's own initialization system and takes the state
+  and the parameters it gives. On a problem without such data it does nothing.
 - `BrownFullBasicInit()` keeps the differential variables and solves for the algebraic
   ones, and for a `DAEProblem` also for the derivatives of the differential ones, which
   needs `differential_vars`. Its own `abstol`, `1e-10` unless given, decides whether to
@@ -243,17 +246,34 @@ they take no `nlsolve`, and when SNES fails the solve returns at `t0` with
 `reinit!` initializes again unless given `reinit_dae = false`. They do not run on a
 communicator other than `MPI.COMM_SELF`, where `CheckInit()` still checks the whole state.
 
-The default is `CheckInit()` even for a problem carrying ModelingToolkit's initialization
-data, which OrdinaryDiffEq would solve with `OverrideInit()`; this package does not solve that
-system and refuses `OverrideInit()` on such a problem.
+`OverrideInit()` goes through SciMLBase's `get_initial_values`, as OrdinaryDiffEq's does, and
+PETSc's SNES solves the initialization system with a finite-difference Jacobian, to the
+solve's `abstol` unless `OverrideInit(; abstol)` gives its own, so no solver package has to
+be loaded. SNES takes a `NonlinearProblem`, and a `NonlinearLeastSquaresProblem` with as many
+equations as unknowns. An `SCCNonlinearProblem`, which ModelingToolkit builds for a fully
+determined system, goes block by block through SCCNonlinearSolve, which ModelingToolkit
+loads: SNES solves the nonlinear blocks and LinearSolve the linear ones. A system with more
+or fewer equations than unknowns, which ModelingToolkit warns about, is refused, as is any
+other kind of initialization problem; `OverrideInit(; nlsolve = alg)` hands the system to
+that solver instead, for those a least-squares one from NonlinearSolve. When the solver
+fails the solve returns at `t0` with `ReturnCode.InitialFailure`.
+
+The parameters the initialization gives are the ones the solve uses, and the ones in
+`sol.prob.p` and `integrator.p`. It runs where OrdinaryDiffEq runs it: at `init` and `solve`,
+on an `ODEProblem` without a mass matrix too, in `reinit!`, in `initialize_dae!`, and after
+a callback on a `DAEProblem` or a mass-matrix problem. The problem's hooks are given the
+problem at `init`, `solve` and `reinit!` and the integrator afterwards. No check follows it,
+as none does in OrdinaryDiffEq. It does not run on a communicator other than
+`MPI.COMM_SELF`, and `PETScAdjoint` does not differentiate it; `initializealg = CheckInit()`
+starts both from the values as given.
 
 `initialize_dae!(integrator, initializealg)` runs the same on the integrator's current state
 and time, with the `initializealg` the solve was given unless another is passed, and writes
 the result into PETSc. It takes `du0` from the problem for a `DAEProblem`, the current
 `abstol` and, for `ShampineCollocationInit()` on an `ODEProblem`, the current `dt / 5`, as
 OrdinaryDiffEq's does. When SNES fails the integrator finishes where it is with
-`ReturnCode.InitialFailure`, and on an `ODEProblem` without a singular mass matrix it does
-nothing. After a callback's `affect!` runs without calling
+`ReturnCode.InitialFailure`, and on an `ODEProblem` without a singular mass matrix only
+`OverrideInit()` does anything. After a callback's `affect!` runs without calling
 `derivative_discontinuity!(integrator, false)`, or its `initialize` calls
 `derivative_discontinuity!(integrator, true)`, the integrator is initialized again with the
 callback's `initializealg`, or the solve's when the callback has none, as OrdinaryDiffEq does.

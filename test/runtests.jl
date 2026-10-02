@@ -2530,13 +2530,6 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws ArgumentError SciMLBase.solve(
                 mass(good), PETScDiffEq.TSImplicit("bdf"); initializealg = :brown,
             )
-            data = SciMLBase.OverrideInitData(
-                SciMLBase.NonlinearProblem((u, p) -> u .- 1, [0.0]), nothing, nothing, nothing,
-            )
-            @test_throws ArgumentError SciMLBase.solve(
-                mass(good; initialization_data = data), PETScDiffEq.TSImplicit("bdf");
-                initializealg = SciMLBase.OverrideInit(),
-            )
             @test checks(
                 mass(good), PETScDiffEq.TSImplicit("bdf"); initializealg = SciMLBase.OverrideInit(),
             )
@@ -2753,6 +2746,275 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.u[i + 1][1] == sol.u[i][1]
             @test abs(sol.u[i][2] - (1 - sol.u[i][1])) <= 1.0e-8
             @test abs(sol.u[i + 1][2] - (1 - sol.u[i + 1][1]) / 2) <= 1.0e-8
+        end
+    end
+
+    struct CannedInit
+        calls::Base.RefValue{Int}
+    end
+    function SciMLBase.solve(
+            prob::Union{SciMLBase.NonlinearProblem, SciMLBase.NonlinearLeastSquaresProblem},
+            alg::CannedInit; abstol, reltol,
+        )
+        alg.calls[] += 1
+        return SciMLBase.build_solution(
+            prob, alg, [1.0], [0.0]; retcode = SciMLBase.ReturnCode.Success,
+        )
+    end
+
+    @testset "OverrideInit solves the problem's own initialization" begin
+        # u[2]^3 + u[2] = u[1] holds the algebraic variable, and p[1] * u[1] = 3 the parameter.
+        function rhs!(du, u, p, t)
+            du[1] = -p[1] * u[1]
+            du[2] = u[2]^3 + u[2] - u[1]
+            return nothing
+        end
+        residual!(r, du, u, p, t) = (rhs!(r, u, p, t); r[1] -= du[1]; nothing)
+        cubic!(r, z, q) = (r[1] = z[1]^3 + z[1] - q[1]; nothing)
+        both!(r, z, q) = (cubic!(r, z, q); r[2] = z[2] * q[1] - 3; nothing)
+        state(valp) = valp isa SciMLBase.DEIntegrator ? valp.u : valp.u0
+        sync!(iprob, valp) = (iprob.p[1] = state(valp)[1]; nothing)
+        data(iprob; update = sync!, map = sol -> [sol.prob.p[1], sol.u[1]], pmap = nothing) =
+            SciMLBase.OverrideInitData(iprob, update, map, pmap)
+        state_only = data(SciMLBase.NonlinearProblem(cubic!, [0.0], [0.0]))
+        with_p = data(
+            SciMLBase.NonlinearProblem(both!, [0.0, 0.0], [0.0]); pmap = (valp, sol) -> [sol.u[2]],
+        )
+        mass(d; u0 = [2.0, 0.0]) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(
+                rhs!; mass_matrix = Diagonal([1.0, 0.0]), initialization_data = d,
+            ), u0, (0.0, 1.0), [1.0],
+        )
+        dae(d) = SciMLBase.DAEProblem(
+            SciMLBase.DAEFunction(residual!; initialization_data = d), [-2.0, 0.0], [2.0, 0.0],
+            (0.0, 1.0), [1.0]; differential_vars = [true, false],
+        )
+        plain(d) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(
+                (du, u, p, t) -> (du[1] = -p[1] * u[1]; du[2] = -u[2]; nothing);
+                initialization_data = d,
+            ), [2.0, 0.0], (0.0, 1.0), [1.0],
+        )
+        function root(a)
+            z = 1.0
+            for _ in 1:60
+                z -= (z^3 + z - a) / (3z^2 + 1)
+            end
+            return z
+        end
+        tol = (abstol = 1.0e-10, reltol = 1.0e-10)
+        own = SciMLBase.OverrideInit()
+        rosw, bdf = PETScDiffEq.TSRosW(), PETScDiffEq.TSImplicit("bdf")
+        at_half() = SciMLBase.DiscreteCallback(
+            (u, t, integ) -> t == 0.5, integ -> (integ.u[1] = 1.0; nothing),
+        )
+
+        @testset "the default runs it and the solve takes its state and parameters" begin
+            for (prob, alg) in ((mass(with_p), bdf), (dae(with_p), PETScDiffEq.TSDAE()))
+                integ = SciMLBase.init(prob, alg; tol...)
+                @test integ.u ≈ [2.0, 1.0] atol = 1.0e-12
+                @test integ.p ≈ [1.5] atol = 1.0e-12
+                @test integ.sol.prob.p == integ.p
+                @test integ.sol.prob.u0 == [2.0, 0.0]
+                @test prob.p == [1.0]
+                SciMLBase.terminate!(integ)
+                @test SciMLBase.solve(prob, alg; initializealg = own, maxiters = 1).u[1] ≈
+                    [2.0, 1.0] atol = 1.0e-8
+                @test_throws SciMLBase.CheckInitFailureError SciMLBase.solve(
+                    prob, alg; initializealg = SciMLBase.CheckInit(),
+                )
+                @test SciMLBase.solve(
+                    prob, alg; initializealg = SciMLBase.NoInit(), maxiters = 1,
+                ).u[1] == [2.0, 0.0]
+            end
+            sol = SciMLBase.solve(plain(with_p), PETScDiffEq.TSRK("5dp"); maxiters = 1)
+            @test sol.u[1] ≈ [2.0, 1.0] atol = 1.0e-8
+            @test sol.prob.p ≈ [1.5] atol = 1.0e-8
+        end
+
+        Sys.WORD_SIZE == 64 && @testset "the solve goes on from what it gives" begin
+            for (prob, alg, err) in (
+                    (mass(with_p), rosw, 1.0e-9), (mass(with_p), bdf, 1.0e-6),
+                    (dae(with_p), PETScDiffEq.TSDAE(), 1.0e-6),
+                )
+                sol = SciMLBase.solve(prob, alg; tol...)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.prob.p ≈ [1.5] atol = 1.0e-12
+                a = 2exp(-1.5)
+                @test sol.u[end] ≈ [a, root(a)] atol = err
+                @test SciMLBase.solve(prob, alg; initializealg = own, tol...).u == sol.u
+            end
+            sol = SciMLBase.solve(mass(state_only), rosw; tol...)
+            @test sol.u[1] ≈ [2.0, 1.0] atol = 1.0e-12
+            @test sol.prob.p == [1.0]
+            a = 2exp(-1)
+            @test sol.u[end] ≈ [a, root(a)] atol = 1.0e-9
+        end
+
+        Sys.WORD_SIZE == 64 && @testset "initialize_dae!, reinit! and callbacks run it again" begin
+            for (prob, alg) in ((mass(with_p), rosw), (dae(with_p), PETScDiffEq.TSDAE()))
+                integ = SciMLBase.init(prob, alg; tol...)
+                SciMLBase.step!(integ)
+                integ.u[1] = 1.0
+                SciMLBase.initialize_dae!(integ)
+                @test integ.u ≈ [1.0, root(1.0)] atol = 1.0e-12
+                @test integ.p ≈ [3.0] atol = 1.0e-12
+                @test integ.sol.prob.p == integ.p
+                SciMLBase.reinit!(integ, [3.0, 0.0])
+                @test integ.u ≈ [3.0, root(3.0)] atol = 1.0e-12
+                @test integ.p ≈ [1.0] atol = 1.0e-12
+                @test integ.sol.prob.p == integ.p
+                SciMLBase.reinit!(integ, [3.0, 0.0]; reinit_dae = false)
+                @test integ.u == [3.0, 0.0]
+                SciMLBase.reinit!(integ, [3.0, 0.0])
+                sol = SciMLBase.solve!(integ)
+                @test sol.prob.p ≈ [1.0] atol = 1.0e-12
+                a = 3exp(-1)
+                @test sol.u[end] ≈ [a, root(a)] atol = 2.0e-6
+                sol = SciMLBase.solve(prob, alg; callback = at_half(), tstops = [0.5], tol...)
+                i = findlast(==(0.5), sol.t)
+                @test sol.u[i] ≈ [1.0, root(1.0)] atol = 1.0e-12
+                @test sol.prob.p ≈ [3.0] atol = 1.0e-12
+                retune = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t == 0.5, integ -> (integ.p = [9.0]; nothing),
+                )
+                sol = SciMLBase.solve(prob, alg; callback = retune, tstops = [0.5], tol...)
+                @test sol.prob.p ≈ [3 / sol.u[findlast(==(0.5), sol.t)][1]] atol = 1.0e-10
+                checked = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t == 0.5, integ -> (integ.u[1] = 1.0; nothing);
+                    initializealg = SciMLBase.CheckInit(),
+                )
+                @test_throws SciMLBase.CheckInitFailureError SciMLBase.solve(
+                    prob, alg; callback = checked, tstops = [0.5], tol...,
+                )
+            end
+            integ = SciMLBase.init(mass(state_only), rosw; tol...)
+            integ.p = [7.0]
+            SciMLBase.initialize_dae!(integ, own)
+            @test integ.sol.prob.p == [7.0]
+            SciMLBase.terminate!(integ)
+            sol = SciMLBase.solve(
+                plain(with_p), PETScDiffEq.TSRK("5dp"); callback = at_half(), tstops = [0.5],
+                tol...,
+            )
+            i = findlast(==(0.5), sol.t)
+            @test sol.u[i][2] == sol.u[i - 1][2]
+            @test sol.prob.p ≈ [1.5] atol = 1.0e-12
+        end
+
+        @testset "the systems SNES takes" begin
+            started(d; kw...) = SciMLBase.solve(mass(d), bdf; maxiters = 1, kw...)
+            oop = SciMLBase.NonlinearProblem((z, q) -> [z[1]^3 + z[1] - q[1]], [0.0], [0.0])
+            @test started(data(oop)).u[1] ≈ [2.0, 1.0] atol = 1.0e-8
+            squares(m, n) = SciMLBase.NonlinearLeastSquaresProblem(
+                SciMLBase.NonlinearFunction(
+                    (r, z, q) -> (fill!(r, 0); cubic!(r, z, q)); resid_prototype = zeros(m),
+                ), zeros(n), [0.0],
+            )
+            @test started(data(squares(1, 1))).u[1] ≈ [2.0, 1.0] atol = 1.0e-8
+            bare = SciMLBase.NonlinearLeastSquaresProblem(cubic!, [0.0], [0.0])
+            @test started(data(bare)).u[1] ≈ [2.0, 1.0] atol = 1.0e-8
+            @test started(data(oop); abstol = [1.0e-9, 1.0e-8]).u[1] ≈ [2.0, 1.0] atol = 1.0e-8
+            @test started(
+                data(oop); initializealg = SciMLBase.OverrideInit(; abstol = 1.0e-12, reltol = 1.0e-12),
+            ).u[1] ≈ [2.0, 1.0] atol = 1.0e-12
+            none = SciMLBase.NonlinearProblem((z, q) -> nothing, nothing, [0.0])
+            sol = started(
+                data(none; map = sol -> [sol.p[1], 1.0], pmap = (valp, sol) -> [4.0]);
+                initializealg = SciMLBase.OverrideInit(),
+            )
+            @test sol.u[1] == [2.0, 1.0]
+            @test sol.prob.p == [4.0]
+            held = SciMLBase.NonlinearLeastSquaresProblem(
+                SciMLBase.NonlinearFunction(
+                    (r, z, q) -> (r[1] = q[1] - 2; nothing); resid_prototype = zeros(1),
+                ), nothing, [0.0],
+            )
+            @test started(data(held; map = sol -> [2.0, 1.0])).u[1] == [2.0, 1.0]
+            sol = SciMLBase.solve(mass(data(held; map = sol -> [3.0, 1.0]); u0 = [3.0, 0.0]), bdf)
+            @test sol.retcode == SciMLBase.ReturnCode.InitialFailure
+            single = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    rhs!; mass_matrix = Diagonal(Float32[1, 0]),
+                    initialization_data = data(
+                        SciMLBase.NonlinearProblem(cubic!, Float32[0], Float32[0]),
+                    ),
+                ), Float32[2, 0], (0.0f0, 1.0f0), Float32[1],
+            )
+            @test SciMLBase.solve(single, bdf; maxiters = 1).u[1] ≈ Float32[2, 1] atol = 1.0e-5
+        end
+
+        @testset "a solve that fails is InitialFailure" begin
+            noroot = data(
+                SciMLBase.NonlinearProblem((r, z, q) -> (r[1] = z[1]^2 + 1; nothing), [0.0], [0.0]),
+            )
+            sol = SciMLBase.solve(mass(noroot), bdf)
+            @test sol.retcode == SciMLBase.ReturnCode.InitialFailure
+            @test sol.t == [0.0]
+            integ = SciMLBase.init(mass(noroot), rosw)
+            @test integ.sol.retcode == SciMLBase.ReturnCode.InitialFailure
+            @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.InitialFailure
+        end
+
+        @testset "a given nlsolve solves it instead" begin
+            over = SciMLBase.NonlinearLeastSquaresProblem(
+                SciMLBase.NonlinearFunction(
+                    (r, z, q) -> (fill!(r, 0); cubic!(r, z, q)); resid_prototype = zeros(2),
+                ), [0.0], [0.0],
+            )
+            for iprob in (over, SciMLBase.NonlinearProblem(cubic!, [0.0], [0.0]))
+                canned = CannedInit(Ref(0))
+                sol = SciMLBase.solve(
+                    mass(data(iprob)), bdf; maxiters = 1,
+                    initializealg = SciMLBase.OverrideInit(; nlsolve = canned),
+                )
+                @test canned.calls[] == 1
+                @test sol.u[1] == [2.0, 1.0]
+            end
+        end
+
+        @testset "what it refuses" begin
+            lsq(m, n) = data(
+                SciMLBase.NonlinearLeastSquaresProblem(
+                    SciMLBase.NonlinearFunction(
+                        (r, z, q) -> (fill!(r, 0); cubic!(r, z, q)); resid_prototype = zeros(m),
+                    ), zeros(n), [0.0],
+                ),
+            )
+            @test_throws "2 equations for 1 unknowns" SciMLBase.solve(mass(lsq(2, 1)), bdf)
+            @test_throws "1 equations for 2 unknowns" SciMLBase.solve(mass(lsq(1, 2)), bdf)
+            scalar = SciMLBase.OverrideInitData(
+                SciMLBase.NonlinearProblem((z, q) -> z^3 + z - q[1], 0.0, [0.0]), nothing,
+                nothing, nothing,
+            )
+            @test_throws "with a `Float64` state" SciMLBase.solve(mass(scalar), bdf)
+            blocks = SciMLBase.SCCNonlinearProblem(
+                [SciMLBase.NonlinearProblem(cubic!, [0.0], [0.0])], [Returns(nothing)],
+            )
+            haskey(Base.loaded_modules, PETScDiffEq._SCC_SOLVER) ||
+                @test_throws "through SCCNonlinearSolve" SciMLBase.solve(
+                mass(data(blocks; update = nothing, map = nothing)), bdf,
+            )
+            everywhere = PETScDiffEq.TSRK("5dp"; comm = MPI.COMM_WORLD)
+            for init in (DiffEqBase.DefaultInit(), own)
+                @test_throws "cannot run `OverrideInit` on a communicator" SciMLBase.solve(
+                    plain(state_only), everywhere; initializealg = init,
+                )
+            end
+            @test SciMLBase.solve(
+                plain(state_only), everywhere; initializealg = SciMLBase.CheckInit(),
+            ).retcode == SciMLBase.ReturnCode.Success
+            adjoint(; kw...) = PETScDiffEq._discrete_adjoint(
+                plain(state_only), PETScDiffEq.TSRK("4"), PETScAdjoint(); t = [1.0],
+                dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing), dt = 0.01,
+                adaptive = false, kw...,
+            )
+            for kw in ((;), (; initializealg = own))
+                @test_throws "does not differentiate a problem's own initialization" adjoint(;
+                    kw...,
+                )
+            end
+            @test adjoint(; initializealg = SciMLBase.CheckInit())[1] ≈ [2exp(-2), 0.0]
         end
     end
 

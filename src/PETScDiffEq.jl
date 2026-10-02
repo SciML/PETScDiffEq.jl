@@ -3819,9 +3819,10 @@ function _setup(
         _check_tol(reltol, n, "reltol")
     end
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
-    initialized = _initialize!(
-        u0, prob, initializealg, f1, dm_jac ? nothing : jac_fn, petsclib, comm,
-        R(prob.tspan[1]), R(prob.tspan[2]), real.(something(abstol, 1.0e-6)), dt, dtmax,
+    p, initialized = _initialize!(
+        u0, prob, prob, initializealg, f1, dm_jac ? nothing : jac_fn, petsclib, comm,
+        R(prob.tspan[1]), R(prob.tspan[2]), real.(something(abstol, 1.0e-6)),
+        real.(something(reltol, 1.0e-3)), dt, dtmax,
     )
     ad_calls === nothing || (ad_calls[] = ad_before)
     user_f1, user_f2 = f1, f2
@@ -3926,7 +3927,7 @@ function _setup(
     # f scatters through the caller's DM, so the handle holds a reference to it.
     dms = clone === nothing ? Ptr{Cvoid}[] : [clone.ptr, _referenced(petsclib, dm.ptr)]
     ctx = TSContext(
-        petsclib, f1, f2, jac_fn, prob.p,
+        petsclib, f1, f2, jac_fn, p,
         similar(u0), copy(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0,
         idx0,
         row_cols0, row_src, row_src2, row_buf, J0,
@@ -4226,7 +4227,7 @@ function _setup(
                     estimate = _initial_dt(
                         _guard_f(user_f1, comm, threw),
                         user_f2 === nothing ? nothing : _guard_f(user_f2, comm, threw), u0,
-                        prob.p, user_t0, tdir, _running_order(petsclib, ts, running),
+                        p, user_t0, tdir, _running_order(petsclib, ts, running),
                         est_abstol, est_reltol, est_dtmin,
                         min(user_dtmax, first_stop, abs(tf - t0)), comm,
                     )
@@ -4404,6 +4405,7 @@ function _solve_unlocked(
         end
     end
     h = _setup(prob, alg; kwargs...)
+    prob = _with_p(prob, h.ctx.p)
     h.init_failed && return _initial_failure(prob, alg, h, kwargs)
     ctx, pl = h.ctx, h.petsclib
     floor = abs(oftype(h.t0, something(get(kwargs, :dtmin, nothing), 0.0)))
@@ -4818,18 +4820,45 @@ SciMLBase.set_u!(integ::PETScIntegrator, u) = _locked(() -> _set_u_unlocked(inte
 _initializealg(integ::PETScIntegrator) =
     get(integ.kwargs, :initializealg, DiffEqBase.DefaultInit())
 
+_with_p(prob, p) = p === prob.p ? prob : _replace_p(prob, p)
+_replace_p(prob::SciMLBase.AbstractODEProblem, p) =
+    SciMLBase.ODEProblem{SciMLBase.isinplace(prob)}(
+    prob.f, prob.u0, prob.tspan, p, prob.problem_type; prob.kwargs...,
+)
+_replace_p(prob::SciMLBase.AbstractDAEProblem, p) =
+    SciMLBase.DAEProblem{SciMLBase.isinplace(prob)}(
+    prob.f, prob.du0, prob.u0, prob.tspan, p;
+    differential_vars = prob.differential_vars, prob.kwargs...,
+)
+
+# OrdinaryDiffEq's OverrideInit leaves its parameters in the integrator and in `sol.prob`.
+function _adopt_p!(integ::PETScIntegrator, p)
+    p === integ.p || _set_p_unlocked(integ, p)
+    p === integ.prob.p && return nothing
+    integ.prob = _with_p(integ.prob, p)
+    sol = integ.sol
+    integ.sol = SciMLBase.build_solution(
+        integ.prob, integ.alg, sol.t, sol.u; retcode = sol.retcode, stats = sol.stats,
+        dense = sol.dense, interp = sol.interp,
+        timeseries_errors = get(integ.kwargs, :timeseries_errors, true),
+        dense_errors = get(integ.kwargs, :dense_errors, false),
+    )
+    return nothing
+end
+
 function _initialize_state!(integ::PETScIntegrator, init)
     h = integ.h
-    prob = integ.p === integ.prob.p ? integ.prob : SciMLBase.remake(integ.prob; p = integ.p)
+    prob = _with_p(integ.prob, integ.p)
     u = integ.u isa Vector ? integ.u : Vector(integ.u)
     before = h.ad_calls === nothing ? 0 : h.ad_calls[]
-    ok = _initialize!(
-        u, prob, init, h.f_init, h.jac_init, h.petsclib, h.ctx.comm, integ.t,
-        _user_t(integ.tdir, h.tf), real.(integ.opts.abstol),
+    p, ok = _initialize!(
+        u, prob, integ, init, h.f_init, h.jac_init, h.petsclib, h.ctx.comm, integ.t,
+        _user_t(integ.tdir, h.tf), real.(integ.opts.abstol), real.(integ.opts.reltol),
         iszero(integ.dt) ? nothing : integ.dt, integ.opts.dtmax,
     )
     h.ad_calls === nothing || (h.ad_calls[] = before)
     u === integ.u || copyto!(integ.u, u)
+    _overrides(init, prob.f) && _adopt_p!(integ, p)
     return ok
 end
 
@@ -4843,10 +4872,10 @@ end
 function _reinitialize!(integ::PETScIntegrator, init, before)
     ctx = integ.h.ctx
     ctx.dae || ctx.M !== nothing || return nothing
-    init = something(init, _initializealg(integ))
+    init = _resolve_init(something(init, _initializealg(integ)), integ.prob.f)
     # PETSc keeps a DAEProblem's derivative to itself, so a state left alone passes the check.
-    ctx.dae && init isa Union{SciMLBase.CheckInit, DiffEqBase.DefaultInit} &&
-        _everywhere(ctx.comm, integ.u == before) && return nothing
+    ctx.dae && init isa SciMLBase.CheckInit && _everywhere(ctx.comm, integ.u == before) &&
+        return nothing
     _initialize_state!(integ, init) || _initial_failure!(integ)
     return nothing
 end
@@ -5294,6 +5323,7 @@ function _init_unlocked(
     stops_given = vcat(tstops, d_discontinuities)
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = stops_given, kwargs...)
+    prob = _with_p(prob, h.ctx.p)
     LibPETSc.TSSetUp(h.petsclib, h.ts)
     _match_steps_here!(h)
     _initial_save!(h)
@@ -5524,6 +5554,10 @@ function _reinit_unlocked(
     end
     _destroy!(old)
     integ.h = h
+    if _overrides(get(setup_kwargs, :initializealg, DiffEqBase.DefaultInit()), prob.f)
+        setfield!(integ, :p, convert(fieldtype(typeof(integ), :p), h.ctx.p))
+        integ.prob = _with_p(integ.prob, integ.p)
+    end
     integ.u = _integ_state(integ.prob, h.u0)
     integ.uprev = _integ_state(integ.prob, h.u0)
     integ.f = integ.prob.f

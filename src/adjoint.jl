@@ -932,6 +932,12 @@ function _discrete_adjoint_unlocked(
     comm = _distributed(alg) ? alg.comm : nothing
     solve_kwargs, has_p, skip_start = _checked_everywhere(comm) do
         given = _adjoint_solve_kwargs(prob, kwargs)
+        _overrides(get(given, :initializealg, DiffEqBase.DefaultInit()), prob.f) && throw(
+            ArgumentError(
+                "PETScAdjoint does not differentiate a problem's own initialization; pass " *
+                    "`initializealg = CheckInit()` to start from `u0` and `p` as given",
+            ),
+        )
         checked = _check_adjoint_problem(
             prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, g, dgdu_continuous,
             dgdp_continuous, comm,
