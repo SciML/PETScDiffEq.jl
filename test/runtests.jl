@@ -7786,7 +7786,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
-    @testset "times PETSc reads as PETSC_DETERMINE, PETSC_CURRENT or PETSC_UNLIMITED" begin
+    Sys.WORD_SIZE == 64 && @testset "times PETSc reads as PETSC_DETERMINE, PETSC_CURRENT or PETSC_UNLIMITED" begin
         # Those are -1, -2 and -3 on PETSc's clock, which runs on -t for a reversed span.
         Success, MaxIters = SciMLBase.ReturnCode.Success, SciMLBase.ReturnCode.MaxIters
         osc!(ddu, du, u, p, t) = (ddu .= .-u; nothing)
