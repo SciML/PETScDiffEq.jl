@@ -1,0 +1,12 @@
+[deps]
+ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
+NonlinearSolve = "8913a72c-1f9b-4ce2-8d82-65094dcecaec"
+PETScDiffEq = "0a65194f-a16f-47d0-900e-080c22068669"
+SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[compat]
+ModelingToolkit = "11.45"
+NonlinearSolve = "4.32"
+SciMLBase = "3.55"
+Test = "1"
