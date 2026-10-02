@@ -83,6 +83,16 @@ end
     e = caught(one_rank)
     @test e !== nothing && occursin("Threads.@threads", sprint(showerror, e))
 
+    spawned() = fetch(Threads.@spawn heat_solve())
+    e = caught(spawned)
+    @test e !== nothing && occursin("Threads.@spawn", sprint(showerror, e))
+    function one_rank_spawn()
+        rank == 0 || return heat_solve()
+        fetch(Threads.@spawn heat_solve())
+    end
+    e = caught(one_rank_spawn)
+    @test e !== nothing && occursin("Threads.@spawn", sprint(showerror, e))
+
     started, release = Threads.Atomic{Int}(0), Base.Event()
     elsewhere = Threads.@spawn Threads.@threads for i in 1:2
         Threads.atomic_add!(started, 1)
