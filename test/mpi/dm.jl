@@ -789,6 +789,12 @@ end
         end
         e = caught(() -> solve(dm_heat(; jac = throwing_jac!), bdf(; dm = da); TOL...))
         @test raised(e, "jac threw")
+
+        never(J, u, da, t) = error("an explicit solve called its jac")
+        @test everywhere(
+            solve(dm_heat(; jac = never), explicit(; dm = da); FIXED...).u ==
+                solve(dm_heat(), explicit(; dm = da); FIXED...).u,
+        )
         @test everywhere(refs(da.ptr) == 1)
     end
 
@@ -814,10 +820,6 @@ end
         for alg in (TSIRK(2; dm = da), TSMPRK([1]; dm = da), TSGeneric("alpha"; dm = da))
             @test refused(() -> solve(prob, alg; dt = 1.0e-3), "cannot run")
         end
-        @test refused(
-            () -> solve(dm_heat(; jac = (J, u, p, t) -> nothing), explicit(; dm = da)),
-            "does not take a `jac`",
-        )
         @test refused(
             () -> solve(
                 ODEProblem(
@@ -848,10 +850,11 @@ end
         )
         @test refused(
             () -> PETScDiffEq._discrete_adjoint(
-                prob, TSRK("4"; dm = da), PETScAdjoint(); t = [0.1],
+                ODEProblem((du, u, p, t) -> heat_dm!(du, u, da, t), heat0(rows), SPAN),
+                TSRK("4"; dm = da), PETScAdjoint(); t = [0.1],
                 dgdu_discrete = (out, u, p, t, i) -> (out .= u), dt = 0.01, adaptive = false,
             ),
-            "PETScAdjoint",
+            "PETScAdjoint needs the ODEFunction's `jac` with a `dm`",
         )
         shell = LibPETSc.DMShellCreate(pl, comm)
         @test refused(
