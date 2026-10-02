@@ -2944,7 +2944,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test SciMLBase.solve(single, bdf; maxiters = 1).u[1] ≈ Float32[2, 1] atol = 1.0e-5
             narrow = SciMLBase.solve(
                 SciMLBase.NonlinearProblem(cubic!, Float32[0], Float32[2]),
-                PETScDiffEq.PETScSNES(PETSc.getlib(; PetscScalar = Float64)); abstol = 1.0e-6,
+                PETScDiffEq.PETScSNES(PETScDiffEq._petsclib(Float64)); abstol = 1.0e-6,
             )
             @test narrow.retcode == SciMLBase.ReturnCode.Success && narrow.u isa Vector{Float32}
             @test narrow.u ≈ Float32[1] atol = 1.0e-5
