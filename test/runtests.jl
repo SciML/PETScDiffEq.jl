@@ -8458,7 +8458,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         )
     end
 
-    @testset "PETScAdjoint" begin
+    Sys.WORD_SIZE == 64 && @testset "PETScAdjoint" begin
         function adj_f!(du, u, p, t)
             du[1] = -p[1] * u[1] + p[2] * u[1] * u[2]
             du[2] = p[3] * u[1] - p[4] * u[2]^2 + p[1] * sin(t)
