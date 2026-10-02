@@ -2011,14 +2011,19 @@ function _coo_structure(J::SparseMatrixCSC{S}, rstart, M) where {S}
 end
 
 function _mass_matrix!(ctx, petsclib, comm, M, rstart, N)
-    I, J, V = findnz(M)
     ctx.mass_mat = LibPETSc.MatCreate(petsclib, comm)
+    _fill_mass!(ctx.mass_mat, petsclib, M, rstart, N)
+    return nothing
+end
+
+function _fill_mass!(A, petsclib, M, rstart, N)
+    I, J, V = findnz(M)
     _coo_matrix!(
-        ctx.mass_mat, petsclib, size(M, 1), N, LibPETSc.PetscInt.(rstart .+ I .- 1),
+        A, petsclib, size(M, 1), N, LibPETSc.PetscInt.(rstart .+ I .- 1),
         LibPETSc.PetscInt.(J .- 1),
     )
-    LibPETSc.MatSetValuesCOO(petsclib, ctx.mass_mat, V, LibPETSc.INSERT_VALUES)
-    PETSc.assemble!(ctx.mass_mat)
+    LibPETSc.MatSetValuesCOO(petsclib, A, V, LibPETSc.INSERT_VALUES)
+    PETSc.assemble!(A)
     return nothing
 end
 
@@ -3826,7 +3831,7 @@ function _setup(
     )
     ad_calls === nothing || (ad_calls[] = ad_before)
     user_f1, user_f2 = f1, f2
-    f_init, jac_init = f1, jac_fn
+    f_init, jac_init = f1, dm_jac ? nothing : jac_fn
     if tdir < 0
         f1 = is_dae ? _reverse_residual(f1) : _reverse_rhs(f1)
         f2 = f2 === nothing ? nothing : _reverse_rhs(f2)

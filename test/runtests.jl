@@ -2544,6 +2544,52 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
         end
 
+        Sys.WORD_SIZE == 64 && @testset "both solve on a communicator of one rank" begin
+            comm = MPI.COMM_WORLD
+            fd = PETScDiffEq.AutoFiniteDiff()
+            proto = sparse(ones(3, 3))
+            rober_dae_jac!(J, du, u, p, gamma, t) =
+                (rober_jac!(J, u, p, t); J[1, 1] -= gamma; J[2, 2] -= gamma; nothing)
+            function rober_dae(jac)
+                kw = jac ? (; jac = rober_dae_jac!, jac_prototype = proto) :
+                    (; jac_prototype = proto)
+                return SciMLBase.DAEProblem(
+                    SciMLBase.DAEFunction(rober_residual!; kw...), zeros(3), bad, span;
+                    differential_vars = [true, true, false],
+                )
+            end
+            bdf, dae_alg = PETScDiffEq.TSImplicit("bdf"; comm), PETScDiffEq.TSDAE(; comm)
+            serial_bdf = PETScDiffEq.TSImplicit("bdf"; autodiff = fd)
+            serial_dae = PETScDiffEq.TSDAE(; autodiff = fd)
+            for jac in (true, false), init in (brown, shampine)
+                kw = jac ? (; jac = rober_jac!, jac_prototype = proto) : (; jac_prototype = proto)
+                for (prob, alg, serial) in (
+                        (mass(bad; kw...), bdf, serial_bdf),
+                        (rober_dae(jac), dae_alg, serial_dae),
+                    )
+                    sol = SciMLBase.solve(prob, alg; initializealg = init, tol...)
+                    ref = SciMLBase.solve(prob, serial; initializealg = init, tol...)
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test sol.u[1] != bad
+                    @test maximum(abs, sol.u[1] - ref.u[1]) <= 1.0e-14
+                    @test isapprox(sol.u[end], ref.u[end]; rtol = 1.0e-12)
+                end
+            end
+            hopeless = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (du[1] = -u[1]; du[2] = u[2]^2 + 1; nothing);
+                    mass_matrix = Diagonal([1.0, 0.0]), jac_prototype = sparse(ones(2, 2)),
+                ), [1.0, 0.0], (0.0, 1.0),
+            )
+            for init in (brown, shampine)
+                sol = SciMLBase.solve(
+                    hopeless, PETScDiffEq.TSImplicit("bdf"; comm); initializealg = init,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.InitialFailure
+                @test sol.t == [0.0]
+            end
+        end
+
         @testset "initialize_dae! runs it on the integrator's state" begin
             calls = Ref(0)
             counted!(du, u, p, t) = (calls[] += 1; du[1] = -u[1]; nothing)
@@ -5865,6 +5911,45 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test_throws "leave out `jac_prototype`" SciMLBase.solve(
             dm_prob((0.0, 0.1); jac_prototype = proto), PETScDiffEq.TSImplicit("bdf"; dm = da),
         )
+        algebraic(i) = i % 4 == 0
+        function chain_dm!(du, u, da, t)
+            U = PETScDiffEq.reshape_local_array(u, da)
+            D = PETScDiffEq.reshape_local_array(du, da)
+            for i in axes(D, 2)
+                l, c, r = U[1, i - 1], U[1, i], U[1, i + 1]
+                D[1, i] = algebraic(i) ? c^3 + c - (l + r) / 2 - 0.1 : l - 2c + r
+            end
+            return nothing
+        end
+        function chain_jac_dm!(J, u, da, t)
+            U = PETScDiffEq.reshape_local_array(u, da)
+            for i in 1:N
+                c = U[1, i]
+                vals = algebraic(i) ? (-0.5, 3c^2 + 1, -0.5) : (1.0, -2.0, 1.0)
+                set_stencil_values!(J, (1, i), ((1, i - 1), (1, i), (1, i + 1)), vals)
+            end
+            return nothing
+        end
+        chain(; kw...) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(
+                chain_dm!; mass_matrix = Diagonal([algebraic(i) ? 0.0 : 1.0 for i in 1:N]), kw...,
+            ), u0, (0.0, 0.1), da,
+        )
+        bdf = PETScDiffEq.TSImplicit("bdf"; dm = da)
+        for init in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            with_jac = SciMLBase.init(
+                chain(; jac = chain_jac_dm!), bdf; initializealg = init, tol...,
+            )
+            plain = SciMLBase.init(chain(), bdf; initializealg = init, tol...)
+            @test with_jac.u == plain.u != u0
+            for integ in (with_jac, plain)
+                SciMLBase.set_u!(integ, integ.u .+ 0.05)
+                SciMLBase.initialize_dae!(integ)
+            end
+            @test with_jac.u == plain.u
+            SciMLBase.terminate!(with_jac)
+            SciMLBase.terminate!(plain)
+        end
         PETScDiffEq.PETScCompat.destroy!(da)
     end
 

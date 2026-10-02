@@ -1,6 +1,6 @@
 using MPI, PETScDiffEq, SciMLBase, SparseArrays, Test
 using LinearAlgebra: Diagonal
-using PETScDiffEq: PETSc, LibPETSc, PETScCompat, AutoForwardDiff, AutoFiniteDiff,
+using PETScDiffEq: PETSc, LibPETSc, PETScCompat, AutoForwardDiff, AutoFiniteDiff, DiffEqBase,
     reshape_local_array
 using SciMLBase: ODEProblem, ODEFunction, DAEProblem, DAEFunction, SplitODEProblem,
     DiscreteCallback, ContinuousCallback, ReturnCode, init, solve, solve!, step!, get_du,
@@ -24,6 +24,7 @@ const ROUNDOFF = 5.0e-14
 # of a serial rosw one, whose parallel linear solves no Newton cleans up, and 2.0e-14 of colouring.
 const JAC_SERIAL_TOL = (bdf = 5.0e-13, rosw = 2.0e-8)
 const COLOUR_TOL = 1.0e-13
+const INIT_GAP = 1.0e-14
 
 function uneven(n)
     counts = floor.(Int, n .* (1:nranks) ./ sum(1:nranks))
@@ -513,6 +514,78 @@ end
         @test got.retcode == ReturnCode.Success
         @test got.t == ref.t
         @test everywhere(got.u == ref.u)
+    end
+
+    @testset "BrownFullBasicInit and ShampineCollocationInit with a DM" begin
+        algebraic(i) = i % 4 == 0
+        m = [algebraic(i) ? 0.0 : 1.0 for i in rows]
+        cubic(u, l, r) = u^3 + u - (l + r) / 2 - 0.1
+        function chain_dm!(du, u, da, t)
+            U, D = reshape_local_array(u, da), reshape_local_array(du, da)
+            for i in axes(D, 2)
+                l, c, r = U[1, i - 1], U[1, i], U[1, i + 1]
+                D[1, i] = algebraic(i) ? cubic(c, l, r) : l - 2c + r
+            end
+            return nothing
+        end
+        function chain_jac_dm!(J, u, da, gamma)
+            U = reshape_local_array(u, da)
+            for (k, i) in enumerate(rows)
+                c = U[1, i]
+                vals = algebraic(i) ? [-0.5, 3c^2 + 1, -0.5] : [1.0, -2.0, 1.0]
+                gamma === nothing || (vals = [0, gamma * m[k], 0] .- vals)
+                set_stencil_values!(J, (1, i), [(1, i - 1), (1, i), (1, i + 1)], vals)
+            end
+            return nothing
+        end
+        function chain!(du, u, p, t)
+            left, right = halo(u)
+            for (k, i) in enumerate(rows)
+                l = k == 1 ? left : u[k - 1]
+                r = k == length(u) ? right : u[k + 1]
+                du[k] = algebraic(i) ? cubic(u[k], l, r) : l - 2u[k] + r
+            end
+            return nothing
+        end
+        residual(f) = (r, du, u, p, t) -> (f(r, u, p, t); r .= m .* du .- r; nothing)
+        ode_jac_dm!(J, u, da, t) = chain_jac_dm!(J, u, da, nothing)
+        dae_jac_dm!(J, du, u, da, gamma, t) = chain_jac_dm!(J, u, da, gamma)
+        function problems(form; jac)
+            if form == :dae
+                fn = jac ? DAEFunction(residual(chain_dm!); jac = dae_jac_dm!) :
+                    DAEFunction(residual(chain_dm!))
+                plain = DAEFunction(residual(chain!); jac_prototype = heat_proto(rows))
+                dv = m .!= 0
+                with_dm = DAEProblem(fn, zero(m), heat0(rows), SPAN, da; differential_vars = dv)
+                without = DAEProblem(plain, zero(m), heat0(rows), SPAN; differential_vars = dv)
+                return with_dm, without
+            end
+            fn = jac ? ODEFunction(chain_dm!; jac = ode_jac_dm!, mass_matrix = Diagonal(m)) :
+                ODEFunction(chain_dm!; mass_matrix = Diagonal(m))
+            return ODEProblem(fn, heat0(rows), SPAN, da),
+                comm_heat(chain!; mass_matrix = Diagonal(m))
+        end
+        method(form; kw...) = form == :dae ? TSDAE("bdf"; kw...) : TSImplicit("bdf"; kw...)
+        for form in (:mass, :dae), jac in (true, false),
+                ia in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            with_dm, without = problems(form; jac)
+            @test caught(() -> solve(with_dm, method(form; dm = da, comm); TOL...)) isa
+                SciMLBase.CheckInitFailureError
+            got = solve(with_dm, method(form; dm = da, comm); initializealg = ia, TOL...)
+            ref = solve(without, method(form; comm); initializealg = ia, TOL...)
+            @test got.retcode == ref.retcode == ReturnCode.Success
+            @test anywhere(maximum(abs, got.u[1] - heat0(rows)) > 0.1)
+            @test everywhere(maximum(abs, got.u[1] - ref.u[1]) <= INIT_GAP)
+            integ = init(with_dm, method(form; dm = da, comm); initializealg = ia, TOL...)
+            SciMLBase.set_u!(integ, integ.u .+ 0.05)
+            SciMLBase.initialize_dae!(integ)
+            plain = init(without, method(form; comm); initializealg = ia, TOL...)
+            SciMLBase.set_u!(plain, plain.u .+ 0.05)
+            SciMLBase.initialize_dae!(plain)
+            @test everywhere(maximum(abs, integ.u - plain.u) <= INIT_GAP)
+            terminate!(integ)
+            terminate!(plain)
+        end
     end
 
     @testset "a jac fills the DM's matrix" begin
