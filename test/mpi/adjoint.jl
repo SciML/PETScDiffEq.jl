@@ -1,5 +1,5 @@
 using MPI, PETScDiffEq, SciMLBase, SparseArrays, Test
-using PETScDiffEq: PETSc, PETScAdjoint, AutoForwardDiff
+using PETScDiffEq: PETSc, LibPETSc, PETScCompat, PETScAdjoint, AutoForwardDiff, reshape_local_array
 using SciMLBase: ODEProblem, ODEFunction, solve
 
 MPI.Init()
@@ -7,7 +7,8 @@ const comm = MPI.COMM_WORLD
 const rank = MPI.Comm_rank(comm)
 const nranks = MPI.Comm_size(comm)
 # PetscInitialize is collective, and the serial reference solves run on single ranks.
-PETSc.initialize(PETSc.getlib(; PetscScalar = Float64))
+const pl = PETSc.getlib(; PetscScalar = Float64)
+PETSc.initialize(pl)
 
 const N = 23
 const P = [0.8, 1.5, 0.5]
@@ -16,6 +17,9 @@ const FORWARD = ((0.0, 0.1), collect(0.0:0.01:0.1), P)
 const BACKWARD = ((0.1, 0.0), collect(0.1:-0.01:0.0), [-P[1], P[2], -P[3]])
 const EXACT = ["-snes_rtol", "1e-13", "-snes_atol", "1e-15", "-ksp_type", "preonly"]
 const SERIAL_GAP = 1.0e-15
+# Measured at 1 to 3 ranks: a dm adjoint is within 1.3e-16 of the comm-mode one in 1-D and
+# 1.1e-15 of a DMDA on MPI.COMM_SELF in 2-D.
+const DM_GAP = 5.0e-15
 const FD_GAP = 2.0e-9
 const thrower = nranks - 1
 
@@ -160,6 +164,128 @@ const METHODS = (
     ("ARKIMEX l2", c -> TSARKIMEX("l2", exact(c); comm = c)),
 )
 
+const GHOSTED = LibPETSc.DM_BOUNDARY_GHOSTED
+const da = PETSc.DMDA(pl, comm, (GHOSTED,), (N,), 1, 1; points_per_proc = (LibPETSc.PetscInt.(counts),))
+
+function dm_heat!(du, u, p, t)
+    U, D = reshape_local_array(u, da), reshape_local_array(du, da)
+    for i in axes(D, 2)
+        D[1, i] = p[1] * ((U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2) + p[2] * source(i) -
+            p[3] * U[1, i]^3
+    end
+    return nothing
+end
+
+function dm_jac!(J, u, p, t)
+    U = reshape_local_array(u, da)
+    for i in rows
+        row = (p[1] / dx^2, -2p[1] / dx^2 - 3 * p[3] * U[1, i]^2, p[1] / dx^2)
+        set_stencil_values!(J, (1, i), ((1, i - 1), (1, i), (1, i + 1)), row)
+    end
+    return nothing
+end
+
+function dm_paramjac!(pJ, u, p, t)
+    U = reshape_local_array(u, da)
+    for (k, i) in enumerate(rows)
+        pJ[k, 1] = (U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2
+        pJ[k, 2] = source(i)
+        pJ[k, 3] = -U[1, i]^3
+    end
+    return nothing
+end
+
+dm_problem(;
+    tspan = first(FORWARD), p = copy(P), f = dm_heat!, jac = dm_jac!, paramjac = dm_paramjac!,
+) = ODEProblem(ODEFunction(f; jac, paramjac), heat0(rows), tspan, p)
+
+with_dm(name) = Dict(
+    "TSRK" => TSRK("4"; dm = da),
+    "backward Euler" => TSImplicit("beuler", exact(comm); dm = da),
+    "Crank-Nicolson" => TSImplicit("cn", exact(comm); dm = da),
+    "theta 0.7" => TSImplicit("theta", 0.7, exact(comm); dm = da),
+    "ARKIMEX l2" => TSARKIMEX("l2", exact(comm); dm = da),
+)[name]
+
+const NX, NY = 5, 4
+const hx, hy = 1 / (NX + 1), 1 / (NY + 1)
+const P2 = [0.8, 1.5, 0.5, 0.3]
+plane(c, processors = (1, 1)) = PETSc.DMDA(
+    pl, c, (GHOSTED, GHOSTED), (NX, NY), 2, 1, LibPETSc.DMDA_STENCIL_STAR; processors,
+)
+points(g) = CartesianIndices(
+    axes(reshape_local_array(zeros(PETScDiffEq._dm_local_size(pl, g)), g))[2:3],
+)
+lap2(U, c, i, j) = (U[c, i - 1, j] - 2U[c, i, j] + U[c, i + 1, j]) / hx^2 +
+    (U[c, i, j - 1] - 2U[c, i, j] + U[c, i, j + 1]) / hy^2
+
+two_fields(g) = function (du, u, p, t)
+    U, D = reshape_local_array(u, g), reshape_local_array(du, g)
+    for I in points(g)
+        i, j = Tuple(I)
+        D[1, I] = p[1] * lap2(U, 1, i, j) + p[2] * i * j * hx * hy - p[3] * U[1, I]^3 + U[2, I]
+        D[2, I] = p[4] * lap2(U, 2, i, j) + U[1, I] - p[3] * U[2, I]
+    end
+    return nothing
+end
+
+two_fields_jac(g) = function (J, u, p, t)
+    U = reshape_local_array(u, g)
+    for I in points(g), c in 1:2
+        i, j = Tuple(I)
+        d = c == 1 ? p[1] : p[4]
+        cols = ((c, i, j), (c, i - 1, j), (c, i + 1, j), (c, i, j - 1), (c, i, j + 1), (3 - c, i, j))
+        diagonal = -2d / hx^2 - 2d / hy^2 - (c == 1 ? 3 * p[3] * U[1, I]^2 : p[3])
+        set_stencil_values!(J, (c, i, j), cols, (diagonal, d / hx^2, d / hx^2, d / hy^2, d / hy^2, 1.0))
+    end
+    return nothing
+end
+
+two_fields_paramjac(g) = function (pJ, u, p, t)
+    U = reshape_local_array(u, g)
+    fill!(pJ, 0.0)
+    A = [reshape_local_array(view(pJ, :, k), g) for k in 1:4]
+    for I in points(g)
+        i, j = Tuple(I)
+        A[1][1, I] = lap2(U, 1, i, j)
+        A[2][1, I] = i * j * hx * hy
+        A[3][1, I] = -U[1, I]^3
+        A[3][2, I] = -U[2, I]
+        A[4][2, I] = lap2(U, 2, i, j)
+    end
+    return nothing
+end
+
+function on_plane(value, g)
+    u = zeros(PETScDiffEq._dm_local_size(pl, g))
+    a = reshape_local_array(u, g)
+    for I in points(g), c in 1:2
+        a[c, I] = value(c, Tuple(I)...)
+    end
+    return u
+end
+
+function plane_gradient(g, alg)
+    w = on_plane((c, i, j) -> c * i * hx * (1 + j * hy), g)
+    u0 = on_plane((c, i, j) -> sinpi(c * i * hx) * sinpi(j * hy), g)
+    fn = ODEFunction(two_fields(g); jac = two_fields_jac(g), paramjac = two_fields_paramjac(g))
+    return PETScDiffEq._discrete_adjoint(
+        ODEProblem(fn, u0, (0.0, 0.02), copy(P2)), alg, PETScAdjoint();
+        t = collect(0.0:0.005:0.02), dgdu_discrete = (out, u, p, t, i) -> (out .= u .+ p[2] .* w),
+        dgdp_discrete = (out, u, p, t, i) -> (fill!(out, 0.0); out[2] = sum(u .* w)), dt = DT,
+        adaptive = false,
+    )
+end
+
+function natural(x, g, c)
+    full = zeros(2, NX, NY)
+    a = reshape_local_array(x, g)
+    for I in points(g), k in 1:2
+        full[k, I] = a[k, I]
+    end
+    return MPI.Allreduce(vec(full), +, c)
+end
+
 @testset "MPI adjoint, $nranks ranks" begin
     @testset "matches the serial adjoint and finite differences: $name, $dir" for (name, make) in
             METHODS, (dir, (tspan, times, p)) in (("forward", FORWARD), ("backward", BACKWARD))
@@ -176,6 +302,36 @@ const METHODS = (
         end
     end
 
+    @testset "a dm matches the comm-mode adjoint: $name, $dir" for (name, make) in METHODS,
+            (dir, (tspan, times, p)) in (("forward", FORWARD), ("backward", BACKWARD))
+        du0, dp = gradient(dm_problem(; tspan, p), with_dm(name), times, rows)
+        @test same_everywhere(dp)
+        ref = gradient(heat_problem(rows, halo; tspan, p), make(comm), times, rows)
+        mine = vcat(gathered(du0, counts), vec(dp))
+        theirs = vcat(gathered(ref[1], counts), vec(ref[2]))
+        rank == 0 && @test relerr(mine, theirs) <= DM_GAP
+    end
+
+    @testset "a 2-D DMDA with two fields matches one on MPI.COMM_SELF: $name, $processors" for (
+                name, make,
+            ) in (
+                ("TSRK", (c, g) -> TSRK("4"; dm = g)),
+                ("Crank-Nicolson", (c, g) -> TSImplicit("cn", exact(c); dm = g)),
+                ("ARKIMEX l2", (c, g) -> TSARKIMEX("l2", exact(c); dm = g)),
+            ), processors in ((1, nranks), (nranks, 1))
+        g = plane(comm, processors)
+        du0, dp = plane_gradient(g, make(comm, g))
+        @test same_everywhere(dp)
+        mine = vcat(natural(du0, g, comm), vec(dp))
+        PETScCompat.destroy!(g)
+        if rank == 0
+            solo = plane(MPI.COMM_SELF)
+            sdu0, sdp = plane_gradient(solo, make(MPI.COMM_SELF, solo))
+            @test relerr(mine, vcat(natural(sdu0, solo, MPI.COMM_SELF), vec(sdp))) <= DM_GAP
+            PETScCompat.destroy!(solo)
+        end
+    end
+
     @testset "the cost sees the states solve saves" begin
         times = FORWARD[2]
         for alg in (TSRK("4"; comm), TSImplicit("beuler", ["-sub_pc_type", "jacobi"]; comm))
@@ -186,6 +342,16 @@ const METHODS = (
                 dt = DT, adaptive = false,
             )
             sol = solve(heat_problem(rows, halo), alg; dt = DT, adaptive = false, saveat = times)
+            @test reverse(seen) == sol.u
+        end
+        for alg in (TSRK("4"; dm = da), TSImplicit("beuler", ["-sub_pc_type", "jacobi"]; dm = da))
+            seen = Vector{Float64}[]
+            record = (out, u, p, t, i) -> (push!(seen, copy(u)); out .= u; nothing)
+            PETScDiffEq._discrete_adjoint(
+                dm_problem(), alg, PETScAdjoint(); t = times, dgdu_discrete = record, dt = DT,
+                adaptive = false,
+            )
+            sol = solve(dm_problem(), alg; dt = DT, adaptive = false, saveat = times)
             @test reverse(seen) == sol.u
         end
     end
@@ -212,6 +378,13 @@ const METHODS = (
             ("f", "TSRK", TSRK("4", ["-ts_trajectory_solution_only", "1"]; comm), :adjoint),
             ("dgdu", "TSRK", TSRK("4"; comm), :adjoint),
             ("dgdp", "TSRK", TSRK("4"; comm), :after),
+            ("jac", "TSRK with a dm", TSRK("4"; dm = da), :adjoint),
+            ("jac", "backward Euler with a dm", with_dm("backward Euler"), :adjoint),
+            ("paramjac", "TSRK with a dm", TSRK("4"; dm = da), :adjoint),
+            ("paramjac", "Crank-Nicolson with a dm", with_dm("Crank-Nicolson"), :adjoint),
+            ("f", "TSRK with a dm", TSRK("4", ["-ts_trajectory_solution_only", "1"]; dm = da), :adjoint),
+            ("dgdu", "TSRK with a dm", TSRK("4"; dm = da), :adjoint),
+            ("dgdp", "TSRK with a dm", TSRK("4"; dm = da), :after),
         )
         started = Ref(false)
         when = pieces === :adjoint ? (args...) -> started[] :
@@ -219,10 +392,17 @@ const METHODS = (
         pick(key, f) = key == what ? throwing(f, what, when) : f
         du = pick("dgdu", cost_du(rows))
         dgdu = (args...) -> (started[] = true; du(args...))
-        prob = heat_problem(
-            rows, halo; f = pick("f", heat(rows, halo)), jac = pick("jac", heat_jac(rows)),
-            paramjac = pick("paramjac", heat_paramjac(rows, halo)),
-        )
+        prob = if alg.dm === nothing
+            heat_problem(
+                rows, halo; f = pick("f", heat(rows, halo)), jac = pick("jac", heat_jac(rows)),
+                paramjac = pick("paramjac", heat_paramjac(rows, halo)),
+            )
+        else
+            dm_problem(;
+                f = pick("f", dm_heat!), jac = pick("jac", dm_jac!),
+                paramjac = pick("paramjac", dm_paramjac!),
+            )
+        end
         e = caught() do
             PETScDiffEq._discrete_adjoint(
                 prob, alg, PETScAdjoint(); t = FORWARD[2], dgdu_discrete = dgdu,
@@ -306,6 +486,20 @@ const METHODS = (
         grow_jac!(J, u, p, t) =
             (foreach(k -> J[k, rows[k]] = rank == thrower ? 2u[k] : -1.0, eachindex(rows)); nothing)
         diagonal = sparse(1:length(rows), rows, 1.0, length(rows), N)
+        rk_dm = TSRK("4"; dm = da)
+        for (prob, what) in (
+                (dm_problem(jac = nothing), "the ODEFunction's `jac` with a `dm`"),
+                (dm_problem(paramjac = nothing), "the ODEFunction's `paramjac` with a `dm`"),
+            )
+            @test refused(() -> gradient(prob, rk_dm, times, rows), "PETScAdjoint needs $what")
+        end
+        some = dm_problem(paramjac = rank == thrower ? nothing : dm_paramjac!)
+        e = caught(() -> gradient(some, rk_dm, times, rows))
+        @test rank == thrower ? e isa ArgumentError && occursin("`paramjac`", e.msg) : remote(e)
+        nranks > 1 && @test refused(
+            () -> gradient(dm_problem(), rk_dm, times, rows; g = (u, p, t) -> sum(abs2, u)),
+            "integral cost on MPI.COMM_SELF only",
+        )
         grows = ODEProblem(
             ODEFunction(grow!; jac = grow_jac!, jac_prototype = diagonal), ones(length(rows)),
             (0.0, 2.0),
@@ -324,3 +518,5 @@ const METHODS = (
         @test all(h -> h.destroyed, keys(PETScDiffEq.LIVE_HANDLES))
     end
 end
+
+PETScCompat.destroy!(da)

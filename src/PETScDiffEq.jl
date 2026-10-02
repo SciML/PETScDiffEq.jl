@@ -3440,12 +3440,6 @@ function _refuse_dm(prob, alg, is_dae)
         ),
     )
     has_jac = prob.f.jac !== nothing
-    has_jac && !_uses_ifunction(alg) && throw(
-        ArgumentError(
-            "PETScDiffEq does not take a `jac` $_WITH_DM on an explicit method, which " *
-                "never uses one; leave it out",
-        ),
-    )
     has_jac && !SciMLBase.isinplace(prob) && throw(
         ArgumentError(
             "a `jac` $_WITH_DM has to be in place, filling the DM's matrix it gets as `J`; " *
