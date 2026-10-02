@@ -127,7 +127,8 @@ function SciMLBase.solve(prob::_SNES_PROBLEMS, alg::PETScSNES; abstol, kwargs...
     function resid(u)
         SciMLBase.isinplace(prob) || return f(u, p)
         proto = f.resid_prototype
-        r = proto === nothing ? (u === nothing ? Float64[] : similar(u)) : similar(proto)
+        r = proto === nothing ? (u === nothing ? Float64[] : similar(u)) :
+            similar(proto, u === nothing ? eltype(proto) : promote_type(eltype(proto), eltype(u)))
         f(r, u, p)
         return r
     end
@@ -139,7 +140,10 @@ function SciMLBase.solve(prob::_SNES_PROBLEMS, alg::PETScSNES; abstol, kwargs...
     end
     pl = alg.petsclib
     like(x) = ismutable(u0) ? copyto!(similar(u0), x) : typeof(u0)(x)
-    residual!(out, x) = (copyto!(out, resid(like(x))); nothing)
+    # PETSc's difference step is below a narrower eltype's spacing, so f runs at PETSc's.
+    wide(x) = ismutable(u0) ?
+        copyto!(similar(u0, promote_type(eltype(u0), pl.PetscScalar)), x) : typeof(u0)(x)
+    residual!(out, x) = (copyto!(out, resid(wide(x))); nothing)
     x = Vector{pl.PetscScalar}(u0)
     code = _snes_solve!(x, residual!, nothing, nothing, pl, abstol) ?
         SciMLBase.ReturnCode.Success : SciMLBase.ReturnCode.ConvergenceFailure
