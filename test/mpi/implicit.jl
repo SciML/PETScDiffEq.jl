@@ -206,6 +206,95 @@ const METHODS = (
         end
     end
 
+    @testset "TSIRK on any split of the state" begin
+        hollow = copy(counts)
+        nranks > 1 && (hollow[2] += hollow[1]; hollow[1] = 0)
+        function spread(blocks)
+            full = findall(>(0), blocks) .- 1
+            k = findfirst(==(rank), full)
+            k === nothing && return (du, u, p, t) -> nothing
+            left = k == 1 ? MPI.PROC_NULL : full[k - 1]
+            right = k == length(full) ? MPI.PROC_NULL : full[k + 1]
+            return function (du, u, p, t)
+                gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
+                MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
+                MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
+                return laplacian!(du, u, gl[1], gr[1])
+            end
+        end
+        split_heat(blocks; jac) = ODEProblem(
+            heat_function(spread(blocks), owned(blocks); jac), heat0(owned(blocks)), SPAN,
+        )
+        serial_heat(; jac) = ODEProblem(heat_function(heat_serial!, 1:N; jac), heat0(1:N), SPAN)
+        stepped(prob, alg) = solve(prob, alg; dt = 1.0e-3)
+        saved(prob, alg) = solve(prob, alg; dt = 1.0e-3, saveat = 0.0125)
+        halve = SciMLBase.DiscreteCallback((u, t, i) -> t == 0.05, i -> (i.u .*= 0.5))
+        halved(prob, alg) = solve(prob, alg; dt = 1.0e-3, callback = halve, tstops = [0.05])
+        function restarted(prob, alg)
+            integ = SciMLBase.init(prob, alg; dt = 1.0e-3)
+            foreach(_ -> SciMLBase.step!(integ), 1:10)
+            SciMLBase.set_u!(integ, 0.5 .* integ.u)
+            return SciMLBase.solve!(integ)
+        end
+        ad = AutoForwardDiff()
+        cases = (
+            (stepped, TSIRK(1; comm), TSIRK(1), true),
+            (stepped, TSIRK(2; comm), TSIRK(2), true),
+            (stepped, TSIRK(3; comm), TSIRK(3), true),
+            (stepped, TSIRK(2; comm, autodiff = ad), TSIRK(2; autodiff = ad), false),
+            (stepped, TSGeneric("irk"; comm), TSGeneric("irk"), true),
+            (saved, TSIRK(3; comm), TSIRK(3), true),
+            (halved, TSIRK(3; comm), TSIRK(3), true),
+            (restarted, TSIRK(3; comm), TSIRK(3), true),
+        )
+        splits = nranks > 1 ? (counts, hollow) : (counts,)
+        for blocks in splits, (solve_with, alg, serial, jac) in cases
+            sol = solve_with(split_heat(blocks; jac), alg)
+            @test sol.retcode == ReturnCode.Success
+            @test all(u -> length(u) == blocks[rank + 1], sol.u)
+            us = gathered(sol, blocks)
+            if rank == 0
+                ref = solve_with(serial_heat(; jac), serial)
+                @test sol.t == ref.t
+                @test maxdiff(us, ref.u) <= SERIAL_GAP
+                if solve_with === stepped && alg isa TSIRK
+                    err = (4.0e-6, 1.0e-10, 5.0e-12)[alg.nstages]
+                    @test maximum(abs, us[end] - heat_exact(SPAN[2])) <= err
+                end
+            end
+        end
+        bad_f = heat_function(throwing(heat!, "f"), rows; jac = true)
+        bad_jac = ODEFunction(
+            heat!; jac = throwing(heat_jac(rows), "jac"), jac_prototype = heat_proto(rows),
+        )
+        for (what, fn) in (("f", bad_f), ("jac", bad_jac))
+            prob = ODEProblem(fn, heat0(rows), SPAN)
+            @test raised(caught(() -> solve(prob, TSIRK(2; comm); dt = 1.0e-3)), what)
+        end
+        nan_after(f, i) = function (du, u, p, t)
+            f(du, u, p, t)
+            t > 0.05 && i > 0 && (du[i] = NaN)
+            return nothing
+        end
+        nan_fn = heat_function(nan_after(heat!, rank == thrower ? 1 : 0), rows; jac = true)
+        failed = solve(ODEProblem(nan_fn, heat0(rows), SPAN), TSIRK(2; comm); dt = 1.0e-3)
+        @test failed.retcode == ReturnCode.ConvergenceFailure
+        failed_us = gathered(failed, counts)
+        if rank == 0
+            first_row = sum(counts[1:thrower]) + 1
+            serial_fn = heat_function(nan_after(heat_serial!, first_row), 1:N; jac = true)
+            failed_ref = solve(ODEProblem(serial_fn, heat0(1:N), SPAN), TSIRK(2); dt = 1.0e-3)
+            @test failed_ref.retcode == ReturnCode.ConvergenceFailure
+            @test failed.t == failed_ref.t
+            @test maxdiff(failed_us, failed_ref.u) <= SERIAL_GAP
+        end
+        mass = Diagonal(fill(2.0, length(rows)))
+        massive = ODEProblem(
+            heat_function(heat!, rows; jac = true, mass_matrix = mass), heat0(rows), SPAN,
+        )
+        @test refused(() -> solve(massive, TSIRK(2; comm); dt = 1.0e-3), "a mass matrix with TSIRK")
+    end
+
     @testset "a DAEProblem" begin
         residual(f) = (r, du, u, p, t) -> (f(r, u, p, t); r .= du .- r; nothing)
         dae_jac(idx) = function (J, du, u, p, gamma, t)
@@ -736,14 +825,6 @@ const METHODS = (
         fn = ODEFunction(heat!; jac = heat_jac(rows), jac_prototype = wrong)
         e = caught(() -> solve(heat(fn), bdf))
         @test rank == thrower ? e isa ArgumentError && occursin("must be $n x $N", e.msg) : remote(e)
-        if nranks > 1
-            skewed = even(N)
-            skewed[end - 1] -= 1
-            skewed[end] += 1
-            idx = owned(skewed)
-            prob = ODEProblem(heat_function(heat!, idx; jac = true), heat0(idx), SPAN)
-            @test refused(() -> solve(prob, TSIRK(2; comm); dt = 1.0e-3), "PETSc's own share")
-        end
     end
 
     @testset "every handle is freed" begin

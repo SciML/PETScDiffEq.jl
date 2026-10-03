@@ -234,8 +234,9 @@ as `dt` shrinks instead of failing, which is worse than an error.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There it needs a `jac` or `autodiff = AutoForwardDiff()`, with a sparse `jac_prototype` holding
-this rank's rows with global columns, and each rank has to hold PETSc's own share of the state,
-which splits it evenly with the first ranks taking one row more; see the MPI section of the
+this rank's rows with global columns. Any split of the state works: PETSc lays out its stage
+vector by its own even split, so on any other the solve runs on that one and moves the state to
+and from each rank's block around every call to `f` and `jac`; see the MPI section of the
 documentation. A `dm` is refused.
 """
 struct TSIRK <: PETScTSAlgorithm
@@ -786,6 +787,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     maxiters::Int
     linear::Bool
     mass_mat::Any
+    relayout::Any
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -1286,7 +1288,9 @@ function _post_step_collective!(ctx, ts_ptr)
                     _symbol(pl, :TSGetSolution), LibPETSc.PetscErrorCode,
                     (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x,
                 )
-                u = _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x[], false))
+                flat = ctx.flat_vec === nothing ? PETSc.VecPtr(pl, x[], false) : ctx.flat_vec
+                u = _read_state!(ctx.u, ctx, flat)
+                ctx.partitioned_u === nothing || (u = copyto!(ctx.partitioned_u, u))
                 if ctx.unstable !== nothing
                     unstable = _asked(ctx) do
                         ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s))
@@ -2037,8 +2041,9 @@ function _coo_matrix!(A, petsclib, n, N, rows, cols)
         LibPETSc.PetscInt(N),
     )
     LibPETSc.MatSetType(petsclib, A, "aij")
+    # MatSetPreallocationCOO reorders the indices it is given, and TSIRK's matrix reuses them.
     LibPETSc.MatSetPreallocationCOO(
-        petsclib, A, LibPETSc.PetscCount(length(rows)), rows, cols,
+        petsclib, A, LibPETSc.PetscCount(length(rows)), copy(rows), copy(cols),
     )
     return A
 end
@@ -2234,6 +2239,32 @@ function _writevec!(pl, v, src)
     return nothing
 end
 
+function _relayout!(ctx, from, to, mode)
+    for call in (:VecScatterBegin, :VecScatterEnd)
+        _check_code(
+            ccall(
+                _symbol(ctx.petsclib, call), LibPETSc.PetscErrorCode,
+                (
+                    Ptr{Cvoid}, LibPETSc.CVec, LibPETSc.CVec, LibPETSc.InsertMode,
+                    LibPETSc.ScatterMode,
+                ),
+                ctx.relayout.scatter, from, to, LibPETSc.INSERT_VALUES, mode,
+            ),
+        )
+    end
+    return to
+end
+
+_own_block(ctx, x) = ctx.relayout === nothing ? x :
+    _relayout!(ctx, x, ctx.relayout.vec, LibPETSc.SCATTER_REVERSE)
+
+function _write_block!(ctx, x, src)
+    ctx.relayout === nothing && return _writevec!(ctx.petsclib, x, src)
+    _writevec!(ctx.petsclib, ctx.relayout.vec, src)
+    _relayout!(ctx, ctx.relayout.vec, x, LibPETSc.SCATTER_FORWARD)
+    return nothing
+end
+
 function _rhs!(
         ::LibPETSc.CTS,
         t,
@@ -2299,8 +2330,8 @@ end
 function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
     pl = ctx.petsclib
     try
-        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        udot = _readvec!(ctx.mudot, pl, PETSc.VecPtr(pl, xdot_ptr, false))
+        _readvec!(ctx.u, pl, _own_block(ctx, PETSc.VecPtr(pl, x_ptr, false)))
+        udot = _readvec!(ctx.mudot, pl, _own_block(ctx, PETSc.VecPtr(pl, xdot_ptr, false)))
         if ctx.dae
             _call!(ctx.f!, ctx, ctx.resid, udot, ctx.u, ctx.p, t)
         else
@@ -2317,7 +2348,7 @@ function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
                 @. ctx.resid = ctx.resid - ctx.du
             end
         end
-        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), ctx.resid)
+        _write_block!(ctx, PETSc.VecPtr(pl, f_ptr, false), ctx.resid)
         ctx.nf += 1
     catch e
         ctx.err = e
@@ -2445,11 +2476,15 @@ function _flip_velocity!(ctx, x)
     return x
 end
 
-_read_state!(dest, ctx, x) = _flip_velocity!(ctx, _readvec!(dest, ctx.petsclib, x))
+_read_state!(dest, ctx, x) =
+    _flip_velocity!(ctx, _readvec!(dest, ctx.petsclib, _own_block(ctx, x)))
 
-_write_state!(h, x) = PETScCompat.with_local_array!(
-    ua -> _flip_velocity!(h.ctx, copyto!(ua, x)), h.u; read = false, write = true,
-)
+function _write_state!(h, x)
+    h.ctx.relayout === nothing || return _write_block!(h.ctx, h.u, x)
+    return PETScCompat.with_local_array!(
+        ua -> _flip_velocity!(h.ctx, copyto!(ua, x)), h.u; read = false, write = true,
+    )
+end
 
 function _i2function!(
         ::LibPETSc.CTS,
@@ -2650,7 +2685,7 @@ function _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
-        _readvec!(ctx.u, ctx.petsclib, x)
+        _readvec!(ctx.u, ctx.petsclib, _own_block(ctx, x))
         if ctx.coo === nothing
             _call_jac!(ctx, xdot_ptr, shift, t)
             ctx.njacs += 1
@@ -3192,6 +3227,15 @@ function _destroy!(h::TSHandles)
     end
     h.ctx.work.ptr == C_NULL || PETScCompat.destroy!(h.ctx.work)
     h.u === nothing || PETScCompat.destroy!(h.u)
+    if h.ctx.relayout !== nothing
+        PETScCompat.destroy!(h.ctx.relayout.vec)
+        _check_code(
+            ccall(
+                _symbol(h.petsclib, :VecScatterDestroy), LibPETSc.PetscErrorCode,
+                (Ptr{Ptr{Cvoid}},), Ref(h.ctx.relayout.scatter),
+            ),
+        )
+    end
     h.ts === nothing || _return_work_vec!(h.ctx, h.ts)
     _release_work_vec!(h.ctx)
     h.ts === nothing || LibPETSc.TSDestroy(h.petsclib, h.ts)
@@ -3348,17 +3392,46 @@ const _NOT_SELF = "on a communicator other than MPI.COMM_SELF"
 _in_threads_loop() = Threads.threadpoolsize() > 1 && current_task() !== Base.roottask &&
     ccall(:jl_in_threaded_region, Cint, ()) != 0
 
-function _check_irk_layout(n, N, comm)
-    nranks = MPI.Comm_size(comm)
-    share = N ÷ nranks + (MPI.Comm_rank(comm) < N % nranks)
-    _everywhere(comm, n == share) && return nothing
-    throw(
-        ArgumentError(
-            "TSIRK $_NOT_SELF needs each rank to hold PETSc's own share of the state, " *
-                "since PETSc lays out its stage vector that way: $(N ÷ nranks) rows" *
-                (N % nranks == 0 ? "" : ", and one more on the first $(N % nranks) ranks"),
+# TSSetUp_IRK splits its stage vector evenly whatever the state's split, so irk runs on that one.
+function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
+    pl, ctx = h.petsclib, h.ctx
+    comm, n = ctx.comm, length(h.u0)
+    x = LibPETSc.VecCreateMPI(
+        pl, comm, LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), LibPETSc.PetscInt(N),
+    )
+    lo, hi = LibPETSc.VecGetOwnershipRange(pl, x)
+    if _everywhere(comm, hi - lo == n)
+        PETScCompat.destroy!(x)
+        return nothing
+    end
+    rstart = first(LibPETSc.VecGetOwnershipRange(pl, h.u))
+    is, scatter = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :ISCreateStride), LibPETSc.PetscErrorCode,
+            (
+                MPI.API.MPI_Comm, LibPETSc.PetscInt, LibPETSc.PetscInt, LibPETSc.PetscInt,
+                Ptr{Ptr{Cvoid}},
+            ),
+            MPI.COMM_SELF, n, rstart, 1, is,
         ),
     )
+    code = ccall(
+        _symbol(pl, :VecScatterCreate), LibPETSc.PetscErrorCode,
+        (LibPETSc.CVec, Ptr{Cvoid}, LibPETSc.CVec, Ptr{Cvoid}, Ptr{Ptr{Cvoid}}),
+        h.u, is[], x, is[], scatter,
+    )
+    _check_code(ccall(_symbol(pl, :ISDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},), is))
+    _check_code(code)
+    ctx.relayout = (; vec = h.u, scatter = scatter[])
+    h.u = x
+    _relayout!(ctx, ctx.relayout.vec, x, LibPETSc.SCATTER_FORWARD)
+    LibPETSc.TSSetSolution(pl, h.ts, x)
+    PETScCompat.destroy!(h.jac_mat)
+    h.jac_mat = LibPETSc.MatCreate(pl, comm)
+    _coo_matrix!(h.jac_mat, pl, hi - lo, N, rows, cols)
+    LibPETSc.TSSetIJacobian(pl, h.ts, h.jac_mat, h.jac_mat, ijacobian, ctxptr)
+    return nothing
 end
 
 function _check_dynamical(prob, alg, has_mass)
@@ -3965,7 +4038,7 @@ function _setup(
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
-        false, false, Int(maxiters), false, nothing,
+        false, false, Int(maxiters), false, nothing, nothing,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -4169,9 +4242,10 @@ function _setup(
                         "$(join(distributable, ", ")) can",
                 ),
             )
-            comm === nothing || chosen != "irk" || _check_irk_layout(n, N, comm)
             running = _running_name(petsclib, ts)
             _refuse_method(running, has_mass, has_jac, is_split, is_dae)
+            comm === nothing || chosen != "irk" ||
+                _irk_on_petsc_split!(h, N, rows, cols, ptrs.sparse_ijacobian, ctxptr)
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
             if chosen == "irk" && has_jac && !uses_sparse_jac
                 PETScCompat.destroy!(h.jac_mat)

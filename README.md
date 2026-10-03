@@ -508,8 +508,14 @@ rows with global column indices, as the prototype does, such as a finite element
 matrix. PETSc assembles a sparse one into a distributed matrix, and its pattern joins the
 prototype's in the Jacobian `a*M - J` of the implicit solve. A rank whose rows of the mass
 matrix are the identity can leave it as `I`, whatever the other ranks give.
-`TSIRK` also needs each rank to hold PETSc's own share of the state, split evenly with the
-first ranks taking one row more, since PETSc lays out its stage vector that way.
+`TSIRK` takes any split of the state. PETSc lays out its stage vector by its own even split,
+the first ranks taking one row more, so on any other split the solve runs on that one and
+moves the state to and from each rank's block around every call to `f` and `jac`, which, like
+`sol.u` and the callbacks, still see the rank's own block. On 2 and 3 ranks, one of them
+holding no rows in some splits, a heat equation and a stiff reaction-diffusion problem gave the
+states of the solve on PETSc's own split bit for bit from the same initial values, and the
+serial solve's to 3e-15 with `-ksp_rtol 1e-14`. On up to 24,000 rows the moves, 12 to 37 a
+step, took 7% to 23% of the solve's time.
 
 PETSc solves the linear systems of a distributed solve with GMRES and block Jacobi, one
 ILU(0) block on each rank, to a relative tolerance of 1e-5, so such a solve agrees with a
