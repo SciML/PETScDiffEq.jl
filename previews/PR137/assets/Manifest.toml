@@ -2,7 +2,7 @@
 
 julia_version = "1.13.1"
 manifest_format = "2.1"
-project_hash = "bbc629a72ee954a57b83002d07ae84390f4fd99d"
+project_hash = "bee5e3a359ada12c152c9a5ee7441a0beaf4c603"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -926,10 +926,10 @@ uuid = "efe28fd5-8261-553b-a9e1-b2916fc3738e"
 version = "0.5.6+0"
 
 [[deps.OrderedCollections]]
-git-tree-sha1 = "05f45c2e0de6259db764adbfd2f1dc6d3f8de13c"
+git-tree-sha1 = "f9b03759e9ef463718934fbed30820b39997511e"
 registries = "General"
 uuid = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
-version = "2.0.1"
+version = "2.0.2"
 
 [[deps.PARMETIS_jll]]
 deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl", "METIS_jll", "MPIABI_jll", "MPICH_jll", "MPIPreferences", "MPItrampoline_jll", "MicrosoftMPI_jll", "OpenMPI_jll", "TOML"]
@@ -958,7 +958,7 @@ version = "0.5.2"
 
 [[deps.PETScDiffEq]]
 deps = ["ADTypes", "DiffEqBase", "DifferentiationInterface", "ForwardDiff", "Libdl", "LinearAlgebra", "MPI", "PETSc", "PETSc_jll", "PrecompileTools", "SciMLBase", "SciMLLogging", "SciMLOperators", "SparseArrays", "SparseMatrixColorings"]
-path = "/home/runner/work/PETScDiffEq.jl/PETScDiffEq.jl"
+path = "/home/runner/_work/PETScDiffEq.jl/PETScDiffEq.jl"
 uuid = "0a65194f-a16f-47d0-900e-080c22068669"
 version = "0.9.14"
 
