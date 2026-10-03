@@ -42,8 +42,9 @@ It works with `TSRK` of any subtype, `TSImplicit("beuler")`, `TSImplicit("cn")`,
 `TSImplicit("theta")` with its `theta`, in its midpoint form or with `-ts_theta_endpoint`,
 and `TSARKIMEX`. PETSc has no adjoint for `TSRosW`, `TSIRK`, `TSMPRK`, BDF,
 `TSBasicSymplectic` or `TSAlpha2`. A `DynamicalODEProblem` or
-`SecondOrderODEProblem` is differentiated on its flat `[v; u]`, with the costs handed
-`ArrayPartition(v, u)` states as `solve` saves them and `du0` returned as one.
+`SecondOrderODEProblem` is differentiated on its flat `[v; u]`, on `MPI.COMM_SELF` only, with
+the costs handed `ArrayPartition(v, u)` states as `solve` saves them and `du0` returned as
+one.
 
 It runs in PETSc's double real build. A `Float32` problem is differentiated there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and the

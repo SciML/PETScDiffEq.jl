@@ -51,7 +51,8 @@ system on the flat `[v; u]` that these methods step. Its `jac` and `paramjac`, w
 are that system's, taking the state as an `ArrayPartition(v, u)` as the forward solve's
 `jac` does, and are otherwise built from `f1` and `f2`. The cost functions are handed the
 state as an `ArrayPartition` and write its derivative into one, and `du0` comes back as
-one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused.
+one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused, and so
+is a `comm` other than `MPI.COMM_SELF` for these problems.
 
 The adjoint runs in PETSc's double real build. A `Float32` problem is solved there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
@@ -584,6 +585,12 @@ function _check_adjoint_problem(
         ArgumentError(
             "PETScAdjoint supports a SplitODEProblem on MPI.COMM_SELF only; $_NOT_SELF " *
                 "solve the summed problem as an ODEProblem",
+        ),
+    )
+    prob.f isa SciMLBase.DynamicalODEFunction && comm !== nothing && throw(
+        ArgumentError(
+            "PETScAdjoint supports a DynamicalODEProblem or SecondOrderODEProblem on " *
+                "MPI.COMM_SELF only",
         ),
     )
     eltype(prob.u0) <: Real || throw(

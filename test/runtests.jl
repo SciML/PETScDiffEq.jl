@@ -10261,6 +10261,87 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        Sys.WORD_SIZE == 64 && @testset "a communicator of one rank" begin
+            world = MPI.COMM_WORLD
+            function springs!(ddu, du, u, p, t)
+                n = length(u)
+                for i in 1:n
+                    ddu[i] = (i > 1 ? u[i - 1] : 0.0) - 2u[i] + (i < n ? u[i + 1] : 0.0)
+                end
+                return nothing
+            end
+            function springs_jac!(J, x, p, t)
+                for i in 1:5, j in max(1, i - 1):min(5, i + 1)
+                    J[i, 5 + j] = i == j ? -2.0 : 1.0
+                end
+                for i in 1:5
+                    J[5 + i, i] = 1.0
+                end
+                return nothing
+            end
+            springs_proto = sparse(
+                vcat([i for i in 1:5 for _ in max(1, i - 1):min(5, i + 1)], 6:10),
+                vcat([5 + j for i in 1:5 for j in max(1, i - 1):min(5, i + 1)], 1:5), 1.0, 10, 10,
+            )
+            springs(; kw...) = SciMLBase.SecondOrderODEProblem(
+                SciMLBase.DynamicalODEFunction{true}(
+                    springs!, (du, v, u, p, t) -> (du .= v; nothing); kw...,
+                ), zeros(5), [0.1, 0.5, 1.0, 0.5, 0.1], (0.0, 2.0),
+            )
+            for (pr, alg, serial_alg, kw) in (
+                    (
+                        springs(), PETScDiffEq.TSBasicSymplectic("velverlet"; comm = world),
+                        PETScDiffEq.TSBasicSymplectic("velverlet"), (; dt = 0.05),
+                    ),
+                    (
+                        springs(; jac = springs_jac!, jac_prototype = springs_proto),
+                        PETScDiffEq.TSAlpha2(; comm = world), PETScDiffEq.TSAlpha2(),
+                        (; abstol = 1.0e-8, reltol = 1.0e-8),
+                    ),
+                    (
+                        springs(; jac_prototype = springs_proto), PETScDiffEq.TSAlpha2(; comm = world),
+                        PETScDiffEq.TSAlpha2(; autodiff = PETScDiffEq.AutoFiniteDiff()),
+                        (; dt = 0.05, adaptive = false),
+                    ),
+                    (
+                        springs(), PETScDiffEq.TSRK("5dp"; comm = world), PETScDiffEq.TSRK("5dp"),
+                        (; abstol = 1.0e-8, reltol = 1.0e-8),
+                    ),
+                    (
+                        springs(; jac = springs_jac!, jac_prototype = springs_proto),
+                        PETScDiffEq.TSImplicit("bdf"; comm = world), PETScDiffEq.TSImplicit("bdf"),
+                        (; abstol = 1.0e-8, reltol = 1.0e-8),
+                    ),
+                )
+                sol = SciMLBase.__solve(pr, alg; kw...)
+                ref = SciMLBase.__solve(pr, serial_alg; kw...)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.u[end] isa typeof(pr.u0)
+                @test sol.t == ref.t
+                @test maximum(maximum(abs, collect(a) - collect(b)) for (a, b) in zip(sol.u, ref.u)) <=
+                    1.0e-13
+            end
+            @test_throws "on a DynamicalODEProblem or SecondOrderODEProblem on a communicator" SciMLBase.__solve(
+                springs(; jac_prototype = springs_proto),
+                PETScDiffEq.TSAlpha2(; comm = world, autodiff = PETScDiffEq.AutoForwardDiff());
+                dt = 0.05,
+            )
+            @test_throws "SecondOrderODEProblem on MPI.COMM_SELF only" PETScDiffEq._discrete_adjoint(
+                springs(; jac = springs_jac!, jac_prototype = springs_proto),
+                PETScDiffEq.TSRK("4"; comm = world), PETScAdjoint(); t = [2.0],
+                dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing), dt = 0.05,
+                adaptive = false,
+            )
+            line = PETScDiffEq.PETSc.DMDA(
+                PETScDiffEq.PETSc.getlib(; PetscScalar = Float64), MPI.COMM_SELF,
+                (PETScDiffEq.LibPETSc.DM_BOUNDARY_NONE,), (10,), 1, 1,
+            )
+            @test_throws "SecondOrderODEProblem with a `dm` yet" SciMLBase.solve(
+                springs(), PETScDiffEq.TSRK("5dp"; dm = line),
+            )
+            PETScDiffEq.PETScCompat.destroy!(line)
+        end
+
         @testset "what these algorithms refuse" begin
             osc = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
             dyn = SciMLBase.DynamicalODEProblem(
@@ -10338,7 +10419,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             run(`$julia --project=$dir -e $setup`)
             scripts = (
                 "explicit.jl", "implicit.jl", "adjoint.jl", "dm.jl", "types.jl", "ensemble.jl",
-                "exit.jl",
+                "exit.jl", "second_order.jl",
             )
             for script in scripts, np in (1, 2, 3)
                 threads = script == "ensemble.jl" ? 2 : 1

@@ -237,12 +237,13 @@ cubic Hermite interpolant of the velocity and the position, which is also what O
 gives for `VelocityVerlet`. `stats.nf` counts evaluations of `f1`, or of the whole system,
 and `stats.nf2` those of `f2` alone.
 
-These problems run on `MPI.COMM_SELF` only and take no mass matrix. Both algorithms take a
-reversed `tspan`. PETSc only steps forward, so `TSAlpha2` then integrates `w(s) = u(-s)`,
-whose velocity is `-u'`, and gives back `u'`: the states, `jac` and callbacks are those of the
-problem as written. `PETScAdjoint` differentiates them through the first-order form
-with `TSRK`, `TSARKIMEX` or `TSImplicit`'s `"beuler"`, `"cn"` or `"theta"`; PETSc has no
-adjoint for `TSBasicSymplectic` or `TSAlpha2`.
+These problems take no mass matrix. They run distributed over a `comm` as the MPI section
+describes, though not with a `dm`. Both algorithms take a reversed `tspan`. PETSc only steps
+forward, so `TSAlpha2` then integrates `w(s) = u(-s)`, whose velocity is `-u'`, and gives back
+`u'`: the states, `jac` and callbacks are those of the problem as written. `PETScAdjoint`
+differentiates them through the first-order form with `TSRK`, `TSARKIMEX` or `TSImplicit`'s
+`"beuler"`, `"cn"` or `"theta"`, on `MPI.COMM_SELF` only; PETSc has no adjoint for
+`TSBasicSymplectic` or `TSAlpha2`.
 
 ## DAE initialization
 
@@ -498,6 +499,27 @@ implicit `TSGeneric` runs distributed for `"beuler"`, `"cn"`, `"theta"`, `"bdf"`
 refused: `"glle"`'s step control follows the round-off of the distributed linear solve, so it
 takes other steps than a serial solve and ends with another error, larger or smaller.
 
+A `DynamicalODEProblem` or `SecondOrderODEProblem` runs distributed as well, with
+`TSBasicSymplectic`, `TSAlpha2` or any algorithm above on its first-order form. Each rank's
+`ArrayPartition(v, u)` holds its block of the velocity and its block of the position, each
+following the other ranks' blocks of the same part in rank order, and the states it gets back,
+in `sol.u`, `integrator.u`, callbacks and `unstable_check`, are such blocks too; `save_idxs` and
+vector tolerances index this rank's `[v; u]`. `f1` and `f2` see only those blocks and are
+collective like `f`, and a rank runs both even when the first throws. A `jac_prototype` holds
+this rank's rows of the first-order system's Jacobian, its `v` rows and then its `u` rows,
+with the columns a serial solve gives them, the whole velocity before the whole position, so
+it is `length(u0)` by the length of the whole state, and `jac` fills it as it would those rows
+of the serial Jacobian. `TSAlpha2` needs each rank's `v` and `u` to have the same
+length, and builds the distributed matrix it factors, `shift_a I - shift_v df/dv - df/du`,
+from the `v` rows; without a `jac` PETSc colours that matrix and differences `f`, as for the
+other implicit algorithms. A `dm` is refused for these problems, and so are `PETScAdjoint` and
+any `autodiff` but `AutoFiniteDiff()` on a communicator. Split over 1 to 3 ranks, unevenly on more than one, a 1-D wave equation and a
+chain of particles gave the serial solve's states to 3e-15 with `TSBasicSymplectic` and fixed
+steps of `TSRK`, the energy error included, and to 1.2e-9 with adaptive steps of `TSRK("5dp")`.
+`TSAlpha2` and `TSImplicit("bdf")` with a `jac` agreed to 2e-10 with `["-ksp_type", "preonly",
+"-pc_type", "redundant"]` in `petsc_options` and to 8e-8 with the default linear solver, and
+colouring, whose differences depend on the layout, moved `TSAlpha2` by up to 3e-6.
+
 `PETScAdjoint` runs distributed too, for `TSRK`, `TSARKIMEX` on an `ODEProblem` and
 `TSImplicit`'s `"beuler"`, `"cn"` and `"theta"`. It needs the problem's `jac`, filling this
 rank's rows of a sparse prototype as above, and when there are parameters a `paramjac`
@@ -605,10 +627,10 @@ has to keep them in the same order on every rank. An ensemble of distributed sol
 
 ## Limitations
 
-A `DynamicalODEProblem` or `SecondOrderODEProblem` does not run distributed yet, whatever the
-algorithm, so `TSBasicSymplectic` and `TSAlpha2` run on `MPI.COMM_SELF` only. PETSc TS is
-built for large distributed problems, and reaching it from the SciML interface is what this
-package is for; use OrdinaryDiffEq.jl for serial problems where it applies.
+A `DynamicalODEProblem` or `SecondOrderODEProblem` runs distributed over a `comm` but not
+with a `dm`, and `PETScAdjoint` takes one on `MPI.COMM_SELF` only. PETSc TS is built for large
+distributed problems, and reaching it from the SciML interface is what this package is for;
+use OrdinaryDiffEq.jl for serial problems where it applies.
 
 On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.
