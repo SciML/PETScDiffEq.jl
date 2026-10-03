@@ -19,16 +19,19 @@ function _petsc_differences(alg)
     return ad !== nothing && ADTypes.dense_ad(ad) isa AutoFiniteDiff
 end
 
+function _coloring_algorithm(backend)
+    coloring = backend isa ADTypes.AutoSparse ? ADTypes.coloring_algorithm(backend) :
+        ADTypes.NoColoringAlgorithm()
+    coloring isa ADTypes.NoColoringAlgorithm || return coloring
+    return SparseMatrixColorings.GreedyColoringAlgorithm()
+end
+
 function _with_pattern(backend, proto)
     if proto isa SparseArrays.AbstractSparseMatrix
-        coloring = backend isa ADTypes.AutoSparse ? ADTypes.coloring_algorithm(backend) :
-            ADTypes.NoColoringAlgorithm()
-        coloring isa ADTypes.NoColoringAlgorithm &&
-            (coloring = SparseMatrixColorings.GreedyColoringAlgorithm())
         return ADTypes.AutoSparse(
             ADTypes.dense_ad(backend);
             sparsity_detector = ADTypes.KnownJacobianSparsityDetector(proto),
-            coloring_algorithm = coloring,
+            coloring_algorithm = _coloring_algorithm(backend),
         )
     end
     backend isa ADTypes.AutoSparse &&
@@ -296,9 +299,12 @@ end
 _direction(R, n) = [one(R) + R(k) / n for k in 1:n]
 _off(u0) = (R = real(eltype(u0)); u0 .+ complex(R(0.01), R(0.02)) .* (1 .+ abs.(u0)) .* _direction(R, length(u0)))
 
-function _check_holomorphic(h, v, backend, advice)
+_norms(::Nothing, xs...) = map(LinearAlgebra.norm, xs)
+_norms(comm::MPI.Comm, xs...) = Tuple(sqrt.(MPI.Allreduce([sum(abs2, x) for x in xs], +, comm)))
+
+function _check_holomorphic(h, v, backend, advice, comm = nothing)
     n = length(v)
-    n == 0 && return nothing
+    comm === nothing && n == 0 && return nothing
     R = real(eltype(v))
     w = _direction(R, n)
     function along(d)
@@ -309,8 +315,8 @@ function _check_holomorphic(h, v, backend, advice)
         return complex.(g[1:n], g[(n + 1):(2n)])
     end
     along_real, along_imag = along(w), along(im .* w)
-    gap = LinearAlgebra.norm(along_imag .- im .* along_real)
-    scale = LinearAlgebra.norm(along_real) + LinearAlgebra.norm(along_imag)
+    gap, re, ims = _norms(comm, along_imag .- im .* along_real, along_real, along_imag)
+    scale = re + ims
     (isfinite(gap) && isfinite(scale)) || return nothing
     gap <= sqrt(eps(R)) * scale && return nothing
     throw(
@@ -321,6 +327,157 @@ function _check_holomorphic(h, v, backend, advice)
                 "no complex Jacobian for PETSc's Newton iteration. Write the state as a real " *
                 "vector of its real and imaginary parts, or use an explicit method",
         ),
+    )
+end
+
+struct Guarded{F}
+    f::F
+    err::Base.RefValue{Any}
+end
+
+# A rank whose `f` throws goes on calling it, on NaN, so the other ranks' halo exchanges match.
+function (g::Guarded)(out, args...)
+    try
+        g.f(out, args...)
+    catch e
+        g.err[] === nothing && (g.err[] = e)
+        fill!(out, NaN)
+    end
+    return nothing
+end
+
+function _global_colours(backend, proto::SparseMatrixCSC, comm)
+    n, N = size(proto)
+    rstart = MPI.Scan(n, +, comm) - n
+    pairs = Vector{Int}(undef, 2 * SparseArrays.nnz(proto))
+    for j in 1:N, q in nzrange(proto, j)
+        pairs[2q - 1], pairs[2q] = rstart + rowvals(proto)[q], j
+    end
+    counts = MPI.Allgather(length(pairs), comm)
+    root = MPI.Comm_rank(comm) == 0
+    whole = root ? Vector{Int}(undef, sum(counts)) : nothing
+    MPI.Gatherv!(pairs, root ? MPI.VBuffer(whole, counts) : nothing, comm)
+    colours = _checked_everywhere(comm) do
+        root || return zeros(Int, N)
+        P = sparse(whole[1:2:end], whole[2:2:end], trues(length(whole) ÷ 2), N, N)
+        problem = SparseMatrixColorings.ColoringProblem(;
+            structure = :nonsymmetric, partition = :column,
+        )
+        result = SparseMatrixColorings.coloring(P, problem, _coloring_algorithm(backend))
+        return Vector{Int}(SparseMatrixColorings.column_colors(result))
+    end
+    MPI.Bcast!(colours, comm)
+    entry = [colours[j] for j in 1:N for _ in nzrange(proto, j)]
+    return colours[rstart .+ (1:n)], entry, maximum(colours; init = 0)
+end
+
+_batch(::AutoForwardDiff{C}, ncolours) where {C} =
+    C === nothing ? ForwardDiff.pickchunksize(ncolours) : min(C, ncolours)
+
+# Each rank seeds its own block; `f`'s halo exchange brings the other ranks' partials.
+struct CommJacobian{F, G, B, P, R, T, W}
+    fun::F
+    g!::G
+    backend::B
+    prep::P
+    x::Vector{R}
+    y::Vector{R}
+    out::Vector{R}
+    tx::T
+    ty::T
+    w::W
+    own::Vector{Int}
+    entry::Vector{Int}
+    ncolours::Int
+    err::Base.RefValue{Any}
+    advice::String
+end
+
+_entry(::Type{<:Real}, d, r, n) = d[r]
+_entry(::Type{<:Complex}, d, r, n) = complex(d[r], d[r + n])
+
+function _coloured!(J, j::CommJacobian, t, x, contexts...)
+    j.err[] = nothing
+    B, n = length(j.tx), size(J, 1)
+    rows = rowvals(J)
+    for b in 1:(B == 0 ? 0 : cld(j.ncolours, B))
+        lo = (b - 1) * B
+        for k in 1:B
+            j.tx[k] .= j.own .== lo + k
+        end
+        DI.value_and_pushforward!(j.fun, j.out, j.ty, j.prep, j.backend, x, j.tx, contexts...)
+        for q in eachindex(j.entry)
+            k = j.entry[q] - lo
+            1 <= k <= B && (J.nzval[q] = _entry(eltype(J), j.ty[k], rows[q], n))
+        end
+    end
+    e = j.err[]
+    e === nothing || throw(_dual_failure(e) ? _dual_error(e, j.backend, j.advice) : e)
+    _check_finite(() -> j.out, J, t, j.advice)
+    return nothing
+end
+
+(j::CommJacobian)(J, u, p, t) = _coloured!(J, j, t, u, DI.Constant(p), DI.Constant(t))
+
+function (j::CommJacobian)(J, u::AbstractVector{<:Complex}, p, t)
+    j.x .= real.(u)
+    j.y .= imag.(u)
+    return _coloured!(
+        J, j, t, j.x, DI.Constant(j.g!), DI.Constant(j.y), DI.Constant(p), DI.Constant(t),
+    )
+end
+
+(j::CommJacobian)(J, du, u, p, gamma, t) = _coloured!(
+    J, j, t, u, DI.Constant(j.g!), DI.Constant(du), DI.Constant(u), DI.Constant(gamma),
+    DI.Constant(p), DI.Constant(t), DI.Cache(j.w),
+)
+
+function (j::CommJacobian)(J, du, u::AbstractVector{<:Complex}, p, gamma, t)
+    j.x .= real.(u)
+    j.y .= imag.(u)
+    return _coloured!(
+        J, j, t, j.x, DI.Constant(j.g!), DI.Constant(j.y), DI.Constant(du), DI.Constant(u),
+        DI.Constant(gamma), DI.Constant(p), DI.Constant(t),
+    )
+end
+
+function _ad_comm_jacobian(backend, f!, proto, u0, p, t, calls, advice, comm, dae)
+    own, entry, ncolours = _global_colours(backend, proto, comm)
+    dense = ADTypes.dense_ad(backend)
+    err = Ref{Any}(nothing)
+    g! = Counted(Guarded(f!, err), calls)
+    R, n = real(eltype(u0)), length(u0)
+    split = eltype(u0) <: Complex
+    x, y = split ? (real.(u0), imag.(u0)) : (copy(u0), R[])
+    out = zeros(R, split ? 2n : n)
+    w = similar(u0)
+    B = ncolours == 0 ? 0 : _batch(dense, ncolours)
+    tx, ty = ntuple(_ -> zeros(R, n), B), ntuple(_ -> zeros(R, length(out)), B)
+    du, u, gamma = DI.Constant(zero(u0)), DI.Constant(copy(u0)), DI.Constant(one(t))
+    pt = (DI.Constant(p), DI.Constant(t))
+    fun, contexts = if split && dae
+        _complex_residual!, (DI.Constant(g!), DI.Constant(y), du, u, gamma, pt...)
+    elseif split
+        _complex_rhs!, (DI.Constant(g!), DI.Constant(y), pt...)
+    elseif dae
+        _shifted_residual!, (DI.Constant(g!), du, u, gamma, pt..., DI.Cache(w))
+    else
+        g!, pt
+    end
+    prepare() = DI.prepare_pushforward(fun, out, dense, copy(x), tx, contexts...)
+    prep = B == 0 ? nothing : _checked_everywhere(prepare, comm)
+    if split
+        v = _off(u0)
+        h = dae ? (z -> (r = similar(z); g!(r, z .- v, z, p, t); r)) :
+            (z -> (dz = similar(z); g!(dz, z, p, t); dz))
+        _checked_everywhere(() -> _check_holomorphic(h, v, dense, advice, comm), comm)
+        _checked_everywhere(comm) do
+            e, err[] = err[], nothing
+            e === nothing || throw(_dual_failure(e) ? _dual_error(e, dense, advice) : e)
+        end
+    end
+    return CommJacobian(
+        fun, g!, dense, prep, x, y, out, tx, ty, w, own, entry, ncolours, err, advice,
     )
 end
 

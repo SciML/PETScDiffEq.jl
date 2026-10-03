@@ -122,10 +122,12 @@ const EXACT = 1.0e-4
         tol = (abstol = R(1.0e-5), reltol = R(1.0e-5))
         bound = BOUNDS[S]
         fd = PETScDiffEq.AutoFiniteDiff()
+        ad = PETScDiffEq.AutoForwardDiff()
         methods = (
             (TSRK("5dp"; comm), TSRK("5dp"), nothing),
             (TSImplicit("bdf"; comm), TSImplicit("bdf"; autodiff = fd), true),
             (TSImplicit("bdf"; comm), TSImplicit("bdf"; autodiff = fd), false),
+            (TSImplicit("bdf"; comm, autodiff = ad), TSImplicit("bdf"; autodiff = ad), false),
             (TSRosW(; comm), TSRosW(; autodiff = fd), true),
         )
 

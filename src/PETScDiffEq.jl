@@ -94,8 +94,9 @@ one it does not restore its Jacobian lag after that stage, so an adaptive solve 
 within its first two steps and a fixed-step solve diverges.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
-There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
-sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+There `autodiff` defaults to `AutoFiniteDiff()`, `AutoForwardDiff()` colours the whole pattern of
+a sparse `jac_prototype` holding this rank's rows with global columns, and a `jac` fills those
+rows; see the MPI section of the documentation.
 With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
 `jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
 differences `f` into when there is none, with `autodiff` then at its default there,
@@ -144,8 +145,9 @@ since PETSc's Newton iteration takes a complex Jacobian, and one that is not is 
 under ForwardDiff.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
-There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
-sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+There `autodiff` defaults to `AutoFiniteDiff()`, `AutoForwardDiff()` colours the whole pattern of
+a sparse `jac_prototype` holding this rank's rows with global columns, and a `jac` fills those
+rows; see the MPI section of the documentation.
 With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
 `jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
 differences `f` into when there is none, with `autodiff` then at its default there,
@@ -231,10 +233,10 @@ and with a non-identity mass matrix the answer drifts further from the true one
 as `dt` shrinks instead of failing, which is worse than an error.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
-There it needs a `jac`, filling this rank's rows of a sparse `jac_prototype` whose columns are
-global, and each rank has to hold PETSc's own share of the state, which splits it evenly with
-the first ranks taking one row more; see the MPI section of the documentation. A `dm` is
-refused.
+There it needs a `jac` or `autodiff = AutoForwardDiff()`, with a sparse `jac_prototype` holding
+this rank's rows with global columns, and each rank has to hold PETSc's own share of the state,
+which splits it evenly with the first ranks taking one row more; see the MPI section of the
+documentation. A `dm` is refused.
 """
 struct TSIRK <: PETScTSAlgorithm
     nstages::Int
@@ -273,8 +275,9 @@ derivative itself, so `du0` is used only to check and solve for a consistent sta
 `initializealg` asks; see the DAE initialization section of the documentation.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
-There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
-sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+There `autodiff` defaults to `AutoFiniteDiff()`, `AutoForwardDiff()` colours the whole pattern of
+a sparse `jac_prototype` holding this rank's rows with global columns, and a `jac` fills those
+rows; see the MPI section of the documentation.
 With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
 `jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
 differences `f` into when there is none, with `autodiff` then at its default there,
@@ -321,8 +324,9 @@ implicit.
 plain `ODEProblem` PETSc does not use its explicit tableau, and it keeps order 3.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
-There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
-sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
+There `autodiff` defaults to `AutoFiniteDiff()`, `AutoForwardDiff()` colours the whole pattern of
+a sparse `jac_prototype` holding this rank's rows with global columns, and a `jac` fills those
+rows; see the MPI section of the documentation.
 With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
 `jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
 differences `f` into when there is none, with `autodiff` then at its default there,
@@ -2018,14 +2022,19 @@ function _coo_structure(J::SparseMatrixCSC{S}, rstart, M, colmap = nothing) wher
 end
 
 function _mass_matrix!(ctx, petsclib, comm, M, rstart, N)
-    I, J, V = findnz(M)
     ctx.mass_mat = LibPETSc.MatCreate(petsclib, comm)
+    _fill_mass!(ctx.mass_mat, petsclib, M, rstart, N)
+    return nothing
+end
+
+function _fill_mass!(A, petsclib, M, rstart, N)
+    I, J, V = findnz(M)
     _coo_matrix!(
-        ctx.mass_mat, petsclib, size(M, 1), N, LibPETSc.PetscInt.(rstart .+ I .- 1),
+        A, petsclib, size(M, 1), N, LibPETSc.PetscInt.(rstart .+ I .- 1),
         LibPETSc.PetscInt.(J .- 1),
     )
-    LibPETSc.MatSetValuesCOO(petsclib, ctx.mass_mat, V, LibPETSc.INSERT_VALUES)
-    PETSc.assemble!(ctx.mass_mat)
+    LibPETSc.MatSetValuesCOO(petsclib, A, V, LibPETSc.INSERT_VALUES)
+    PETSc.assemble!(A)
     return nothing
 end
 
@@ -3501,12 +3510,6 @@ function _refuse_dm(prob, alg, is_dae)
         ),
     )
     has_jac = prob.f.jac !== nothing
-    has_jac && !_uses_ifunction(alg) && throw(
-        ArgumentError(
-            "PETScDiffEq does not take a `jac` $_WITH_DM on an explicit method, which " *
-                "never uses one; leave it out",
-        ),
-    )
     has_jac && !SciMLBase.isinplace(prob) && throw(
         ArgumentError(
             "a `jac` $_WITH_DM has to be in place, filling the DM's matrix it gets as `J`; " *
@@ -3576,19 +3579,12 @@ function _refuse_distributed(prob, alg, is_dae, N)
                     "of the Jacobian, with global column indices",
             ),
         )
-    else
-        _petsc_differences(alg) || throw(
-            ArgumentError(
-                "PETScDiffEq cannot use `$(_autodiff(alg))` $_NOT_SELF, since it would call " *
-                    "`f` a different number of times on each rank; give the problem a `jac`, " *
-                    "or leave `autodiff` at its default, `AutoFiniteDiff()` there, for " *
-                    "PETSc's colouring",
-            ),
-        )
+    elseif _petsc_differences(alg)
         _ts_type(alg) == "irk" && throw(
             ArgumentError(
-                "TSIRK needs a `jac` $_NOT_SELF, since PETSc builds its coupled-stage " *
-                    "matrix from one and has no finite-difference fallback for it",
+                "TSIRK needs a `jac` or `autodiff = AutoForwardDiff()` $_NOT_SELF, since " *
+                    "PETSc builds its coupled-stage matrix from one and has no " *
+                    "finite-difference fallback for it",
             ),
         )
         proto isa SparseArrays.AbstractSparseMatrix || throw(
@@ -3596,6 +3592,22 @@ function _refuse_distributed(prob, alg, is_dae, N)
                 "without a `jac`, PETSc's colouring $_NOT_SELF needs a sparse " *
                     "`jac_prototype` holding this rank's rows of the Jacobian, with global " *
                     "column indices",
+            ),
+        )
+    else
+        ADTypes.dense_ad(_autodiff(alg)) isa AutoForwardDiff || throw(
+            ArgumentError(
+                "PETScDiffEq cannot use `$(_autodiff(alg))` $_NOT_SELF, where `f` has to " *
+                    "carry the derivatives to the other ranks in its own halo exchange, as " *
+                    "it does ForwardDiff's dual numbers; give the problem a `jac`, or use " *
+                    "`AutoForwardDiff()` or the default there, `AutoFiniteDiff()`",
+            ),
+        )
+        proto isa SparseMatrixCSC || throw(
+            ArgumentError(
+                "without a `jac`, `$(_autodiff(alg))` $_NOT_SELF needs a sparse " *
+                    "`jac_prototype` holding this rank's rows of the Jacobian, with global " *
+                    "column indices, to colour the whole pattern",
             ),
         )
     end
@@ -3891,15 +3903,22 @@ function _setup(
         f_ad = dyn ? f1 : SciMLBase.unwrapped_f(is_split ? prob.f.f1.f : prob.f.f)
         user_t0 = R(prob.tspan[1])
         advice = something(jac_advice, is_dae ? _DAE_ADVICE : _ODE_ADVICE)
-        is_dae ?
+        if comm !== nothing
+            _ad_comm_jacobian(
+                _autodiff(alg), is_dae ? f_ad : _as_inplace(f_ad, iip), prob.f.jac_prototype,
+                u0, prob.p, user_t0, ad_calls, advice, comm, is_dae,
+            )
+        elseif is_dae
             _ad_dae_jacobian(
                 _autodiff(alg), f_ad, prob.f.jac_prototype, u0, prob.p, user_t0, ad_calls,
                 advice,
-            ) :
+            )
+        else
             _ad_jacobian(
                 _autodiff(alg), dyn ? f_ad : _as_inplace(f_ad, iip), prob.f.jac_prototype, u0,
                 prob.p, user_t0, ad_calls, advice,
             )
+        end
     elseif dm_jac
         Ghosted(unwrap(prob.f.jac), petsclib, dm.ptr)
     elseif dyn
@@ -3919,7 +3938,7 @@ function _setup(
     )
     ad_calls === nothing || (ad_calls[] = ad_before)
     user_f1, user_f2 = f1, f2
-    f_init, jac_init = f1, jac_fn
+    f_init, jac_init = f1, dm_jac ? nothing : jac_fn
     if tdir < 0
         f1 = is_dae ? _reverse_residual(f1) : _reverse_rhs(f1)
         f2 = f2 === nothing ? nothing : _reverse_rhs(f2)

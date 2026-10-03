@@ -19,11 +19,10 @@ end
 _zero_rows(M::SparseArrays.AbstractSparseMatrix) = _zero_lines(M, 1)
 _zero_cols(M::SparseArrays.AbstractSparseMatrix) = _zero_lines(M, 2)
 
-_any_zero_col(vars, mass, n, ::Nothing) = any(vars)
+_own_zero_cols(vars, mass, n, ::Nothing) = vars
 # On a communicator a column is zero only if it is in every rank's rows.
-function _any_zero_col(vars, mass, n, comm::MPI.Comm)
-    _anywhere(comm, mass isa SparseArrays.AbstractSparseMatrix) ||
-        return _anywhere(comm, any(vars))
+function _own_zero_cols(vars, mass, n, comm::MPI.Comm)
+    _anywhere(comm, mass isa SparseArrays.AbstractSparseMatrix) || return vars
     N, rstart = MPI.Allreduce(n, +, comm), MPI.Scan(n, +, comm) - n
     used = zeros(Bool, N)
     if mass isa SparseArrays.AbstractSparseMatrix
@@ -31,7 +30,7 @@ function _any_zero_col(vars, mass, n, comm::MPI.Comm)
     else
         used[rstart .+ (1:n)] .= .!vars
     end
-    return !all(MPI.Allreduce(used, |, comm))
+    return .!MPI.Allreduce(used, |, comm)[rstart .+ (1:n)]
 end
 
 const _INIT_ALGS = Union{
@@ -162,10 +161,11 @@ function _consistent!(
         plain = mass === nothing || mass == LinearAlgebra.I
         comm === nothing && plain && return true
         # A rank whose own block is the identity still joins the collectives below.
-        eqs = plain ? falses(length(u0)) : _zero_rows(mass)
-        vars = plain ? falses(length(u0)) : _zero_cols(mass)
-        _anywhere(comm, any(eqs)) && _any_zero_col(vars, mass, length(u0), comm) ||
-            return true
+        n = length(u0)
+        eqs = plain ? falses(n) : _zero_rows(mass)
+        _anywhere(comm, any(eqs)) || return true
+        vars = _own_zero_cols(plain ? falses(n) : _zero_cols(mass), mass, n, comm)
+        _anywhere(comm, any(vars)) || return true
     end
     init isa _INIT_ALGS || throw(
         ArgumentError("PETScDiffEq does not support `initializealg = $(repr(init))`"),
@@ -185,21 +185,26 @@ function _consistent!(
     _within(r, tol, comm) && return true
     init isa SciMLBase.CheckInit &&
         throw(SciMLBase.CheckInitFailureError(_rms(r, comm), abstol, !is_dae))
-    comm === nothing || throw(
-        ArgumentError(
-            "PETScDiffEq cannot run `$name` $_NOT_SELF; start from consistent values, " *
-                "which `CheckInit()` checks",
-        ),
-    )
+    brown = init isa DiffEqBase.BrownFullBasicInit
+    if comm !== nothing
+        atol = _smallest(comm, Float64(tol isa Number ? tol : minimum(tol; init = Inf)))
+        h = brown ? nothing : _collocation_step(init, is_dae, t0, tf, dt, dtmax)
+        return _consistent_on!(comm, u0, du0, prob, f, jac, pl, t0, atol, h, eqs, vars)
+    end
     proto = prob.f.jac_prototype
     sp = jac === nothing ? proto isa SparseArrays.AbstractSparseMatrix :
         proto isa SparseMatrixCSC
     pattern = sp ? SparseMatrixCSC(proto) : nothing
     atol = tol isa Number ? tol : minimum(tol)
-    if init isa DiffEqBase.BrownFullBasicInit
+    if brown
         is_dae && return _brown_dae!(u0, du0, prob, f, jac, pl, t0, atol, pattern)
         return _brown_mass!(u0, prob, f, jac, pl, t0, atol, pattern, eqs, vars)
     end
+    h = _collocation_step(init, is_dae, t0, tf, dt, dtmax)
+    return _shampine!(u0, prob, f, jac, pl, t0, atol, pattern, h)
+end
+
+function _collocation_step(init, is_dae, t0, tf, dt, dtmax)
     span = abs(tf - t0)
     top = dtmax === nothing || isinf(dtmax) ? span : abs(dtmax)
     step = if init.initdt !== nothing
@@ -211,8 +216,12 @@ function _consistent!(
     else
         (tf - t0) / 1000
     end
-    return _shampine!(u0, prob, f, jac, pl, t0, atol, pattern, oftype(t0, step))
+    return oftype(t0, step)
 end
+
+const _NO_DIFFERENTIAL_VARS = "BrownFullBasicInit needs the DAEProblem's `differential_vars` " *
+    "to know which variables are algebraic; set them, start from consistent values, or use " *
+    "another `initializealg`"
 
 _jac_buffer(S, pattern, n) = pattern === nothing ? zeros(S, n, n) : _structure(S, pattern)
 _or_nothing(jac, jacobian) = jac === nothing ? nothing : jacobian
@@ -248,13 +257,7 @@ end
 
 function _brown_dae!(u0::Vector{S}, du0, prob, f, jac, pl, t0, atol, pattern) where {S}
     dv = prob.differential_vars
-    dv === nothing && throw(
-        ArgumentError(
-            "BrownFullBasicInit needs the DAEProblem's `differential_vars` to know which " *
-                "variables are algebraic; set them, start from consistent values, or use " *
-                "another `initializealg`",
-        ),
-    )
+    dv === nothing && throw(ArgumentError(_NO_DIFFERENTIAL_VARS))
     p, n = prob.p, length(u0)
     du, u = similar(u0), similar(u0)
     function split!(x)
@@ -309,6 +312,216 @@ function _shampine!(u0::Vector{S}, prob, f, jac, pl, t0, atol, pattern, h) where
     return true
 end
 
+_init_dm(f::Ghosted) = f.dm
+_init_dm(f) = nothing
+
+function _global_flags(comm, flags, rstart, N)
+    whole = zeros(Bool, N)
+    whole[rstart .+ (1:length(flags))] .= flags
+    return MPI.Allreduce(whole, |, comm)
+end
+
+# A row Brown's algorithm does not solve pins its variable, keeping the state's layout.
+function _consistent_on!(
+        comm, u0::Vector{S}, du0, prob, f, jac, pl, t0, atol, h, eqs, vars,
+    ) where {S}
+    is_dae, brown = du0 !== nothing, h === nothing
+    p, n, dm = prob.p, length(u0), _init_dm(f)
+    dv = nothing
+    if brown && is_dae
+        dv = _checked_everywhere(comm) do
+            prob.differential_vars === nothing && throw(ArgumentError(_NO_DIFFERENTIAL_VARS))
+            Vector{Bool}(vec(prob.differential_vars))
+        end
+    elseif brown
+        _everywhere(comm, eqs == vars) || throw(
+            ArgumentError(
+                "BrownFullBasicInit $_NOT_SELF solves each zero row of the mass matrix for " *
+                    "the variable of the same index, so its zero columns have to be its zero " *
+                    "rows; start from consistent values, which `CheckInit()` checks, or use " *
+                    "`ShampineCollocationInit()`",
+            ),
+        )
+    end
+    N, rstart = MPI.Allreduce(n, +, comm), MPI.Scan(n, +, comm) - n
+    collocation = !(is_dae || brown)
+    mass = collocation ? prob.f.mass_matrix : nothing
+    own = !(mass === nothing || mass == LinearAlgebra.I)
+    sparse_mass = collocation && dm === nothing &&
+        _anywhere(comm, own && mass isa SparseArrays.AbstractSparseMatrix)
+    M = if !collocation
+        nothing
+    elseif sparse_mass
+        _distributed_mass(S, own ? mass : nothing, n, N, comm)
+    else
+        LinearAlgebra.Diagonal(own ? Vector{S}(mass.diag) : ones(S, n))
+    end
+    use_jac = dm === nothing && _everywhere(comm, jac !== nothing)
+    dvg = use_jac && is_dae && brown ? _global_flags(comm, dv, rstart, N) : nothing
+    x = brown && is_dae ? ifelse.(dv, du0, u0) : copy(u0)
+    a, b, start = similar(u0), similar(u0), copy(u0)
+    R = real(S)
+    clone = xv = rv = A = mm = mv = snes = opts = nothing
+    try
+        if dm === nothing
+            xv = _state_vec(pl, comm, n)
+            J = _structure(S, SparseMatrixCSC(prob.f.jac_prototype))
+            rows, cols, coo = _coo_structure(J, rstart, M)
+            A = LibPETSc.MatCreate(pl, comm)
+            # PETSc's MPIAIJ preallocation rewrites the index arrays it is given.
+            _coo_matrix!(A, pl, n, N, copy(rows), copy(cols))
+            if !use_jac
+                LibPETSc.MatSetValuesCOO(pl, A, coo.vals, LibPETSc.INSERT_VALUES)
+                PETSc.assemble!(A)
+            end
+        else
+            clone = LibPETSc.PetscDM(_dm_vec!(pl, :DMClone, dm)[], pl)
+            xv = LibPETSc.DMCreateGlobalVector(pl, clone)
+            A = LibPETSc.DMCreateMatrix(pl, clone)
+        end
+        rv = LibPETSc.VecDuplicate(pl, xv)
+        if sparse_mass
+            mm = LibPETSc.MatCreate(pl, comm)
+            _fill_mass!(mm, pl, M, rstart, N)
+            mv = (LibPETSc.VecDuplicate(pl, xv), LibPETSc.VecDuplicate(pl, xv))
+        end
+        residual! = if brown && is_dae
+            function (out, x)
+                @. a = ifelse(dv, x, du0)
+                @. b = ifelse(dv, u0, x)
+                f(out, a, b, p, t0)
+                return nothing
+            end
+        elseif brown
+            (out, x) -> (f(a, x, p, t0); @. out = ifelse(eqs, a, x - u0); nothing)
+        elseif is_dae
+            (out, x) -> (@. a = (x - start) / h; f(out, a, x, p, t0); nothing)
+        else
+            function (out, x)
+                @. a = (x - start) / h
+                if sparse_mass
+                    # MatMult is collective, so it comes before `f`, which may throw.
+                    _writevec!(pl, mv[1], a)
+                    _mat_mult!(pl, mm, mv[1].ptr, mv[2].ptr)
+                    _readvec!(out, pl, mv[2])
+                else
+                    @. out = M.diag * a
+                end
+                f(b, x, p, t0)
+                out .-= b
+                return nothing
+            end
+        end
+        values! = nothing
+        if use_jac
+            src = coo.src
+            entry = (J, k) -> src[k] == 0 ? zero(S) : J.nzval[src[k]]
+            values! = if brown && is_dae
+                J1, deriv = copy(J), [dvg[c + 1] for c in cols]
+                function (vals, x)
+                    @. a = ifelse(dv, x, du0)
+                    @. b = ifelse(dv, u0, x)
+                    jac(J, a, b, p, zero(t0), t0)
+                    jac(J1, a, b, p, one(t0), t0)
+                    for k in eachindex(vals)
+                        vals[k] = deriv[k] ? entry(J1, k) - entry(J, k) : entry(J, k)
+                    end
+                    return nothing
+                end
+            elseif brown
+                keep = [eqs[r - rstart + 1] for r in rows]
+                function (vals, x)
+                    jac(J, x, p, t0)
+                    for k in eachindex(vals)
+                        vals[k] = keep[k] ? entry(J, k) : S(rows[k] == cols[k])
+                    end
+                    return nothing
+                end
+            elseif is_dae
+                function (vals, x)
+                    @. a = (x - start) / h
+                    jac(J, a, x, p, inv(h), t0)
+                    for k in eachindex(vals)
+                        vals[k] = entry(J, k)
+                    end
+                    return nothing
+                end
+            else
+                function (vals, x)
+                    jac(J, x, p, t0)
+                    for k in eachindex(vals)
+                        vals[k] = coo.mass[k] / h - entry(J, k)
+                    end
+                    return nothing
+                end
+            end
+        end
+        s = InitNewton(
+            pl, residual!, values!, similar(x), similar(x), LibPETSc.PetscInt[], nothing, comm,
+            use_jac ? coo.vals : S[],
+        )
+        snes = LibPETSc.SNESCreate(pl, comm)
+        options = [
+            "-pc_factor_nonzeros_along_diagonal", "-sub_pc_factor_nonzeros_along_diagonal",
+            "-ksp_rtol", _option(sqrt(eps(R))),
+        ]
+        dm === nothing || _everywhere(comm, _dm_colours(pl, clone.ptr)) ||
+            push!(options, "-snes_fd_color_use_mat")
+        opts = PETScCompat.PetscOptions(pl; PETSc.parse_options(options)...)
+        GC.@preserve s begin
+            ctxptr = pointer_from_objref(s)
+            dm === nothing || _check_code(
+                ccall(
+                    _symbol(pl, :SNESSetDM), LibPETSc.PetscErrorCode,
+                    (LibPETSc.CSNES, Ptr{Cvoid}), snes.ptr, clone.ptr,
+                ),
+            )
+            LibPETSc.SNESSetFunction(pl, snes, rv, INIT_RESIDUAL_PTR[], ctxptr)
+            if use_jac
+                LibPETSc.SNESSetJacobian(pl, snes, A, A, INIT_JACOBIAN_PTR[], ctxptr)
+            else
+                LibPETSc.SNESSetJacobian(
+                    pl, snes, A, A, _symbol(pl, :SNESComputeJacobianDefaultColor), C_NULL,
+                )
+            end
+            push!(opts)
+            try
+                _check_code(
+                    ccall(
+                        _symbol(pl, :SNESSetFromOptions), LibPETSc.PetscErrorCode,
+                        (LibPETSc.CSNES,), snes.ptr,
+                    ),
+                )
+                _snes_tolerances!(pl, snes, R, atol, 1.0e-8, 50)
+                _newton!(x, pl, snes, xv, s) || return false
+            finally
+                pop!(opts)
+            end
+        end
+    finally
+        snes === nothing || LibPETSc.SNESDestroy(pl, snes)
+        opts === nothing || PETScCompat.destroy!(opts)
+        mv === nothing || foreach(PETScCompat.destroy!, mv)
+        for obj in (mm, rv, A, xv)
+            obj === nothing || PETScCompat.destroy!(obj)
+        end
+        clone === nothing || _check_code(
+            ccall(
+                _symbol(pl, :DMDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+                Ref(clone.ptr),
+            ),
+        )
+    end
+    if brown && is_dae
+        @. u0 = ifelse(dv, u0, x)
+    elseif brown
+        @. u0 = ifelse(eqs, x, u0)
+    else
+        copyto!(u0, x)
+    end
+    return true
+end
+
 mutable struct InitNewton{L, S}
     petsclib::L
     residual!::Any
@@ -317,6 +530,20 @@ mutable struct InitNewton{L, S}
     r::Vector{S}
     idx::Vector{LibPETSc.PetscInt}
     err::Any
+    comm::Union{Nothing, MPI.Comm}
+    vals::Vector{S}
+end
+
+# A rank whose function throws keeps making the collective calls, on NaN until the ranks agree.
+function _init_call!(f, s::InitNewton, out)
+    s.comm === nothing && return f()
+    try
+        f()
+    catch e
+        s.err === nothing && (s.err = e)
+        fill!(out, NaN)
+    end
+    return nothing
 end
 
 function _init_residual!(
@@ -326,7 +553,7 @@ function _init_residual!(
     pl = s.petsclib
     try
         _readvec!(s.x, pl, PETSc.VecPtr(pl, x_ptr, false))
-        s.residual!(s.r, s.x)
+        _init_call!(() -> s.residual!(s.r, s.x), s, s.r)
         _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), s.r)
     catch e
         s.err = e
@@ -345,7 +572,12 @@ function _init_jacobian!(
     B = LibPETSc.PetscMat(B_ptr, pl)
     try
         _readvec!(s.x, pl, PETSc.VecPtr(pl, x_ptr, false))
-        _set_matrix!(pl, B, s.jacobian(s.x), s.idx)
+        if s.comm === nothing
+            _set_matrix!(pl, B, s.jacobian(s.x), s.idx)
+        else
+            _init_call!(() -> s.jacobian(s.vals, s.x), s, s.vals)
+            LibPETSc.MatSetValuesCOO(pl, B, s.vals, LibPETSc.INSERT_VALUES)
+        end
         PETSc.assemble!(B)
         B.ptr == A.ptr || PETSc.assemble!(A)
     catch e
@@ -433,6 +665,7 @@ for R in (Float32, Float64)
 end
 
 function _snes_run!(pl, snes, xv, s)
+    s.comm === nothing || return _snes_run_everywhere!(pl, snes, xv, s)
     try
         _quiet_errors(() -> LibPETSc.SNESSolve(pl, snes, C_NULL, xv), pl, false)
     catch e
@@ -445,17 +678,46 @@ function _snes_run!(pl, snes, xv, s)
     return true
 end
 
+function _snes_run_everywhere!(pl, snes, xv, s)
+    failed, err = false, nothing
+    try
+        _quiet_errors(() -> LibPETSc.SNESSolve(pl, snes, C_NULL, xv), pl, false)
+    catch e
+        failed = e isa LibPETSc.PetscError && e.code in (PETSC_ERR_MAT_LU_ZRPVT, PETSC_ERR_FP)
+        failed || (err = e)
+    end
+    err = something(s.err, err, Some(nothing))
+    threw, failed = MPI.Allreduce([err !== nothing, failed], |, s.comm)
+    threw && throw(something(err, _remote_error()))
+    return !failed
+end
+
 _snes_tolerances!(pl, snes, ::Type{R}, atol, stol, maxit) where {R} =
     LibPETSc.SNESSetTolerances(
     pl, snes, R(atol), zero(R), R(stol), LibPETSc.PetscInt(maxit),
     LibPETSc.PetscInt(10000),
 )
 
+function _newton!(x, pl, snes, xv, s)
+    _writevec!(pl, xv, x)
+    _snes_run!(pl, snes, xv, s) || return false
+    Int(LibPETSc.SNESGetConvergedReason(pl, snes)) > 0 || return false
+    _readvec!(x, pl, xv)
+    # PETSc's steppers take a residual left at the start as error no step size removes.
+    fnorm = LibPETSc.SNESGetFunctionNorm(pl, snes)
+    if fnorm > 0
+        _snes_tolerances!(pl, snes, real(eltype(x)), 0, 0, 1)
+        _snes_run!(pl, snes, xv, s) &&
+            LibPETSc.SNESGetFunctionNorm(pl, snes) < fnorm && _readvec!(x, pl, xv)
+    end
+    return true
+end
+
 function _snes_solve!(x::Vector{S}, residual!, jacobian, pattern, pl, atol) where {S}
     m, R = length(x), real(S)
     s = InitNewton(
         pl, residual!, jacobian, similar(x), similar(x),
-        LibPETSc.PetscInt[i - 1 for i in 1:m], nothing,
+        LibPETSc.PetscInt[i - 1 for i in 1:m], nothing, nothing, S[],
     )
     xv, rv = PETScCompat.PetscVec(pl, m), PETScCompat.PetscVec(pl, m)
     A = pattern === nothing ? PETScCompat.PetscMat(pl, zeros(S, m, m)) :
@@ -474,17 +736,7 @@ function _snes_solve!(x::Vector{S}, residual!, jacobian, pattern, pl, atol) wher
             end
             _snes_tolerances!(pl, snes, R, atol, 1.0e-8, 50)
             _direct_solver!(pl, snes, pattern !== nothing)
-            _writevec!(pl, xv, x)
-            _snes_run!(pl, snes, xv, s) || return false
-            Int(LibPETSc.SNESGetConvergedReason(pl, snes)) > 0 || return false
-            _readvec!(x, pl, xv)
-            # PETSc's steppers take a residual left at the start as error no step size removes.
-            fnorm = LibPETSc.SNESGetFunctionNorm(pl, snes)
-            if fnorm > 0
-                _snes_tolerances!(pl, snes, R, 0, 0, 1)
-                _snes_run!(pl, snes, xv, s) &&
-                    LibPETSc.SNESGetFunctionNorm(pl, snes) < fnorm && _readvec!(x, pl, xv)
-            end
+            _newton!(x, pl, snes, xv, s) || return false
         end
     finally
         LibPETSc.SNESDestroy(pl, snes)

@@ -107,6 +107,19 @@ when there are parameters, filling this rank's rows; both are collective like `f
 `no_start`, the length of `p` and whether `dgdp_discrete` is given must agree across the
 ranks.
 
+With a `dm`, the adjoint runs on the DM as the solve does, for the same methods and discrete
+costs, and on a DM of a single rank for integral costs and a `SplitODEProblem` with
+`TSARKIMEX` too. The `ODEFunction` then needs `jac(J, u, p, t)`, filling the DM's matrix
+from the ghosted `u` as in an implicit solve, an explicit method included, whose own solve
+ignores it, and `paramjac(pJ, u, p, t)` when there are parameters, which gets `u` ghosted
+too and fills this rank's rows of `pJ` in the DM's order, a column per entry of `p`;
+`PETScDiffEq.reshape_local_array(view(pJ, :, k), dm)` indexes column `k` by grid point. A
+`SplitODEProblem` needs `f2`'s as well. Neither is built when missing, since automatic
+differentiation would not see the ghosted array and colouring only approximates the
+Jacobian. The costs, `du0` and `dp` follow the distributed convention, with the DM's block
+of the state as this rank's rows: the cost functions get that block as `solve` saves it,
+not the ghosted array. The `dm` has to belong to PETSc's double real build.
+
 Returns `(du0, dp')`, where `dp` is `nothing` when `p` is `nothing` or
 `SciMLBase.NullParameters()`. Differentiating `solve` itself with a reverse-mode AD package
 is not supported.
@@ -219,6 +232,48 @@ function _adjoint_rhsjacobian_body!(adj, s, x_ptr, A_ptr)
 end
 
 const ADJ_RHSJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
+function _adjoint_dm_rhsjacobian!(
+        ::LibPETSc.CTS,
+        s::Float64,
+        x_ptr::LibPETSc.CVec,
+        A_ptr::LibPETSc.CMat,
+        ::LibPETSc.CMat,
+        ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    adj = unsafe_pointer_to_objref(ctx_ptr)::AdjointContext
+    return _adjoint_dm_rhsjacobian_body!(adj, s, x_ptr, A_ptr)
+end
+
+# The user fills df/du in the DM's matrix, which becomes `tdir * df/du` here.
+function _adjoint_dm_rhsjacobian_body!(adj, s, x_ptr, A_ptr)
+    pl = adj.petsclib
+    try
+        _readvec!(adj.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        A = LibPETSc.PetscMat(A_ptr, pl)
+        _mat_zero!(pl, A)
+        err = nothing
+        try
+            adj.jac!(A, adj.u, adj.p, _user_t(adj.tdir, s))
+        catch e
+            adj.comm === nothing && rethrow()
+            err = e
+        end
+        # Assembly is collective, so every rank skips it once any rank's jac threw.
+        if _anywhere(adj.comm, err !== nothing)
+            adj.err === nothing && (adj.err = something(err, _remote_error()))
+            return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+        end
+        PETSc.assemble!(A)
+        adj.tdir < 0 && _mat_op!(pl, :MatScale, A, -1.0)
+    catch e
+        adj.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+const ADJ_DM_RHSJACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _adjoint_rhsjacobianp!(
         ::LibPETSc.CTS,
@@ -443,6 +498,14 @@ function _init_adjoint_pointers!()
             LibPETSc.CMat, Ptr{Cvoid},
         )
     )
+    ADJ_DM_RHSJACOBIAN_PTR[] = @cfunction(
+        _adjoint_dm_rhsjacobian!,
+        LibPETSc.PetscErrorCode,
+        (
+            LibPETSc.CTS, Float64, LibPETSc.CVec, LibPETSc.CMat,
+            LibPETSc.CMat, Ptr{Cvoid},
+        )
+    )
     ADJ_RHSJACOBIANP_PTR[] = @cfunction(
         _adjoint_rhsjacobianp!,
         LibPETSc.PetscErrorCode,
@@ -570,7 +633,7 @@ end
 
 function _check_adjoint_problem(
         prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, g, dgdu_continuous,
-        dgdp_continuous, comm,
+        dgdp_continuous, comm, dm = nothing,
     )
     prob isa SciMLBase.AbstractODEProblem ||
         throw(ArgumentError("PETScAdjoint supports an ODEProblem, not a DAEProblem"))
@@ -621,6 +684,7 @@ function _check_adjoint_problem(
     )
     differences = _petsc_differences(alg)
     parts = (("the ODEFunction's", prob.f), (is_split ? (("`f2`'s", prob.f.f2),) : ())...)
+    dm === nothing || _check_adjoint_dm(prob, dm, parts)
     for (whose, fun) in parts
         differences && fun.jac === nothing && throw(
             ArgumentError(
@@ -632,8 +696,8 @@ function _check_adjoint_problem(
     end
     comm === nothing || prob.f.jac !== nothing || throw(
         ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `jac` $_NOT_SELF, since automatic " *
-                "differentiation would call `f` a different number of times on each rank",
+            "PETScAdjoint needs the ODEFunction's `jac` $_NOT_SELF, where it builds none " *
+                "by automatic differentiation",
         ),
     )
     p = prob.p
@@ -645,6 +709,13 @@ function _check_adjoint_problem(
         ),
     )
     for (whose, fun) in parts
+        has_p && !isempty(p) && dm !== nothing && fun.paramjac === nothing && throw(
+            ArgumentError(
+                "PETScAdjoint needs $whose `paramjac` $_WITH_DM when the problem has " *
+                    "parameters, filling this rank's rows from the ghosted `u` as `jac` " *
+                    "does: automatic differentiation would not see the ghosted array `f` takes",
+            ),
+        )
         has_p && !isempty(p) && differences && fun.paramjac === nothing && throw(
             ArgumentError(
                 "PETScAdjoint needs $whose `paramjac` under " *
@@ -656,8 +727,7 @@ function _check_adjoint_problem(
     has_p && !isempty(p) && comm !== nothing && prob.f.paramjac === nothing && throw(
         ArgumentError(
             "PETScAdjoint needs the ODEFunction's `paramjac` $_NOT_SELF when the problem has " *
-                "parameters, since automatic differentiation would call `f` a different " *
-                "number of times on each rank",
+                "parameters, where it builds none by automatic differentiation",
         ),
     )
     for (name, given) in (("dgdp_discrete", dgdp_discrete), ("dgdp_continuous", dgdp_continuous))
@@ -715,6 +785,34 @@ function _check_adjoint_problem(
             throw(ArgumentError("cost time $ti lies outside tspan = $(prob.tspan)"))
     end
     return has_p
+end
+
+function _check_adjoint_dm(prob, dm, parts)
+    S = PETSc.scalartype(_dm_lib(dm))
+    S === Float64 || throw(
+        ArgumentError(
+            "PETScAdjoint runs in PETSc's double real build, so its `dm` has to belong to " *
+                "that build, not to the $(_build_name(S)) one",
+        ),
+    )
+    prob.f isa SciMLBase.DynamicalODEFunction && throw(
+        ArgumentError(
+            "PETScAdjoint takes an ODEProblem or a SplitODEProblem $_WITH_DM, not a " *
+                "DynamicalODEProblem or SecondOrderODEProblem, which it has not been " *
+                "verified with",
+        ),
+    )
+    for (whose, fun) in parts
+        fun.jac === nothing && throw(
+            ArgumentError(
+                "PETScAdjoint needs $whose `jac` $_WITH_DM, filling the DM's matrix as in " *
+                    "an implicit solve: automatic differentiation would not see the ghosted " *
+                    "array `f` takes, PETSc's colouring only approximates the Jacobian, and " *
+                    "its TSARKIMEX adjoint cannot use one coloured at all",
+            ),
+        )
+    end
+    return nothing
 end
 
 const _ARKIMEX_IMPLICIT_FIRST_STAGE = ("1bee", "l2", "prssp2")
@@ -910,6 +1008,19 @@ function _set_rhs_jacobian!(adj::AdjointContext, ts, n, N, coo_rows, coo_cols)
     return nothing
 end
 
+function _set_dm_rhs_jacobian!(adj::AdjointContext, ts)
+    pl = adj.petsclib
+    adj.jac_mat = LibPETSc.DMCreateMatrix(pl, LibPETSc.PetscDM(_ts_dm(pl, ts), pl))
+    code = ccall(
+        _symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
+        ts, adj.jac_mat.ptr, adj.jac_mat.ptr, ADJ_DM_RHSJACOBIAN_PTR[],
+        pointer_from_objref(adj),
+    )
+    _check_code(code, "TSSetRHSJacobian")
+    return nothing
+end
+
 function _set_jacobianp!(adj::AdjointContext, ts, n, N, name, callback)
     pl, np = adj.petsclib, size(adj.pJ, 2)
     # MPIDENSE stores this rank's rows of every column, column-major, which is adj.pJ.
@@ -934,8 +1045,7 @@ function _discrete_adjoint_unlocked(
         t = nothing, dgdu_discrete = nothing, dgdp_discrete = nothing, no_start = false,
         g = nothing, dgdu_continuous = nothing, dgdp_continuous = nothing, kwargs...,
     )
-    _alg_dm(alg) === nothing ||
-        throw(ArgumentError("PETScAdjoint does not support a solve $_WITH_DM yet"))
+    dm = _alg_dm(alg)
     comm = _distributed(alg) ? alg.comm : nothing
     solve_kwargs, has_p, skip_start = _checked_everywhere(comm) do
         given = _adjoint_solve_kwargs(prob, kwargs)
@@ -947,7 +1057,7 @@ function _discrete_adjoint_unlocked(
         )
         checked = _check_adjoint_problem(
             prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, g, dgdu_continuous,
-            dgdp_continuous, comm,
+            dgdp_continuous, comm, dm,
         )
         given, checked, Bool(no_start)
     end
@@ -983,7 +1093,9 @@ function _discrete_adjoint_unlocked(
         user_t0 = Float64(prob.tspan[1])
         rhs, f_rhs = is_split ? (prob.f.f2, inplace(prob.f.f2)) : (prob.f, f_ad)
         jac, J = nothing, zeros(0, 0)
-        if !implicit || is_split
+        if dm !== nothing
+            (!implicit || is_split) && (jac = Ghosted(rhs.jac, pl, dm.ptr))
+        elseif !implicit || is_split
             jac = rhs.jac === nothing ?
                 _ad_jacobian(
                     backend, f_rhs, rhs.jac_prototype, h.u0, p, user_t0, Ref(0),
@@ -996,12 +1108,14 @@ function _discrete_adjoint_unlocked(
         end
         no_rows = (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
         rows = J isa SparseMatrixCSC && comm === nothing ? _row_structure(J, n) : no_rows
-        coo_rows, coo_cols, coo = if comm === nothing || implicit
+        coo_rows, coo_cols, coo = if comm === nothing || implicit || dm !== nothing
             nothing, nothing, nothing
         else
             _coo_structure(J, first(LibPETSc.VecGetOwnershipRange(pl, h.u)), nothing)
         end
-        paramjac(fun, f) = np == 0 ? nothing : fun.paramjac === nothing ?
+        paramjac(fun, f) = np == 0 ? nothing :
+            dm !== nothing ? Ghosted(fun.paramjac, pl, dm.ptr) :
+            fun.paramjac === nothing ?
             _ad_paramjacobian(backend, f, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE) :
             user_jac(fun.paramjac)
         context(jac, J, rows, paramjac, pscale, coo) = AdjointContext(
@@ -1036,8 +1150,14 @@ function _discrete_adjoint_unlocked(
         adjptr = pointer_from_objref(adj)
         GC.@preserve ctx adj q ex begin
             integral && _set_integral!(q, ts, np)
-            implicit || _set_rhs_jacobian!(adj, ts, n, N, coo_rows, coo_cols)
-            is_split && _set_rhs_jacobian!(ex, ts, n, N, nothing, nothing)
+            implicit || (
+                dm === nothing ? _set_rhs_jacobian!(adj, ts, n, N, coo_rows, coo_cols) :
+                    _set_dm_rhs_jacobian!(adj, ts)
+            )
+            is_split && (
+                dm === nothing ? _set_rhs_jacobian!(ex, ts, n, N, nothing, nothing) :
+                    _set_dm_rhs_jacobian!(ex, ts)
+            )
             if np > 0
                 implicit ?
                     _set_jacobianp!(adj, ts, n, N, :TSSetIJacobianP, ADJ_IJACOBIANP_PTR[]) :
