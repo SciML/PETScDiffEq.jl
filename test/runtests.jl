@@ -2544,6 +2544,52 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
         end
 
+        Sys.WORD_SIZE == 64 && @testset "both solve on a communicator of one rank" begin
+            comm = MPI.COMM_WORLD
+            fd = PETScDiffEq.AutoFiniteDiff()
+            proto = sparse(ones(3, 3))
+            rober_dae_jac!(J, du, u, p, gamma, t) =
+                (rober_jac!(J, u, p, t); J[1, 1] -= gamma; J[2, 2] -= gamma; nothing)
+            function rober_dae(jac)
+                kw = jac ? (; jac = rober_dae_jac!, jac_prototype = proto) :
+                    (; jac_prototype = proto)
+                return SciMLBase.DAEProblem(
+                    SciMLBase.DAEFunction(rober_residual!; kw...), zeros(3), bad, span;
+                    differential_vars = [true, true, false],
+                )
+            end
+            bdf, dae_alg = PETScDiffEq.TSImplicit("bdf"; comm), PETScDiffEq.TSDAE(; comm)
+            serial_bdf = PETScDiffEq.TSImplicit("bdf"; autodiff = fd)
+            serial_dae = PETScDiffEq.TSDAE(; autodiff = fd)
+            for jac in (true, false), init in (brown, shampine)
+                kw = jac ? (; jac = rober_jac!, jac_prototype = proto) : (; jac_prototype = proto)
+                for (prob, alg, serial) in (
+                        (mass(bad; kw...), bdf, serial_bdf),
+                        (rober_dae(jac), dae_alg, serial_dae),
+                    )
+                    sol = SciMLBase.solve(prob, alg; initializealg = init, tol...)
+                    ref = SciMLBase.solve(prob, serial; initializealg = init, tol...)
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test sol.u[1] != bad
+                    @test maximum(abs, sol.u[1] - ref.u[1]) <= 1.0e-14
+                    @test isapprox(sol.u[end], ref.u[end]; rtol = 1.0e-12)
+                end
+            end
+            hopeless = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (du[1] = -u[1]; du[2] = u[2]^2 + 1; nothing);
+                    mass_matrix = Diagonal([1.0, 0.0]), jac_prototype = sparse(ones(2, 2)),
+                ), [1.0, 0.0], (0.0, 1.0),
+            )
+            for init in (brown, shampine)
+                sol = SciMLBase.solve(
+                    hopeless, PETScDiffEq.TSImplicit("bdf"; comm); initializealg = init,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.InitialFailure
+                @test sol.t == [0.0]
+            end
+        end
+
         @testset "initialize_dae! runs it on the integrator's state" begin
             calls = Ref(0)
             counted!(du, u, p, t) = (calls[] += 1; du[1] = -u[1]; nothing)
@@ -5893,9 +5939,13 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         )
         @test with_ad.t == plain.t
         @test with_ad.u == plain.u
-        @test_throws "on an explicit method" SciMLBase.solve(
-            dm_prob((0.0, 0.1)), PETScDiffEq.TSRK(; dm = da); dt = 1.0e-3,
-        )
+        empty!(seen)
+        @test SciMLBase.solve(dm_prob((0.0, 0.1)), PETScDiffEq.TSRK(; dm = da); dt = 1.0e-3).u ==
+            SciMLBase.solve(
+            SciMLBase.ODEProblem(heat_dm!, u0, (0.0, 0.1), da), PETScDiffEq.TSRK(; dm = da);
+            dt = 1.0e-3,
+        ).u
+        @test isempty(seen)
         @test_throws "has to be in place" SciMLBase.solve(
             SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction{false}((u, p, t) -> -u; jac = (u, p, t) -> nothing), u0,
@@ -5906,6 +5956,45 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test_throws "leave out `jac_prototype`" SciMLBase.solve(
             dm_prob((0.0, 0.1); jac_prototype = proto), PETScDiffEq.TSImplicit("bdf"; dm = da),
         )
+        algebraic(i) = i % 4 == 0
+        function chain_dm!(du, u, da, t)
+            U = PETScDiffEq.reshape_local_array(u, da)
+            D = PETScDiffEq.reshape_local_array(du, da)
+            for i in axes(D, 2)
+                l, c, r = U[1, i - 1], U[1, i], U[1, i + 1]
+                D[1, i] = algebraic(i) ? c^3 + c - (l + r) / 2 - 0.1 : l - 2c + r
+            end
+            return nothing
+        end
+        function chain_jac_dm!(J, u, da, t)
+            U = PETScDiffEq.reshape_local_array(u, da)
+            for i in 1:N
+                c = U[1, i]
+                vals = algebraic(i) ? (-0.5, 3c^2 + 1, -0.5) : (1.0, -2.0, 1.0)
+                set_stencil_values!(J, (1, i), ((1, i - 1), (1, i), (1, i + 1)), vals)
+            end
+            return nothing
+        end
+        chain(; kw...) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(
+                chain_dm!; mass_matrix = Diagonal([algebraic(i) ? 0.0 : 1.0 for i in 1:N]), kw...,
+            ), u0, (0.0, 0.1), da,
+        )
+        bdf = PETScDiffEq.TSImplicit("bdf"; dm = da)
+        for init in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            with_jac = SciMLBase.init(
+                chain(; jac = chain_jac_dm!), bdf; initializealg = init, tol...,
+            )
+            plain = SciMLBase.init(chain(), bdf; initializealg = init, tol...)
+            @test with_jac.u == plain.u != u0
+            for integ in (with_jac, plain)
+                SciMLBase.set_u!(integ, integ.u .+ 0.05)
+                SciMLBase.initialize_dae!(integ)
+            end
+            @test with_jac.u == plain.u
+            SciMLBase.terminate!(with_jac)
+            SciMLBase.terminate!(plain)
+        end
         PETScDiffEq.PETScCompat.destroy!(da)
     end
 
@@ -9345,6 +9434,201 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test single[1] isa typeof(make(Float32.(θ0), (0.0f0, 1.0f0)).u0)
             @test collect(single[1]) == Float32.(collect(double[1]))
             @test single[2] == Float32.(double[2])
+        end
+
+        @testset "a solve with a dm" begin
+            PETSc, LibPETSc = PETScDiffEq.PETSc, PETScDiffEq.LibPETSc
+            grid(u, da) = PETScDiffEq.reshape_local_array(u, da)
+            pl = PETSc.getlib(; PetscScalar = Float64)
+            N = 15
+            dx = 1 / (N + 1)
+            da = PETSc.DMDA(pl, MPI.COMM_SELF, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), 1, 1)
+            source(i) = i * dx * (1 - i * dx)
+            function rd_dm!(du, u, p, t)
+                U, D = grid(u, da), grid(du, da)
+                for i in 1:N
+                    D[1, i] = p[1] * ((U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2) +
+                        p[2] * source(i) - p[3] * U[1, i]^3
+                end
+                return nothing
+            end
+            function rd_jac_dm!(J, u, p, t)
+                U = grid(u, da)
+                for i in 1:N
+                    row = (p[1] / dx^2, -2p[1] / dx^2 - 3p[3] * U[1, i]^2, p[1] / dx^2)
+                    set_stencil_values!(J, (1, i), ((1, i - 1), (1, i), (1, i + 1)), row)
+                end
+                return nothing
+            end
+            function rd_paramjac_dm!(pJ, u, p, t)
+                U = grid(u, da)
+                L, S, C = (grid(view(pJ, :, k), da) for k in 1:3)
+                for i in 1:N
+                    L[1, i] = (U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2
+                    S[1, i] = source(i)
+                    C[1, i] = -U[1, i]^3
+                end
+                return nothing
+            end
+            at(u, i) = 1 <= i <= N ? u[i] : 0.0
+            laplacian(u, i) = (at(u, i - 1) - 2u[i] + at(u, i + 1)) / dx^2
+            function rd!(du, u, p, t)
+                for i in 1:N
+                    du[i] = p[1] * laplacian(u, i) + p[2] * source(i) - p[3] * u[i]^3
+                end
+                return nothing
+            end
+            function rd_jac!(J, u, p, t)
+                for i in 1:N, j in max(1, i - 1):min(N, i + 1)
+                    J[i, j] = i == j ? -2p[1] / dx^2 - 3p[3] * u[i]^2 : p[1] / dx^2
+                end
+                return nothing
+            end
+            function rd_paramjac!(pJ, u, p, t)
+                for i in 1:N
+                    pJ[i, 1], pJ[i, 2], pJ[i, 3] = laplacian(u, i), source(i), -u[i]^3
+                end
+                return nothing
+            end
+            q0 = [0.8, 1.5, 0.5]
+            v0 = sinpi.((1:N) .* dx)
+            on_dm(tspan = (0.0, 0.1); p = q0, u0 = v0, jac = rd_jac_dm!, paramjac = rd_paramjac_dm!) =
+                SciMLBase.ODEProblem(SciMLBase.ODEFunction(rd_dm!; jac, paramjac), u0, tspan, p)
+            plain(tspan = (0.0, 0.1); p = q0) = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(rd!; jac = rd_jac!, paramjac = rd_paramjac!), v0, tspan, p,
+            )
+            weights = (1:N) .* dx
+            cost(u, p) = sum(abs2, u) / 2 + p[2] * sum(u .* weights)
+            cost_du!(out, u, p, t, i...) = (out .= u .+ p[2] .* weights; nothing)
+            cost_dp!(out, u, p, t, i...) = (fill!(out, 0.0); out[2] = sum(u .* weights); nothing)
+            times = collect(0.0:0.01:0.1)
+            function dm_grad(prob, alg; t = times, dgdu_discrete = cost_du!, kw...)
+                du0, dp = PETScDiffEq._discrete_adjoint(
+                    prob, alg, PETScAdjoint(); t, dgdu_discrete, dt = 1.0e-3, adaptive = false,
+                    kw...,
+                )
+                return vcat(du0, vec(dp))
+            end
+            beuler(; kw...) = TSImplicit("beuler", exact; kw...)
+            cn(; kw...) = TSImplicit("cn", exact; kw...)
+            methods = (
+                ("RK4", (; kw...) -> TSRK("4"; kw...)), ("backward Euler", beuler),
+                ("Crank-Nicolson", cn), ("theta 0.7", (; kw...) -> TSImplicit("theta", 0.7, exact; kw...)),
+                ("ARKIMEX l2", (; kw...) -> TSARKIMEX("l2", exact; kw...)),
+            )
+            # Measured: within 5.1e-16 of the adjoint without the DM and 1.2e-9 of the differences.
+            @testset "matches the adjoint without the DM and finite differences: $name" for (
+                    name, make,
+                ) in methods
+                for (tspan, t, p) in (
+                        ((0.0, 0.1), times, q0),
+                        ((0.1, 0.0), reverse(times), [-q0[1], q0[2], -q0[3]]),
+                    )
+                    got = dm_grad(on_dm(tspan; p), make(; dm = da); t, dgdp_discrete = cost_dp!)
+                    ref = dm_grad(plain(tspan; p), make(); t, dgdp_discrete = cost_dp!)
+                    @test relerr(got, ref) < 1.0e-14
+                end
+                alg = make(; dm = da)
+                function loss(θ)
+                    sol = SciMLBase.solve(
+                        on_dm(; u0 = θ[1:N], p = θ[(N + 1):end]), alg; dt = 1.0e-3,
+                        adaptive = false, saveat = times,
+                    )
+                    return sum(cost(u, θ[(N + 1):end]) for u in sol.u)
+                end
+                got = dm_grad(on_dm(), alg; dgdp_discrete = cost_dp!)
+                @test relerr(got, central_differences(loss, vcat(v0, q0))) < 5.0e-9
+            end
+
+            @testset "the costs get the owned state as the solve saves it" begin
+                seen = Vector{Float64}[]
+                record(out, u, p, t, i) = (push!(seen, copy(u)); out .= u; nothing)
+                dm_grad(on_dm(), TSRK("4"; dm = da); dgdu_discrete = record)
+                sol = SciMLBase.solve(
+                    on_dm(), TSRK("4"; dm = da); dt = 1.0e-3, adaptive = false, saveat = times,
+                )
+                @test reverse(seen) == sol.u
+            end
+
+            @testset "integral costs, an adaptive solve and a split problem, as without it" begin
+                g(u, p, t) = cost(u, p)
+                gu!(out, u, p, t) = cost_du!(out, u, p, t)
+                gp!(out, u, p, t) = cost_dp!(out, u, p, t)
+                for (make, costs) in (
+                        ((; kw...) -> TSRK("4"; kw...), (; g)),
+                        (cn, (; dgdu_continuous = gu!, dgdp_continuous = gp!)),
+                    )
+                    cost_kw = (; t = nothing, dgdu_discrete = nothing, costs...)
+                    got = dm_grad(on_dm(), make(; dm = da); cost_kw...)
+                    @test relerr(got, dm_grad(plain(), make(); cost_kw...)) < 1.0e-14
+                end
+                adaptive = (; t = [0.0, 0.1], adaptive = true, abstol = 1.0e-8, reltol = 1.0e-8)
+                got = dm_grad(on_dm(), TSRK("5dp"; dm = da); adaptive...)
+                @test relerr(got, dm_grad(plain(), TSRK("5dp"); adaptive...)) < 1.0e-14
+                f1_dm!(du, u, p, t) = rd_dm!(du, u, [p[1], 0.0, 0.0], t)
+                f2_dm!(du, u, p, t) = rd_dm!(du, u, [0.0, p[2], p[3]], t)
+                halves = SciMLBase.SplitODEProblem(
+                    SciMLBase.ODEFunction(
+                        f1_dm!; jac = (J, u, p, t) -> rd_jac_dm!(J, u, [p[1], 0.0, 0.0], t),
+                        paramjac = (pJ, u, p, t) -> (rd_paramjac_dm!(pJ, u, p, t); pJ[:, 2:3] .= 0),
+                    ),
+                    SciMLBase.ODEFunction(
+                        f2_dm!; jac = (J, u, p, t) -> rd_jac_dm!(J, u, [0.0, 0.0, p[3]], t),
+                        paramjac = (pJ, u, p, t) -> (rd_paramjac_dm!(pJ, u, p, t); pJ[:, 1] .= 0),
+                    ),
+                    v0, (0.0, 0.1), q0,
+                )
+                summed = SciMLBase.SplitODEProblem(
+                    (du, u, p, t) -> rd!(du, u, [p[1], 0.0, 0.0], t),
+                    (du, u, p, t) -> rd!(du, u, [0.0, p[2], p[3]], t), v0, (0.0, 0.1), q0,
+                )
+                got = dm_grad(halves, TSARKIMEX("3", exact; dm = da); dgdp_discrete = cost_dp!)
+                ref = dm_grad(summed, TSARKIMEX("3", exact); dgdp_discrete = cost_dp!)
+                @test relerr(got, ref) < 1.0e-14
+            end
+
+            @testset "an explicit solve takes the jac and ignores it" begin
+                fixed = (; dt = 1.0e-3, adaptive = false)
+                @test SciMLBase.solve(on_dm(), TSRK("4"; dm = da); fixed...).u ==
+                    SciMLBase.solve(on_dm(; jac = nothing), TSRK("4"; dm = da); fixed...).u
+            end
+
+            @testset "what it refuses with a dm" begin
+                pl32 = PETSc.getlib(; PetscScalar = Float32)
+                PETScDiffEq.PETScCompat.isinitialized(pl32) || PETSc.initialize(pl32)
+                da32 = PETSc.DMDA(pl32, MPI.COMM_SELF, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), 1, 1)
+                swing = SciMLBase.DynamicalODEProblem(
+                    (dv, v, u, p, t) -> (dv .= -u; nothing), (du, v, u, p, t) -> (du .= v; nothing),
+                    v0, v0, (0.0, 0.1),
+                )
+                for (message, call) in (
+                        (
+                            "PETScAdjoint needs the ODEFunction's `jac` with a `dm`",
+                            () -> dm_grad(on_dm(; jac = nothing), TSRK("4"; dm = da)),
+                        ),
+                        (
+                            "PETScAdjoint needs the ODEFunction's `jac` with a `dm`",
+                            () -> dm_grad(on_dm(; jac = nothing), TSImplicit("cn"; dm = da)),
+                        ),
+                        (
+                            "PETScAdjoint needs the ODEFunction's `paramjac` with a `dm`",
+                            () -> dm_grad(on_dm(; paramjac = nothing), cn(; dm = da)),
+                        ),
+                        (
+                            "PETScAdjoint runs in PETSc's double real build, so its `dm` has to " *
+                                "belong to that build, not to the Float32 real one",
+                            () -> dm_grad(on_dm(), TSRK("4"; dm = da32)),
+                        ),
+                        (
+                            "PETScAdjoint takes an ODEProblem or a SplitODEProblem with a `dm`",
+                            () -> dm_grad(swing, TSRK("4"; dm = da)),
+                        ),
+                    )
+                    @test_throws "ArgumentError: $message" call()
+                end
+                PETScDiffEq.PETScCompat.destroy!(da32)
+            end
+            PETScDiffEq.PETScCompat.destroy!(da)
         end
 
         @testset "what it refuses, and why" begin

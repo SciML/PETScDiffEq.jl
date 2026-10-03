@@ -273,8 +273,19 @@ The two that solve use PETSc's SNES with the Jacobian the solve itself uses: the
 `jac`, the ForwardDiff one or PETSc's finite differences, sparse under a `jac_prototype`. So
 they take no `nlsolve`, and when SNES fails the solve returns at `t0` with
 `ReturnCode.InitialFailure`. A start that already passes the check is left untouched, and
-`reinit!` initializes again unless given `reinit_dae = false`. They do not run on a
-communicator other than `MPI.COMM_SELF`, where `CheckInit()` still checks the whole state.
+`reinit!` initializes again unless given `reinit_dae = false`.
+
+On a communicator other than `MPI.COMM_SELF` they run wherever they run serially, and SNES
+solves the whole state on the communicator, each rank its own rows, with the distributed
+Jacobian of the solve: the problem's `jac` filling this rank's rows of the sparse
+`jac_prototype`, or PETSc's colouring of that prototype, and with a `dm` the DM's colouring,
+whether or not the problem has a `jac`. Its linear solves are GMRES with block Jacobi, one
+ILU(0) block on each rank, to a relative tolerance of the square root of the precision's
+spacing, and the solve's `petsc_options` do not reach them. A row `BrownFullBasicInit()` does
+not solve keeps its variable there, so it takes a mass matrix whose zero columns are its zero
+rows, as a `Diagonal` one's are, and refuses a sparse one where they differ. When SNES fails
+the solve returns at `t0` with `ReturnCode.InitialFailure` on every rank, and an `f` or `jac`
+that throws on some ranks makes every rank throw, as in a solve.
 
 `OverrideInit()` goes through SciMLBase's `get_initial_values`, as OrdinaryDiffEq's does, and
 PETSc's SNES solves the initialization system with a finite-difference Jacobian, to the
@@ -370,7 +381,8 @@ checked. The explicit methods take any `f`.
 With SciMLSensitivity loaded, `adjoint_sensitivities(sol, alg; sensealg = PETScAdjoint(), ...)`
 runs PETSc's own discrete adjoint for `TSRK`, `TSARKIMEX` and `TSImplicit`'s `"beuler"`,
 `"cn"` and `"theta"`, for discrete costs, integral costs through PETSc's quadrature `TS`, or
-both; `TSARKIMEX` takes a `SplitODEProblem` too, and discrete costs only. The keywords
+both; `TSARKIMEX` takes a `SplitODEProblem` too, and discrete costs only. It runs
+distributed over a `comm` and on a DMDA as well, as the MPI section describes. The keywords
 that set the steps have to be repeated from `solve`. It runs in PETSc's double
 real build, so a `Float32` problem is differentiated in `Float64` and its gradients come
 back as `Float32`, and a complex one is refused. `?PETScAdjoint` and the documentation cover
@@ -583,9 +595,9 @@ into PETSc's `shift * M - J` itself. A `DAEProblem`'s `jac(J, du, u, p, gamma, t
 ghosted and `du` owned, and writes PETSc's whole `dG/du + gamma dG/du'`. `jac` runs on every
 rank at every Jacobian, so anything collective in it has to be called on all of them in the
 same order, and it has to be in place: an out-of-place one is refused, as is a
-`jac_prototype`, since the DM gives the pattern, and a `jac` on an explicit method, which
-would never use it. `autodiff` is ignored with a `jac`. The heat equation above with its
-Jacobian, whose columns past the ends of the grid are dropped:
+`jac_prototype`, since the DM gives the pattern. An explicit method takes a `jac` and ignores
+it in its own solve, for `PETScAdjoint`. `autodiff` is ignored with a `jac`. The heat
+equation above with its Jacobian, whose columns past the ends of the grid are dropped:
 
 ```julia
 function heat_jac!(J, u, da, t)
@@ -607,8 +619,24 @@ and `du` owned. Everything else the package calls, such as a callback, `unstable
 DM itself stays free for further solves. A DMDA on `MPI.COMM_SELF`, or on a single rank, gives
 a serial solve. Only a DMDA is taken so far.
 
-A solve with a `dm` refuses `TSIRK`, `TSMPRK`, an implicit `TSGeneric` and `PETScAdjoint`
-with an `ArgumentError`. A distributed solve, with a `dm` or without, is refused inside
+`PETScAdjoint` runs with a `dm` too, for the methods and discrete costs it takes on a `comm`,
+and on a DM of a single rank for integral costs and a `SplitODEProblem` with `TSARKIMEX` as
+well. It needs the problem's `jac`, filling the DM's matrix as above, and when there are
+parameters a `paramjac(pJ, u, p, t)` that gets `u` ghosted and fills this rank's rows of `pJ`
+in the DM's order, a column per entry of `p`, which
+`PETScDiffEq.reshape_local_array(view(pJ, :, k), dm)` indexes by grid point; a
+`SplitODEProblem` needs `f2`'s as well. Neither is built when missing: automatic
+differentiation would not see the ghosted array, and colouring only approximates the
+Jacobian, which moved the gradient by up to 3.5e-9 in a reaction-diffusion test and which
+PETSc's `TSARKIMEX` adjoint cannot use at all. The rest follows the distributed adjoint above:
+the cost functions get this rank's block of the state as `solve` saves it, not the ghosted
+array, `du0` comes back as that block and `dp` whole on every rank, and a function that
+throws on some ranks makes every rank throw. On 1-D and 2-D DMDAs of 1 to 3 ranks the
+gradient agreed with the comm-mode and serial adjoints of the same discretization to 2e-15
+and with central differences of the same fixed-step solve to 1.4e-9.
+
+A solve with a `dm` refuses `TSIRK`, `TSMPRK` and an implicit `TSGeneric` with an
+`ArgumentError`. A distributed solve, with a `dm` or without, is refused inside
 `Threads.@threads` on more than one thread, as `EnsembleThreads` runs its trajectories:
 nothing there keeps the ranks' solves in the same order, and ranks taking them in different
 orders run different solves as one and can return wrong results without an error.
