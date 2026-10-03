@@ -400,7 +400,7 @@ x = (8rank .+ (1:8)) .* dx
 function heat!(du, u, p, t)
     left = rank == 0 ? MPI.PROC_NULL : rank - 1
     right = rank == nranks - 1 ? MPI.PROC_NULL : rank + 1
-    gl, gr = zeros(1), zeros(1)
+    gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
     MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
     MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
     for i in eachindex(u)
@@ -474,9 +474,22 @@ sol = solve(ODEProblem(f, sinpi.(x), (0.0, 0.1)), TSImplicit("bdf"; comm))
 
 Without a `jac`, `autodiff` defaults to `AutoFiniteDiff()` on such a `comm`: PETSc colours the
 prototype's pattern and differences `f`, calling it the same number of times on every rank.
-ForwardDiff and the other `autodiff` backends are refused there, since the number of times
-they call `f` differs between ranks. So are a `jac` or colouring without a sparse prototype,
-a dense mass matrix, and `TSIRK` without a `jac`.
+`autodiff = AutoForwardDiff()`, alone or in an `AutoSparse`, has ForwardDiff differentiate `f`
+instead. At the start rank 0 gathers every rank's rows of the prototype, colours the columns of
+the whole pattern and sends the colours back, and each rank seeds its own block of the state
+with them. Every rank then calls `f` once per chunk of colours, and the dual numbers `f` sends
+in its halo exchange carry the other ranks' share of each derivative, so `f`'s buffers have to
+take `u`'s element type, as `zeros(eltype(u), 1)` above does. With `zeros(1)` the rank that
+receives a dual number throws in the middle of the exchange and the ranks hang, which is one
+reason it is not the default. On 1 to 3 ranks, including one holding no rows, the Jacobians of
+the heat equation and of a Brusselator matched those of a serial ForwardDiff solve and of a
+hand-written `jac` bit for bit, and the solves matched the `jac`'s exactly. Nor is it reliably
+cheaper on a stiff problem: on twelve Robertson cells coupled by diffusion, with `"bdf"` at
+`abstol = 1e-10` and `reltol = 1e-6`, it took at most the colouring's Newton iterations to
+t = 1e5 with a third of the calls to `f`, but to t = 1e11 it took 31% fewer on one rank and 47%
+more on three. Other backends are refused there, since `f` would have to carry their derivatives
+through its own communication. So are a `jac`, PETSc's colouring or ForwardDiff without a sparse
+prototype, a dense mass matrix, and `TSIRK` without a `jac` or `AutoForwardDiff()`.
 
 A mass matrix is a `Diagonal` of this rank's entries, or a sparse matrix holding this rank's
 rows with global column indices, as the prototype does, such as a finite element mass
@@ -501,9 +514,9 @@ takes other steps than a serial solve and ends with another error, larger or sma
 `PETScAdjoint` runs distributed too, for `TSRK`, `TSARKIMEX` on an `ODEProblem` and
 `TSImplicit`'s `"beuler"`, `"cn"` and `"theta"`. It needs the problem's `jac`, filling this
 rank's rows of a sparse prototype as above, and when there are parameters a `paramjac`
-filling this rank's rows, since automatic differentiation would call `f` a different number
-of times on each rank; both are collective like `f`. An explicit method takes such a `jac`
-in its own solve too, and ignores it there. `dgdu_discrete` gets this rank's rows of the
+filling this rank's rows, since it builds neither by automatic differentiation there; both
+are collective like `f`. An explicit method takes such a `jac` in its own solve too, and
+ignores it there. `dgdu_discrete` gets this rank's rows of the
 state and writes their gradient, and `dgdp_discrete` gives this rank's share of the cost's
 direct derivative with respect to `p`, which the ranks add up. `du0` comes back as this
 rank's rows and `dp` as the whole gradient, the same on every rank. The cost times,

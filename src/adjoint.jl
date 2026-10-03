@@ -625,8 +625,8 @@ function _check_adjoint_problem(
     end
     comm === nothing || prob.f.jac !== nothing || throw(
         ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `jac` $_NOT_SELF, since automatic " *
-                "differentiation would call `f` a different number of times on each rank",
+            "PETScAdjoint needs the ODEFunction's `jac` $_NOT_SELF, where it builds none " *
+                "by automatic differentiation",
         ),
     )
     p = prob.p
@@ -649,8 +649,7 @@ function _check_adjoint_problem(
     has_p && !isempty(p) && comm !== nothing && prob.f.paramjac === nothing && throw(
         ArgumentError(
             "PETScAdjoint needs the ODEFunction's `paramjac` $_NOT_SELF when the problem has " *
-                "parameters, since automatic differentiation would call `f` a different " *
-                "number of times on each rank",
+                "parameters, where it builds none by automatic differentiation",
         ),
     )
     for (name, given) in (("dgdp_discrete", dgdp_discrete), ("dgdp_continuous", dgdp_continuous))

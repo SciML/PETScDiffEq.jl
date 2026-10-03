@@ -5523,6 +5523,47 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws r"ADTypes backend" PETScDiffEq.TSRosW(; autodiff = :forward)
             @test PETScDiffEq.TSDAE().autodiff isa PETScDiffEq.AutoForwardDiff
         end
+
+        Sys.WORD_SIZE == 64 && @testset "on a communicator the whole pattern is coloured" begin
+            n = 30
+            h2 = (n + 1)^2
+            function cubic_heat!(du, u, p, t)
+                for i in 1:n
+                    l = i > 1 ? u[i - 1] : zero(eltype(u))
+                    r = i < n ? u[i + 1] : zero(eltype(u))
+                    du[i] = h2 * (l - 2u[i] + r) - u[i]^3
+                end
+                return nothing
+            end
+            function cubic_heat_jac!(J, u, p, t)
+                for i in 1:n
+                    J[i, i] = -2h2 - 3u[i]^2
+                    i > 1 && (J[i, i - 1] = h2)
+                    i < n && (J[i, i + 1] = h2)
+                end
+                return nothing
+            end
+            proto = spdiagm(-1 => ones(n - 1), 0 => ones(n), 1 => ones(n - 1))
+            problem(; kw...) = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(cubic_heat!; jac_prototype = proto, kw...),
+                [sin(pi * i / (n + 1)) for i in 1:n], (0.0, 0.1),
+            )
+            ad = PETScDiffEq.AutoForwardDiff()
+            world = MPI.COMM_WORLD
+            tight = (; abstol = 1.0e-8, reltol = 1.0e-8)
+            for make in (kw -> PETScDiffEq.TSImplicit("bdf"; kw...), kw -> PETScDiffEq.TSRosW(; kw...))
+                sol = SciMLBase.solve(problem(), make((; comm = world, autodiff = ad)); tight...)
+                given = SciMLBase.solve(
+                    problem(; jac = cubic_heat_jac!), make((; comm = world)); tight...,
+                )
+                serial = SciMLBase.solve(problem(), make((; autodiff = ad)); tight...)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.stats.njacs == given.stats.njacs > 0
+                @test sol.t == given.t
+                @test sol.u == given.u
+                @test sol.u[end] ≈ serial.u[end] rtol = 1.0e-9
+            end
+        end
     end
 
     @testset "TSGeneric convergence order" begin

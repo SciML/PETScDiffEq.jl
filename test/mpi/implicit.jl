@@ -73,7 +73,7 @@ end
 function halo(u)
     left = rank == 0 ? MPI.PROC_NULL : rank - 1
     right = rank == nranks - 1 ? MPI.PROC_NULL : rank + 1
-    gl, gr = zeros(1), zeros(1)
+    gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
     MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
     MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
     return gl[1], gr[1]
@@ -493,6 +493,77 @@ const METHODS = (
         end
     end
 
+    @testset "AutoForwardDiff colours the whole pattern for every rank" begin
+        ad = AutoForwardDiff()
+        heat(idx, f; jac = false) = ODEProblem(heat_function(f, idx; jac), heat0(idx), SPAN)
+        calls = Ref(0)
+        counting(f) = (du, u, p, t) -> (calls[] += 1; f(du, u, p, t))
+        for (make, err) in METHODS
+            calls[] = 0
+            sol = compare(
+                heat(rows, counting(heat!)), make(comm; autodiff = ad), heat(1:N, heat_serial!),
+                make(MPI.COMM_SELF; autodiff = ad), heat_exact(SPAN[2]), err; TOL...,
+            )
+            @test sol.stats.njacs > 0
+            @test same_everywhere(calls[])
+            @test same_everywhere(sol.stats.nf)
+            given = solve(heat(rows, heat!; jac = true), make(comm); TOL...)
+            @test sol.t == given.t
+            @test sol.u == given.u
+        end
+        residual(f) = (r, du, u, p, t) -> (f(r, u, p, t); r .= du .- r; nothing)
+        function dae(idx, f)
+            du0 = similar(heat0(idx))
+            f(du0, heat0(idx), nothing, 0.0)
+            fn = DAEFunction(residual(f); jac_prototype = heat_proto(idx))
+            return DAEProblem(fn, du0, heat0(idx), SPAN)
+        end
+        compare(
+            dae(rows, heat!), TSDAE("bdf"; comm, autodiff = ad), dae(1:N, heat_serial!),
+            TSDAE("bdf"; autodiff = ad), heat_exact(SPAN[2]), 1.5e-6; TOL...,
+        )
+        fade!(du, u, p, t) = (du .= -u; nothing)
+        halves(idx, f) = SplitODEProblem(heat_function(f, idx; jac = false), fade!, heat0(idx), SPAN)
+        compare(
+            halves(rows, heat!), TSARKIMEX(; comm, autodiff = ad), halves(1:N, heat_serial!),
+            TSARKIMEX(; autodiff = ad), exp(-SPAN[2]) .* heat_exact(SPAN[2]), 4.0e-8; TOL...,
+        )
+        irk_counts = even(N)
+        idx = owned(irk_counts)
+        sol = solve(heat(idx, heat!), TSIRK(2; comm, autodiff = ad); dt = 1.0e-3)
+        @test sol.retcode == ReturnCode.Success
+        us = gathered(sol, irk_counts)
+        if rank == 0
+            ref = solve(heat(1:N, heat_serial!), TSIRK(2; autodiff = ad); dt = 1.0e-3)
+            @test sol.t == ref.t
+            @test maxdiff(us, ref.u) <= SERIAL_GAP
+        end
+        prob = heat(rows, throwing(heat!, "f"))
+        @test raised(caught(() -> solve(prob, TSImplicit("bdf"; comm, autodiff = ad))), "f threw")
+        if nranks > 1
+            layout = copy(counts)
+            layout[2] += layout[1]
+            layout[1] = 0
+            function skipping!(du, u, p, t)
+                isempty(u) && return nothing
+                left = rank == 1 ? MPI.PROC_NULL : rank - 1
+                right = rank == nranks - 1 ? MPI.PROC_NULL : rank + 1
+                gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
+                MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
+                MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
+                return laplacian!(du, u, gl[1], gr[1])
+            end
+            calls[] = 0
+            sol = compare(
+                heat(owned(layout), counting(skipping!)), TSImplicit("bdf"; comm, autodiff = ad),
+                heat(1:N, heat_serial!), TSImplicit("bdf"; autodiff = ad), heat_exact(SPAN[2]),
+                1.5e-6; layout, TOL...,
+            )
+            @test isempty(sol.u[end]) == (rank == 0)
+            @test same_everywhere(calls[])
+        end
+    end
+
     @testset "refusals" begin
         n = length(rows)
         heat(fn) = ODEProblem(fn, heat0(rows), SPAN)
@@ -502,9 +573,14 @@ const METHODS = (
             () -> solve(heat(ODEFunction(heat!; jac = heat_jac(rows))), bdf), "sparse `jac_prototype`",
         )
         @test refused(() -> solve(heat(ODEFunction(heat!)), bdf), "sparse `jac_prototype`")
+        zygote = PETScDiffEq.ADTypes.AutoZygote()
         @test refused(
-            () -> solve(coloured, TSImplicit("bdf"; comm, autodiff = AutoForwardDiff())),
-            "cannot use `AutoForwardDiff()`",
+            () -> solve(coloured, TSImplicit("bdf"; comm, autodiff = zygote)),
+            "AutoZygote()` on a communicator",
+        )
+        @test refused(
+            () -> solve(heat(ODEFunction(heat!)), TSImplicit("bdf"; comm, autodiff = AutoForwardDiff())),
+            "sparse `jac_prototype`",
         )
         for alg in (TSIRK(2; comm), TSGeneric("irk"; comm))
             @test refused(() -> solve(coloured, alg; dt = 1.0e-3), "TSIRK needs a `jac`")
