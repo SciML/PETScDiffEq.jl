@@ -1419,6 +1419,64 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test PETScDiffEq.PETSc.inttype(lib) === PETScDiffEq.LibPETSc.PetscInt
     end
 
+    @testset "a Krylov dot product does not depend on where the vectors sit in memory" begin
+        pl = PETScDiffEq.PETSc.getlib(; PetscScalar = Float64)
+        lib = PETScDiffEq.LibPETSc
+        len, m = 40, 4
+        wrap(buf, off) = lib.VecCreateSeqWithArray(
+            pl, MPI.COMM_SELF, lib.PetscInt(1), lib.PetscInt(len),
+            unsafe_wrap(Array, pointer(buf, off + 1), len),
+        )
+        # These gaps fail PETSc's stride test, so only the packed copy could go through GEMV.
+        offsets = [3len + 200, 0, len + 70, 2len + 140]
+        function layout_free(state)
+            x = lib.VecDuplicate(pl, state)
+            function mdot(ys)
+                z = zeros(m)
+                PETScDiffEq._check_code(
+                    ccall(
+                        PETScDiffEq._symbol(pl, :VecMDot), PETScDiffEq.LibPETSc.PetscErrorCode,
+                        (Ptr{Cvoid}, PETScDiffEq.LibPETSc.PetscInt, Ptr{Ptr{Cvoid}}, Ptr{Float64}),
+                        x.ptr, m, [y.ptr for y in ys], z,
+                    ),
+                )
+                return z
+            end
+            agree = map(1:20) do trial
+                PETScDiffEq.PETScCompat.with_local_array!(x; read = false, write = true) do a
+                    a .= cos.(7trial .+ 3 .* (1:len))
+                end
+                Y = [sin(17trial + 3i + 5k) for i in 1:len, k in 1:m]
+                packed, scattered = vec(Y), zeros(4len + 300)
+                for k in 1:m
+                    scattered[offsets[k] .+ (1:len)] .= Y[:, k]
+                end
+                GC.@preserve packed scattered begin
+                    a = [wrap(packed, (k - 1) * len) for k in 1:m]
+                    b = [wrap(scattered, offsets[k]) for k in 1:m]
+                    same = mdot(a) == mdot(b)
+                    foreach(PETScDiffEq.PETScCompat.destroy!, [a; b])
+                    same
+                end
+            end
+            PETScDiffEq.PETScCompat.destroy!(x)
+            return all(agree)
+        end
+        first_order = SciMLBase.init(
+            SciMLBase.ODEProblem(decay!, ones(len), (0.0, 1.0)), PETScDiffEq.TSImplicit("bdf"),
+        )
+        @test layout_free(first_order.h.u)
+        SciMLBase.terminate!(first_order)
+        second_order = SciMLBase.init(
+            SciMLBase.SecondOrderODEProblem(
+                (dv, v, u, p, t) -> (dv .= -u; nothing), zeros(len), ones(len), (0.0, 1.0),
+            ),
+            PETScDiffEq.TSAlpha2(); dt = 0.01,
+        )
+        @test layout_free(second_order.h.solution)
+        SciMLBase.terminate!(second_order)
+    end
+
     @testset "which side of the bracket the root lands on" begin
         rootprob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         function crossed(rootfind)

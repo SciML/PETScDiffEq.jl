@@ -746,6 +746,54 @@ const METHODS = (
         end
     end
 
+    @testset "a Krylov dot product does not depend on where the vectors sit in memory" begin
+        pl = PETSc.getlib(; PetscScalar = Float64)
+        lib = PETScDiffEq.LibPETSc
+        integ = SciMLBase.init(
+            ODEProblem(heat_function(heat!, rows; jac = true), heat0(rows), SPAN),
+            TSImplicit("bdf"; comm); TOL...,
+        )
+        x = lib.VecDuplicate(pl, integ.h.u)
+        len, m = length(rows), 4
+        wrap(buf, off) = lib.VecCreateMPIWithArray(
+            pl, comm, lib.PetscInt(1), lib.PetscInt(len), lib.PetscInt(lib.PETSC_DECIDE),
+            unsafe_wrap(Array, pointer(buf, off + 1), len),
+        )
+        function mdot(ys)
+            z = zeros(m)
+            PETScDiffEq._check_code(
+                ccall(
+                    PETScDiffEq._symbol(pl, :VecMDot), PETScDiffEq.LibPETSc.PetscErrorCode,
+                    (Ptr{Cvoid}, PETScDiffEq.LibPETSc.PetscInt, Ptr{Ptr{Cvoid}}, Ptr{Float64}),
+                    x.ptr, m, [y.ptr for y in ys], z,
+                ),
+            )
+            return z
+        end
+        # These gaps fail PETSc's stride test, so only the packed copy could go through GEMV.
+        offsets = [3len + 200, 0, len + 70, 2len + 140]
+        agree = map(1:20) do trial
+            PETScDiffEq.PETScCompat.with_local_array!(x; read = false, write = true) do a
+                a .= cos.(7trial .+ 3 .* (1:len) .+ 11rank)
+            end
+            Y = [sin(17trial + 3i + 5k + 11rank) for i in 1:len, k in 1:m]
+            packed, scattered = vec(Y), zeros(4len + 300)
+            for k in 1:m
+                scattered[offsets[k] .+ (1:len)] .= Y[:, k]
+            end
+            GC.@preserve packed scattered begin
+                a = [wrap(packed, (k - 1) * len) for k in 1:m]
+                b = [wrap(scattered, offsets[k]) for k in 1:m]
+                same = mdot(a) == mdot(b)
+                foreach(PETScDiffEq.PETScCompat.destroy!, [a; b])
+                same
+            end
+        end
+        @test all(agree)
+        PETScDiffEq.PETScCompat.destroy!(x)
+        SciMLBase.terminate!(integ)
+    end
+
     @testset "every handle is freed" begin
         @test isempty(PETScDiffEq.PARALLEL_HANDLES)
         @test all(h -> h.destroyed, keys(PETScDiffEq.LIVE_HANDLES))

@@ -3305,10 +3305,25 @@ function _tolvec(h::TSHandles{<:Any, <:Any, R, S}, petsclib, tol, n, name) where
     return v
 end
 
-_state_vec(petsclib, ::Nothing, n) = PETScCompat.PetscVec(petsclib, n)
-_state_vec(petsclib, comm::MPI.Comm, n) = LibPETSc.VecCreateMPI(
-    petsclib, comm, LibPETSc.PetscInt(n), LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE),
-)
+# PETSc's GEMV VecMDot groups vectors by address, so Krylov sums would follow the heap layout.
+function _plain_mdot(f, petsclib)
+    opts = PETScCompat.PetscOptions(petsclib; vec_mdot_use_gemv = "0")
+    push!(opts)
+    try
+        return f()
+    finally
+        pop!(opts)
+        PETScCompat.destroy!(opts)
+    end
+end
+
+_state_vec(petsclib, ::Nothing, n) =
+    _plain_mdot(() -> PETScCompat.PetscVec(petsclib, n), petsclib)
+_state_vec(petsclib, comm::MPI.Comm, n) = _plain_mdot(petsclib) do
+    LibPETSc.VecCreateMPI(
+        petsclib, comm, LibPETSc.PetscInt(n), LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE),
+    )
+end
 _work_vec(petsclib, ::Nothing, u, n) = PETScCompat.PetscVec(petsclib, n)
 _work_vec(petsclib, ::MPI.Comm, u, n) = LibPETSc.VecDuplicate(petsclib, u)
 
@@ -3668,15 +3683,17 @@ function _set_second_order_solution!(h::TSHandles{<:Any, <:Any, <:Any, S}, nv) w
     ptr = pointer(a)
     LibPETSc.VecRestoreArrayRead(pl, h.u, a)
     comm = h.ctx.comm
-    part(p, len) = comm === nothing ?
-        LibPETSc.VecCreateSeqWithArray(
-            pl, MPI.COMM_SELF, LibPETSc.PetscInt(1), LibPETSc.PetscInt(len),
-            unsafe_wrap(Array, p, len),
-        ) :
-        LibPETSc.VecCreateMPIWithArray(
-            pl, comm, LibPETSc.PetscInt(1), LibPETSc.PetscInt(len),
-            LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), unsafe_wrap(Array, p, len),
-        )
+    part(p, len) = _plain_mdot(pl) do
+        comm === nothing ?
+            LibPETSc.VecCreateSeqWithArray(
+                pl, MPI.COMM_SELF, LibPETSc.PetscInt(1), LibPETSc.PetscInt(len),
+                unsafe_wrap(Array, p, len),
+            ) :
+            LibPETSc.VecCreateMPIWithArray(
+                pl, comm, LibPETSc.PetscInt(1), LibPETSc.PetscInt(len),
+                LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), unsafe_wrap(Array, p, len),
+            )
+    end
     v = part(ptr, nv)
     push!(h.tolvecs, v)
     u = part(ptr + nv * sizeof(S), n - nv)
