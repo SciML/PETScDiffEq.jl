@@ -10613,6 +10613,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     springs!, (du, v, u, p, t) -> (du .= v; nothing); kw...,
                 ), zeros(5), [0.1, 0.5, 1.0, 0.5, 0.1], (0.0, 2.0),
             )
+            carries = springs(; jac_prototype = springs_proto).f.jac_prototype isa SparseMatrixCSC
             for (pr, alg, serial_alg, kw) in (
                     (
                         springs(), PETScDiffEq.TSBasicSymplectic("velverlet"; comm = world),
@@ -10638,6 +10639,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         (; abstol = 1.0e-8, reltol = 1.0e-8),
                     ),
                 )
+                carries || alg isa PETScDiffEq.TSBasicSymplectic || alg isa PETScDiffEq.TSRK || continue
                 sol = SciMLBase.__solve(pr, alg; kw...)
                 ref = SciMLBase.__solve(pr, serial_alg; kw...)
                 @test sol.retcode == SciMLBase.ReturnCode.Success

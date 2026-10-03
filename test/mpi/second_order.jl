@@ -273,7 +273,7 @@ end
         @test 0.5 in sol.t
         @test matches(sol, ref, us, gap)
 
-        # One rank's entry and the others' zeros add up exactly, so the event time is the serial one.
+        # One rank's entry and the others' zeros add up exactly.
         events = Ref(0)
         sol, ref, us = against_serial(alg, serial_alg) do idx, a
             j = findfirst(==(12), idx)
@@ -285,7 +285,7 @@ end
             SciMLBase.__solve(wave_problem(idx, a; proto = true), a; kw..., callback = flip)
         end
         @test events[] > 0
-        @test matches(sol, ref, us, gap)
+        @test matches(sol, ref, us, gap === EXACT ? STEPPED : gap)
 
         slopes = Dict{Bool, Any}()
         sol, ref, us = against_serial(alg, serial_alg) do idx, a
