@@ -376,7 +376,7 @@ function _consistent_on!(
             end
         else
             clone = LibPETSc.PetscDM(_dm_vec!(pl, :DMClone, dm)[], pl)
-            xv = LibPETSc.DMCreateGlobalVector(pl, clone)
+            xv = _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(pl, clone), pl)
             A = LibPETSc.DMCreateMatrix(pl, clone)
         end
         rv = LibPETSc.VecDuplicate(pl, xv)

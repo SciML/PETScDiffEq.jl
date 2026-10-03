@@ -4426,7 +4426,7 @@ function _setup(
     end
     clone = dm === nothing ? nothing : _clone_dm(petsclib, dm)
     uvec = clone === nothing ? _state_vec(petsclib, comm, n) :
-        LibPETSc.DMCreateGlobalVector(petsclib, clone)
+        _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib)
     A = dyn && kept === nothing ? typeof(similar(prob.u0, U)) : Vector{U}
     # f scatters through the caller's DM, so the handle holds a reference to it.
     dms = clone === nothing ? Ptr{Cvoid}[] : [clone.ptr, _referenced(petsclib, dm.ptr)]
@@ -4438,7 +4438,7 @@ function _setup(
         R[], A[], A[], nothing, nothing,
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
         clone === nothing ? _work_vec(petsclib, comm, uvec, n) :
-            LibPETSc.DMCreateGlobalVector(petsclib, clone),
+            _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
         R(NaN), similar(u0), t0, copy(u0), nothing, nothing, false,
         slow_idxs, medium_idxs, fast_idxs,
@@ -4584,7 +4584,8 @@ function _setup(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
             )
             _set_tolerances!(h, something(abstol, 1.0e-6), something(reltol, 1.0e-3))
-            effective_options = ["-ts_error_if_step_fails", "false"]
+            # With a dm the Krylov vectors come from the DM inside the solve, under these options.
+            effective_options = ["-ts_error_if_step_fails", "false", "-vec_mdot_use_gemv", "0"]
             # TSSetMaxTime reads -1 as PETSC_DETERMINE; the option is stored as given.
             tf == -1 && push!(effective_options, "-ts_max_time=-1")
             append!(effective_options, _default_options(alg))
