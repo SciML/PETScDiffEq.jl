@@ -320,6 +320,11 @@ implicit.
 `"bpr3"` is refused on a `SplitODEProblem`, where it converges at first order. On a
 plain `ODEProblem` PETSc does not use its explicit tableau, and it keeps order 3.
 
+On a plain `ODEProblem`, every type but `"1bee"`, `"l2"` and `"prssp2"` has an explicit
+first stage that PETSc evaluates at a stale time on the first step when `tspan` starts
+away from 0, so those configurations are refused. A `SplitODEProblem` has no such limit.
+The refusal follows the type PETSc runs after `petsc_options`, not only the constructor.
+
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a
 sparse `jac_prototype` whose columns are global; see the MPI section of the documentation.
@@ -620,6 +625,9 @@ _uses_ifunction(alg::TSGeneric) = !alg.explicit
 const _RK_NO_ESTIMATE = ("1fe", "2b", "3", "4")
 const _ROSW_NO_ESTIMATE = ("theta1", "theta2")
 const _ARKIMEX_NO_ESTIMATE = ("prssp2", "ars443", "bpr3")
+# Types whose first stage is implicit; the rest evaluate an explicit first stage at a
+# stale time on the first step after a restart when the span does not start at 0.
+const _ARKIMEX_IMPLICIT_FIRST_STAGE = ("1bee", "l2", "prssp2")
 
 function _adapts(name::AbstractString)
     type, sub = first(split(name)), last(split(name))
@@ -3047,6 +3055,23 @@ function _refuse_method(name, has_mass, has_jac, is_split, is_dae)
     return nothing
 end
 
+function _refuse_arkimex_stale_stage(name, is_split, t0)
+    startswith(name, "arkimex ") || return nothing
+    is_split && return nothing
+    iszero(t0) && return nothing
+    sub = last(split(name))
+    sub in _ARKIMEX_IMPLICIT_FIRST_STAGE && return nothing
+    throw(
+        ArgumentError(
+            "PETScDiffEq does not support TSARKIMEX(\"$sub\") on an ODEProblem whose " *
+                "tspan starts away from 0: PETSc's arkimex evaluates this type's explicit " *
+                "first stage at a stale time (0) on the first step after a restart; " *
+                "start tspan at 0, use a SplitODEProblem, or use \"1bee\", \"l2\" or " *
+                "\"prssp2\", whose first stage is implicit",
+        ),
+    )
+end
+
 _set_subtype!(petsclib, ts, alg::TSRK) =
     PETScCompat.TSRKSetType(petsclib, ts, alg.subtype)
 _set_subtype!(petsclib, ts, alg::TSRosW) =
@@ -4153,6 +4178,9 @@ function _setup(
             comm === nothing || chosen != "irk" || _check_irk_layout(n, N, comm)
             running = _running_name(petsclib, ts)
             _refuse_method(running, has_mass, has_jac, is_split, is_dae)
+            _checked_everywhere(comm) do
+                _refuse_arkimex_stale_stage(running, is_split, t0)
+            end
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
             if chosen == "irk" && has_jac && !uses_sparse_jac
                 PETScCompat.destroy!(h.jac_mat)

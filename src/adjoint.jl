@@ -710,8 +710,6 @@ function _check_adjoint_problem(
     return has_p
 end
 
-const _ARKIMEX_IMPLICIT_FIRST_STAGE = ("1bee", "l2", "prssp2")
-
 function _check_adjoint_ts(h::TSHandles, alg, cost_s, integral, is_split)
     pl, ts = h.petsclib, h.ts
     implicit = _uses_ifunction(alg)
