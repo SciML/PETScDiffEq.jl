@@ -827,15 +827,17 @@ const METHODS = (
         @test rank == thrower ? e isa ArgumentError && occursin("must be $n x $N", e.msg) : remote(e)
     end
 
-    @testset "a Krylov dot product does not depend on where the vectors sit in memory" begin
+    @testset "a Krylov dot product does not depend on where the vectors sit in memory: $(nameof(typeof(alg)))" for alg in (
+            TSImplicit("bdf"; comm), TSIRK(2; comm),
+        )
         pl = PETSc.getlib(; PetscScalar = Float64)
         lib = PETScDiffEq.LibPETSc
         integ = SciMLBase.init(
-            ODEProblem(heat_function(heat!, rows; jac = true), heat0(rows), SPAN),
-            TSImplicit("bdf"; comm); TOL...,
+            ODEProblem(heat_function(heat!, rows; jac = true), heat0(rows), SPAN), alg;
+            TOL..., (alg isa TSIRK ? (; dt = 1.0e-3, adaptive = false) : (;))...,
         )
         x = lib.VecDuplicate(pl, integ.h.u)
-        len, m = length(rows), 4
+        len, m = Int(lib.VecGetLocalSize(pl, x)), 4
         wrap(buf, off) = lib.VecCreateMPIWithArray(
             pl, comm, lib.PetscInt(1), lib.PetscInt(len), lib.PetscInt(lib.PETSC_DECIDE),
             unsafe_wrap(Array, pointer(buf, off + 1), len),

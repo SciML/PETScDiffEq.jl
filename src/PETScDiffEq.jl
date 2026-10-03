@@ -3755,9 +3755,11 @@ _in_threads_loop() = Threads.threadpoolsize() > 1 && current_task() !== Base.roo
 function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
     pl, ctx = h.petsclib, h.ctx
     comm, n = ctx.comm, length(h.u0)
-    x = LibPETSc.VecCreateMPI(
-        pl, comm, LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), LibPETSc.PetscInt(N),
-    )
+    x = _plain_mdot(pl) do
+        LibPETSc.VecCreateMPI(
+            pl, comm, LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), LibPETSc.PetscInt(N),
+        )
+    end
     lo, hi = LibPETSc.VecGetOwnershipRange(pl, x)
     if _everywhere(comm, hi - lo == n)
         PETScCompat.destroy!(x)
