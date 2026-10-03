@@ -9432,9 +9432,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         ((; kw...) -> TSRK("4"; kw...), (; g)),
                         (cn, (; dgdu_continuous = gu!, dgdp_continuous = gp!)),
                     )
-                    integral = (; t = nothing, dgdu_discrete = nothing, costs...)
-                    got = dm_grad(on_dm(), make(; dm = da); integral...)
-                    @test relerr(got, dm_grad(plain(), make(); integral...)) < 1.0e-14
+                    cost_kw = (; t = nothing, dgdu_discrete = nothing, costs...)
+                    got = dm_grad(on_dm(), make(; dm = da); cost_kw...)
+                    @test relerr(got, dm_grad(plain(), make(); cost_kw...)) < 1.0e-14
                 end
                 adaptive = (; t = [0.0, 0.1], adaptive = true, abstol = 1.0e-8, reltol = 1.0e-8)
                 got = dm_grad(on_dm(), TSRK("5dp"; dm = da); adaptive...)
