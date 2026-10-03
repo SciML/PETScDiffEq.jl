@@ -43,9 +43,9 @@ for example `["-ts_adapt_type", "none"]`. They are parsed after the options
 this package sets, so they win.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, with `u0`
-holding this rank's rows; see the MPI section of the documentation. A `dm`, a DMDA from
-PETSc.jl, runs it on the DM's communicator and gives `f` the state ghosted from the DM, as
-that section describes.
+holding this rank's rows; see the MPI section of the documentation. A `dm`, a DMDA or a
+DMStag from PETSc.jl, runs it on the DM's communicator and gives `f` the state ghosted from
+the DM, as that section describes.
 """
 struct TSRK <: PETScTSAlgorithm
     subtype::String
@@ -1007,13 +1007,31 @@ end
 """
     PETScDiffEq.reshape_local_array(x, dm)
 
-This rank's part of a vector on the DMDA `dm`, indexed by grid point in global numbering:
-`a[c, i]` on a 1-D grid and `a[c, i, j]` on a 2-D one, where `c` runs over the degrees of
-freedom at each point. `x` can be the ghosted array `f` receives or the block of the state the
-rank owns, such as `du`, `u0` or a saved state, and `a` shares its memory. This is PETSc.jl's
-`reshape_local_array`, which PETSc.jl 0.4 calls `reshapelocalarray` and pads to three grid axes.
+This rank's part of a vector on the DMDA or DMStag `dm`, indexed by grid point in global
+numbering. `x` can be the ghosted array `f` receives or the block of the state the rank owns,
+such as `du`, `u0` or a saved state, told apart by their lengths, and `a` shares its memory.
+
+On a DMDA it is `a[c, i]` on a 1-D grid and `a[c, i, j]` on a 2-D one, where `c` runs over the
+degrees of freedom at each point. This is PETSc.jl's `reshape_local_array`, which PETSc.jl 0.4
+calls `reshapelocalarray` and pads to three grid axes.
+
+On a DMStag it is `a[loc, c, i]`, `a[loc, c, i, j]` or `a[loc, c, i, j, k]`, component `c` at
+location `loc` of element `(i, j, k)`, where `loc` is a `LibPETSc.DMStagStencilLocation` such as
+`DMSTAG_ELEMENT`, `DMSTAG_LEFT` or `DMSTAG_DOWN_LEFT`, and `c` and the elements count from 1,
+where PETSc counts from 0. On the ghosted array this is the slot `DMStagGetLocationSlot` gives
+within the element. A point on an element's upper side, such as `DMSTAG_RIGHT` or
+`DMSTAG_UP_RIGHT`, is the lower one of the next element, so on a grid of `N` elements
+`a[DMSTAG_RIGHT, c, N]` and `a[DMSTAG_LEFT, c, N + 1]` are both the last vertex. `axes(a, d)`
+is the range of elements along grid axis `d` whose points `a` holds. On the ghosted array it
+takes in the ghost elements, and on the owned block of the last rank along an axis that is not
+periodic it ends at element `N + 1`, which holds only the points on that boundary. Reading or
+writing any other point throws an `ArgumentError`, unless `@inbounds` skips the check.
 """
-reshape_local_array(x, dm) = PETScCompat.reshape_local_array(x, dm)
+reshape_local_array(x, dm) =
+    _is_stag(_dm_lib(dm), dm.ptr) ? _stag_array(x, dm) : PETScCompat.reshape_local_array(x, dm)
+@static if PETScCompat.V05
+    reshape_local_array(x, dm::PETSc.DMDA) = PETScCompat.reshape_local_array(x, dm)
+end
 
 # LibPETSc.PetscInt is a non-constant global, slow to convert to in a hot ccall.
 const _PetscInt = LibPETSc.PetscInt
@@ -1037,21 +1055,267 @@ function _stencil(I::Tuple)
     return _Stencil(k - 1, j - 1, i - 1, c - 1)
 end
 _stencil(I) = throw(ArgumentError("$_GRID_INDEX; got $(repr(I))"))
+_stencil(I::Tuple{LibPETSc.DMStagStencilLocation, Vararg}) = throw(
+    ArgumentError("$(repr(I)) is a point of a DMStag, but this matrix is not a DMStag's"),
+)
+
+# PETSc's DMStagStencil, in its field order.
+struct _StagStencil
+    loc::Cint
+    i::_PetscInt
+    j::_PetscInt
+    k::_PetscInt
+    c::_PetscInt
+end
+
+function _is_stag(pl, dm, flag = Ref{Cint}(0))
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscObjectTypeCompare), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Cstring, Ptr{Cint}), dm, "stag", flag,
+        ),
+    )
+    return flag[] != 0
+end
+
+# Elements an array holds, 0-based; `sz` counts the owned block's element past a closed end.
+struct _StagBox
+    dim::Int
+    dof::NTuple{4, Int}
+    lo::NTuple{3, Int}
+    sz::NTuple{3, Int}
+    n::NTuple{3, Int}
+end
+
+const _Err = LibPETSc.PetscErrorCode
+const _P = Ptr{_PetscInt}
+
+function _stag_box!(ints, pl, dm, owned)
+    GC.@preserve ints begin
+        p, s = pointer(ints), sizeof(_PetscInt)
+        _check_code(ccall(_symbol(pl, :DMGetDimension), _Err, (Ptr{Cvoid}, _P), dm, p))
+        _check_code(
+            ccall(
+                _symbol(pl, :DMStagGetDOF), _Err, (Ptr{Cvoid}, _P, _P, _P, _P),
+                dm, p + s, p + 2s, p + 3s, p + 4s,
+            ),
+        )
+        if owned
+            _check_code(
+                ccall(
+                    _symbol(pl, :DMStagGetCorners), _Err,
+                    (Ptr{Cvoid}, _P, _P, _P, _P, _P, _P, _P, _P, _P),
+                    dm, p + 5s, p + 6s, p + 7s, p + 8s, p + 9s, p + 10s, p + 11s, p + 12s, p + 13s,
+                ),
+            )
+        else
+            _check_code(
+                ccall(
+                    _symbol(pl, :DMStagGetGhostCorners), _Err, (Ptr{Cvoid}, _P, _P, _P, _P, _P, _P),
+                    dm, p + 5s, p + 6s, p + 7s, p + 8s, p + 9s, p + 10s,
+                ),
+            )
+        end
+    end
+    dim = Int(ints[1])
+    on(k, x, y) = k <= dim ? Int(x) : y
+    n = ntuple(k -> on(k, ints[8 + k], 1), Val(3))
+    extra = owned ? ntuple(k -> on(k, ints[11 + k], 0), Val(3)) : (0, 0, 0)
+    return _StagBox(
+        dim, ntuple(k -> Int(ints[1 + k]), Val(4)), ntuple(k -> on(k, ints[5 + k], 0), Val(3)),
+        n .+ extra, n,
+    )
+end
+
+# Locations count from 1 in base 3, axis 1 fastest: 0 below, 1 within, 2 above.
+@inline function _stag_point(box::_StagBox, loc, I)
+    v = Int(loc) - 1
+    d = (v % 3, (v ÷ 3) % 3, v ÷ 9)
+    l = ntuple(k -> (k <= length(I) ? Int(I[k]) : 1) - 1 + (d[k] == 2) - box.lo[k], Val(3))
+    b = ((d[1] == 1) + 2 * (d[2] == 1) + 4 * (d[3] == 1)) & ((1 << box.dim) - 1)
+    m = (l[1] == box.n[1]) + 2 * (l[2] == box.n[2]) + 4 * (l[3] == box.n[3])
+    return v, d, l, b, m
+end
+
+@inline _stag_holds(box::_StagBox, v, d, c, I, l, b, m) =
+    length(I) == box.dim && 0 <= v <= 26 && (box.dim >= 2 || d[2] == 1) &&
+    (box.dim >= 3 || d[3] == 1) && 1 <= c <= box.dof[count_ones(b) + 1] &&
+    0 <= l[1] < box.sz[1] && 0 <= l[2] < box.sz[2] && 0 <= l[3] < box.sz[3] && b & m == 0
+
+@noinline function _stag_refuse(box::_StagBox, holder, loc, c, I, v, d, l, b, m)
+    dim = box.dim
+    length(I) == dim ||
+        throw(ArgumentError("a $dim-D DMStag takes $dim element indices, not $(length(I))"))
+    0 <= v <= 26 && (dim >= 2 || d[2] == 1) && (dim >= 3 || d[3] == 1) ||
+        throw(ArgumentError("`$loc` is not a location on a $dim-D DMStag"))
+    k = box.dof[count_ones(b) + 1]
+    1 <= c <= k || throw(
+        ArgumentError(
+            "`$loc` has $k components on this DMStag, counted from 1, so no component $c",
+        ),
+    )
+    elements = join(((box.lo[a] + 1):(box.lo[a] + box.sz[a]) for a in 1:dim), " x ")
+    all(a -> 0 <= l[a] < box.sz[a], 1:3) || throw(
+        ArgumentError(
+            "$holder holds the points of elements $elements, so not `$loc` of element " *
+                "$(Tuple(I))",
+        ),
+    )
+    throw(
+        ArgumentError(
+            "$holder holds only the lower points of an element past the end of the grid, so " *
+                "not `$loc` of element $(Tuple(I))",
+        ),
+    )
+end
+
+"""
+    PETScDiffEq.StagArray
+
+What `PETScDiffEq.reshape_local_array` returns for a DMStag; see its docstring.
+"""
+struct StagArray{A <: AbstractVector}
+    x::A
+    box::_StagBox
+    cnt::NTuple{8, Int}
+    row::NTuple{4, Int}
+    layer::Int
+    offset::NTuple{64, Int}
+end
+
+function _stag_count(pl, name, dm)
+    n = Ref{_PetscInt}(0)
+    _check_code(ccall(_symbol(pl, name), _Err, (Ptr{Cvoid}, _P), dm, n))
+    return Int(n[])
+end
+
+function _stag_slot(pl, dm, b, dim)
+    loc = 1 + sum((k > dim || isodd(b >> (k - 1)) ? 1 : 0) * 3^(k - 1) for k in 1:3)
+    slot = Ref{_PetscInt}(0)
+    _check_code(
+        ccall(
+            _symbol(pl, :DMStagGetLocationSlot), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Cint, _PetscInt, Ptr{_PetscInt}), dm, loc, 0, slot,
+        ),
+    )
+    return Int(slot[])
+end
+
+# PETSc orders the owned block element by element, axis 1 fastest, leaving out absent points.
+function _stag_array(x::AbstractVector, dm)
+    pl, ptr = _dm_lib(dm), dm.ptr
+    ints = zeros(_PetscInt, 14)
+    ghost = _stag_box!(ints, pl, ptr, false)
+    dim, dof = ghost.dim, ghost.dof
+    epe = _stag_count(pl, :DMStagGetEntriesPerElement, ptr)
+    codes = 0:((1 << dim) - 1)
+    if length(x) == prod(ghost.sz) * epe
+        box = ghost
+        slot = ntuple(Val(8)) do i
+            b = i - 1
+            return b in codes && dof[count_ones(b) + 1] > 0 ? _stag_slot(pl, ptr, b, dim) : 0
+        end
+        cnt = ntuple(_ -> epe, Val(8))
+        offset = ntuple(i -> slot[(i - 1) % 8 + 1], Val(64))
+    elseif length(x) == _stag_count(pl, :DMStagGetEntries, ptr)
+        box = _stag_box!(ints, pl, ptr, true)
+        held(m, below) = sum(a -> a < below && a & m == 0 ? dof[count_ones(a) + 1] : 0, codes)
+        cnt = ntuple(m -> held(m - 1, 8), Val(8))
+        offset = ntuple(i -> held(divrem(i - 1, 8)...), Val(64))
+    else
+        throw(
+            DimensionMismatch(
+                "the array has $(length(x)) entries, but this rank's ghosted points of the " *
+                    "DMStag have $(prod(ghost.sz) * epe) and its own " *
+                    "$(_stag_count(pl, :DMStagGetEntries, ptr))",
+            ),
+        )
+    end
+    extra = box.sz .- box.n
+    row = ntuple(r -> box.n[1] * cnt[2r - 1] + extra[1] * cnt[2r], Val(4))
+    return StagArray(x, box, cnt, row, box.n[2] * row[1] + extra[2] * row[2], offset)
+end
+
+@inline function _stag_index(a::StagArray, loc, c, I)
+    v, d, l, b, m = _stag_point(a.box, loc, I)
+    @boundscheck _stag_holds(a.box, v, d, c, I, l, b, m) ||
+        _stag_refuse(a.box, "this array", loc, c, I, v, d, l, b, m)
+    return l[3] * a.layer + l[2] * a.row[((m & 4) >> 1) + 1] + l[1] * a.cnt[(m & 6) + 1] +
+        a.offset[8m + b + 1] + Int(c)
+end
+
+const _Location = LibPETSc.DMStagStencilLocation
+
+Base.@propagate_inbounds Base.getindex(a::StagArray, loc::_Location, c::Integer, I::Integer...) =
+    a.x[_stag_index(a, loc, c, I)]
+Base.@propagate_inbounds Base.getindex(
+    a::StagArray, loc::_Location, c::Integer, I::CartesianIndex,
+) = a[loc, c, Tuple(I)...]
+Base.@propagate_inbounds function Base.setindex!(
+        a::StagArray, v, loc::_Location, c::Integer, I::Integer...,
+    )
+    a.x[_stag_index(a, loc, c, I)] = v
+    return a
+end
+Base.@propagate_inbounds Base.setindex!(
+    a::StagArray, v, loc::_Location, c::Integer, I::CartesianIndex,
+) = setindex!(a, v, loc, c, Tuple(I)...)
+Base.axes(a::StagArray, d::Integer) = (a.box.lo[d] + 1):(a.box.lo[d] + a.box.sz[d])
+Base.axes(a::StagArray) = ntuple(d -> axes(a, d), a.box.dim)
+
+function _stag_stencil(I::Tuple{_Location, Integer, Vararg{Integer}}, box::_StagBox)
+    loc, c, e = I[1], I[2], Base.tail(Base.tail(I))
+    v, d, l, b, m = _stag_point(box, loc, e)
+    _stag_holds(box, v, d, c, e, l, b, m) ||
+        _stag_refuse(box, "this rank's ghosted region", loc, c, e, v, d, l, b, m)
+    at(k) = k <= length(e) ? e[k] - 1 : 0
+    return _StagStencil(Cint(Int(loc)), at(1), at(2), at(3), c - 1)
+end
+_stag_stencil(I, box) = throw(
+    ArgumentError(
+        "a DMStag's matrix takes points `(loc, c, i)`, `(loc, c, i, j)` or " *
+            "`(loc, c, i, j, k)`, as `reshape_local_array` indexes it; got $(repr(I))",
+    ),
+)
+
+const _OnePoint = Union{CartesianIndex, Tuple{Vararg{Integer}}, Tuple{_Location, Vararg}}
+
+function _stag_stencils!(buf, I::_OnePoint, box)
+    resize!(buf, 1)
+    buf[1] = _stag_stencil(I, box)
+    return 1
+end
+function _stag_stencils!(buf, Is, box)
+    n = length(Is)
+    resize!(buf, n)
+    for (k, I) in enumerate(Is)
+        buf[k] = _stag_stencil(I, box)
+    end
+    return n
+end
 
 struct _StencilBuffers{S}
     rows::Vector{_Stencil}
     cols::Vector{_Stencil}
     vals::Vector{S}
+    stag_rows::Vector{_StagStencil}
+    stag_cols::Vector{_StagStencil}
+    ints::Vector{_PetscInt}
+    dm::Vector{Ptr{Cvoid}}
+    flag::Vector{Cint}
 end
 
 function _stencil_buffers(::Type{S}) where {S}
     tls = task_local_storage()
     b = get(tls, _StencilBuffers{S}, nothing)
     b === nothing || return b::_StencilBuffers{S}
-    return tls[_StencilBuffers{S}] = _StencilBuffers{S}(_Stencil[], _Stencil[], S[])
+    return tls[_StencilBuffers{S}] = _StencilBuffers{S}(
+        _Stencil[], _Stencil[], S[], _StagStencil[], _StagStencil[], zeros(_PetscInt, 14),
+        [C_NULL], Cint[0],
+    )
 end
 
-function _stencils!(buf, I::Union{CartesianIndex, Tuple{Vararg{Integer}}})
+function _stencils!(buf, I::_OnePoint)
     resize!(buf, 1)
     buf[1] = _stencil(I)
     return 1
@@ -1113,17 +1377,54 @@ drops an index past a ghosted edge, which has no global entry, and refuses an en
 the DM's stencil. `add = true` adds to the entries instead of setting them, and PETSc wants a
 `PETSc.assemble!(J)` between a set and an add. It allocates nothing once warm, so with tuples
 for `cols` and `vals` a `jac` can call it at every grid point without allocating.
+
+On a DMStag's matrix the indices are points `(loc, c, i)`, `(loc, c, i, j)` or
+`(loc, c, i, j, k)`, as `reshape_local_array` indexes a DMStag, and the block goes through
+`DMStagMatSetValuesStencil`. A point outside this rank's ghosted region throws an
+`ArgumentError`, and one past a ghosted edge, which has no global entry, is dropped.
 """
 function set_stencil_values!(
         J::LibPETSc.AbstractPetscMat{L}, rows, cols, vals; add::Bool = false,
     ) where {L}
     pl = PETSc.getlib(L)
     b = _stencil_buffers(PETSc.scalartype(pl))
+    mode = add ? LibPETSc.ADD_VALUES : LibPETSc.INSERT_VALUES
+    dm = _mat_dm!(b.dm, pl, J)
+    if dm != C_NULL && _is_stag(pl, dm, b.flag)
+        box = _stag_box!(b.ints, pl, dm, false)
+        m, n = _stag_stencils!(b.stag_rows, rows, box), _stag_stencils!(b.stag_cols, cols, box)
+        _row_major!(b.vals, vals, m, n)
+        _set_stag_stencil!(pl, dm, J, b.stag_rows, b.stag_cols, b.vals, mode)
+        return J
+    end
     m, n = _stencils!(b.rows, rows), _stencils!(b.cols, cols)
     _row_major!(b.vals, vals, m, n)
-    mode = add ? LibPETSc.ADD_VALUES : LibPETSc.INSERT_VALUES
     _set_stencil!(pl, J, b.rows, b.cols, b.vals, mode)
     return J
+end
+
+function _mat_dm!(buf, pl, J)
+    _check_code(
+        ccall(
+            _symbol(pl, :MatGetDM), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}),
+            J.ptr, buf,
+        ),
+    )
+    return buf[]
+end
+
+function _set_stag_stencil!(pl, dm, J, r, c, v::Vector{S}, mode) where {S}
+    _check_code(
+        ccall(
+            _symbol(pl, :DMStagMatSetValuesStencil), LibPETSc.PetscErrorCode,
+            (
+                Ptr{Cvoid}, Ptr{Cvoid}, _PetscInt, Ptr{_StagStencil}, _PetscInt,
+                Ptr{_StagStencil}, Ptr{S}, Cint,
+            ),
+            dm, J.ptr, length(r), r, length(c), c, v, Cint(mode),
+        ),
+    )
+    return nothing
 end
 
 function _set_stencil!(pl, J, r, c, v::Vector{S}, mode) where {S}
@@ -3479,9 +3780,10 @@ function _check_dm(petsclib, dm)
         ),
     )
     type = _dm_type(petsclib, dm)
-    type == "da" || throw(
+    type in ("da", "stag") || throw(
         ArgumentError(
-            "PETScDiffEq takes only a DMDA as the `dm` so far, not a DM of type `$type`",
+            "PETScDiffEq takes only a DMDA or a DMStag as the `dm` so far, not a DM of type " *
+                "`$type`",
         ),
     )
     return nothing

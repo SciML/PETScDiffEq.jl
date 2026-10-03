@@ -610,14 +610,72 @@ fn = ODEFunction(heat!; jac = heat_jac!)
 sol_jac = solve(ODEProblem(fn, sinpi.((xs .+ (1:xm)) .* dx), (0.0, 0.1), da), TSImplicit("bdf"; dm = da))
 ```
 
+A DMStag, PETSc's staggered grid, keeps values on the vertices, edges, faces and cells of its
+elements, and runs through the same calls. On one, `PETScDiffEq.reshape_local_array(x, dm)`
+indexes `x[loc, c, i]` on a 1-D grid, `x[loc, c, i, j]` on a 2-D one and `x[loc, c, i, j, k]`
+on a 3-D one: component `c` at location `loc` of element `(i, j, k)`, where `loc` is a
+`LibPETSc.DMStagStencilLocation` such as `DMSTAG_ELEMENT`, `DMSTAG_LEFT` or `DMSTAG_DOWN`, and
+`c` and the elements count from 1, where PETSc counts from 0. A point on the upper side of an
+element, `DMSTAG_RIGHT` say, is the lower one of the next element. `axes(x, d)` gives the
+elements along axis `d` whose points `x` holds: the ghosted array takes in the ghost elements,
+and on the last rank along an axis that is not periodic the owned block runs to element
+`N + 1`, which holds only the points on that boundary, so `f` fills the cells up to `N` and the
+vertices up to `N + 1`. Any other point throws an `ArgumentError`. A `jac` writes through
+`set_stencil_values!` with points `(loc, c, i)`, `(loc, c, i, j)` or `(loc, c, i, j, k)`, which
+go to `DMStagMatSetValuesStencil`. Without one PETSc colours the DM's matrix as for a DMDA, so
+its stencil has to cover what `f` reads: a `DMSTAG_STENCIL_NONE` grid couples only the
+components at each point, `DMSTAG_STENCIL_STAR` reaches the neighbours along each axis within
+the stencil width and `DMSTAG_STENCIL_BOX`, PETSc.jl's default, the diagonal ones too. A wave
+with fluxes on the vertices, zero at both ends, and pressures in the cells:
+
+```julia
+stag = PETSc.DMStag(petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), (1, 1), 1)
+LEFT, RIGHT, CELL = LibPETSc.DMSTAG_LEFT, LibPETSc.DMSTAG_RIGHT, LibPETSc.DMSTAG_ELEMENT
+
+function wave!(du, u, stag, t)
+    U = PETScDiffEq.reshape_local_array(u, stag)
+    D = PETScDiffEq.reshape_local_array(du, stag)
+    for i in axes(D, 1)
+        D[LEFT, 1, i] = i == 1 || i == N + 1 ? 0.0 : (U[CELL, 1, i - 1] - U[CELL, 1, i]) * N
+        i <= N && (D[CELL, 1, i] = (U[LEFT, 1, i] - U[RIGHT, 1, i]) * N)
+    end
+end
+
+function wave_jac!(J, u, stag, t)
+    for i in owned
+        1 < i <= N && set_stencil_values!(J, (LEFT, 1, i), ((CELL, 1, i - 1), (CELL, 1, i)), (N, -N))
+        i <= N && set_stencil_values!(J, (CELL, 1, i), ((LEFT, 1, i), (RIGHT, 1, i)), (N, -N))
+    end
+end
+
+u0 = zeros(LibPETSc.DMStagGetEntries(petsclib, stag))
+U0 = PETScDiffEq.reshape_local_array(u0, stag)
+owned = axes(U0, 1)
+for i in owned
+    i <= N && (U0[CELL, 1, i] = sinpi((i - 0.5) / N))
+end
+fn = ODEFunction(wave!; jac = wave_jac!)
+sol_stag = solve(ODEProblem(fn, u0, (0.0, 0.5), stag), TSImplicit("bdf"; dm = stag))
+```
+
+On `MPI.COMM_SELF` and on 1 to 3 ranks, a damped form of this wave and a 2-D one with fluxes on
+the faces matched the same equations written without a DM: bit for bit with `TSRK`, and to
+1.2e-14 with a `jac` and a direct linear solve, `["-ksp_type", "preonly", "-pc_type",
+"redundant"]`, in `TSImplicit` and `TSRosW`, which colouring moved by up to 1.4e-14. The wave
+also matched through the integrator to 1.1e-19 and with a mass matrix to 9.4e-15, on 1 to 3
+ranks as a `SplitODEProblem` in `TSARKIMEX` and a `DAEProblem` in `TSDAE` to 5.7e-15 and in its
+DAE initialization to 1.1e-19, and `PETScAdjoint` with a `jac` and a `paramjac` matched the
+serial adjoint to 2.3e-15 relative.
+
 The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
 `TSARKIMEX` and `TSGeneric(ts_type; explicit = true)`, `saveat`, dense output, callbacks and
 the integrator interface, a `Diagonal` mass matrix, a `SplitODEProblem`, whose `f2` gets `u`
 ghosted as `f` does, and a `DAEProblem`, whose residual `f(r, du, u, p, t)` gets `u` ghosted
 and `du` owned. Everything else the package calls, such as a callback, `unstable_check` or
 `isoutofdomain`, sees the owned block. The TS works on a copy of the DM from `DMClone`, so the
-DM itself stays free for further solves. A DMDA on `MPI.COMM_SELF`, or on a single rank, gives
-a serial solve. Only a DMDA is taken so far.
+DM itself stays free for further solves. A DM on `MPI.COMM_SELF`, or on a single rank, gives a
+serial solve. Only a DMDA or a DMStag is taken so far, and any other DM, such as a DMPlex, is
+refused with an `ArgumentError`.
 
 `PETScAdjoint` runs with a `dm` too, for the methods and discrete costs it takes on a `comm`,
 and on a DM of a single rank for integral costs and a `SplitODEProblem` with `TSARKIMEX` as
