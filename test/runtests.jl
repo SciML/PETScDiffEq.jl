@@ -5998,6 +5998,227 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         PETScDiffEq.PETScCompat.destroy!(da)
     end
 
+    Sys.WORD_SIZE == 64 && @testset "a DMStag as the dm" begin
+        PETSc = PETScDiffEq.PETSc
+        LibPETSc = PETScDiffEq.LibPETSc
+        on_grid = PETScDiffEq.reshape_local_array
+        pl = PETSc.getlib(; PetscScalar = Float64)
+        PETScDiffEq.PETScCompat.isinitialized(pl) || PETSc.initialize(pl)
+        LEFT, RIGHT, ELEM = LibPETSc.DMSTAG_LEFT, LibPETSc.DMSTAG_RIGHT, LibPETSc.DMSTAG_ELEMENT
+        DOWN, UP = LibPETSc.DMSTAG_DOWN, LibPETSc.DMSTAG_UP
+        open_edge, ghosted = LibPETSc.DM_BOUNDARY_NONE, LibPETSc.DM_BOUNDARY_GHOSTED
+
+        # One rank orders a 2 x 2 grid of faces and cells element by element, each element's
+        # bottom face, left face and cell, the column past the end holding only left faces
+        # and the row past the end only bottom ones.
+        plane = PETSc.DMStag(pl, MPI.COMM_SELF, (open_edge, open_edge), (2, 2), (0, 1, 1), 1)
+        index = collect(1.0:16.0)
+        a = on_grid(index, plane)
+        @test [a[loc, 1, 1, 1] for loc in (DOWN, LEFT, ELEM)] == [1, 2, 3]
+        @test a[RIGHT, 1, 1, 1] == a[LEFT, 1, 2, 1] == 5
+        @test a[LEFT, 1, 3, 1] == 7
+        @test a[ELEM, 1, CartesianIndex(2, 2)] == 13
+        @test a[LEFT, 1, 3, 2] == 14
+        @test a[UP, 1, 1, 2] == a[DOWN, 1, 1, 3] == 15
+        @test a[DOWN, 1, 2, 3] == 16
+        @test axes(a) == (1:3, 1:3)
+        @test axes(on_grid(zeros(PETScDiffEq._dm_local_size(pl, plane)), plane), 2) == 1:3
+        @test_throws "only the lower points" a[ELEM, 1, 3, 1]
+        @test_throws "has 1 components" a[ELEM, 2, 1, 1]
+        @test_throws "takes 2 element indices" a[ELEM, 1, 1]
+        @test_throws "not a location on a 2-D DMStag" a[LibPETSc.DMSTAG_BACK, 1, 1, 1]
+        @test_throws "elements 1:3 x 1:3" a[ELEM, 1, 4, 1]
+        @test_throws DimensionMismatch on_grid(zeros(15), plane)
+        z = zeros(16)
+        b = on_grid(z, plane)
+        b[ELEM, 1, 1, 2] = 2.5
+        b[UP, 1, CartesianIndex(2, 1)] = 3.5
+        @test findall(!iszero, z) == [10, 11]
+        @test z[10:11] == [2.5, 3.5]
+
+        J = LibPETSc.DMCreateMatrix(pl, plane)
+        set_stencil_values!(
+            J, (ELEM, 1, 2, 1), [(LEFT, 1, 2, 1), (RIGHT, 1, 2, 1), (UP, 1, 2, 1)], [1.0, 2.0, 3.0],
+        )
+        set_stencil_values!(J, [(LEFT, 1, 3, 2), (DOWN, 1, 2, 3)], (LEFT, 1, 3, 2), (4.0, 5.0))
+        PETSc.assemble!(J)
+        function entry(r, c)
+            v = Ref(0.0)
+            PETScDiffEq._check_code(
+                ccall(
+                    PETScDiffEq._symbol(pl, :MatGetValues), PETScDiffEq.LibPETSc.PetscErrorCode,
+                    (
+                        Ptr{Cvoid}, PETScDiffEq.LibPETSc.PetscInt,
+                        Ptr{PETScDiffEq.LibPETSc.PetscInt}, PETScDiffEq.LibPETSc.PetscInt,
+                        Ptr{PETScDiffEq.LibPETSc.PetscInt}, Ptr{Float64},
+                    ),
+                    J.ptr, 1, [Int64(r - 1)], 1, [Int64(c - 1)], v,
+                ),
+            )
+            return v[]
+        end
+        @test [entry(6, c) for c in (5, 7, 11)] == [1.0, 2.0, 3.0]
+        @test [entry(r, 14) for r in (14, 16)] == [4.0, 5.0]
+        @test_throws "takes points `(loc, c, i)`" set_stencil_values!(J, (1, 1, 1), (1, 1, 1), 1.0)
+        @test_throws "ghosted region" set_stencil_values!(J, (ELEM, 1, 1, 1), (ELEM, 1, 5, 1), 1.0)
+        PETScDiffEq.PETScCompat.destroy!(J)
+        da = PETSc.DMDA(pl, MPI.COMM_SELF, (ghosted,), (4,), 1, 1)
+        J = LibPETSc.DMCreateMatrix(pl, da)
+        @test_throws "is a point of a DMStag" set_stencil_values!(
+            J, (ELEM, 1, 1), (ELEM, 1, 1), 1.0,
+        )
+        PETScDiffEq.PETScCompat.destroy!(J)
+        PETScDiffEq.PETScCompat.destroy!(da)
+
+        # A damped wave: fluxes on the vertices, held at zero on the ends, and pressures in
+        # the cells. One rank keeps the natural order, vertex then cell.
+        N = 12
+        h = 1 / N
+        line = PETSc.DMStag(pl, MPI.COMM_SELF, (ghosted,), (N,), (1, 1), 1)
+        function wave_dm!(du, u, dm, t)
+            U, D = on_grid(u, dm), on_grid(du, dm)
+            for i in axes(D, 1)
+                D[LEFT, 1, i] = i == 1 || i == N + 1 ? 0.0 :
+                    -(U[ELEM, 1, i] - U[ELEM, 1, i - 1]) / h - U[LEFT, 1, i]
+                i <= N && (D[ELEM, 1, i] = -(U[RIGHT, 1, i] - U[LEFT, 1, i]) / h - U[ELEM, 1, i]^3)
+            end
+            return nothing
+        end
+        function wave!(dx, x, p, t)
+            for v in 1:(N + 1)
+                dx[2v - 1] = v == 1 || v == N + 1 ? 0.0 : -(x[2v] - x[2v - 2]) / h - x[2v - 1]
+            end
+            for i in 1:N
+                dx[2i] = -(x[2i + 1] - x[2i - 1]) / h - x[2i]^3
+            end
+            return nothing
+        end
+        njac = Ref(0)
+        function wave_jac_dm!(J, u, dm, t)
+            njac[] += 1
+            U = on_grid(u, dm)
+            for i in 1:N
+                1 < i && set_stencil_values!(
+                    J, (LEFT, 1, i), ((ELEM, 1, i - 1), (ELEM, 1, i), (LEFT, 1, i)),
+                    (1 / h, -1 / h, -1.0),
+                )
+                set_stencil_values!(
+                    J, (ELEM, 1, i), ((LEFT, 1, i), (RIGHT, 1, i), (ELEM, 1, i)),
+                    (1 / h, -1 / h, -3U[ELEM, 1, i]^2),
+                )
+            end
+            return nothing
+        end
+        function wave_jac!(J, x, p, t)
+            for v in 2:N
+                J[2v - 1, 2v - 2], J[2v - 1, 2v], J[2v - 1, 2v - 1] = 1 / h, -1 / h, -1.0
+            end
+            for i in 1:N
+                J[2i, 2i - 1], J[2i, 2i + 1], J[2i, 2i] = 1 / h, -1 / h, -3x[2i]^2
+            end
+            return nothing
+        end
+        n = 2N + 1
+        near(r) = max(1, r - 2):min(n, r + 2)
+        proto = sparse(
+            [r for r in 1:n for _ in near(r)], [c for r in 1:n for c in near(r)],
+            ones(sum(length ∘ near, 1:n)), n, n,
+        )
+        x0 = [isodd(k) ? 0.0 : sinpi((k ÷ 2 - 0.5) * h) for k in 1:n]
+        @test on_grid(x0, line)[ELEM, 1, 3] == x0[6]
+        span = (0.0, 0.3)
+        fixed = (dt = 1.0e-3, adaptive = false)
+        tol = (abstol = 1.0e-9, reltol = 1.0e-9)
+        direct = ["-ksp_type", "preonly", "-pc_type", "lu"]
+        gap(a, b) = maximum(maximum(abs, x - y) for (x, y) in zip(a, b))
+        halve = SciMLBase.DiscreteCallback((u, t, i) -> t == 0.1, i -> (i.u .*= 0.5))
+        got = SciMLBase.solve(
+            SciMLBase.ODEProblem(wave_dm!, x0, span, line), PETScDiffEq.TSRK("5dp"; dm = line);
+            saveat = 0.05, callback = halve, tstops = [0.1], fixed...,
+        )
+        ref = SciMLBase.solve(
+            SciMLBase.ODEProblem(wave!, x0, span), PETScDiffEq.TSRK("5dp");
+            saveat = 0.05, callback = halve, tstops = [0.1], fixed...,
+        )
+        @test got.retcode == SciMLBase.ReturnCode.Success
+        @test got.t == ref.t
+        @test got.u == ref.u
+
+        with_jac(f, jac; kw...) = SciMLBase.ODEFunction(f; jac, kw...)
+        for make in (
+                (; kw...) -> PETScDiffEq.TSImplicit("bdf", direct; kw...),
+                (; kw...) -> PETScDiffEq.TSRosW("ra34pw2", direct; kw...),
+            )
+            njac[] = 0
+            got = SciMLBase.solve(
+                SciMLBase.ODEProblem(with_jac(wave_dm!, wave_jac_dm!), x0, span, line),
+                make(; dm = line); saveat = 0.05, tol...,
+            )
+            ref = SciMLBase.solve(
+                SciMLBase.ODEProblem(with_jac(wave!, wave_jac!; jac_prototype = proto), x0, span),
+                make(); saveat = 0.05, tol...,
+            )
+            coloured = SciMLBase.solve(
+                SciMLBase.ODEProblem(wave_dm!, x0, span, line), make(; dm = line);
+                saveat = 0.05, tol...,
+            )
+            @test got.retcode == coloured.retcode == SciMLBase.ReturnCode.Success
+            @test got.stats.njacs == njac[] > 0
+            @test coloured.stats.njacs == 0
+            @test got.stats.nf < coloured.stats.nf
+            # Measured 5.1e-26 for bdf and 1.4e-15 for rosw against the serial solve, and 1.0e-14
+            # and 1.1e-15 against colouring.
+            @test gap(got.u, ref.u) <= 1.0e-13
+            @test gap(coloured.u, got.u) <= 1.0e-13
+        end
+
+        weights = Diagonal(1 .+ (1:n) ./ n)
+        bdf(; kw...) = PETScDiffEq.TSImplicit("bdf", direct; kw...)
+        got = SciMLBase.solve(
+            SciMLBase.ODEProblem(
+                with_jac(wave_dm!, wave_jac_dm!; mass_matrix = weights), x0, span, line,
+            ),
+            bdf(; dm = line); saveat = 0.05, tol...,
+        )
+        ref = SciMLBase.solve(
+            SciMLBase.ODEProblem(
+                with_jac(wave!, wave_jac!; jac_prototype = proto, mass_matrix = weights), x0, span,
+            ),
+            bdf(); saveat = 0.05, tol...,
+        )
+        @test got.retcode == SciMLBase.ReturnCode.Success
+        # Measured 9.4e-15.
+        @test gap(got.u, ref.u) <= 1.0e-13
+
+        function walk(prob, alg)
+            integ = SciMLBase.init(prob, alg; fixed...)
+            seen = map(1:10) do _
+                SciMLBase.step!(integ)
+                (copy(integ.u), integ((integ.tprev + integ.t) / 2), SciMLBase.get_du(integ))
+            end
+            SciMLBase.terminate!(integ)
+            return reduce(vcat, (vcat(s...) for s in seen))
+        end
+        mine = walk(
+            SciMLBase.ODEProblem(with_jac(wave_dm!, wave_jac_dm!), x0, span, line),
+            bdf(; dm = line),
+        )
+        theirs = walk(
+            SciMLBase.ODEProblem(with_jac(wave!, wave_jac!; jac_prototype = proto), x0, span),
+            bdf(),
+        )
+        # Measured 7.1e-24.
+        @test maximum(abs, mine - theirs) <= 1.0e-15
+
+        plex = LibPETSc.DMPlexCreate(pl, MPI.COMM_SELF)
+        @test_throws "not a DM of type `plex`" SciMLBase.solve(
+            SciMLBase.ODEProblem(wave_dm!, x0, span, plex), PETScDiffEq.TSRK(; dm = plex); fixed...,
+        )
+        LibPETSc.DMDestroy(pl, plex)
+        PETScDiffEq.PETScCompat.destroy!(line)
+        PETScDiffEq.PETScCompat.destroy!(plane)
+    end
+
     @testset "Adaptive stepping" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         sol = SciMLBase.solve(
@@ -10586,6 +10807,89 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        Sys.WORD_SIZE == 64 && @testset "a communicator of one rank" begin
+            world = MPI.COMM_WORLD
+            function springs!(ddu, du, u, p, t)
+                n = length(u)
+                for i in 1:n
+                    ddu[i] = (i > 1 ? u[i - 1] : 0.0) - 2u[i] + (i < n ? u[i + 1] : 0.0)
+                end
+                return nothing
+            end
+            function springs_jac!(J, x, p, t)
+                for i in 1:5, j in max(1, i - 1):min(5, i + 1)
+                    J[i, 5 + j] = i == j ? -2.0 : 1.0
+                end
+                for i in 1:5
+                    J[5 + i, i] = 1.0
+                end
+                return nothing
+            end
+            springs_proto = sparse(
+                vcat([i for i in 1:5 for _ in max(1, i - 1):min(5, i + 1)], 6:10),
+                vcat([5 + j for i in 1:5 for j in max(1, i - 1):min(5, i + 1)], 1:5), 1.0, 10, 10,
+            )
+            springs(; kw...) = SciMLBase.SecondOrderODEProblem(
+                SciMLBase.DynamicalODEFunction{true}(
+                    springs!, (du, v, u, p, t) -> (du .= v; nothing); kw...,
+                ), zeros(5), [0.1, 0.5, 1.0, 0.5, 0.1], (0.0, 2.0),
+            )
+            carries = springs(; jac_prototype = springs_proto).f.jac_prototype isa SparseMatrixCSC
+            for (pr, alg, serial_alg, kw) in (
+                    (
+                        springs(), PETScDiffEq.TSBasicSymplectic("velverlet"; comm = world),
+                        PETScDiffEq.TSBasicSymplectic("velverlet"), (; dt = 0.05),
+                    ),
+                    (
+                        springs(; jac = springs_jac!, jac_prototype = springs_proto),
+                        PETScDiffEq.TSAlpha2(; comm = world), PETScDiffEq.TSAlpha2(),
+                        (; abstol = 1.0e-8, reltol = 1.0e-8),
+                    ),
+                    (
+                        springs(; jac_prototype = springs_proto), PETScDiffEq.TSAlpha2(; comm = world),
+                        PETScDiffEq.TSAlpha2(; autodiff = PETScDiffEq.AutoFiniteDiff()),
+                        (; dt = 0.05, adaptive = false),
+                    ),
+                    (
+                        springs(), PETScDiffEq.TSRK("5dp"; comm = world), PETScDiffEq.TSRK("5dp"),
+                        (; abstol = 1.0e-8, reltol = 1.0e-8),
+                    ),
+                    (
+                        springs(; jac = springs_jac!, jac_prototype = springs_proto),
+                        PETScDiffEq.TSImplicit("bdf"; comm = world), PETScDiffEq.TSImplicit("bdf"),
+                        (; abstol = 1.0e-8, reltol = 1.0e-8),
+                    ),
+                )
+                carries || alg isa PETScDiffEq.TSBasicSymplectic || alg isa PETScDiffEq.TSRK || continue
+                sol = SciMLBase.__solve(pr, alg; kw...)
+                ref = SciMLBase.__solve(pr, serial_alg; kw...)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.u[end] isa typeof(pr.u0)
+                @test sol.t == ref.t
+                @test maximum(maximum(abs, collect(a) - collect(b)) for (a, b) in zip(sol.u, ref.u)) <=
+                    1.0e-13
+            end
+            @test_throws "on a DynamicalODEProblem or SecondOrderODEProblem on a communicator" SciMLBase.__solve(
+                springs(; jac_prototype = springs_proto),
+                PETScDiffEq.TSAlpha2(; comm = world, autodiff = PETScDiffEq.AutoForwardDiff());
+                dt = 0.05,
+            )
+            @test_throws "SecondOrderODEProblem on MPI.COMM_SELF only" PETScDiffEq._discrete_adjoint(
+                springs(; jac = springs_jac!, jac_prototype = springs_proto),
+                PETScDiffEq.TSRK("4"; comm = world), PETScAdjoint(); t = [2.0],
+                dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing), dt = 0.05,
+                adaptive = false,
+            )
+            line = PETScDiffEq.PETSc.DMDA(
+                PETScDiffEq.PETSc.getlib(; PetscScalar = Float64), MPI.COMM_SELF,
+                (PETScDiffEq.LibPETSc.DM_BOUNDARY_NONE,), (10,), 1, 1,
+            )
+            @test_throws "SecondOrderODEProblem with a `dm` yet" SciMLBase.solve(
+                springs(), PETScDiffEq.TSRK("5dp"; dm = line),
+            )
+            PETScDiffEq.PETScCompat.destroy!(line)
+        end
+
         @testset "what these algorithms refuse" begin
             osc = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
             dyn = SciMLBase.DynamicalODEProblem(
@@ -10663,7 +10967,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             run(`$julia --project=$dir -e $setup`)
             scripts = (
                 "explicit.jl", "implicit.jl", "adjoint.jl", "dm.jl", "types.jl", "ensemble.jl",
-                "exit.jl",
+                "exit.jl", "second_order.jl",
             )
             for script in scripts, np in (1, 2, 3)
                 threads = script == "ensemble.jl" ? 2 : 1
