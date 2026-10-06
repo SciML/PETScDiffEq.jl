@@ -60,10 +60,10 @@ version = "0.1.45"
 
 [[deps.Adapt]]
 deps = ["LinearAlgebra"]
-git-tree-sha1 = "7c2c19b5a26e601634bf718490b89d59685f122e"
+git-tree-sha1 = "6da5f4e2d02f93b0ae3896685a32971a3c61cdea"
 registries = "General"
 uuid = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
-version = "4.7.1"
+version = "4.7.2"
 
     [deps.Adapt.extensions]
     AdaptSparseArraysExt = "SparseArrays"
@@ -960,7 +960,7 @@ version = "0.5.2"
 deps = ["ADTypes", "DiffEqBase", "DifferentiationInterface", "ForwardDiff", "Libdl", "LinearAlgebra", "MPI", "PETSc", "PETSc_jll", "PrecompileTools", "SciMLBase", "SciMLLogging", "SciMLOperators", "SparseArrays", "SparseMatrixColorings"]
 path = "/home/runner/work/PETScDiffEq.jl/PETScDiffEq.jl"
 uuid = "0a65194f-a16f-47d0-900e-080c22068669"
-version = "0.9.18"
+version = "0.9.19"
 
     [deps.PETScDiffEq.extensions]
     PETScDiffEqSciMLSensitivityExt = "SciMLSensitivity"
