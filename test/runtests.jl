@@ -65,9 +65,15 @@ function damped_oscillator_jac!(J, u, p, t)
 end
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
+const GROUP = let group = get(ENV, "GROUP", "")
+    isempty(group) ? "All" : group
+end
+GROUP in ("All", "Core", "MPI") || error("GROUP is All, Core or MPI, not $GROUP")
+is_mpi(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") && s.args[3] == "MPI"
+
 # Julia compiles a block as one thunk before running any of it, so each testset stands alone.
 macro each_toplevel(ts, block)
-    stmts = block.args
+    stmts = filter(s -> GROUP == "All" || (GROUP == "MPI") == is_mpi(s), block.args)
     isdefined(Test, :push_testset) &&
         return esc(Expr(:toplevel, :(Test.push_testset($ts)), stmts..., :(Test.pop_testset())))
     wrap(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") ? :(Test.@with_testset $ts $s) : s
@@ -11276,18 +11282,23 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             setup = "push!(LOAD_PATH, \"@stdlib\"); using Pkg; " *
                 "Pkg.develop(path = $(repr(root))); Pkg.instantiate()"
             run(`$julia --project=$dir -e $setup`)
-            scripts = (
-                "explicit.jl", "implicit.jl", "adjoint.jl", "dm.jl", "types.jl", "ensemble.jl",
-                "exit.jl", "second_order.jl",
+            # exit.jl leaves integrators alive for the exit hooks, so it runs last.
+            launches = (
+                (
+                    1, [
+                        "explicit.jl", "implicit.jl", "adjoint.jl", "dm.jl", "types.jl",
+                        "second_order.jl", "exit.jl",
+                    ],
+                ),
+                (2, ["ensemble.jl"]),
             )
-            for script in scripts, np in (1, 2, 3)
-                threads = script == "ensemble.jl" ? 2 : 1
-                rank_cmd = `$julia --threads=$threads --project=$dir $(joinpath(dir, script))`
+            for np in (1, 2, 3), (threads, scripts) in launches
+                rank_cmd = `$julia --threads=$threads --project=$dir $(joinpath(dir, "all.jl")) $scripts`
                 cmd = `$(MPI.mpiexec()) -n $np $rank_cmd`
                 proc = run(pipeline(cmd; stdout, stderr); wait = false)
                 # A rank left waiting in a collective hangs rather than fails, and a rank
                 # killed there can hang again in its exit hooks.
-                timer = Timer(900) do _
+                timer = Timer(3600) do _
                     kill(proc)
                     sleep(30)
                     process_running(proc) && kill(proc, Base.SIGKILL)

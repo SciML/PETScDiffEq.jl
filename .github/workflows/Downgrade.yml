@@ -13,7 +13,12 @@ on:
 jobs:
   downgrade:
     name: "Downgrade"
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [Core, MPI]
     uses: "SciML/.github/.github/workflows/downgrade.yml@v1"
     with:
       mode: "deps"
+      group: "${{ matrix.group }}"
     secrets: "inherit"

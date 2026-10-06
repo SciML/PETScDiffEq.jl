@@ -15,7 +15,7 @@ jobs:
   test:
     # Explicit arch axis so include:x86 adds a new cell instead of merging into
     # Julia 1 / ubuntu-latest (which would silently replace the x64 lane).
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ matrix.group }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -27,12 +27,14 @@ jobs:
         version: ['1.10', '1']
         os: [ubuntu-latest]
         arch: [x64]
+        group: [Core, MPI]
         # PETSc_jll 3.25 has no 32-bit builds, and Julia 1.10 cannot resolve 3.25, so the
         # 32-bit lane runs where it gets 3.22.
         include:
           - version: '1.10'
             os: ubuntu-latest
             arch: x86
+            group: All
     steps:
       - uses: actions/checkout@v7
       - name: Install 32-bit runtime libraries (i386)
@@ -49,6 +51,8 @@ jobs:
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        env:
+          GROUP: ${{ matrix.group }}
         # PETSc.jl 0.5 needs Julia 1.12, so 1.10 cannot take the latest compatible versions.
         with:
           force_latest_compatible_version: ${{ matrix.version == '1.10' && 'false' || 'auto' }}
