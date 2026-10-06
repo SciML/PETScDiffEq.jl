@@ -43,8 +43,8 @@ for example `["-ts_adapt_type", "none"]`. They are parsed after the options
 this package sets, so they win.
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, with `u0`
-holding this rank's rows; see the MPI section of the documentation. A `dm`, a DMDA or a
-DMStag from PETSc.jl, runs it on the DM's communicator and gives `f` the state ghosted from
+holding this rank's rows; see the MPI section of the documentation. A `dm`, a DMDA, DMStag
+or DMPlex from PETSc.jl, runs it on the DM's communicator and gives `f` the state ghosted from
 the DM, as that section describes.
 """
 struct TSRK <: PETScTSAlgorithm
@@ -952,7 +952,19 @@ function _dm_local_size(pl, dm)
     end
 end
 
-_clone_dm(pl, dm) = LibPETSc.PetscDM(_dm_vec!(pl, :DMClone, dm.ptr)[], pl)
+_clone_dm(pl, dm) = _clone_dm(pl, dm.ptr)
+
+# DMClone does not carry a DMPlex's local section over.
+function _clone_dm(pl, dm::Ptr{Cvoid})
+    clone = LibPETSc.PetscDM(_dm_vec!(pl, :DMClone, dm)[], pl)
+    _is_plex(pl, dm) && _check_code(
+        ccall(
+            _symbol(pl, :DMSetLocalSection), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
+            clone.ptr, _section(pl, :DMGetLocalSection, dm),
+        ),
+    )
+    return clone
+end
 
 function _referenced(pl, obj)
     _check_code(
@@ -1014,8 +1026,8 @@ end
 """
     PETScDiffEq.reshape_local_array(x, dm)
 
-This rank's part of a vector on the DMDA or DMStag `dm`, indexed by grid point in global
-numbering. `x` can be the ghosted array `f` receives or the block of the state the rank owns,
+This rank's part of a vector on the DMDA, DMStag or DMPlex `dm`, indexed by grid or mesh point.
+`x` can be the ghosted array `f` receives or the block of the state the rank owns,
 such as `du`, `u0` or a saved state, told apart by their lengths, and `a` shares its memory.
 
 On a DMDA it is `a[c, i]` on a 1-D grid and `a[c, i, j]` on a 2-D one, where `c` runs over the
@@ -1033,9 +1045,24 @@ is the range of elements along grid axis `d` whose points `a` holds. On the ghos
 takes in the ghost elements, and on the owned block of the last rank along an axis that is not
 periodic it ends at element `N + 1`, which holds only the points on that boundary. Reading or
 writing any other point throws an `ArgumentError`, unless `@inbounds` skips the check.
+
+On a DMPlex it is `a[c, p]`, component `c` of mesh point `p`, where `p` is PETSc's own point
+number, counted from 0, as `DMPlexGetDepthStratum`, `DMPlexGetHeightStratum`, `DMPlexGetCone`
+and `DMPlexGetSupport` give it, and `c` counts from 1 over the degrees of freedom the DM's local
+section gives the point. The ghosted array holds every point of this rank's part of the mesh,
+the owned block only the points the rank owns, and `checkbounds(Bool, a, c, p)` tells whether
+`a` holds component `c` of `p`. The ghosted array is laid out by the local section and the
+owned block by the global section, which PETSc builds collectively the first time it is asked
+for, as a solve does on every rank before it calls `f`. Any other index throws an
+`ArgumentError`, unless `@inbounds` skips the check of `c`. The section has to be point-major,
+without a permutation or constrained degrees of freedom.
 """
-reshape_local_array(x, dm) =
-    _is_stag(_dm_lib(dm), dm.ptr) ? _stag_array(x, dm) : PETScCompat.reshape_local_array(x, dm)
+function reshape_local_array(x, dm)
+    pl = _dm_lib(dm)
+    _is_stag(pl, dm.ptr) && return _stag_array(x, dm)
+    _is_plex(pl, dm.ptr) && return _plex_array(x, dm)
+    return PETScCompat.reshape_local_array(x, dm)
+end
 @static if PETScCompat.V05
     reshape_local_array(x, dm::PETSc.DMDA) = PETScCompat.reshape_local_array(x, dm)
 end
@@ -1301,12 +1328,267 @@ function _stag_stencils!(buf, Is, box)
     return n
 end
 
+function _is_plex(pl, dm, flag = Ref{Cint}(0))
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscObjectTypeCompare), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Cstring, Ptr{Cint}), dm, "plex", flag,
+        ),
+    )
+    return flag[] != 0
+end
+
+function _section(pl, name, obj)
+    s = Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(ccall(_symbol(pl, name), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}), obj, s))
+    return s[]
+end
+
+function _section_int(pl, name, s)
+    n = Ref{_PetscInt}(0)
+    _check_code(ccall(_symbol(pl, name), _Err, (Ptr{Cvoid}, _P), s, n))
+    return Int(n[])
+end
+
+function _section_flag(pl, name, s)
+    b = Ref{Cint}(0)
+    _check_code(ccall(_symbol(pl, name), _Err, (Ptr{Cvoid}, Ptr{Cint}), s, b))
+    return b[] != 0
+end
+
+function _section_chart(pl, s)
+    lo, hi = Ref{_PetscInt}(0), Ref{_PetscInt}(0)
+    _check_code(
+        ccall(_symbol(pl, :PetscSectionGetChart), _Err, (Ptr{Cvoid}, _P, _P), s, lo, hi),
+    )
+    return Int(lo[]):(Int(hi[]) - 1)
+end
+
+@inline function _section_at(fn, s, p)
+    v = Ref{_PetscInt}(0)
+    _check_code(ccall(fn, _Err, (Ptr{Cvoid}, _PetscInt, _P), s, p, v))
+    return Int(v[])
+end
+
+const _SECTION_HELP = "build one with PetscSectionCreate, PetscSectionSetChart, " *
+    "PetscSectionSetDof and PetscSectionSetUp and give it to DMSetLocalSection"
+
+function _plex_layout(pl, s)
+    !_section_flag(pl, :PetscSectionHasConstraints, s) &&
+        _section_flag(pl, :PetscSectionGetPointMajor, s) &&
+        _section(pl, :PetscSectionGetPermutation, s) == C_NULL || throw(
+        ArgumentError(
+            "PETScDiffEq takes a DMPlex whose local section is point-major, with no " *
+                "permutation and no constrained degrees of freedom; leave boundary values " *
+                "to `f`",
+        ),
+    )
+    return nothing
+end
+
+# PETSc has no getter for whether a section is set up, so its offsets are checked.
+function _check_plex_section(pl, dm)
+    s = _section(pl, :DMGetLocalSection, dm)
+    s == C_NULL && throw(ArgumentError("the DMPlex `dm` has no local section; $_SECTION_HELP"))
+    _plex_layout(pl, s)
+    n = _section_int(pl, :PetscSectionGetStorageSize, s)
+    seen = falses(n)
+    getdof, getoff = _symbol(pl, :PetscSectionGetDof), _symbol(pl, :PetscSectionGetOffset)
+    for p in _section_chart(pl, s)
+        dof = _section_at(getdof, s, p)
+        dof > 0 || continue
+        off = _section_at(getoff, s, p)
+        0 <= off && off + dof <= n && !any(view(seen, (off + 1):(off + dof))) || throw(
+            ArgumentError(
+                "the local section of the DMPlex `dm` is not set up; call " *
+                    "PetscSectionSetUp on it before DMSetLocalSection",
+            ),
+        )
+        seen[(off + 1):(off + dof)] .= true
+    end
+    return n
+end
+
+# The owned block's first offset and length, kept on the global section while it lives.
+function _plex_owned(pl, g, getdof, getoff)
+    key = "PETScDiffEq_owned"
+    is = Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscObjectQuery), _Err, (Ptr{Cvoid}, Cstring, Ptr{Ptr{Cvoid}}),
+            g, key, is,
+        ),
+    )
+    if is[] != C_NULL
+        first, step = Ref{_PetscInt}(0), Ref{_PetscInt}(0)
+        _check_code(
+            ccall(_symbol(pl, :ISStrideGetInfo), _Err, (Ptr{Cvoid}, _P, _P), is[], first, step),
+        )
+        return Int(first[]), _section_int(pl, :ISGetLocalSize, is[])
+    end
+    start, n = typemax(Int), 0
+    for p in _section_chart(pl, g)
+        dof = _section_at(getdof, g, p)
+        dof > 0 || continue
+        start = min(start, _section_at(getoff, g, p))
+        n += dof
+    end
+    start = n == 0 ? 0 : start
+    _check_code(
+        ccall(
+            _symbol(pl, :ISCreateStride), _Err,
+            (MPI.API.MPI_Comm, _PetscInt, _PetscInt, _PetscInt, Ptr{Ptr{Cvoid}}),
+            MPI.COMM_SELF, n, start, 1, is,
+        ),
+    )
+    try
+        _check_code(
+            ccall(
+                _symbol(pl, :PetscObjectCompose), _Err, (Ptr{Cvoid}, Cstring, Ptr{Cvoid}),
+                g, key, is[],
+            ),
+        )
+    finally
+        _check_code(ccall(_symbol(pl, :ISDestroy), _Err, (Ptr{Ptr{Cvoid}},), is))
+    end
+    return start, n
+end
+
+"""
+    PETScDiffEq.PlexArray
+
+What `PETScDiffEq.reshape_local_array` returns for a DMPlex; see its docstring.
+"""
+struct PlexArray{A <: AbstractVector}
+    x::A
+    section::Ptr{Cvoid}
+    getdof::Ptr{Cvoid}
+    getoff::Ptr{Cvoid}
+    chart::UnitRange{Int}
+    start::Int
+end
+
+function _plex_array(x::AbstractVector, dm)
+    pl, ptr = _dm_lib(dm), dm.ptr
+    s = _section(pl, :DMGetLocalSection, ptr)
+    s == C_NULL && throw(ArgumentError("the DMPlex has no local section; $_SECTION_HELP"))
+    _plex_layout(pl, s)
+    getdof, getoff = _symbol(pl, :PetscSectionGetDof), _symbol(pl, :PetscSectionGetOffset)
+    chart = _section_chart(pl, s)
+    nlocal = _section_int(pl, :PetscSectionGetStorageSize, s)
+    length(x) == nlocal && return PlexArray(x, s, getdof, getoff, chart, 0)
+    g = _section(pl, :DMGetGlobalSection, ptr)
+    start, n = _plex_owned(pl, g, getdof, getoff)
+    length(x) == n || throw(
+        DimensionMismatch(
+            "the array has $(length(x)) entries, but this rank's ghosted points of the " *
+                "DMPlex have $nlocal and its own $n",
+        ),
+    )
+    return PlexArray(x, g, getdof, getoff, chart, start)
+end
+
+@noinline function _plex_refuse(a::PlexArray, c, p)
+    p in a.chart || throw(
+        ArgumentError("point $p is outside this rank's points $(a.chart) of the DMPlex"),
+    )
+    dof = _section_at(a.getdof, a.section, p)
+    dof < 0 && throw(
+        ArgumentError(
+            "point $p is a ghost on this rank, which the ghosted array holds but the owned " *
+                "block does not",
+        ),
+    )
+    throw(
+        ArgumentError(
+            "point $p has $dof degrees of freedom, counted from 1, so no component $c",
+        ),
+    )
+end
+
+@inline function _plex_index(a::PlexArray, c, p)
+    p in a.chart || _plex_refuse(a, c, p)
+    @boundscheck 1 <= c <= _section_at(a.getdof, a.section, p) || _plex_refuse(a, c, p)
+    return _section_at(a.getoff, a.section, p) - a.start + Int(c)
+end
+
+Base.@propagate_inbounds Base.getindex(a::PlexArray, c::Integer, p::Integer) =
+    a.x[_plex_index(a, c, p)]
+Base.@propagate_inbounds function Base.setindex!(a::PlexArray, v, c::Integer, p::Integer)
+    a.x[_plex_index(a, c, p)] = v
+    return a
+end
+Base.checkbounds(::Type{Bool}, a::PlexArray, c::Integer, p::Integer) =
+    p in a.chart && 1 <= c <= _section_at(a.getdof, a.section, p)
+
+# A ghost point's dof count and offset are stored as -(x + 1).
+function _plex_global(I::Tuple{Integer, Integer}, g, chart, getdof, getoff)
+    c, p = I
+    p in chart ||
+        throw(ArgumentError("point $p is outside this rank's points $chart of the DMPlex"))
+    dof, off = _section_at(getdof, g, p), _section_at(getoff, g, p)
+    dof < 0 && ((dof, off) = (-(dof + 1), -(off + 1)))
+    1 <= c <= dof || throw(
+        ArgumentError(
+            "point $p has $dof degrees of freedom, counted from 1, so no component $c",
+        ),
+    )
+    return _PetscInt(off + c - 1)
+end
+_plex_global(I::CartesianIndex{2}, g, chart, getdof, getoff) =
+    _plex_global(Tuple(I), g, chart, getdof, getoff)
+_plex_global(I, g, chart, getdof, getoff) = throw(
+    ArgumentError(
+        "a DMPlex's matrix takes points `(c, p)`, component `c` of point `p`, as " *
+            "`reshape_local_array` indexes it; got $(repr(I))",
+    ),
+)
+
+function _plex_globals!(buf, I::_OnePoint, args...)
+    resize!(buf, 1)
+    buf[1] = _plex_global(I, args...)
+    return 1
+end
+function _plex_globals!(buf, Is, args...)
+    n = length(Is)
+    resize!(buf, n)
+    for (k, I) in enumerate(Is)
+        buf[k] = _plex_global(I, args...)
+    end
+    return n
+end
+
+function _set_plex_values!(b, pl, dm, J, rows, cols, vals, mode)
+    g = _section(pl, :DMGetGlobalSection, dm)
+    args = (
+        g, _section_chart(pl, g), _symbol(pl, :PetscSectionGetDof),
+        _symbol(pl, :PetscSectionGetOffset),
+    )
+    m, n = _plex_globals!(b.plex_rows, rows, args...), _plex_globals!(b.plex_cols, cols, args...)
+    _row_major!(b.vals, vals, m, n)
+    _mat_set_values!(pl, J, b.plex_rows, b.plex_cols, b.vals, mode)
+    return nothing
+end
+
+function _mat_set_values!(pl, J, r, c, v::Vector{S}, mode) where {S}
+    _check_code(
+        ccall(
+            _symbol(pl, :MatSetValues), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, _PetscInt, _P, _PetscInt, _P, Ptr{S}, Cint),
+            J.ptr, length(r), r, length(c), c, v, Cint(mode),
+        ),
+    )
+    return nothing
+end
+
 struct _StencilBuffers{S}
     rows::Vector{_Stencil}
     cols::Vector{_Stencil}
     vals::Vector{S}
     stag_rows::Vector{_StagStencil}
     stag_cols::Vector{_StagStencil}
+    plex_rows::Vector{_PetscInt}
+    plex_cols::Vector{_PetscInt}
     ints::Vector{_PetscInt}
     dm::Vector{Ptr{Cvoid}}
     flag::Vector{Cint}
@@ -1317,8 +1599,8 @@ function _stencil_buffers(::Type{S}) where {S}
     b = get(tls, _StencilBuffers{S}, nothing)
     b === nothing || return b::_StencilBuffers{S}
     return tls[_StencilBuffers{S}] = _StencilBuffers{S}(
-        _Stencil[], _Stencil[], S[], _StagStencil[], _StagStencil[], zeros(_PetscInt, 14),
-        [C_NULL], Cint[0],
+        _Stencil[], _Stencil[], S[], _StagStencil[], _StagStencil[], _PetscInt[], _PetscInt[],
+        zeros(_PetscInt, 14), [C_NULL], Cint[0],
     )
 end
 
@@ -1389,6 +1671,12 @@ On a DMStag's matrix the indices are points `(loc, c, i)`, `(loc, c, i, j)` or
 `(loc, c, i, j, k)`, as `reshape_local_array` indexes a DMStag, and the block goes through
 `DMStagMatSetValuesStencil`. A point outside this rank's ghosted region throws an
 `ArgumentError`, and one past a ghosted edge, which has no global entry, is dropped.
+
+On a DMPlex's matrix the indices are points `(c, p)`, component `c` of mesh point `p`, as
+`reshape_local_array` indexes a DMPlex, and the block goes through `MatSetValues` at the
+global indices the DM's global section gives them, a ghost point's included. A point outside
+this rank's part of the mesh throws an `ArgumentError`, and PETSc refuses an entry outside the
+pattern `DMCreateMatrix` gives from the DM's adjacency.
 """
 function set_stencil_values!(
         J::LibPETSc.AbstractPetscMat{L}, rows, cols, vals; add::Bool = false,
@@ -1402,6 +1690,10 @@ function set_stencil_values!(
         m, n = _stag_stencils!(b.stag_rows, rows, box), _stag_stencils!(b.stag_cols, cols, box)
         _row_major!(b.vals, vals, m, n)
         _set_stag_stencil!(pl, dm, J, b.stag_rows, b.stag_cols, b.vals, mode)
+        return J
+    end
+    if dm != C_NULL && _is_plex(pl, dm, b.flag)
+        _set_plex_values!(b, pl, dm, J, rows, cols, vals, mode)
         return J
     end
     m, n = _stencils!(b.rows, rows), _stencils!(b.cols, cols)
@@ -3929,13 +4221,13 @@ function _check_dm(petsclib, dm)
         ),
     )
     type = _dm_type(petsclib, dm)
-    type in ("da", "stag") || throw(
+    type in ("da", "stag", "plex") || throw(
         ArgumentError(
-            "PETScDiffEq takes only a DMDA or a DMStag as the `dm` so far, not a DM of type " *
-                "`$type`",
+            "PETScDiffEq takes only a DMDA, a DMStag or a DMPlex as the `dm` so far, not a DM " *
+                "of type `$type`",
         ),
     )
-    return nothing
+    return type == "plex" ? _check_plex_section(petsclib, dm.ptr) : nothing
 end
 
 function _refuse_distributed(prob, alg, is_dae, N)
@@ -4250,7 +4542,11 @@ function _setup(
     PETScCompat.isinitialized(petsclib) || PETSc.initialize(petsclib)
     _arm_exit_cleanup!(petsclib)
     if dm !== nothing
-        _checked_everywhere(() -> _check_dm(petsclib, dm), comm)
+        held = _checked_everywhere(() -> _check_dm(petsclib, dm), comm)
+        # A DMPlex hands out an empty section until it is given one.
+        held === nothing || _anywhere(comm, held > 0) || throw(
+            ArgumentError("the DMPlex `dm` has no degrees of freedom; $_SECTION_HELP"),
+        )
         _checked_everywhere(comm) do
             m = _dm_local_size(petsclib, dm)
             m == n || throw(

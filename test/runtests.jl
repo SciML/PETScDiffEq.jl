@@ -6268,13 +6268,266 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         # Measured 7.1e-24.
         @test maximum(abs, mine - theirs) <= 1.0e-15
 
-        plex = LibPETSc.DMPlexCreate(pl, MPI.COMM_SELF)
-        @test_throws "not a DM of type `plex`" SciMLBase.solve(
-            SciMLBase.ODEProblem(wave_dm!, x0, span, plex), PETScDiffEq.TSRK(; dm = plex); fixed...,
+        made = Ref{Ptr{Cvoid}}()
+        PETScDiffEq._check_code(
+            ccall(
+                PETScDiffEq._symbol(pl, :DMShellCreate), PETScDiffEq.LibPETSc.PetscErrorCode,
+                (MPI.API.MPI_Comm, Ptr{Ptr{Cvoid}}), MPI.COMM_SELF, made,
+            ),
         )
-        LibPETSc.DMDestroy(pl, plex)
+        shell = LibPETSc.PetscDM(made[], pl)
+        @test_throws "not a DM of type `shell`" SciMLBase.solve(
+            SciMLBase.ODEProblem(wave_dm!, x0, span, shell), PETScDiffEq.TSRK(; dm = shell);
+            fixed...,
+        )
+        PETScDiffEq.PETScCompat.destroy!(shell)
         PETScDiffEq.PETScCompat.destroy!(line)
         PETScDiffEq.PETScCompat.destroy!(plane)
+    end
+
+    Sys.WORD_SIZE == 64 && @testset "a DMPlex as the dm" begin
+        PETSc = PETScDiffEq.PETSc
+        LibPETSc = PETScDiffEq.LibPETSc
+        on_mesh = PETScDiffEq.reshape_local_array
+        pl = PETSc.getlib(; PetscScalar = Float64)
+        PETScDiffEq.PETScCompat.isinitialized(pl) || PETSc.initialize(pl)
+        sym(name) = PETScDiffEq._symbol(pl, name)
+        chk(code) = PETScDiffEq._check_code(code)
+        # PETSc's 64-bit builds take Int64 indices.
+        function stratum(dm, depth)
+            lo, hi = Ref(0), Ref(0)
+            chk(
+                ccall(
+                    sym(:DMPlexGetDepthStratum), Cint, (Ptr{Cvoid}, Int64, Ptr{Int64}, Ptr{Int64}),
+                    dm.ptr, depth, lo, hi,
+                ),
+            )
+            return lo[]:(hi[] - 1)
+        end
+        function adjacent(size_name, name, dm, p)
+            n, q = Ref(0), Ref{Ptr{Int64}}()
+            chk(ccall(sym(size_name), Cint, (Ptr{Cvoid}, Int64, Ptr{Int64}), dm.ptr, p, n))
+            chk(ccall(sym(name), Cint, (Ptr{Cvoid}, Int64, Ptr{Ptr{Int64}}), dm.ptr, p, q))
+            return copy(unsafe_wrap(Array, q[], n[]))
+        end
+        cone(dm, p) = adjacent(:DMPlexGetConeSize, :DMPlexGetCone, dm, p)
+        support(dm, p) = adjacent(:DMPlexGetSupportSize, :DMPlexGetSupport, dm, p)
+        mesh(faces, simplex) = PETSc.DMPlex(
+            pl, MPI.COMM_SELF; dm_plex_dim = 2, dm_plex_simplex = simplex ? "1" : "0",
+            dm_plex_box_faces = join(faces, ","),
+        )
+        setdof(name, s, p, k) =
+            chk(ccall(sym(name), Cint, (Ptr{Cvoid}, Int64, Int64), s, p, k))
+        # dofs[d + 1] degrees of freedom on each point of depth d.
+        function with_dofs!(dm, dofs; setup = true, pinned = nothing)
+            s, lo, hi = Ref{Ptr{Cvoid}}(), Ref(0), Ref(0)
+            chk(
+                ccall(
+                    sym(:PetscSectionCreate), Cint, (MPI.API.MPI_Comm, Ptr{Ptr{Cvoid}}),
+                    MPI.COMM_SELF, s,
+                ),
+            )
+            chk(
+                ccall(
+                    sym(:DMPlexGetChart), Cint, (Ptr{Cvoid}, Ptr{Int64}, Ptr{Int64}), dm.ptr, lo, hi,
+                ),
+            )
+            setdof(:PetscSectionSetChart, s[], lo[], hi[])
+            for (d, k) in enumerate(dofs), p in stratum(dm, d - 1)
+                setdof(:PetscSectionSetDof, s[], p, k)
+            end
+            pinned === nothing || setdof(:PetscSectionSetConstraintDof, s[], pinned, 1)
+            setup && chk(ccall(sym(:PetscSectionSetUp), Cint, (Ptr{Cvoid},), s[]))
+            chk(ccall(sym(:DMSetLocalSection), Cint, (Ptr{Cvoid}, Ptr{Cvoid}), dm.ptr, s[]))
+            chk(ccall(sym(:PetscSectionDestroy), Cint, (Ptr{Ptr{Cvoid}},), s))
+            return dm
+        end
+        function entry(J, r, c)
+            v = Ref(0.0)
+            chk(
+                ccall(
+                    sym(:MatGetValues), Cint,
+                    (Ptr{Cvoid}, Int64, Ptr{Int64}, Int64, Ptr{Int64}, Ptr{Float64}),
+                    J.ptr, 1, [r - 1], 1, [c - 1], v,
+                ),
+            )
+            return v[]
+        end
+
+        # On a 2 x 2 grid of squares PETSc numbers the 4 cells, then the 9 vertices, then the
+        # 12 edges, and the local section lays out the points in that order.
+        squares = with_dofs!(mesh((2, 2), false), (1, 0, 2))
+        @test stratum(squares, 2) == 0:3
+        @test stratum(squares, 0) == 4:12
+        a = on_mesh(collect(1.0:17.0), squares)
+        @test (a[1, 0], a[2, 0], a[2, 3]) == (1, 2, 8)
+        @test (a[1, 4], a[1, 12]) == (9, 17)
+        @test checkbounds(Bool, a, 2, 3)
+        @test !checkbounds(Bool, a, 3, 3)
+        @test !checkbounds(Bool, a, 1, 13)
+        @test !checkbounds(Bool, a, 1, 25)
+        @test_throws "has 2 degrees of freedom, counted from 1, so no component 3" a[3, 0]
+        @test_throws "has 0 degrees of freedom" a[1, 13]
+        @test_throws "outside this rank's points 0:24" a[1, 25]
+        @test_throws DimensionMismatch on_mesh(zeros(16), squares)
+        z = zeros(17)
+        b = on_mesh(z, squares)
+        b[2, 1] = 2.5
+        b[1, 5] = 3.5
+        @test findall(!iszero, z) == [4, 10]
+        @test z[[4, 10]] == [2.5, 3.5]
+        @test PETScDiffEq._dm_local_size(pl, squares) == 17
+
+        corner = first(cone(squares, first(cone(squares, 0))))
+        J = LibPETSc.DMCreateMatrix(pl, squares)
+        set_stencil_values!(J, (2, 0), [(1, 0), (1, corner)], [1.0, 2.0])
+        set_stencil_values!(J, [(1, corner), (2, 0)], (2, 0), (3.0, 4.0); add = false)
+        PETSc.assemble!(J)
+        @test entry(J, 2, 1) == 1.0
+        @test entry(J, 2, 9 + corner - 4) == 2.0
+        @test entry(J, 9 + corner - 4, 2) == 3.0
+        @test entry(J, 2, 2) == 4.0
+        @test_throws "takes points `(c, p)`" set_stencil_values!(J, (1, 0, 0), (1, 0), 1.0)
+        @test_throws "so no component 3" set_stencil_values!(J, (3, 0), (1, 0), 1.0)
+        @test_throws "outside this rank's points" set_stencil_values!(J, (1, 0), (1, 99), 1.0)
+        PETScDiffEq.PETScCompat.destroy!(J)
+
+        span = (0.0, 0.1)
+        fixed = (dt = 1.0e-3, adaptive = false)
+        tol = (abstol = 1.0e-9, reltol = 1.0e-9)
+        direct = ["-ksp_type", "preonly", "-pc_type", "lu"]
+        gap(x, y) = maximum(maximum(abs, p - q) for (p, q) in zip(x, y))
+        decay_dm!(du, u, p, t) = (du .= -u; nothing)
+        bare = mesh((2, 2), false)
+        @test_throws "has no degrees of freedom" SciMLBase.solve(
+            SciMLBase.ODEProblem(decay_dm!, zeros(9), span, bare), TSRK(; dm = bare); fixed...,
+        )
+        loose = with_dofs!(mesh((2, 2), false), (1, 0, 0); setup = false)
+        @test_throws "is not set up; call PetscSectionSetUp" SciMLBase.solve(
+            SciMLBase.ODEProblem(decay_dm!, zeros(9), span, loose), TSRK(; dm = loose); fixed...,
+        )
+        pinned = with_dofs!(mesh((2, 2), false), (1, 0, 0); pinned = 4)
+        @test_throws "no constrained degrees of freedom" SciMLBase.solve(
+            SciMLBase.ODEProblem(decay_dm!, zeros(9), span, pinned), TSRK(; dm = pinned); fixed...,
+        )
+        @test_throws "no constrained degrees of freedom" on_mesh(zeros(9), pinned)
+        foreach(PETScDiffEq.PETScCompat.destroy!, (bare, loose, pinned, squares))
+
+        # Reaction-diffusion coupling each point to its neighbours, on the DMPlex and on the
+        # same connectivity written without a DM, in the order the mesh numbers the points.
+        κ = 4.0
+        function on_plex(points, near)
+            function f!(du, u, dm, t)
+                U, D = on_mesh(u, dm), on_mesh(du, dm)
+                for p in points
+                    s = 0.0
+                    for x in near[p]
+                        s += U[1, x] - U[1, p]
+                    end
+                    D[1, p] = κ * s - U[1, p]^3
+                end
+                return nothing
+            end
+            function jac!(J, u, dm, t)
+                U = on_mesh(u, dm)
+                for p in points
+                    k = length(near[p])
+                    set_stencil_values!(
+                        J, (1, p), [(1, p); [(1, x) for x in near[p]]],
+                        [-κ * k - 3U[1, p]^2; fill(κ, k)],
+                    )
+                end
+                return nothing
+            end
+            return f!, jac!
+        end
+        function by_hand(points, near)
+            at = Dict(p => k for (k, p) in enumerate(points))
+            nk = [[at[x] for x in near[p]] for p in points]
+            function f!(du, u, p, t)
+                for k in eachindex(u)
+                    s = 0.0
+                    for j in nk[k]
+                        s += u[j] - u[k]
+                    end
+                    du[k] = κ * s - u[k]^3
+                end
+                return nothing
+            end
+            function jac!(J, u, p, t)
+                for k in eachindex(u)
+                    J[k, k] = -κ * length(nk[k]) - 3u[k]^2
+                    for j in nk[k]
+                        J[k, j] = κ
+                    end
+                end
+                return nothing
+            end
+            n = length(points)
+            ks = [[k; nk[k]] for k in 1:n]
+            return f!, jac!, sparse([k for k in 1:n for _ in ks[k]], reduce(vcat, ks), 1.0, n, n)
+        end
+        function walk(integ)
+            seen = map(1:10) do _
+                SciMLBase.step!(integ)
+                vcat(copy(integ.u), integ((integ.tprev + integ.t) / 2), SciMLBase.get_du(integ))
+            end
+            SciMLBase.terminate!(integ)
+            return reduce(vcat, seen)
+        end
+
+        # The vertices of a triangulated box, coupled along its edges, and the cells of a box
+        # of squares, coupled across them once the adjacency says so.
+        tri = with_dofs!(mesh((4, 3), true), (1, 0, 0))
+        verts = stratum(tri, 0)
+        along = Dict(
+            v => [only(filter(!=(v), cone(tri, e))) for e in support(tri, v)] for v in verts
+        )
+        quads = with_dofs!(mesh((4, 3), false), (0, 0, 1))
+        chk(ccall(sym(:DMSetBasicAdjacency), Cint, (Ptr{Cvoid}, Cint, Cint), quads.ptr, 1, 0))
+        cells = stratum(quads, 2)
+        across = Dict(
+            c => [x for e in cone(quads, c) for x in support(quads, e) if x != c] for c in cells
+        )
+        solvers = (
+            (; kw...) -> TSImplicit("bdf", direct; kw...),
+            (; kw...) -> TSRosW("ra34pw2", direct; kw...),
+        )
+        for (dm, points, near) in ((tri, verts, along), (quads, cells, across))
+            f_dm!, jac_dm! = on_plex(points, near)
+            f!, jac!, proto = by_hand(points, near)
+            x0 = sinpi.((1:length(points)) ./ length(points)) .+ 0.5
+            on_dm(; kw...) =
+                SciMLBase.ODEProblem(SciMLBase.ODEFunction(f_dm!; kw...), x0, span, dm)
+            plain(; kw...) = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(f!; jac_prototype = proto, kw...), x0, span,
+            )
+            got = SciMLBase.solve(on_dm(), TSRK("5dp"; dm); saveat = 0.02, fixed...)
+            ref = SciMLBase.solve(plain(), TSRK("5dp"); saveat = 0.02, fixed...)
+            @test got.retcode == SciMLBase.ReturnCode.Success
+            @test got.t == ref.t
+            @test got.u == ref.u
+            for make in solvers
+                got = SciMLBase.solve(on_dm(; jac = jac_dm!), make(; dm); saveat = 0.02, tol...)
+                coloured = SciMLBase.solve(on_dm(), make(; dm); saveat = 0.02, tol...)
+                ref = SciMLBase.solve(plain(; jac = jac!), make(); saveat = 0.02, tol...)
+                @test got.retcode == coloured.retcode == SciMLBase.ReturnCode.Success
+                @test got.stats.njacs > 0
+                @test coloured.stats.njacs == 0
+                @test got.stats.nf < coloured.stats.nf
+                # Measured 0.0 against the serial solve for both and up to 1.5e-14 against
+                # colouring.
+                @test gap(got.u, ref.u) <= 1.0e-13
+                @test gap(coloured.u, got.u) <= 1.0e-13
+            end
+            bdf(; kw...) = TSImplicit("bdf", direct; kw...)
+            mine = walk(SciMLBase.init(on_dm(; jac = jac_dm!), bdf(; dm); fixed...))
+            theirs = walk(SciMLBase.init(plain(; jac = jac!), bdf(); fixed...))
+            # Measured 0.0.
+            @test maximum(abs, mine - theirs) <= 1.0e-15
+        end
+        PETScDiffEq.PETScCompat.destroy!(tri)
+        PETScDiffEq.PETScCompat.destroy!(quads)
     end
 
     @testset "Adaptive stepping" begin

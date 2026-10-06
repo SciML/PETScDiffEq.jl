@@ -695,6 +695,87 @@ ranks as a `SplitODEProblem` in `TSARKIMEX` and a `DAEProblem` in `TSDAE` to 5.7
 DAE initialization to 1.1e-19, and `PETScAdjoint` with a `jac` and a `paramjac` matched the
 serial adjoint to 2.3e-15 relative.
 
+A DMPlex, PETSc's unstructured mesh, runs through the same calls once it has a local section, a
+`PetscSection` that gives each mesh point its degrees of freedom: on the vertices, on the
+cells, or on any mix of the mesh's strata. The section has to be set up, point-major, without a
+permutation and without constrained degrees of freedom. `DMPlexCreateBoxMesh` leaves a mesh
+with an empty one, and a mesh without degrees of freedom, a section that is not set up and the
+other layouts are refused with an `ArgumentError`. `PETScDiffEq.reshape_local_array(x, dm)`
+indexes `x[c, p]`, component `c` of mesh point `p`, where `p` is PETSc's own point number,
+counted from 0 as `DMPlexGetDepthStratum`, `DMPlexGetHeightStratum`, `DMPlexGetCone` and
+`DMPlexGetSupport` give it, and `c` counts from 1. The ghosted `u` holds every point of this
+rank's part of the mesh, and `du` only the points the rank owns, which
+`checkbounds(Bool, D, c, p)` picks out. A point's neighbours are on its rank when the mesh is
+distributed with an overlap of one cell. The mesh does not change during a solve, so its
+connectivity is best gathered once, outside `f`. A `jac` writes through `set_stencil_values!`
+with points `(c, p)`, which go to `MatSetValues` at the indices of the DM's global section. The
+DM's matrix has the pattern of the DM's adjacency, which by default couples each point to the
+closure of its star: enough for vertices coupled along edges, while cells coupled across their
+faces need `DMSetBasicAdjacency(dm, true, false)`. PETSc refuses a `jac` entry outside the
+pattern, and without a `jac` it colours the pattern. Finite-element assembly through PetscFE
+and `DMPlexSNESComputeResidualFEM` is not used. Reaction-diffusion on the vertices of a
+triangulated box, which `PETSc.DMPlex` builds and distributes through `DMSetFromOptions`:
+
+```julia
+dm = PETSc.DMPlex(
+    petsclib, MPI.COMM_WORLD; dm_plex_dim = 2, dm_plex_simplex = true,
+    dm_plex_box_faces = "16,16", dm_distribute_overlap = 1,
+)
+vstart, vend = LibPETSc.DMPlexGetDepthStratum(petsclib, dm, 0)
+section = LibPETSc.PetscSectionCreate(petsclib, MPI.COMM_WORLD)
+LibPETSc.PetscSectionSetChart(petsclib, section, LibPETSc.DMPlexGetChart(petsclib, dm)...)
+for v in vstart:(vend - 1)
+    LibPETSc.PetscSectionSetDof(petsclib, section, v, 1)
+end
+LibPETSc.PetscSectionSetUp(petsclib, section)
+LibPETSc.DMSetLocalSection(petsclib, dm, section)
+LibPETSc.PetscSectionDestroy(petsclib, Ref(section))
+
+u0 = zeros(LibPETSc.VecGetLocalSize(petsclib, LibPETSc.DMCreateGlobalVector(petsclib, dm)))
+U0 = PETScDiffEq.reshape_local_array(u0, dm)
+owned = [v for v in vstart:(vend - 1) if checkbounds(Bool, U0, 1, v)]
+along_edges(v) = [
+    only(filter(!=(v), LibPETSc.DMPlexGetCone(petsclib, dm, e))) for
+        e in LibPETSc.DMPlexGetSupport(petsclib, dm, v)
+]
+neighbours = Dict(v => along_edges(v) for v in owned)
+for v in owned
+    U0[1, v] = sinpi(v / 10)
+end
+
+function rd!(du, u, dm, t)
+    U, D = PETScDiffEq.reshape_local_array(u, dm), PETScDiffEq.reshape_local_array(du, dm)
+    for v in owned
+        D[1, v] = 256 * sum(U[1, w] - U[1, v] for w in neighbours[v]) - U[1, v]^3
+    end
+end
+
+function rd_jac!(J, u, dm, t)
+    U = PETScDiffEq.reshape_local_array(u, dm)
+    for v in owned
+        ws = neighbours[v]
+        set_stencil_values!(
+            J, (1, v), [(1, v); [(1, w) for w in ws]],
+            [-256 * length(ws) - 3U[1, v]^2; fill(256.0, length(ws))],
+        )
+    end
+end
+
+fn = ODEFunction(rd!; jac = rd_jac!)
+sol_plex = solve(ODEProblem(fn, u0, (0.0, 0.1), dm), TSImplicit("bdf"; dm))
+```
+
+PETSc.jl 0.4's `PetscSectionCreate` fills a `Ref` it is given, `PetscSectionCreate(petsclib,
+MPI.COMM_WORLD, section)` with `section = Ref{LibPETSc.PetscSection}()`, instead of returning
+the section. On `MPI.COMM_SELF` and on 1 to 3 ranks, reaction-diffusion on the vertices of a
+triangulated box and in the cells of a box of squares, coupled across their edges, matched the
+same equations assembled without a DM from the same mesh: bit for bit with `TSRK`, to 1.2e-14
+with a `jac` and a direct linear solve in `TSImplicit` and `TSRosW`, which colouring moved by up
+to 9.8e-14, and exactly through the integrator. On `MPI.COMM_SELF` the vertex problem also
+matched with a mass matrix exactly, as a `SplitODEProblem` in `TSARKIMEX` to 5.4e-15 and as a
+`DAEProblem` in `TSDAE` to 1.1e-14, and `PETScAdjoint` with a `jac` and a `paramjac` matched the
+adjoint without a DM exactly.
+
 The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
 `TSARKIMEX` and `TSGeneric(ts_type; explicit = true)`, `saveat`, dense output, callbacks and
 the integrator interface, a `Diagonal` mass matrix, a `SplitODEProblem`, whose `f2` gets `u`
@@ -702,8 +783,8 @@ ghosted as `f` does, and a `DAEProblem`, whose residual `f(r, du, u, p, t)` gets
 and `du` owned. Everything else the package calls, such as a callback, `unstable_check` or
 `isoutofdomain`, sees the owned block. The TS works on a copy of the DM from `DMClone`, so the
 DM itself stays free for further solves. A DM on `MPI.COMM_SELF`, or on a single rank, gives a
-serial solve. Only a DMDA or a DMStag is taken so far, and any other DM, such as a DMPlex, is
-refused with an `ArgumentError`.
+serial solve. Only a DMDA, a DMStag or a DMPlex is taken so far, and any other DM, such as a
+DMShell, is refused with an `ArgumentError`.
 
 `PETScAdjoint` runs with a `dm` too, for the methods and discrete costs it takes on a `comm`,
 and on a DM of a single rank for integral costs and a `SplitODEProblem` with `TSARKIMEX` as

@@ -31,6 +31,11 @@ const INIT_GAP = 1.0e-14
 const STAG_SERIAL_TOL = 1.0e-13
 const STAG_STEP_TOL = 1.0e-15
 const STAG_ADJOINT_GAP = 1.0e-14
+# Measured at 1 to 3 ranks: DMPlex solves with a jac are within 6.0e-15 of the serial ones,
+# colouring within 9.8e-14 of them, and steps match exactly.
+const PLEX_SERIAL_TOL = 1.0e-13
+const PLEX_COLOUR_TOL = 5.0e-13
+const PLEX_STEP_TOL = 1.0e-15
 
 function uneven(n)
     counts = floor.(Int, n .* (1:nranks) ./ sum(1:nranks))
@@ -454,6 +459,198 @@ function flow_natural(u, dm)
         i <= QX && j <= QY && (x[cell(i, j)] = a[ELEM, 1, i, j])
     end
     return MPI.Reduce(x, +, comm; root = 0)
+end
+
+
+# Reaction-diffusion on a DMPlex box, coupling each vertex to its neighbours along the edges
+# or each cell to its neighbours across the edges, held in the mesh's coordinate order so the
+# distributed and serial meshes sum the same terms in the same order.
+const PLEX_FACES = (5, 4)
+const PLEX_K = 4.0
+
+plex_call(code) = PETScDiffEq._check_code(code)
+plex_sym(name) = PETScDiffEq._symbol(pl, name)
+
+# PETSc's 64-bit builds take Int64 indices.
+function plex_range(dm, name, k)
+    lo, hi = Ref(0), Ref(0)
+    plex_call(
+        ccall(plex_sym(name), Cint, (Ptr{Cvoid}, Int64, Ptr{Int64}, Ptr{Int64}), dm.ptr, k, lo, hi),
+    )
+    return lo[]:(hi[] - 1)
+end
+
+function plex_adjacent(dm, p, size_name, name)
+    n, q = Ref(0), Ref{Ptr{Int64}}()
+    plex_call(ccall(plex_sym(size_name), Cint, (Ptr{Cvoid}, Int64, Ptr{Int64}), dm.ptr, p, n))
+    plex_call(ccall(plex_sym(name), Cint, (Ptr{Cvoid}, Int64, Ptr{Ptr{Int64}}), dm.ptr, p, q))
+    return copy(unsafe_wrap(Array, q[], n[]))
+end
+plex_cone(dm, p) = plex_adjacent(dm, p, :DMPlexGetConeSize, :DMPlexGetCone)
+plex_support(dm, p) = plex_adjacent(dm, p, :DMPlexGetSupportSize, :DMPlexGetSupport)
+
+# PETSc distributes the box as DMSetFromOptions builds it.
+plex_mesh(c, simplex) = PETSc.DMPlex(
+    pl, c; dm_plex_dim = 2, dm_plex_simplex = simplex ? "1" : "0",
+    dm_plex_box_faces = join(PLEX_FACES, ","), dm_distribute_overlap = 1,
+)
+
+plex_set(name, s, p, k) =
+    plex_call(ccall(plex_sym(name), Cint, (Ptr{Cvoid}, Int64, Int64), s, p, k))
+
+function plex_section!(dm, points, cells)
+    c, s, lo, hi = Ref{MPI.API.MPI_Comm}(), Ref{Ptr{Cvoid}}(), Ref(0), Ref(0)
+    plex_call(
+        ccall(plex_sym(:PetscObjectGetComm), Cint, (Ptr{Cvoid}, Ptr{MPI.API.MPI_Comm}), dm.ptr, c),
+    )
+    plex_call(
+        ccall(plex_sym(:PetscSectionCreate), Cint, (MPI.API.MPI_Comm, Ptr{Ptr{Cvoid}}), c[], s),
+    )
+    plex_call(
+        ccall(
+            plex_sym(:DMPlexGetChart), Cint, (Ptr{Cvoid}, Ptr{Int64}, Ptr{Int64}), dm.ptr, lo, hi,
+        ),
+    )
+    plex_set(:PetscSectionSetChart, s[], lo[], hi[])
+    for p in points
+        plex_set(:PetscSectionSetDof, s[], p, 1)
+    end
+    plex_call(ccall(plex_sym(:PetscSectionSetUp), Cint, (Ptr{Cvoid},), s[]))
+    plex_call(ccall(plex_sym(:DMSetLocalSection), Cint, (Ptr{Cvoid}, Ptr{Cvoid}), dm.ptr, s[]))
+    plex_call(ccall(plex_sym(:PetscSectionDestroy), Cint, (Ptr{Ptr{Cvoid}},), s))
+    cells && plex_call(
+        ccall(plex_sym(:DMSetBasicAdjacency), Cint, (Ptr{Cvoid}, Cint, Cint), dm.ptr, 1, 0),
+    )
+    return nothing
+end
+
+plex_handle(name, obj) = (
+    h = Ref{Ptr{Cvoid}}();
+    plex_call(ccall(plex_sym(name), Cint, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}), obj, h)); h[]
+)
+
+function plex_xy(dm)
+    v = plex_handle(:DMGetCoordinatesLocal, dm.ptr)
+    s = plex_handle(:DMGetCoordinateSection, dm.ptr)
+    n, off, a = Ref(0), Ref(0), Ref{Ptr{Float64}}()
+    plex_call(ccall(plex_sym(:VecGetLocalSize), Cint, (Ptr{Cvoid}, Ptr{Int64}), v, n))
+    plex_call(ccall(plex_sym(:VecGetArrayRead), Cint, (Ptr{Cvoid}, Ptr{Ptr{Float64}}), v, a))
+    x = copy(unsafe_wrap(Array, a[], n[]))
+    plex_call(ccall(plex_sym(:VecRestoreArrayRead), Cint, (Ptr{Cvoid}, Ptr{Ptr{Float64}}), v, a))
+    return Dict(
+        map(plex_range(dm, :DMPlexGetDepthStratum, 0)) do p
+            plex_call(
+                ccall(
+                    plex_sym(:PetscSectionGetOffset), Cint, (Ptr{Cvoid}, Int64, Ptr{Int64}),
+                    s, p, off,
+                ),
+            )
+            p => (x[off[] + 1], x[off[] + 2])
+        end,
+    )
+end
+
+plex_key(x) = round.(x; digits = 9)
+
+# The points carrying the unknowns, where each sits, and its neighbours in coordinate order.
+function plex_layout(dm, cells)
+    xy = plex_xy(dm)
+    if cells
+        points = plex_range(dm, :DMPlexGetHeightStratum, 0)
+        corners(c) = unique(v for e in plex_cone(dm, c) for v in plex_cone(dm, e))
+        centre(c) = sum(v -> collect(xy[v]), corners(c)) ./ length(corners(c))
+        at = Dict(c => plex_key(centre(c)) for c in points)
+        across(c) = [x for e in plex_cone(dm, c) for x in plex_support(dm, e) if x != c]
+        near = Dict(c => across(c) for c in points)
+    else
+        points = plex_range(dm, :DMPlexGetDepthStratum, 0)
+        at = Dict(v => plex_key(collect(xy[v])) for v in points)
+        along(v) = [only(filter(!=(v), plex_cone(dm, e))) for e in plex_support(dm, v)]
+        near = Dict(v => along(v) for v in points)
+    end
+    return collect(points), at, Dict(p => sort(near[p]; by = q -> at[q]) for p in points)
+end
+
+function plex_problem(simplex, cells)
+    dm = plex_mesh(comm, simplex)
+    stratum = cells ? :DMPlexGetHeightStratum : :DMPlexGetDepthStratum
+    plex_section!(dm, plex_range(dm, stratum, 0), cells)
+    points, at, near = plex_layout(dm, cells)
+    probe = reshape_local_array(zeros(PETScDiffEq._dm_local_size(pl, dm)), dm)
+    own = [p for p in points if checkbounds(Bool, probe, 1, p)]
+    serial = plex_mesh(MPI.COMM_SELF, simplex)
+    spoints, sat, snear = plex_layout(serial, cells)
+    PETScCompat.destroy!(serial)
+    index = Dict(sat[p] => k for (k, p) in enumerate(spoints))
+    near_k = [[index[sat[q]] for q in snear[p]] for p in spoints]
+    n = length(spoints)
+    proto = sparse(
+        [k for k in 1:n for _ in 0:length(near_k[k])], reduce(vcat, [k; near_k[k]] for k in 1:n),
+        1.0, n, n,
+    )
+    u0 = zeros(length(own))
+    U0 = reshape_local_array(u0, dm)
+    start(x) = sinpi(x[1]) * cospi(x[2]) + 0.5
+    for p in own
+        U0[1, p] = start(at[p])
+    end
+    return (;
+        dm, own, near, slot = [index[at[p]] for p in own], u0, near_k, proto, n,
+        x0 = [start(sat[p]) for p in spoints],
+    )
+end
+
+function plex_natural(u, q)
+    x = zeros(q.n)
+    a = reshape_local_array(u, q.dm)
+    for (p, k) in zip(q.own, q.slot)
+        x[k] = a[1, p]
+    end
+    return MPI.Reduce(x, +, comm; root = 0)
+end
+
+function plex_rd_dm!(du, u, q, t)
+    U, D = reshape_local_array(u, q.dm), reshape_local_array(du, q.dm)
+    for p in q.own
+        s = 0.0
+        for x in q.near[p]
+            s += U[1, x] - U[1, p]
+        end
+        D[1, p] = PLEX_K * s - U[1, p]^3
+    end
+    return nothing
+end
+
+function plex_rd_jac_dm!(J, u, q, t)
+    U = reshape_local_array(u, q.dm)
+    for p in q.own
+        set_stencil_values!(J, (1, p), (1, p), -PLEX_K * length(q.near[p]) - 3U[1, p]^2)
+        for x in q.near[p]
+            set_stencil_values!(J, (1, p), (1, x), PLEX_K)
+        end
+    end
+    return nothing
+end
+
+function plex_rd!(du, u, q, t)
+    for k in eachindex(u)
+        s = 0.0
+        for j in q.near_k[k]
+            s += u[j] - u[k]
+        end
+        du[k] = PLEX_K * s - u[k]^3
+    end
+    return nothing
+end
+
+function plex_rd_jac!(J, u, q, t)
+    for k in eachindex(u)
+        J[k, k] = -PLEX_K * length(q.near_k[k]) - 3u[k]^2
+        for j in q.near_k[k]
+            J[k, j] = PLEX_K
+        end
+    end
+    return nothing
 end
 
 
@@ -1350,6 +1547,65 @@ end
             PETScCompat.destroy!(plane)
         end
         @test everywhere(refs(stag.ptr) == 1)
+    end
+
+    @testset "a DMPlex: f and jac by mesh point" begin
+        direct = ["-ksp_type", "preonly", "-pc_type", "redundant"]
+        bdf(; kw...) = TSImplicit("bdf", direct; kw...)
+        rosw(; kw...) = TSRosW("ra34pw2", direct; kw...)
+        for (simplex, cells) in ((true, false), (false, true))
+            q = plex_problem(simplex, cells)
+            back = plex_natural(q.u0, q)
+            rank == 0 && @test back == q.x0
+            dm_rd(; kw...) = ODEProblem(ODEFunction(plex_rd_dm!; kw...), q.u0, SPAN, q)
+            serial_rd(; kw...) = ODEProblem(
+                ODEFunction(plex_rd!; jac_prototype = q.proto, kw...), q.x0, SPAN, q,
+            )
+            got = solve(dm_rd(), explicit(; dm = q.dm); saveat = 0.02, FIXED...)
+            @test got.retcode == ReturnCode.Success
+            us = plex_natural.(got.u, Ref(q))
+            if rank == 0
+                ref = solve(serial_rd(), explicit(); saveat = 0.02, FIXED...)
+                @test got.t == ref.t
+                @test us == ref.u
+            end
+            for make in (bdf, rosw)
+                got = solve(
+                    dm_rd(; jac = plex_rd_jac_dm!), make(; dm = q.dm); saveat = 0.02, TOL...,
+                )
+                coloured = solve(dm_rd(), make(; dm = q.dm); saveat = 0.02, TOL...)
+                @test got.retcode == coloured.retcode == ReturnCode.Success
+                @test got.stats.njacs > 0
+                @test coloured.stats.njacs == 0
+                @test got.stats.nf < coloured.stats.nf
+                @test same_everywhere(got.stats.nf)
+                us, cs = plex_natural.(got.u, Ref(q)), plex_natural.(coloured.u, Ref(q))
+                if rank == 0
+                    ref = solve(serial_rd(; jac = plex_rd_jac!), make(); saveat = 0.02, TOL...)
+                    @test maxdiff(us, ref.u) <= PLEX_SERIAL_TOL
+                    @test maxdiff(cs, us) <= PLEX_COLOUR_TOL
+                end
+            end
+            function walk(integ, gather)
+                seen = map(1:20) do _
+                    step!(integ)
+                    gather.((integ.u, integ((integ.tprev + integ.t) / 2), get_du(integ)))
+                end
+                terminate!(integ)
+                return seen
+            end
+            integ = init(dm_rd(; jac = plex_rd_jac_dm!), bdf(; dm = q.dm); FIXED...)
+            ts_dm = held(PETScDiffEq._ts_dm(pl, integ.h.ts))
+            @test PETScDiffEq._dm_type(pl, LibPETSc.PetscDM(ts_dm, pl)) == "plex"
+            seen = walk(integ, u -> plex_natural(u, q))
+            @test everywhere(released(ts_dm))
+            if rank == 0
+                ref = walk(init(serial_rd(; jac = plex_rd_jac!), bdf(); FIXED...), copy)
+                @test maximum(maxdiff(a, b) for (a, b) in zip(seen, ref)) <= PLEX_STEP_TOL
+            end
+            @test everywhere(refs(q.dm.ptr) == 1)
+            PETScCompat.destroy!(q.dm)
+        end
     end
 
     @testset "every handle is freed" begin

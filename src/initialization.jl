@@ -375,7 +375,7 @@ function _consistent_on!(
                 PETSc.assemble!(A)
             end
         else
-            clone = LibPETSc.PetscDM(_dm_vec!(pl, :DMClone, dm)[], pl)
+            clone = _clone_dm(pl, dm)
             xv = _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(pl, clone), pl)
             A = LibPETSc.DMCreateMatrix(pl, clone)
         end
