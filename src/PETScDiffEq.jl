@@ -4040,8 +4040,7 @@ end
 
 const _NOT_SELF = "on a communicator other than MPI.COMM_SELF"
 
-_in_threads_loop() = Threads.threadpoolsize() > 1 && current_task() !== Base.roottask &&
-    ccall(:jl_in_threaded_region, Cint, ()) != 0
+_in_threads_loop() = Threads.threadpoolsize() > 1 && current_task() !== Base.roottask
 
 # TSSetUp_IRK splits its stage vector evenly whatever the state's split, so irk runs on that one.
 function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
@@ -4509,10 +4508,10 @@ function _setup(
         MPI.Allreduce([length(prob.u0), Int(_in_threads_loop())], +, comm)
     looped > 0 && throw(
         ArgumentError(
-            "PETScDiffEq cannot solve $_NOT_SELF when a rank calls it inside " *
-                "`Threads.@threads`, as `EnsembleThreads` runs its trajectories: the ranks " *
-                "could take them in different orders and return wrong results; use " *
-                "`EnsembleSerial()`",
+            "PETScDiffEq cannot solve $_NOT_SELF when a rank calls it off the root task " *
+                "(inside `Threads.@threads` or from a `Threads.@spawn` task): the ranks " *
+                "could take concurrent solves in different orders and return wrong " *
+                "results; run distributed solves on the root task, or use `EnsembleSerial()`",
         ),
     )
     if dm !== nothing

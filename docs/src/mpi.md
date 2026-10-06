@@ -412,10 +412,9 @@ gradient agreed with the comm-mode and serial adjoints of the same discretizatio
 and with central differences of the same fixed-step solve to 1.4e-9.
 
 A solve with a `dm` refuses `TSIRK`, `TSMPRK` and an implicit `TSGeneric` with an
-`ArgumentError`. A distributed solve, with a `dm` or without, is refused inside
-`Threads.@threads` on more than one thread, as `EnsembleThreads` runs its trajectories:
-nothing there keeps the ranks' solves in the same order, and ranks taking them in different
-orders run different solves as one and can return wrong results without an error.
-Distributed solves running at once from `Threads.@spawn` tasks are not refused, so the caller
-has to keep them in the same order on every rank. An ensemble of distributed solves runs with
+`ArgumentError`. A distributed solve, with a `dm` or without, is refused off the root task
+when Julia has more than one thread, whether inside `Threads.@threads` (as `EnsembleThreads`
+runs its trajectories) or from a `Threads.@spawn` task: nothing there keeps the ranks' solves
+in the same order, and ranks taking them in different orders run different solves as one and
+can return wrong results without an error. An ensemble of distributed solves runs with
 `EnsembleSerial()`.
