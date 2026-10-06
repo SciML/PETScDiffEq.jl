@@ -162,6 +162,7 @@ const METHODS = (
     ("Crank-Nicolson", c -> TSImplicit("cn", exact(c); comm = c)),
     ("theta 0.7", c -> TSImplicit("theta", 0.7, exact(c); comm = c)),
     ("ARKIMEX l2", c -> TSARKIMEX("l2", exact(c); comm = c)),
+    ("ARKIMEX 3", c -> TSARKIMEX("3", exact(c); comm = c)),
 )
 
 const GHOSTED = LibPETSc.DM_BOUNDARY_GHOSTED
@@ -205,6 +206,7 @@ with_dm(name) = Dict(
     "Crank-Nicolson" => TSImplicit("cn", exact(comm); dm = da),
     "theta 0.7" => TSImplicit("theta", 0.7, exact(comm); dm = da),
     "ARKIMEX l2" => TSARKIMEX("l2", exact(comm); dm = da),
+    "ARKIMEX 3" => TSARKIMEX("3", exact(comm); dm = da),
 )[name]
 
 const NX, NY = 5, 4

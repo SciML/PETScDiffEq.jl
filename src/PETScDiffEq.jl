@@ -2937,8 +2937,29 @@ function _split_rhs_body!(ctx, t, x_ptr, f_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
+# PETSc solves for arkimex's first-stage slope, never into a stage vector, at a stale time.
+function _stage_time(ctx, ts, t)
+    startswith(ctx.alg_name, "arkimex") || ctx.alg_name == "dirk" || return t
+    pl = ctx.petsclib
+    x = Ref{LibPETSc.CVec}(C_NULL)
+    ccall(
+        _symbol(pl, :SNESGetSolution), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{LibPETSc.CVec}), _snes(pl, ts), x,
+    )
+    x[] == C_NULL && return t
+    ns, stages = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{LibPETSc.CVec}}(C_NULL)
+    ccall(
+        _symbol(pl, :TSGetStages), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{Cvoid}, Ptr{Ptr{LibPETSc.CVec}}), ts, ns, stages,
+    )
+    for i in 1:ns[]
+        unsafe_load(stages[], i) == x[] && return t
+    end
+    return LibPETSc.TSGetTime(pl, LibPETSc.TS(ts, pl))
+end
+
 function _ifunction!(
-        ::LibPETSc.CTS,
+        ts::LibPETSc.CTS,
         t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
@@ -2946,12 +2967,13 @@ function _ifunction!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
+    return _ifunction_body!(ctx, ts, t, x_ptr, xdot_ptr, f_ptr)
 end
 
-function _ifunction_body!(ctx, t, x_ptr, xdot_ptr, f_ptr)
+function _ifunction_body!(ctx, ts, t, x_ptr, xdot_ptr, f_ptr)
     pl = ctx.petsclib
     try
+        t = _stage_time(ctx, ts, t)
         _readvec!(ctx.u, pl, _own_block(ctx, PETSc.VecPtr(pl, x_ptr, false)))
         udot = _readvec!(ctx.mudot, pl, _own_block(ctx, PETSc.VecPtr(pl, xdot_ptr, false)))
         if ctx.dae
@@ -3210,7 +3232,7 @@ function _i2jacobian_body!(ctx, t, u_ptr, v_ptr, shift_v, shift_a, A_ptr, B_ptr)
 end
 
 function _ijacobian!(
-        ::LibPETSc.CTS,
+        ts::LibPETSc.CTS,
         t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
@@ -3220,14 +3242,15 @@ function _ijacobian!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+    return _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
-function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
+        t = _stage_time(ctx, ts, t)
         _readvec!(ctx.u, ctx.petsclib, x)
         _call_jac!(ctx, xdot_ptr, shift, t)
         ctx.njacs += 1
@@ -3248,7 +3271,7 @@ function _ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
 function _dm_ijacobian!(
-        ::LibPETSc.CTS,
+        ts::LibPETSc.CTS,
         t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
@@ -3258,15 +3281,16 @@ function _dm_ijacobian!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _dm_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+    return _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
 # The user fills J = df/du in the DM's matrix, which becomes `shift * M - J` here.
-function _dm_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+function _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     pl = ctx.petsclib
     A = LibPETSc.PetscMat(A_ptr, pl)
     B = LibPETSc.PetscMat(B_ptr, pl)
     try
+        t = _stage_time(ctx, ts, t)
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
         _mat_zero!(pl, B)
         err = nothing
@@ -3303,7 +3327,7 @@ function _dm_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
 function _sparse_ijacobian!(
-        ::LibPETSc.CTS,
+        ts::LibPETSc.CTS,
         t,
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
@@ -3313,14 +3337,15 @@ function _sparse_ijacobian!(
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
-    return _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+    return _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
-function _sparse_ijacobian_body!(ctx, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
+function _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
+        t = _stage_time(ctx, ts, t)
         _readvec!(ctx.u, ctx.petsclib, _own_block(ctx, x))
         if ctx.coo === nothing
             _call_jac!(ctx, xdot_ptr, shift, t)

@@ -66,16 +66,11 @@ the step-size controller.
 one stiff method whose adaptive solve it differentiates. It takes a `SplitODEProblem` as
 well, on `MPI.COMM_SELF`: the implicit part's `jac` and `paramjac` are the problem's, which
 a `SplitODEProblem` takes from `f1`, and the explicit part's are those of `f2`'s own
-`ODEFunction`, each built by automatic differentiation when missing. Three things are
+`ODEFunction`, each built by automatic differentiation when missing. Two things are
 refused, because PETSc's ARKIMEX adjoint cannot do them. It has no quadrature, so an
-integral cost stops with "No method adjointintegral". With `-ts_arkimex_fully_implicit` on a
-`SplitODEProblem` the solve takes `f2` implicitly while the adjoint still takes it
-explicitly, which put the gradient 24% off in the test problem. And on a plain `ODEProblem`,
-every type but `"1bee"`, `"l2"` and `"prssp2"` has an explicit first stage that PETSc
-evaluates at a stale time on the first step after a restart, at 0 on the first step of the
-solve, without the adjoint seeing it; such a type needs `tspan` to start at 0 and the stages
-kept in the trajectory, without `-ts_trajectory_solution_only`. Starting at `t = 1` put the
-gradient 2e-4 off for an `f` that depends on `t`. A `SplitODEProblem` has no such limit.
+integral cost stops with "No method adjointintegral". And with `-ts_arkimex_fully_implicit`
+on a `SplitODEProblem` the solve takes `f2` implicitly while the adjoint still takes it
+explicitly, which put the gradient 24% off in the test problem.
 
 An integral cost, the integral of `g(u, p, t)` over `tspan`, goes through PETSc's quadrature
 `TS`, which sums it with the method's own stages: `dt * b[i] * g` at each stage of a `TSRK`,

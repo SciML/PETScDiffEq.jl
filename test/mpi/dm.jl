@@ -1020,6 +1020,34 @@ end
         end
     end
 
+    @testset "TSARKIMEX takes its first stage at the step's start" begin
+        a = 2 .+ (1:N) ./ N
+        exact(t) = 1 ./ (a[rows] .- sin(t))
+        function rhs!(du, u, da, t)
+            U, D = reshape_local_array(u, da), reshape_local_array(du, da)
+            for i in axes(D, 2)
+                D[1, i] = U[1, i]^2 * cos(t)
+            end
+            return nothing
+        end
+        function jac!(J, u, da, t)
+            U = reshape_local_array(u, da)
+            for i in rows
+                J[i, i] = 2 * U[1, i] * cos(t)
+            end
+            return nothing
+        end
+        tight = ["-snes_rtol", "1e-12", "-snes_atol", "1e-14", "-ksp_rtol", "1e-12"]
+        for jac in (nothing, jac!), span in ((1.0, 2.0), (2.0, 1.0))
+            sol = solve(
+                ODEProblem(ODEFunction(rhs!; jac), exact(span[1]), span, da),
+                TSARKIMEX("4", tight; dm = da, comm); dt = 0.05, adaptive = false,
+            )
+            err = MPI.Allreduce(maximum(abs, sol.u[end] - exact(span[2])), max, comm)
+            @test err < 1.0e-7
+        end
+    end
+
     @testset "a jac fills the DM's matrix" begin
         stencil(i) = ([(1, i - 1), (1, i), (1, i + 1)], [1, -2, 1] ./ dx^2)
         njac = Ref(0)

@@ -157,6 +157,25 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test all(o -> isapprox(o, 3; atol = 0.15), orders)
     end
 
+    Sys.WORD_SIZE == 64 && @testset "TSARKIMEX keeps order when tspan starts away from 0" begin
+        f!(du, u, p, t) = (du[1] = cos(t); nothing)
+        t0 = 1.0
+        prob = SciMLBase.ODEProblem(f!, [sin(t0)], (t0, t0 + 1))
+        for alg in (
+                PETScDiffEq.TSARKIMEX("3"),
+                PETScDiffEq.TSARKIMEX("l2", ["-ts_arkimex_type", "3"]),
+                PETScDiffEq.TSGeneric("arkimex", ["-ts_arkimex_type", "3"]),
+            )
+            errs = map((0.01, 0.005)) do dt
+                sol = SciMLBase.solve(prob, alg; dt, adaptive = false)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                abs(sol.u[end][1] - sin(t0 + 1))
+            end
+            @test errs[1] < 1.0e-6
+            @test log2(errs[1] / errs[2]) ≈ 3 atol = 0.3
+        end
+    end
+
     @testset "TSARKIMEX IMEX split" begin
         stiff!(du, u, p, t) = (du[1] = -50.0 * u[1]; nothing)
         forcing!(du, u, p, t) = (du[1] = 1.0; nothing)
@@ -175,6 +194,101 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test all(o -> isapprox(o, 3; atol = 0.2), orders)
 
         @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.01)
+    end
+
+    Sys.WORD_SIZE == 64 && @testset "TSARKIMEX takes its first stage at the step's start" begin
+        exact(t) = 1 / (2 - sin(t))
+        seen = Float64[]
+        rhs!(du, u, p, t) = (push!(seen, t); du[1] = u[1]^2 * cos(t); nothing)
+        jac!(J, u, p, t) = (push!(seen, t); J[1, 1] = 2 * u[1] * cos(t); nothing)
+        tight = ["-snes_rtol", "1e-13", "-snes_atol", "1e-14", "-ksp_rtol", "1e-13"]
+        problem(span, f = rhs!) = SciMLBase.ODEProblem(f, [exact(span[1])], span)
+        err(sol) = abs(sol.u[end][1] - exact(sol.t[end]))
+        fixed(prob, alg, dt; kw...) = SciMLBase.solve(prob, alg; dt, adaptive = false, kw...)
+        order(prob, alg) = log2(err(fixed(prob, alg, 0.1)) / err(fixed(prob, alg, 0.05)))
+        fourth = PETScDiffEq.TSARKIMEX("4", tight)
+
+        @testset "$sub keeps its order on $span" for sub in (
+                    "1bee", "a2", "l2", "2c", "2d", "2e", "prssp2", "3", "ars443", "bpr3", "4", "5",
+                ), span in ((0.0, 1.0), (1.0, 2.0), (1.0, 0.0), (-1.0, 0.0))
+            alg = PETScDiffEq.TSARKIMEX(sub, tight)
+            @test order(problem(span), alg) ≈ SciMLBase.alg_order(alg) atol = 0.3
+        end
+        esdirk = PETScDiffEq.TSGeneric("dirk", [tight; "-ts_dirk_type"; "es324sal"])
+        @test order(problem((1.0, 2.0)), esdirk) ≈ 3 atol = 0.3
+
+        @testset "f and jac are called inside $span" for span in ((1.0, 2.0), (2.0, 1.0))
+            empty!(seen)
+            sol = fixed(problem(span, SciMLBase.ODEFunction(rhs!; jac = jac!)), fourth, 0.05)
+            @test all(t -> 1 <= t <= 2, seen)
+            @test err(sol) < 1.0e-7
+        end
+
+        @testset "a mass matrix, a DAEProblem and an option that picks arkimex" begin
+            span = (1.0, 2.0)
+            x0 = exact(1.0)
+            doubled = SciMLBase.ODEFunction(
+                (du, u, p, t) -> (du[1] = 2 * u[1]^2 * cos(t); nothing); mass_matrix = Diagonal([2.0]),
+            )
+            constrained = SciMLBase.ODEFunction(
+                (du, u, p, t) -> (du[1] = u[1]^2 * cos(t); du[2] = sin(t) * u[1] - u[2]; nothing);
+                mass_matrix = Diagonal([1.0, 0.0]),
+            )
+            residual!(r, du, u, p, t) =
+                (r[1] = du[1] - u[1]^2 * cos(t); r[2] = sin(t) * u[1] - u[2]; nothing)
+            picked = [tight; "-ts_type"; "arkimex"; "-ts_arkimex_type"; "4"]
+            slope = [x0^2 * cos(1.0), cos(1.0) * x0 + sin(1.0) * x0^2 * cos(1.0)]
+            for (prob, alg) in (
+                    (SciMLBase.ODEProblem(doubled, [x0], span), fourth),
+                    (SciMLBase.ODEProblem(constrained, [x0, sin(1.0) * x0], span), fourth),
+                    (
+                        SciMLBase.DAEProblem(residual!, slope, [x0, sin(1.0) * x0], span),
+                        PETScDiffEq.TSDAE("beuler", picked),
+                    ),
+                    (problem(span), PETScDiffEq.TSImplicit("beuler", picked)),
+                )
+                @test err(fixed(prob, alg, 0.05)) < 1.0e-7
+                @test err(SciMLBase.solve!(SciMLBase.init(prob, alg; dt = 0.05, adaptive = false))) < 1.0e-7
+            end
+        end
+
+        @testset "after a restart away from the last stage's time" begin
+            span = (0.0, 1.0)
+            root = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> sin(7.3 * (t - 0.11)), integ -> nothing; save_positions = (false, false),
+            )
+            @test err(fixed(problem(span), fourth, 0.025; callback = root)) < 1.0e-7
+
+            integ = SciMLBase.init(problem(span), fourth; dt = 0.025, adaptive = false)
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            SciMLBase.change_t_via_interpolation!(integ, 0.04)
+            @test err(SciMLBase.solve!(integ)) < 1.0e-7
+
+            SciMLBase.reinit!(integ, [exact(1.0)]; t0 = 1.0, tf = 2.0)
+            @test err(SciMLBase.solve!(integ)) < 1.0e-7
+
+            marks = [0.2, 0.5, 0.8]
+            outside(u, p, t) = !isempty(marks) && t > marks[1] && (popfirst!(marks); true)
+            rejected = SciMLBase.solve(
+                problem(span), PETScDiffEq.TSARKIMEX("4"); dt = 0.05, abstol = 1.0e-7,
+                reltol = 1.0e-7, isoutofdomain = outside,
+            )
+            @test isempty(marks)
+            @test err(rejected) < 5.0e-6
+
+            jump = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = t <= 0.5 ? 1.0 : 2.0; nothing), [0.0], span,
+            )
+            @test fixed(jump, fourth, 0.1; d_discontinuities = [0.5]).u[end][1] ≈ 1.5 atol = 1.0e-12
+        end
+
+        @testset "a right-hand side with no value at t = 0" begin
+            root! = (du, u, p, t) -> (du[1] = 1 / (2 * sqrt(t - 0.5)); nothing)
+            sol = fixed(SciMLBase.ODEProblem(root!, [sqrt(0.5)], (1.0, 2.0)), fourth, 0.05)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test abs(sol.u[end][1] - sqrt(1.5)) < 1.0e-6
+        end
     end
 
     @testset "an IMEX split whose explicit part reads u" begin
@@ -9572,6 +9686,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     (0.0, 1.0), forward_t, (sparse_jac = true, coupled = true),
                 ),
                 ("2e out of place", "2e", (0.0, 1.0), forward_t, (oop = true,)),
+                ("3 from t = 1", "3", (1.0, 2.0), forward_t .+ 1, (;)),
+                ("4 backward in time", "4", (1.0, 0.0), backward_t, (;)),
+                (
+                    "3 backward in time with a trajectory of states only", "3", (1.0, 0.0),
+                    backward_t, (sensealg = states_only,),
+                ),
                 ("l2 backward in time", "l2", (1.0, 0.0), backward_t, (;)),
                 (
                     "1bee backward in time with a trajectory of states only", "1bee",
@@ -9692,6 +9812,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 name, subtype, make, tspan,
             ) in (
                 ("3", "3", adj_prob, (0.0, 1.0)),
+                ("4 backward in time", "4", adj_prob, (1.0, 0.0)),
                 ("a split problem, 3", "3", split_prob, (0.0, 1.0)),
                 ("a split problem, 4 backward in time", "4", split_prob, (1.0, 0.0)),
             )
@@ -10215,27 +10336,6 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     (
                         "PETScAdjoint cannot take an integral cost with TSARKIMEX",
                         () -> grad(parts, TSARKIMEX(); g = coupled),
-                    ),
-                    (
-                        "PETScAdjoint does not support TSARKIMEX(\"3\") on an ODEProblem whose " *
-                            "tspan starts away from 0",
-                        () -> grad(adj_prob(copy(u0), copy(p0), (1.0, 0.0)), TSARKIMEX(); t = backward_t),
-                    ),
-                    (
-                        "PETScAdjoint does not support TSARKIMEX(\"4\") on an ODEProblem whose " *
-                            "tspan starts away from 0",
-                        () -> grad(
-                            adj_prob(copy(u0), copy(p0), (1.0, 2.0)),
-                            TSImplicit("beuler", ["-ts_type", "arkimex", "-ts_arkimex_type", "4"]);
-                            t = [2.0],
-                        ),
-                    ),
-                    (
-                        "PETScAdjoint does not support `-ts_trajectory_solution_only` with " *
-                            "TSARKIMEX(\"3\") on an ODEProblem",
-                        () -> grad(
-                            prob, TSARKIMEX(); sensealg = PETScAdjoint(petsc_options = states_only),
-                        ),
                     ),
                     (
                         "PETScAdjoint does not support `-ts_arkimex_fully_implicit` on a " *
