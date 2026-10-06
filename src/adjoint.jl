@@ -40,11 +40,7 @@ compare it against a gradient computed without it.
 explicit part's are those of `f2`'s own `ODEFunction`; each is built by automatic
 differentiation when missing. PETSc's ARKIMEX adjoint has no quadrature, so an integral
 cost is refused, and `-ts_arkimex_fully_implicit` is refused on a `SplitODEProblem`, since
-the adjoint would still take `f2` explicitly. On a plain `ODEProblem`, every type but
-`"1bee"`, `"l2"` and `"prssp2"` has an explicit first stage, which PETSc evaluates at a
-stale time on the first step after a restart without its adjoint seeing that. Such a type
-therefore needs `tspan` to start at 0 and the stages kept in the trajectory, and is
-refused otherwise; a `SplitODEProblem` has no such limit.
+the adjoint would still take `f2` explicitly.
 
 A `DynamicalODEProblem` or `SecondOrderODEProblem` is differentiated as the first-order
 system on the flat `[v; u]` that these methods step. Its `jac` and `paramjac`, when given,
@@ -814,9 +810,6 @@ function _check_adjoint_dm(prob, dm, parts)
     end
     return nothing
 end
-
-const _ARKIMEX_IMPLICIT_FIRST_STAGE = ("1bee", "l2", "prssp2")
-
 function _check_adjoint_ts(h::TSHandles, alg, cost_s, integral, is_split)
     pl, ts = h.petsclib, h.ts
     implicit = _uses_ifunction(alg)
@@ -841,28 +834,6 @@ function _check_adjoint_ts(h::TSHandles, alg, cost_s, integral, is_split)
                 "adjointintegral\"; give the cost at discrete times, or use TSRK or TSImplicit",
         ),
     )
-    if ts_type == "arkimex" && !is_split
-        sub = LibPETSc.TSARKIMEXGetType(pl, ts)
-        stale = "PETSc's arkimex evaluates this type's explicit first stage at a stale " *
-            "time on the first step after a restart, which its adjoint does not see; " *
-            "give a SplitODEProblem, or use \"1bee\", \"l2\" or \"prssp2\", whose " *
-            "first stage is implicit"
-        sub in _ARKIMEX_IMPLICIT_FIRST_STAGE || h.t0 == 0 || throw(
-            ArgumentError(
-                "PETScAdjoint does not support TSARKIMEX(\"$sub\") on an ODEProblem whose " *
-                    "tspan starts away from 0: $stale, or start tspan at 0",
-            ),
-        )
-        tj = _trajectory(pl, ts)
-        sub in _ARKIMEX_IMPLICIT_FIRST_STAGE || tj == C_NULL ||
-            !_petsc_flag(pl, :TSTrajectoryGetSolutionOnly, tj) || throw(
-            ArgumentError(
-                "PETScAdjoint does not support `-ts_trajectory_solution_only` with " *
-                    "TSARKIMEX(\"$sub\") on an ODEProblem, where every step is taken " *
-                    "again from a restart: $stale, or keep the stages in the trajectory",
-            ),
-        )
-    end
     if is_split && _petsc_flag(pl, :TSARKIMEXGetFullyImplicit, ts)
         throw(
             ArgumentError(

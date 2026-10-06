@@ -632,6 +632,28 @@ const METHODS = (
         end
     end
 
+    @testset "TSARKIMEX takes its first stage at the step's start" begin
+        a = 2 .+ (1:N) ./ N
+        exact(t) = 1 ./ (a[rows] .- sin(t))
+        rhs!(du, u, p, t) = (du .= u .^ 2 .* cos(t); nothing)
+        function jac!(J, u, p, t)
+            for (k, i) in enumerate(rows)
+                J[k, i] = 2 * u[k] * cos(t)
+            end
+            return nothing
+        end
+        tight = ["-snes_rtol", "1e-12", "-snes_atol", "1e-14", "-ksp_rtol", "1e-12"]
+        for jac in (nothing, jac!), span in ((1.0, 2.0), (2.0, 1.0))
+            fn = ODEFunction(rhs!; jac, jac_prototype = heat_proto(rows))
+            sol = solve(
+                ODEProblem(fn, exact(span[1]), span), TSARKIMEX("4", tight; comm);
+                dt = 0.05, adaptive = false,
+            )
+            err = MPI.Allreduce(maximum(abs, sol.u[end] - exact(span[2])), max, comm)
+            @test err < 1.0e-7
+        end
+    end
+
     @testset "f, jac or f2 throwing on one rank raises on every rank" begin
         proto = heat_proto(rows)
         bdf = TSImplicit("bdf"; comm)
