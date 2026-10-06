@@ -65,9 +65,15 @@ function damped_oscillator_jac!(J, u, p, t)
 end
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
+const GROUP = let group = get(ENV, "GROUP", "")
+    isempty(group) ? "All" : group
+end
+GROUP in ("All", "Core", "MPI") || error("GROUP is All, Core or MPI, not $GROUP")
+is_mpi(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") && s.args[3] == "MPI"
+
 # Julia compiles a block as one thunk before running any of it, so each testset stands alone.
 macro each_toplevel(ts, block)
-    stmts = block.args
+    stmts = filter(s -> GROUP == "All" || (GROUP == "MPI") == is_mpi(s), block.args)
     isdefined(Test, :push_testset) &&
         return esc(Expr(:toplevel, :(Test.push_testset($ts)), stmts..., :(Test.pop_testset())))
     wrap(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") ? :(Test.@with_testset $ts $s) : s
