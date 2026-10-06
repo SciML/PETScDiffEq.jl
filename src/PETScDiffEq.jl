@@ -6135,7 +6135,8 @@ function _init_unlocked(
     _initial_save!(h)
     stops = _tstops(stops_given, h)
     dt0 = h.tdir * LibPETSc.TSGetTimeStep(h.petsclib, h.ts)
-    integ = PETScIntegrator(
+    # With `h` abstract, inferring this call leaves an edge Julia 1.10 takes 40 s to verify.
+    integ = Base.inferencebarrier(PETScIntegrator)(
         alg, _integ_state(prob, h.u0), _integ_state(prob, h.u0), _user_t(h.tdir, h.t0),
         _user_t(h.tdir, h.t0),
         dt0, h.tdir,
