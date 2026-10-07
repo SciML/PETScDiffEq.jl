@@ -2,7 +2,7 @@
 
 julia_version = "1.13.1"
 manifest_format = "2.1"
-project_hash = "bbc629a72ee954a57b83002d07ae84390f4fd99d"
+project_hash = "bee5e3a359ada12c152c9a5ee7441a0beaf4c603"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -60,10 +60,10 @@ version = "0.1.45"
 
 [[deps.Adapt]]
 deps = ["LinearAlgebra"]
-git-tree-sha1 = "6da5f4e2d02f93b0ae3896685a32971a3c61cdea"
+git-tree-sha1 = "0d64e8eff17936a5e10e61a9d054e1f716792da9"
 registries = "General"
 uuid = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
-version = "4.7.2"
+version = "4.7.3"
 
     [deps.Adapt.extensions]
     AdaptSparseArraysExt = "SparseArrays"
@@ -958,7 +958,7 @@ version = "0.5.2"
 
 [[deps.PETScDiffEq]]
 deps = ["ADTypes", "DiffEqBase", "DifferentiationInterface", "ForwardDiff", "Libdl", "LinearAlgebra", "MPI", "PETSc", "PETSc_jll", "PrecompileTools", "SciMLBase", "SciMLLogging", "SciMLOperators", "SparseArrays", "SparseMatrixColorings"]
-path = "/home/runner/work/PETScDiffEq.jl/PETScDiffEq.jl"
+path = "/home/runner/_work/PETScDiffEq.jl/PETScDiffEq.jl"
 uuid = "0a65194f-a16f-47d0-900e-080c22068669"
 version = "0.9.20"
 
