@@ -876,10 +876,10 @@ function _check_adjoint_ts(h::TSHandles, alg, integral, is_split)
 end
 
 # PETSc's adaptor ends a step on each time of the span, which the trajectory then holds.
-function _set_time_span!(h::TSHandles, cost_s, R)
+function _set_time_span!(h::TSHandles{<:Any, <:Any, R}, cost_s) where {R}
     # Closer than this to a time of the span, a cost time is matched to that step instead.
     near(s) = 100 * Float64(eps(R(max(1.0, abs(s)))))
-    span = [h.t0]
+    span = R[h.t0]
     for s in sort(cost_s)
         last(span) + near(s) < s < h.tf - near(s) && push!(span, s)
     end
@@ -888,7 +888,7 @@ function _set_time_span!(h::TSHandles, cost_s, R)
     push!(span, h.tf == -1 ? nextfloat(h.tf) : h.tf)
     code = ccall(
         _symbol(h.petsclib, :TSSetTimeSpan), LibPETSc.PetscErrorCode,
-        (LibPETSc.CTS, LibPETSc.PetscInt, Ptr{Float64}),
+        (LibPETSc.CTS, LibPETSc.PetscInt, Ptr{R}),
         h.ts, LibPETSc.PetscInt(length(span)), span,
     )
     _check_code(code, "TSSetTimeSpan")
@@ -1074,7 +1074,7 @@ function _discrete_adjoint_unlocked(
         cost_s = h.tdir .* cost_t
         implicit, arkimex, adaptive = _check_adjoint_ts(h, alg, integral, is_split)
         # PETSc 3.22 allocates the span's states in TSSetUp, which the solve below is first to call.
-        adaptive && _set_time_span!(h, cost_s, first(_eltypes(prob)))
+        adaptive && _set_time_span!(h, cost_s)
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
         inplace(fun) = _as_inplace(SciMLBase.unwrapped_f(fun.f), iip)
