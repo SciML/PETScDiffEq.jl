@@ -9801,6 +9801,25 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "a prototype entry jac never writes stays out of the gradient" begin
+            chain!(du, u, p, t) = (du[1] = -p[1] * u[1]; du[2] = p[1] * u[1] - u[2]^2; nothing)
+            # The derivative of the first row by `u[2]` is zero, and this leaves it unwritten.
+            chain_jac!(J, u, p, t) = (J[1, 1] = -p[1]; J[2, 1] = p[1]; J[2, 2] = -2u[2]; nothing)
+            chain_pjac!(pJ, u, p, t) = (pJ[1, 1] = -u[1]; pJ[2, 1] = u[1]; nothing)
+            with(proto) = PETScDiffEq._discrete_adjoint(
+                SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(
+                        chain!; jac = chain_jac!, paramjac = chain_pjac!, jac_prototype = proto,
+                    ), [1.0, 0.5], (0.0, 1.0), [0.7],
+                ), TSRK("4"), PETScAdjoint();
+                t = [1.0], dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing),
+                dt = 0.01, adaptive = false,
+            )
+            dense, filled = with(nothing), with(sparse(ones(2, 2)))
+            @test isapprox(filled[1], dense[1]; rtol = 1.0e-12)
+            @test isapprox(filled[2], dense[2]; rtol = 1.0e-12)
+        end
+
         @testset "dp is nothing without parameters and empty with no entries" begin
             function g!(du, u, p, t)
                 du[1] = -u[1] + 0.3 * u[1] * u[2]
