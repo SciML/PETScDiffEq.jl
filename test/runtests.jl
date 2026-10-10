@@ -9782,6 +9782,36 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 4.0e-10
         end
 
+        # Measured: 8.3e-11 for 5dp, and 1.6e-10 on PETSc 3.22 and 2.5e-10 on 3.25 for ARKIMEX 3.
+        @testset "an adaptive solve ends a step on each interior cost time: $name" for (
+                name, alg,
+            ) in (("5dp", TSRK("5dp")), ("ARKIMEX 3", TSARKIMEX("3", exact)))
+            tspan, ts = (0.0, 6.0), [0.7, 1.9, 3.2, 4.4, 6.0]
+            prob = adj_prob(copy(u0), copy(p0), tspan)
+            tolerances = (abstol = 1.0e-6, reltol = 1.0e-6, dt = 0.01)
+            # unstable_check sees every accepted step of the adjoint's forward solve but the last.
+            steps = [tspan[1]]
+            du0, dp = PETScDiffEq._discrete_adjoint(
+                prob, alg, PETScAdjoint();
+                t = ts, dgdu_discrete = coupled_du!, dgdp_discrete = coupled_dp!,
+                unstable_check = (dt, u, p, t) -> (push!(steps, t); false), tolerances...,
+            )
+            push!(steps, tspan[2])
+            stepped(θ) = SciMLBase.solve(
+                adj_prob(θ[1:2], θ[3:6], tspan), alg;
+                dt = 6.0, adaptive = false, tstops = steps[2:(end - 1)],
+            )
+            at = indexin(ts, steps)
+            @test length(steps) > 2 * length(ts)
+            @test !any(isnothing, at)
+            @test stepped(vcat(u0, p0)).t == steps
+            function loss(θ)
+                sol = stepped(θ)
+                return sum(coupled(sol.u[i], θ[3:6], t) for (i, t) in zip(at, ts))
+            end
+            @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-9
+        end
+
         function quadrature(θ, alg, tspan, cost; dt = 0.01, kwargs...)
             aug!(dz, z, p, t) = (
                 adj_f!(view(dz, 1:2), view(z, 1:2), p, t); dz[3] = cost(view(z, 1:2), p, t); nothing
@@ -10848,10 +10878,6 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     (
                         "cost time t[1] = 0.105 is not a time the solve stepped to",
                         () -> grad(prob, TSRK("4"); t = [0.105]),
-                    ),
-                    (
-                        "an adaptive solve steps onto no time but tspan's ends",
-                        () -> grad(prob, TSRK("5dp"); t = [0.5], adaptive = true),
                     ),
                     (
                         "the forward solve stopped with TS_CONVERGED_ITS",

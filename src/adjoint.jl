@@ -59,9 +59,13 @@ repeated as that `solve` was given it. A complex state is refused.
 Costs are discrete, integral or both. At each `t[i]`, `dgdu_discrete(out, u, p, t, i)`
 writes the cost's derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`,
 if given, its direct derivative with respect to `p`; `no_start = true` leaves out `t[1]`.
-PETSc's adjoint has no derivative of interpolation, so with fixed steps every cost time must
-be a time the solve steps to, such as `tspan[1]` plus a multiple of `dt`. An adaptive solve
-lands only on the ends of `tspan`, so its costs are limited to those, and its gradient
+PETSc's adjoint has no derivative of interpolation, so every cost time has to be the end of
+a step. With fixed steps it must be a time the solve steps to, such as `tspan[1]` plus a
+multiple of `dt`. An adaptive solve takes cost times anywhere in `tspan`: they are given to
+PETSc as its time span, `TSSetTimeSpan`, and its step-size controller ends a step on each
+one. Those steps are this run's own. `solve` with the same tolerances takes others and
+interpolates to its `saveat` times, so the gradient is that of the cost on the states this
+run steps to, which differ from the ones `solve` saves by the error of the two solves. It
 treats the accepted step sizes as constants rather than differentiating the controller.
 
 An integral cost, the integral of `g(u, p, t)` from `tspan[1]` to `tspan[2]`, is given as
@@ -84,7 +88,8 @@ trajectory is kept in memory, every stage of every step; `-ts_trajectory_solutio
 keeps only the states and recomputes each step during the adjoint, and
 `-ts_trajectory_type basic` writes one file per step to the working directory instead. For
 an adaptive solve the memory trajectory reserves 8 bytes for each of `maxiters` steps before
-starting, 8 MB at the default and 8 GB at `maxiters = 10^9`. `TSImplicit` and `TSARKIMEX`
+starting, 8 MB at the default and 8 GB at `maxiters = 10^9`, and PETSc's time span holds one
+more copy of the state for each cost time inside `tspan`. `TSImplicit` and `TSARKIMEX`
 solve transposed linear systems with the same Krylov solver and tolerances as their Newton
 steps, so with default options the gradient can be off by up to about their relative
 tolerance of 1e-5 while the forward states are far closer; pass
@@ -596,8 +601,9 @@ const _ADJOINT_REFUSED_KWARGS = (
         "between PETSc steps, where the saved trajectory does not see what they change; " *
         "remove the callback from the call and from the problem",
     tstops = "PETScAdjoint does not support `tstops`: a solve with stops is stepped " *
-        "outside PETSc's own loop, which saves no trajectory; remove them and choose a " *
-        "`dt` whose steps land on the cost times",
+        "outside PETSc's own loop, which saves no trajectory; remove them, and choose a " *
+        "`dt` whose steps land on the cost times or solve adaptively, which ends a step " *
+        "on each cost time",
     d_discontinuities = "PETScAdjoint does not support `d_discontinuities`; remove them",
     isoutofdomain = "PETScAdjoint does not support `isoutofdomain`: its forward solve is " *
         "PETSc's own, which does not take a step again that leaves the domain; remove it",
@@ -811,7 +817,7 @@ function _check_adjoint_dm(prob, dm, parts)
     end
     return nothing
 end
-function _check_adjoint_ts(h::TSHandles, alg, cost_s, integral, is_split)
+function _check_adjoint_ts(h::TSHandles, alg, integral, is_split)
     pl, ts = h.petsclib, h.ts
     implicit = _uses_ifunction(alg)
     ts_type = LibPETSc.TSGetType(pl, ts)
@@ -865,17 +871,28 @@ function _check_adjoint_ts(h::TSHandles, alg, cost_s, integral, is_split)
                 "`-ts_trajectory_type basic`, but this solve's is `$traj`; use one of those",
         ),
     )
-    if LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, ts)) != "none"
-        tol = 100 * eps(max(1.0, abs(h.t0), abs(h.tf)))
-        all(s -> abs(s - h.t0) <= tol || abs(s - h.tf) <= tol, cost_s) || throw(
-            ArgumentError(
-                "an adaptive solve steps onto no time but tspan's ends, so its cost " *
-                    "times can only be those; pass `adaptive = false` and a `dt` whose " *
-                    "steps land on every cost time, to `solve` as well as here",
-            ),
-        )
+    adaptive = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, ts)) != "none"
+    return implicit, ts_type == "arkimex", adaptive
+end
+
+# PETSc's adaptor ends a step on each time of the span, which the trajectory then holds.
+function _set_time_span!(h::TSHandles, cost_s, R)
+    # Closer than this to a time of the span, a cost time is matched to that step instead.
+    near(s) = 100 * Float64(eps(R(max(1.0, abs(s)))))
+    span = [h.t0]
+    for s in sort(cost_s)
+        last(span) + near(s) < s < h.tf - near(s) && push!(span, s)
     end
-    return implicit, ts_type == "arkimex"
+    length(span) == 1 && return nothing
+    # TSSetTimeSpan passes its last time to TSSetMaxTime, which reads -1 as PETSC_DETERMINE.
+    push!(span, h.tf == -1 ? nextfloat(h.tf) : h.tf)
+    code = ccall(
+        _symbol(h.petsclib, :TSSetTimeSpan), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, LibPETSc.PetscInt, Ptr{Float64}),
+        h.ts, LibPETSc.PetscInt(length(span)), span,
+    )
+    _check_code(code, "TSSetTimeSpan")
+    return nothing
 end
 
 _throw_callback_error(ctx, adj, comm = nothing, q = nothing, ex = nothing) = _throw_anywhere(
@@ -1055,7 +1072,9 @@ function _discrete_adjoint_unlocked(
     local du0, dp
     try
         cost_s = h.tdir .* cost_t
-        implicit, arkimex = _check_adjoint_ts(h, alg, cost_s, integral, is_split)
+        implicit, arkimex, adaptive = _check_adjoint_ts(h, alg, integral, is_split)
+        # PETSc 3.22 allocates the span's states in TSSetUp, which the solve below is first to call.
+        adaptive && _set_time_span!(h, cost_s, first(_eltypes(prob)))
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
         inplace(fun) = _as_inplace(SciMLBase.unwrapped_f(fun.f), iip)
