@@ -3312,6 +3312,60 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test plain.stats.nf2 == 0
     end
 
+    @testset "stats count the linear solves and the callback condition calls" begin
+        chain_prob = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(chain!; jac = chain_jac!, jac_prototype = CHAIN_PROTOTYPE),
+            [1.0, 0.5, 0.25], (0.0, 1.0),
+        )
+        fixed = (dt = 0.05, adaptive = false)
+        linear = ["-snes_type", "ksponly"]
+        beuler(opts = linear; kw...) = PETScDiffEq.TSImplicit("beuler", opts; kw...)
+        counts(sol) = (sol.stats.naccept, sol.stats.nsolve, sol.stats.nw, sol.stats.ncondition)
+        @test counts(SciMLBase.solve(chain_prob, beuler(); fixed...)) == (20, 20, -1, 0)
+        krylov = [linear..., "-ksp_type", "gmres", "-pc_type", "none"]
+        @test counts(SciMLBase.solve(chain_prob, beuler(krylov); fixed...)) == (20, 20, -1, 0)
+        rosw = PETScDiffEq.TSRosW("ra34pw2")
+        @test counts(SciMLBase.solve(chain_prob, rosw; fixed...)) == (20, 80, -1, 0)
+        @test counts(SciMLBase.solve(chain_prob, PETScDiffEq.TSRK("4"); fixed...)) == (20, 0, -1, 0)
+        newton = SciMLBase.solve(chain_prob, beuler(String[]); fixed...)
+        @test newton.stats.nsolve == newton.stats.nnonliniter >= 20
+        @test SciMLBase.solve(chain_prob, beuler(["-snes_ksp_ew"]); fixed...).stats.nsolve == -1
+        if Sys.WORD_SIZE == 64
+            on_world = beuler(; comm = MPI.COMM_WORLD)
+            @test counts(SciMLBase.solve(chain_prob, on_world; fixed...)) == (20, 20, -1, 0)
+        end
+
+        integ = SciMLBase.init(chain_prob, beuler(); fixed...)
+        @test counts(integ.sol) == (0, 0, -1, 0)
+        SciMLBase.step!(integ)
+        SciMLBase.step!(integ)
+        @test counts(integ.sol) == (2, 2, -1, 0)
+        SciMLBase.reinit!(integ)
+        @test counts(integ.sol) == (0, 0, -1, 0)
+        @test counts(SciMLBase.solve!(integ)) == (20, 20, -1, 0)
+
+        asked = [0, 0, 0]
+        each_step = SciMLBase.DiscreteCallback(
+            (u, t, integ) -> (asked[1] += 1; false), integ -> nothing,
+        )
+        crossing = SciMLBase.ContinuousCallback(
+            (u, t, integ) -> (asked[2] += 1; u[1] - 0.8), integ -> nothing,
+        )
+        crossings = SciMLBase.VectorContinuousCallback(
+            (out, u, t, integ) -> (asked[3] += 1; out[1] = u[1] - 0.7; out[2] = u[2] - 9.0; nothing),
+            (integ, i) -> nothing, 2,
+        )
+        watched = SciMLBase.CallbackSet(crossing, crossings, each_step)
+        integ = SciMLBase.init(chain_prob, beuler(); callback = watched, fixed...)
+        SciMLBase.step!(integ)
+        @test integ.sol.stats.ncondition == sum(asked) > 2
+        sol = SciMLBase.solve!(integ)
+        @test asked[1] == sol.stats.naccept
+        @test minimum(asked[2:3]) > sol.stats.naccept
+        @test sol.stats.ncondition == sum(asked)
+        @test sol.stats.nsolve == sol.stats.naccept
+    end
+
     @testset "a solver failure is a retcode, a misuse is an error" begin
         blow!(du, u, p, t) = (du[1] = -1.0e6 * (exp(u[1]) - 1); nothing)
         stiff = SciMLBase.ODEProblem(blow!, [20.0], (0.0, 10.0))
