@@ -780,7 +780,7 @@ end
 function _ad_comm_paramjacobian(backend, f!, u0, p, t, advice, comm)
     dense = ADTypes.dense_ad(backend)
     err = Ref{Any}(nothing)
-    g! = Guarded(f!, err)
+    g! = _guarded(f!, err)
     out = zeros(length(u0))
     B = _batch(dense, length(p))
     tx = ntuple(_ -> zeros(eltype(p), length(p)), B)

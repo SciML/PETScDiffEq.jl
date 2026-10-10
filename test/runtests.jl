@@ -10540,6 +10540,53 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(du0, central_differences(loss, u0)) < 1.0e-8
         end
 
+        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX on a split problem on a communicator of one rank" begin
+            world = MPI.COMM_WORLD
+            on_world = TSARKIMEX("3", exact; comm = world)
+            for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t))
+                prob = split_prob(copy(u0), copy(p0), tspan; kind = :sparse)
+                serial = grad(prob, TSARKIMEX("3", exact); t)
+                du0, dp = grad(prob, on_world; t)
+                @test du0 ≈ serial[1] rtol = 1.0e-13
+                @test dp ≈ serial[2] rtol = 1.0e-13
+            end
+            given = grad(split_prob(copy(u0), copy(p0), (0.0, 1.0)), TSARKIMEX("3", exact))
+            differentiating =
+                TSARKIMEX("3", exact; comm = world, autodiff = PETScDiffEq.AutoForwardDiff())
+            pattern = sparse(ones(2, 2))
+            bare = SciMLBase.SplitODEProblem(
+                SciMLBase.ODEFunction(implicit_part!; jac_prototype = pattern),
+                SciMLBase.ODEFunction(explicit_part!; jac_prototype = pattern),
+                copy(u0), (0.0, 1.0), copy(p0),
+            )
+            sparse_split(; kw...) =
+                split_prob(copy(u0), copy(p0), (0.0, 1.0); kind = :sparse, kw...)
+            for prob in (bare, sparse_split(f2_jac = nothing), sparse_split(f2_paramjac = nothing))
+                du0, dp = grad(prob, differentiating)
+                @test du0 ≈ given[1] rtol = 1.0e-12
+                @test dp ≈ given[2] rtol = 1.0e-12
+            end
+            zygote = PETScDiffEq.ADTypes.AutoZygote()
+            taped = TSARKIMEX("3", exact; comm = world, autodiff = zygote)
+            for (prob, what) in (
+                    (sparse_split(f2_jac = nothing), "cannot build `f2`'s `jac` with `$zygote`"),
+                    (sparse_split(f2_paramjac = nothing), "cannot build `f2`'s `paramjac` with `$zygote`"),
+                )
+                @test_throws what grad(prob, taped)
+            end
+            dense_f2 = SciMLBase.SplitODEProblem(
+                SciMLBase.ODEFunction(
+                    implicit_part!; jac = implicit_jac!, paramjac = implicit_paramjac!,
+                    jac_prototype = pattern,
+                ),
+                SciMLBase.ODEFunction(
+                    explicit_part!; jac = explicit_jac!, paramjac = explicit_paramjac!,
+                ),
+                copy(u0), (0.0, 1.0), copy(p0),
+            )
+            @test_throws "to come with a sparse `jac_prototype`" grad(dense_f2, on_world)
+        end
+
         @testset "an adaptive TSARKIMEX holds its accepted steps fixed: $name" for (
                 name, subtype, make, tspan,
             ) in (
@@ -10778,11 +10825,13 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(vec(single[2]), vec(double[2])) < 5.0e-7
         end
 
-        @testset "a partitioned problem runs on its flat [v; u]: $name" for (name, alg) in (
-                ("RK4", TSRK("4")), ("backward Euler", TSImplicit("beuler", exact)),
-                ("Crank-Nicolson", TSImplicit("cn", exact)),
-                ("theta 0.7", TSImplicit("theta", 0.7, exact)),
+        @testset "a partitioned problem runs on its flat [v; u]: $name" for (name, on) in (
+                ("RK4", (; autodiff = nothing, kw...) -> TSRK("4"; kw...)),
+                ("backward Euler", (; kw...) -> TSImplicit("beuler", exact; kw...)),
+                ("Crank-Nicolson", (; kw...) -> TSImplicit("cn", exact; kw...)),
+                ("theta 0.7", (; kw...) -> TSImplicit("theta", 0.7, exact; kw...)),
             )
+            alg = on()
             kick!(dv, v, u, p, t) = (
                 dv[1] = -p[1] * u[1] - p[2] * v[1] + u[2] * v[2];
                 dv[2] = -p[3] * sin(u[2]) + p[1] * cos(t) * u[1]; nothing
@@ -10879,6 +10928,27 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test single[1] isa typeof(make(Float32.(θ0), (0.0f0, 1.0f0)).u0)
             @test collect(single[1]) == Float32.(collect(double[1]))
             @test single[2] == Float32.(double[2])
+            # On a communicator the prototype's columns go through the ranks' layout.
+            fn = SciMLBase.DynamicalODEFunction{true}(
+                kick!, drift!; jac = joined_jac!, paramjac = joined_paramjac!,
+                jac_prototype = sparse([1, 1, 1, 1, 2, 2, 3, 4, 4], [1, 2, 3, 4, 3, 4, 1, 2, 3], 1.0, 4, 4),
+            )
+            if Sys.WORD_SIZE == 64 && fn.jac_prototype isa SparseMatrixCSC
+                bare = SciMLBase.DynamicalODEFunction{true}(kick!, drift!; fn.jac_prototype)
+                dual = on(; comm = MPI.COMM_WORLD, autodiff = PETScDiffEq.AutoForwardDiff())
+                for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t))
+                    prob = SciMLBase.DynamicalODEProblem(fn, v0, copy(u0), tspan, copy(p0))
+                    flat = grad(make(θ0, tspan; kind = :flat), alg; t)
+                    du0, dp = grad(prob, on(; comm = MPI.COMM_WORLD); t)
+                    @test du0 isa typeof(prob.u0)
+                    @test collect(du0) ≈ flat[1] rtol = 1.0e-12
+                    @test dp ≈ flat[2] rtol = 1.0e-12
+                    built = SciMLBase.DynamicalODEProblem(bare, v0, copy(u0), tspan, copy(p0))
+                    du0, dp = grad(built, dual; t)
+                    @test collect(du0) ≈ flat[1] rtol = 1.0e-12
+                    @test dp ≈ flat[2] rtol = 1.0e-12
+                end
+            end
         end
 
         @testset "a solve with a dm" begin
@@ -12071,12 +12141,20 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test maximum(maximum(abs, collect(a) - collect(b)) for (a, b) in zip(sol.u, ref.u)) <=
                     1.0e-13
             end
-            @test_throws "SecondOrderODEProblem on MPI.COMM_SELF only" PETScDiffEq._discrete_adjoint(
-                springs(; jac = springs_jac!, jac_prototype = springs_proto),
-                PETScDiffEq.TSRK("4"; comm = world), PETScAdjoint(); t = [2.0],
-                dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing), dt = 0.05,
+            adjoint(alg) = PETScDiffEq._discrete_adjoint(
+                springs(; jac = springs_jac!, jac_prototype = springs_proto), alg, PETScAdjoint();
+                t = [2.0], dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing), dt = 0.05,
                 adaptive = false,
             )
+            if carries
+                du0, dp = adjoint(PETScDiffEq.TSRK("4"; comm = world))
+                @test du0 isa typeof(springs().u0)
+                @test collect(du0) ≈ collect(first(adjoint(PETScDiffEq.TSRK("4")))) rtol = 1.0e-12
+                @test dp === nothing
+            else
+                # SciMLBase 3.1 drops the `jac` as well, which is refused in other words.
+                @test_throws ArgumentError adjoint(PETScDiffEq.TSRK("4"; comm = world))
+            end
             line = PETScDiffEq.PETSc.DMDA(
                 PETScDiffEq.PETSc.getlib(; PetscScalar = Float64), MPI.COMM_SELF,
                 (PETScDiffEq.LibPETSc.DM_BOUNDARY_NONE,), (10,), 1, 1,

@@ -160,8 +160,8 @@ Jacobian from the prototype instead, for `TSAlpha2` and for the implicit algorit
 first-order form, as it does for an `ODEProblem`: the columns are coloured in the prototype's
 order, and each rank seeds the entries of its own `[v; u]` that those columns stand for, so
 `f1` and `f2` have to exchange dual numbers as `f` does there. It needs the sparse prototype,
-and other backends are refused. A `dm` is refused for these problems, and so is `PETScAdjoint`
-on a communicator. Split over 1 to 3 ranks, unevenly on more than one, a 1-D wave equation and a
+and other backends are refused. A `dm` is refused for these problems. Split over 1 to 3 ranks,
+unevenly on more than one, a 1-D wave equation and a
 chain of particles gave the serial solve's states to 3e-15 with `TSBasicSymplectic` and fixed
 steps of `TSRK`, the energy error included, and to 1.2e-9 with adaptive steps of `TSRK("5dp")`.
 `TSAlpha2` and `TSImplicit("bdf")` with a `jac` agreed to 2e-10 with `["-ksp_type", "preonly",
@@ -172,29 +172,49 @@ entry to 1e-12, and the solves took the `jac` solve's steps, with states within 
 own on the wave equation under `TSAlpha2` and `TSImplicit("bdf")` and within 1e-10 on the chain
 under `TSImplicit("bdf")`.
 
-`PETScAdjoint` runs distributed too, for `TSRK`, `TSARKIMEX` on an `ODEProblem` and
-`TSImplicit`'s `"beuler"`, `"cn"` and `"theta"`. It takes the problem's `jac`, filling this
-rank's rows of a sparse prototype as above, and when there are parameters a `paramjac`
-filling this rank's rows; both are collective like `f`. An explicit method takes such a
-`jac` in its own solve too, and ignores it there. Without a `jac` it builds one with
-ForwardDiff from the sparse prototype, coloured as above, so `f`'s buffers have to take
-`u`'s element type. An implicit method needs `autodiff = AutoForwardDiff()` for that, since
-the default on such a `comm`, `AutoFiniteDiff()`, leaves the adjoint no Jacobian to multiply
-by; `TSRK` has no `autodiff` and needs only the prototype. Without a `paramjac` it seeds `p`
-instead: every rank calls `f` once per chunk of parameters and keeps its own rows. `u` holds
-plain numbers in those calls, so a halo exchange of `u` goes through as in the solve, and
-only what `f` sends that depends on `p` has to travel in a buffer that takes dual numbers.
-Other backends are refused for both. On 1 and 2 ranks the gradients built this way were
-within 1.5e-15 relative of those from a hand-written `jac` and `paramjac` and of the serial
-adjoint's, for `TSRK`, `TSImplicit` and `TSARKIMEX`. `dgdu_discrete` gets this rank's rows
-of the state and writes their gradient, and `dgdp_discrete` gives this rank's share of the
-cost's direct derivative with respect to `p`, which the ranks add up. `du0` comes back as
-this rank's rows and `dp` as the whole gradient, the same on every rank. The cost times,
-`no_start`, the length of `p` and whether `dgdp_discrete`, `jac` and `paramjac` are given
-have to agree across the ranks. A `jac`, `paramjac`, cost function or `f` that throws on
-some ranks makes every rank throw, as in a solve. The transposed linear solves of
-`TSImplicit` and `TSARKIMEX` use the solver above; `["-ksp_type", "preonly", "-pc_type",
-"redundant"]` in `petsc_options` solves them directly.
+`PETScAdjoint` runs distributed too, for `TSRK`, `TSARKIMEX` and `TSImplicit`'s `"beuler"`,
+`"cn"` and `"theta"` on an `ODEProblem`, and for `TSARKIMEX` on a `SplitODEProblem`. It takes
+the problem's `jac`, filling this rank's rows of a sparse prototype as above, and when there
+are parameters a `paramjac` filling this rank's rows; both are collective like `f`. An
+explicit method takes such a `jac` in its own solve too, and ignores it there. Without a
+`jac` it builds one with ForwardDiff from the sparse prototype, coloured as above, so `f`'s
+buffers have to take `u`'s element type. An implicit method needs
+`autodiff = AutoForwardDiff()` for that, since the default on such a `comm`,
+`AutoFiniteDiff()`, leaves the adjoint no Jacobian to multiply by; `TSRK` has no `autodiff`
+and needs only the prototype. Without a `paramjac` it seeds `p` instead: every rank calls
+`f` once per chunk of parameters and keeps its own rows. `u` holds plain numbers in those
+calls, so a halo exchange of `u` goes through as in the solve, and only what `f` sends that
+depends on `p` has to travel in a buffer that takes dual numbers. Other backends are refused
+for both. On 1 and 2 ranks the gradients built this way were within 1.5e-15 relative of
+those from a hand-written `jac` and `paramjac` and of the serial adjoint's, for `TSRK`,
+`TSImplicit` and `TSARKIMEX`. A `SplitODEProblem` takes all of this for each part: `f1`'s
+`jac`, `paramjac` and prototype are the problem's, and `f2`'s `ODEFunction` carries its own
+`jac`, `paramjac` and sparse `jac_prototype` of this rank's rows, none of which
+`TSARKIMEX`'s own solve reads; the prototype is needed with or without the `jac`.
+`dgdu_discrete` gets this rank's rows of the state and writes their gradient, and
+`dgdp_discrete` gives this rank's share of the cost's direct derivative with respect to `p`,
+which the ranks add up. `du0` comes back as this rank's rows and `dp` as the whole gradient,
+the same on every rank. The cost times, `no_start`, the length of `p` and whether
+`dgdp_discrete`, `jac` and `paramjac` are given have to agree across the ranks. A `jac`,
+`paramjac`, cost function or `f` that throws on some ranks makes every rank throw, as in a
+solve. The transposed linear solves of `TSImplicit` and `TSARKIMEX` use the solver above;
+`["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
+On 1 and 2 ranks a reaction-diffusion problem split into its diffusion and its reaction gave
+the gradient of the serial split adjoint to 7e-16 and that of central differences of the
+same fixed-step solve to 1.2e-9. With `f2`'s `jac` and `paramjac` built the gradient was the
+same to the last digit, and with `f1`'s built it was within 8.2e-15, which is where building
+them puts it on `MPI.COMM_SELF` too.
+
+A `DynamicalODEProblem` or `SecondOrderODEProblem` is differentiated there too, with the same
+methods on its first-order form. Its `jac` fills the prototype described above, this rank's
+`v` rows and then its `u` rows with the columns of the whole `[v; u]`, and `paramjac` fills
+the same rows. A missing one is built with ForwardDiff as for an `ODEProblem`, the `jac` from
+that prototype with each rank seeding its own `[v; u]`. The cost functions get this rank's
+`ArrayPartition(v, u)` and write their derivative into one, and `du0` comes back as one. On 2
+ranks a damped nonlinear wave gave the serial adjoint's gradient to 3.1e-14 with each of the
+six methods, and on one rank that of central differences of the same fixed-step solve to
+2e-10. With `jac` and `paramjac` built the gradient stayed within 3.1e-15 of the one from
+hand-written ones on the same ranks.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
 which every algorithm that takes `comm` takes as well. The solve then runs on the DM's
