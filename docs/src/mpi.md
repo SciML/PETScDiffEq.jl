@@ -72,7 +72,10 @@ does, so an affect that throws has to do so after its own communication.
 The implicit algorithms build their Jacobian as a distributed PETSc matrix whose pattern
 comes from the problem's `jac_prototype`, which then holds this rank's rows only: it is
 `length(u0)` by the length of the whole state, with global column indices. A `jac` fills
-those rows, and is collective like `f`. For the heat equation above:
+those rows, and is collective like `f`. A `SplitODEProblem` under an algorithm other than
+`TSARKIMEX`, which solves the sum of its parts, needs such a prototype on both parts, since
+the pattern is their union, and a rank runs both parts even when the first throws. For the
+heat equation above:
 
 ```julia
 using SparseArrays
@@ -233,7 +236,10 @@ ghosted and `du` owned, and writes PETSc's whole `dG/du + gamma dG/du'`. `jac` r
 rank at every Jacobian, so anything collective in it has to be called on all of them in the
 same order, and it has to be in place: an out-of-place one is refused, as is a
 `jac_prototype`, since the DM gives the pattern. An explicit method takes a `jac` and ignores
-it in its own solve, for `PETScAdjoint`. `autodiff` is ignored with a `jac`. The heat
+it in its own solve, for `PETScAdjoint`. `autodiff` is ignored with a `jac`. The two `jac`s of
+a `SplitODEProblem` cannot be added in the DM's matrix, so an implicit algorithm other than
+`TSARKIMEX`, which solves the sum of the parts, refuses a `jac` on both; with one on a single
+part or none, PETSc colours the matrix. The heat
 equation above with its Jacobian, whose columns past the ends of the grid are dropped:
 
 ```julia
