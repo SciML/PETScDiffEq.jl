@@ -1,0 +1,11 @@
+name,value
+julia,1.10.12
+cpu,"unknown"
+PETScDiffEq,0.7.10
+PETSc,0.4.14
+DiffEqDevTools,3.6.3
+OrdinaryDiffEqBDF,2.4.11
+OrdinaryDiffEqRosenbrock,2.7.4
+OrdinaryDiffEqSDIRK,2.9.6
+Sundials,6.7.1
+PETSc_jll,3.22.2+0
