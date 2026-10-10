@@ -70,7 +70,9 @@ a `SplitODEProblem` takes from `f1`, and the explicit part's are those of `f2`'s
 refused, because PETSc's ARKIMEX adjoint cannot do them. It has no quadrature, so an
 integral cost stops with "No method adjointintegral". And with `-ts_arkimex_fully_implicit`
 on a `SplitODEProblem` the solve takes `f2` implicitly while the adjoint still takes it
-explicitly, which put the gradient 24% off in the test problem.
+explicitly, which put the gradient 24% off in the test problem. With any other algorithm,
+which solves a `SplitODEProblem` as the sum of its parts, `PETScAdjoint` refuses the problem;
+give it the `ODEProblem` of the sum.
 
 An integral cost, the integral of `g(u, p, t)` over `tspan`, goes through PETSc's quadrature
 `TS`, which sums it with the method's own stages: `dt * b[i] * g` at each stage of a `TSRK`,

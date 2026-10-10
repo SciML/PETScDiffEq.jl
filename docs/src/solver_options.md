@@ -76,6 +76,17 @@ OrdinaryDiffEq's integrator does.
 `ODEFunction`'s `jac`, `jac_prototype` and `mass_matrix`. Supply a `jac_prototype` for
 anything sparse: without one the Jacobian is dense and forces a dense factorization.
 
+`TSARKIMEX` integrates the `f1` of a `SplitODEProblem` implicitly and its `f2` explicitly.
+Every other algorithm solves it as the `ODEProblem` of `f1 + f2` and returns that problem's
+states bit for bit. `stats.nf` then counts the evaluations of the sum and `stats.nf2` stays
+zero, as with an OrdinaryDiffEq method that is not IMEX. A `SplitFunction`'s own `jac` and
+`jac_prototype` are those of `f1`, and `f2` carries its own as an `ODEFunction`. The Jacobian
+of the sum is the sum of the two `jac`s when both parts have one; a `jac` on one part alone
+is not used, and the Jacobian is built as for an `ODEProblem` without one. Its pattern is the
+union of the two `jac_prototype`s when both are sparse, and it is dense when either part has
+none. The `mass_matrix` of the `SplitFunction` applies to the sum. An operator as either
+part is refused, as it is with `TSARKIMEX`.
+
 Without a `jac`, the implicit algorithms build the Jacobian with ForwardDiff, as
 OrdinaryDiffEq does, and colour a sparse `jac_prototype`, so a tridiagonal problem costs
 one dual evaluation of `f` per Jacobian rather than one evaluation per state. The

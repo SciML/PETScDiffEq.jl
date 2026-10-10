@@ -205,8 +205,6 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
         orders = [log2(errs[i] / errs[i + 1]) for i in 1:(length(errs) - 1)]
         @test all(o -> isapprox(o, 3; atol = 0.2), orders)
-
-        @test_throws ArgumentError SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.01)
     end
 
     Sys.WORD_SIZE == 64 && @testset "TSARKIMEX takes its first stage at the step's start" begin
@@ -5450,6 +5448,149 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "every algorithm but TSARKIMEX solves a SplitODEProblem as the sum of its parts" begin
+        fast!(du, u, p, t) = (du[1] = -p * u[1]; du[2] = -2p * u[2]; nothing)
+        slow!(du, u, p, t) = (du[1] = u[2] * cos(t); du[2] = -u[1] * u[2]; nothing)
+        function summed!(du, u, p, t)
+            rest = similar(du)
+            fast!(du, u, p, t)
+            slow!(rest, u, p, t)
+            du .+= rest
+            return nothing
+        end
+        fast_jac!(J, u, p, t) = (J[1, 1] = -p; J[2, 2] = -2p; nothing)
+        slow_jac!(J, u, p, t) = (J[1, 2] = cos(t); J[2, 1] = -u[2]; J[2, 2] = -u[1]; nothing)
+        summed_jac!(J, u, p, t) =
+            (J[1, 1] = -p; J[1, 2] = cos(t); J[2, 1] = -u[2]; J[2, 2] = -2p - u[1]; nothing)
+        fast(u, p, t) = [-p * u[1], -2p * u[2]]
+        slow(u, p, t) = [u[2] * cos(t), -u[1] * u[2]]
+        summed(u, p, t) = fast(u, p, t) + slow(u, p, t)
+        fast_jac(u, p, t) = [-p 0.0; 0.0 -2p]
+        slow_jac(u, p, t) = [0.0 cos(t); -u[2] -u[1]]
+        summed_jac(u, p, t) = fast_jac(u, p, t) + slow_jac(u, p, t)
+        fast_proto = sparse([1, 2], [1, 2], ones(2))
+        slow_proto = sparse([1, 2, 2], [2, 1, 2], ones(3))
+        full, mass = sparse(ones(2, 2)), Diagonal([2.0, 1.0])
+        u0, span, p = [1.0, 0.5], (0.0, 1.0), 3.0
+        of(f; kw...) = SciMLBase.ODEFunction(f; kw...)
+        parts(f1, f2; kw...) =
+            SciMLBase.SplitODEProblem(SciMLBase.SplitFunction(f1, f2; kw...), u0, span, p)
+        whole(f; kw...) = SciMLBase.ODEProblem(of(f; kw...), u0, span, p)
+        tol = (abstol = 1.0e-8, reltol = 1.0e-8)
+        function same(split, plain, alg; kw...)
+            sol = SciMLBase.solve(split, alg; kw...)
+            ref = SciMLBase.solve(plain, alg; kw...)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.t == ref.t
+            @test sol.u == ref.u
+            @test sol(0.37) == ref(0.37)
+            @test (sol.stats.nf, sol.stats.nf2) == (ref.stats.nf, 0)
+            @test sol.stats.njacs == ref.stats.njacs
+            return sol
+        end
+        bdf, fd = TSImplicit("bdf"), PETScDiffEq.AutoFiniteDiff()
+        split, plain = parts(fast!, slow!), whole(summed!)
+        for alg in (TSRK("5dp"), bdf, TSRosW(; autodiff = fd))
+            same(split, plain, alg; tol...)
+        end
+        for alg in (
+                TSGeneric("ssp"; explicit = true), TSIRK(2), TSMPRK([1], "2a22"),
+            )
+            same(split, plain, alg; dt = 0.01)
+        end
+        same(parts(fast, slow), whole(summed), bdf; tol...)
+        both = parts(of(fast!; jac = fast_jac!), of(slow!; jac = slow_jac!))
+        with_jac = same(both, whole(summed!; jac = summed_jac!), TSRosW(); tol...)
+        @test with_jac.stats.nf < SciMLBase.solve(split, TSRosW(); tol...).stats.nf
+        same(
+            parts(of(fast; jac = fast_jac), of(slow; jac = slow_jac)),
+            whole(summed; jac = summed_jac), TSRosW(); tol...,
+        )
+        same(parts(of(fast!; jac = fast_jac!), slow!), plain, bdf; tol...)
+        same(
+            parts(of(fast!; jac_prototype = fast_proto), of(slow!; jac_prototype = slow_proto)),
+            whole(summed!; jac_prototype = full), TSRosW(); tol...,
+        )
+        sparse_both = parts(
+            of(fast!; jac = fast_jac!, jac_prototype = fast_proto),
+            of(slow!; jac = slow_jac!, jac_prototype = slow_proto),
+        )
+        sparse_whole = whole(summed!; jac = summed_jac!, jac_prototype = full)
+        same(sparse_both, sparse_whole, bdf; tol...)
+        same(parts(of(fast!; jac_prototype = fast_proto), slow!), plain, bdf; tol...)
+        same(
+            parts(fast!, slow!; mass_matrix = mass), whole(summed!; mass_matrix = mass), bdf;
+            tol...,
+        )
+        bump = SciMLBase.ContinuousCallback(
+            (u, t, integ) -> u[1] - 0.5, integ -> (integ.u[2] += 0.1; nothing),
+        )
+        same(split, plain, TSRK("5dp"); callback = bump, tol...)
+        function stepped(prob)
+            integ = SciMLBase.init(prob, bdf; tol...)
+            SciMLBase.step!(integ)
+            mid = (integ.t, copy(integ.u), SciMLBase.get_du(integ), integ.sol.stats.nf2)
+            SciMLBase.reinit!(integ)
+            sol = SciMLBase.solve!(integ)
+            return mid, sol.t, sol.u, sol.stats.nf, sol.stats.nf2
+        end
+        @test stepped(sparse_both) == stepped(sparse_whole)
+        @test SciMLBase.solve(split, TSARKIMEX("3"); tol...).stats.nf2 > 0
+        if Sys.WORD_SIZE == 64
+            world = MPI.COMM_WORLD
+            same(split, plain, TSRK("5dp"; comm = world); tol...)
+            same(sparse_both, sparse_whole, TSImplicit("bdf"; comm = world); tol...)
+        end
+        zero!(du, u, p, t) = (du .= 0.0; nothing)
+        @test_throws "operator-valued" SciMLBase.solve(
+            SciMLBase.SplitODEProblem(
+                SciMLOperators.MatrixOperator([-1.0 0.0; 0.0 -2.0]), zero!, u0, span,
+            ), TSRK("5dp"),
+        )
+        @test_throws "have to be one size" SciMLBase.solve(
+            parts(of(fast!; jac_prototype = fast_proto), of(slow!; jac_prototype = sparse(ones(3, 3)))),
+            bdf,
+        )
+
+        PETSc, LibPETSc = PETScDiffEq.PETSc, PETScDiffEq.LibPETSc
+        pl = PETSc.getlib(; PetscScalar = Float64)
+        da = PETSc.DMDA(pl, MPI.COMM_SELF, (LibPETSc.DM_BOUNDARY_GHOSTED,), (5,), 1, 1)
+        function spread!(du, u, da, t)
+            U, D = PETScDiffEq.reshape_local_array(u, da), PETScDiffEq.reshape_local_array(du, da)
+            for i in axes(D, 2)
+                D[1, i] = U[1, i - 1] - 2U[1, i] + U[1, i + 1]
+            end
+            return nothing
+        end
+        function react!(du, u, da, t)
+            U, D = PETScDiffEq.reshape_local_array(u, da), PETScDiffEq.reshape_local_array(du, da)
+            for i in axes(D, 2)
+                D[1, i] = U[1, i] * (1 - U[1, i])
+            end
+            return nothing
+        end
+        function spread_react!(du, u, da, t)
+            other = similar(du)
+            spread!(du, u, da, t)
+            react!(other, u, da, t)
+            du .+= other
+            return nothing
+        end
+        unused_jac!(J, u, da, t) = nothing
+        x0 = [0.1, 0.4, 0.9, 0.4, 0.1]
+        on_dm(f1, f2) = SciMLBase.SplitODEProblem(f1, f2, x0, span, da)
+        dm_whole = SciMLBase.ODEProblem(spread_react!, x0, span, da)
+        for alg in (TSRK("5dp"; dm = da), TSImplicit("bdf"; dm = da))
+            same(on_dm(spread!, react!), dm_whole, alg; tol...)
+        end
+        dm_both = on_dm(of(spread!; jac = unused_jac!), of(react!; jac = unused_jac!))
+        same(dm_both, dm_whole, TSRK("5dp"; dm = da); tol...)
+        @test_throws "cannot add the `jac`s" SciMLBase.solve(
+            dm_both, TSImplicit("bdf"; dm = da); tol...,
+        )
+        PETScDiffEq.PETScCompat.destroy!(da)
+    end
+
     @testset "without a jac the Jacobian is differentiated, as OrdinaryDiffEq does" begin
         function rober!(du, u, p, t)
             du[1] = -0.04u[1] + 1.0e4 * u[2] * u[3]
@@ -6211,7 +6352,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             dm_prob((0.0, 0.1); jac_prototype = proto), PETScDiffEq.TSImplicit("bdf"; dm = da),
         )
         algebraic(i) = i % 4 == 0
+        calls = Ref(0)
         function chain_dm!(du, u, da, t)
+            calls[] += 1
             U = PETScDiffEq.reshape_local_array(u, da)
             D = PETScDiffEq.reshape_local_array(du, da)
             for i in axes(D, 2)
@@ -6221,6 +6364,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             return nothing
         end
         function chain_jac_dm!(J, u, da, t)
+            push!(seen, length(u))
             U = PETScDiffEq.reshape_local_array(u, da)
             for i in 1:N
                 c = U[1, i]
@@ -6229,26 +6373,39 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             return nothing
         end
-        chain(; kw...) = SciMLBase.ODEProblem(
+        chain(x0 = u0, grid = da; kw...) = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(
-                chain_dm!; mass_matrix = Diagonal([algebraic(i) ? 0.0 : 1.0 for i in 1:N]), kw...,
-            ), u0, (0.0, 0.1), da,
+                chain_dm!; kw...,
+                mass_matrix = Diagonal([algebraic(i) ? 0.0 : 1.0 for i in eachindex(x0)]),
+            ), x0, (0.0, 0.1), grid,
         )
         bdf = PETScDiffEq.TSImplicit("bdf"; dm = da)
+        wide = PETSc.DMDA(pl, MPI.COMM_SELF, (ghosted,), (400,), 1, 1)
         for init in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            empty!(seen)
             with_jac = SciMLBase.init(
                 chain(; jac = chain_jac_dm!), bdf; initializealg = init, tol...,
             )
+            @test !isempty(seen)
             plain = SciMLBase.init(chain(), bdf; initializealg = init, tol...)
-            @test with_jac.u == plain.u != u0
+            @test with_jac.u != u0
+            @test maximum(abs, with_jac.u - plain.u) <= 1.0e-13
             for integ in (with_jac, plain)
                 SciMLBase.set_u!(integ, integ.u .+ 0.05)
                 SciMLBase.initialize_dae!(integ)
             end
-            @test with_jac.u == plain.u
+            @test maximum(abs, with_jac.u - plain.u) <= 1.0e-13
             SciMLBase.terminate!(with_jac)
             SciMLBase.terminate!(plain)
+            calls[] = 0
+            coloured = SciMLBase.init(
+                chain(fill(0.5, 400), wide), PETScDiffEq.TSImplicit("bdf"; dm = wide);
+                initializealg = init, tol...,
+            )
+            @test calls[] < 200
+            SciMLBase.terminate!(coloured)
         end
+        PETScDiffEq.PETScCompat.destroy!(wide)
         PETScDiffEq.PETScCompat.destroy!(da)
     end
 
@@ -7538,6 +7695,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test isapprox(sol.u[end][1], 1.5exp(-0.5) - 0.5exp(-1.0); atol = 1.0e-6)
             @test isapprox(sol.u[end][2], exp(-1.0); atol = 1.0e-6)
         end
+
+        @testset "a Diagonal or sparse mass matrix is not made dense" begin
+            band(n, l, d) = spdiagm(-1 => fill(l, n - 1), 0 => fill(d, n), 1 => fill(l, n - 1))
+            function run(M)
+                n = size(M, 1)
+                A = band(n, 1.0, -2.0)
+                f = SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (mul!(du, A, u); nothing);
+                    jac = (J, u, p, t) -> (copyto!(nonzeros(J), nonzeros(A)); nothing),
+                    jac_prototype = A, mass_matrix = M,
+                )
+                return SciMLBase.solve(
+                    SciMLBase.ODEProblem(f, sinpi.((1:n) ./ (n + 1)), (0.0, 0.1)),
+                    PETScDiffEq.TSImplicit("beuler"); dt = 0.01, adaptive = false,
+                )
+            end
+            lumped(n) = Diagonal(1 .+ (1:n) ./ n)
+            for M in (lumped(20), band(20, 1 / 6, 2 / 3))
+                @test run(M).u ≈ run(Matrix(M)).u rtol = 1.0e-12
+            end
+            for M in (lumped(2000), band(2000, 1 / 6, 2 / 3))
+                @test (@allocated run(M)) < 16_000_000
+            end
+        end
     end
 
     @testset "An operator-valued right-hand side is rejected" begin
@@ -7613,6 +7794,49 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.retcode == SciMLBase.ReturnCode.Success
             @test sol.t == [1.0]
             @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-4
+        end
+
+        @testset "an option PETSc reads inside the solve is in force there" begin
+            n = 8
+            A = spdiagm(-1 => ones(n - 1), 0 => fill(-2.0, n), 1 => ones(n - 1))
+            lin = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction((du, u, p, t) -> mul!(du, A, u); jac_prototype = A),
+                ones(n), (0.0, 1.0),
+            )
+            coloured(opts) = PETScDiffEq.TSImplicit(
+                "beuler", opts; autodiff = PETScDiffEq.AutoFiniteDiff(),
+            )
+            sol = SciMLBase.solve(lin, coloured(String[]); dt = 0.1)
+            # One colour per column, where PETSc's default finds three.
+            natural = coloured(["-mat_coloring_type", "natural"])
+            more = SciMLBase.solve(lin, natural; dt = 0.1)
+            @test more.stats.nf - sol.stats.nf == (n - 3) * sol.stats.nnonliniter
+            @test more.u[end] ≈ sol.u[end]
+            stepped = SciMLBase.solve!(SciMLBase.init(lin, natural; dt = 0.1))
+            @test stepped.stats.nf == more.stats.nf
+        end
+
+        @testset "the integrator sets up under its options" begin
+            function stage_type(integ)
+                pl = integ.h.petsclib
+                stage, name = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+                ccall(
+                    PETScDiffEq._symbol(pl, :SNESGetFunction), Cint,
+                    (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Cvoid}, Ptr{Cvoid}),
+                    PETScDiffEq._snes(pl, integ.h.ts.ptr), stage, C_NULL, C_NULL,
+                )
+                ccall(
+                    PETScDiffEq._symbol(pl, :VecGetType), Cint,
+                    (Ptr{Cvoid}, Ptr{Ptr{Cchar}}), stage[], name,
+                )
+                return unsafe_string(name[])
+            end
+            # TSIRK creates its stage vector in TSSetUp, of the type `-vec_type` names.
+            integ = SciMLBase.init(prob, PETScDiffEq.TSIRK(2, ["-vec_type", "mpi"]); dt = 0.1)
+            @test stage_type(integ) == "mpi"
+            SciMLBase.reinit!(integ)
+            @test stage_type(integ) == "mpi"
+            SciMLBase.terminate!(integ)
         end
     end
 
@@ -9489,6 +9713,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
             end
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-9
+        end
+
+        @testset "an option PETSc reads while the adjoint runs is in force there" begin
+            cd(mktempdir()) do
+                view = ["-ts_adjoint_view_solution", "ascii:lambda.txt"]
+                grad(
+                    adj_prob(copy(u0), copy(p0), (0.0, 1.0)), TSRK("4");
+                    sensealg = PETScAdjoint(petsc_options = view),
+                )
+                @test isfile("lambda.txt")
+            end
         end
 
         @testset "dp is nothing without parameters and empty with no entries" begin
