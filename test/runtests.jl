@@ -10904,7 +10904,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         ),
                     ),
                     (
-                        "PETScAdjoint is reached through `adjoint_sensitivities",
+                        "differentiating `solve` with `sensealg = PETScAdjoint()` needs",
                         () -> SciMLBase._concrete_solve_adjoint(
                             prob, TSRK("4"), PETScAdjoint(), u0, p0,
                             SciMLBase.ChainRulesOriginator(),

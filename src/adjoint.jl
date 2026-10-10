@@ -122,8 +122,28 @@ of the state as this rank's rows: the cost functions get that block as `solve` s
 not the ghosted array. The `dm` has to belong to PETSc's double real build.
 
 Returns `(du0, dp')`, where `dp` is `nothing` when `p` is `nothing` or
-`SciMLBase.NullParameters()`. Differentiating `solve` itself with a reverse-mode AD package
-is not supported.
+`SciMLBase.NullParameters()`.
+
+Given to `solve` as its `sensealg`, it is also what Zygote, or another reverse-mode package
+that takes its rules from ChainRules, differentiates that `solve` with:
+
+```julia
+using Zygote
+loss(p) = sum(abs2, Array(solve(prob, alg; p, saveat = ts, sensealg = PETScAdjoint())) .- data)
+Zygote.gradient(loss, p)
+```
+
+`solve` returns what it returns without the `sensealg`. The pullback runs the adjoint above
+with the keywords `solve` was given, the times it saved as cost times and the loss's
+derivative with respect to each saved state as `dgdu_discrete`, and gives the gradients with
+respect to `u0` and `p`. Saved times the loss does not depend on are left out, and
+`save_idxs` is taken. With fixed steps the saved times have to be step ends. In an adaptive
+solve the saved states are interpolated while the adjoint's run steps to their times, so the
+gradient is off by about the error of the solve, and the times of steps saved without
+`saveat` are held fixed. A loss that calls `sol(t)` or reads `sol.prob` is refused, since
+only the saved states carry a derivative, and so are a `Float32` problem, a
+`DynamicalODEProblem` or `SecondOrderODEProblem`, a `comm` other than `MPI.COMM_SELF`, a
+`dm`, and Enzyme, ReverseDiff, Tracker and Mooncake, which it has not been verified with.
 """
 struct PETScAdjoint <: SciMLBase.AbstractAdjointSensitivityAlgorithm{0, false, Val{:central}}
     petsc_options::Vector{String}
@@ -1318,16 +1338,16 @@ function _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs
     return _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; costs...))
 end
 
-function SciMLBase._concrete_solve_adjoint(
-        ::SupportedProblem, ::AnyPETScTS, ::PETScAdjoint, u0, p,
-        ::SciMLBase.ADOriginator, args...; kwargs...,
-    )
-    throw(
-        ArgumentError(
-            "PETScAdjoint is reached through `adjoint_sensitivities(sol, alg; sensealg = " *
-                "PETScAdjoint(), t, dgdu_discrete, ...)`; differentiating `solve` with it " *
-                "is not supported, since SciMLSensitivity's reverse-mode `solve` accepts " *
-                "only its own adjoint types",
-        ),
-    )
-end
+# The SciMLSensitivity extension has the method for a PETScAdjoint, built on ChainRulesCore.
+_solve_and_pullback(args...; kwargs...) = throw(
+    ArgumentError(
+        "differentiating `solve` with `sensealg = PETScAdjoint()` needs " *
+            "SciMLSensitivity, whose extension of this package holds the pullback; load " *
+            "it with `using SciMLSensitivity`",
+    ),
+)
+
+SciMLBase._concrete_solve_adjoint(
+    prob::SupportedProblem, alg::AnyPETScTS, sensealg::PETScAdjoint, u0, p,
+    originator::SciMLBase.ADOriginator, args...; kwargs...,
+) = _solve_and_pullback(prob, alg, sensealg, u0, p, originator, args...; kwargs...)
