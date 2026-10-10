@@ -3514,6 +3514,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 integ.opts.verbose = verbose
                 @test_logs min_level = Logging.Warn SciMLBase.solve!(integ)
             end
+            # An implicit solve gives up on its Newton solve, which it reports at the end.
+            bdf = PETScDiffEq.TSImplicit("bdf")
+            for verbose in (false, quiet)
+                sol = @test_logs min_level = Logging.Warn SciMLBase.solve(breaks, bdf; verbose)
+                @test sol.retcode == SciMLBase.ReturnCode.Unstable
+                integ = SciMLBase.init(breaks, bdf)
+                integ.opts.verbose = verbose
+                @test_logs min_level = Logging.Warn SciMLBase.solve!(integ)
+            end
         end
 
         @testset "a solve that ends early keeps its last step as the one just taken" begin

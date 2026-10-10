@@ -5110,7 +5110,9 @@ _underflows(h::TSHandles{<:Any, <:Any, Float32}, alg, uend, retcode) =
 _saves_early_end(h::TSHandles, tend, tol) =
     h.end_saveat === nothing || any(s -> abs(s - tend) <= tol, h.end_saveat)
 
-function _assemble(prob, alg, h::TSHandles, tend, uend, st, kwargs)
+function _assemble(
+        prob, alg, h::TSHandles, tend, uend, st, kwargs, verbose = get(kwargs, :verbose, true),
+    )
     ctx = h.ctx
     tf, t0, tol = h.tf, h.t0, _near(h.tf)
     # -ts_exact_final_time interpolate reports a point past tf mid-sequence.
@@ -5159,7 +5161,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st, kwargs)
     else
         SciMLBase.ReturnCode.Failure
     end
-    ctx.stuck === nothing || @warn "`$(_warn_name(alg))` ends here because $(ctx.stuck)"
+    ctx.stuck === nothing || _ends_early(alg, ctx.stuck, verbose)
     if h.jac_mat !== nothing && h.ad_calls === nothing && st.nsteps > 0 && ctx.njacs == 0
         @warn "`$(_ts_type(alg))` took $(st.nsteps) steps without ever calling the " *
             "Jacobian this package gave PETSc, so it is not solving implicitly and the " *
@@ -6446,6 +6448,7 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
     integ.iter = st.iter
     sol = _assemble(
         integ.prob, integ.alg, h, integ.tdir * integ.t, copy(integ.u), st, integ.kwargs,
+        integ.opts.verbose,
     )
     integ.sol = retcode === nothing ? sol : SciMLBase.solution_new_retcode(sol, retcode)
     integ.finished = true
