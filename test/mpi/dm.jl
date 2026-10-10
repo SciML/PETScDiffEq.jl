@@ -1124,6 +1124,16 @@ end
             )
             @test by_index.t == got.t
             @test everywhere(by_index.u == got.u)
+            dual = solve(
+                dm_heat(), make(; dm = da, comm, autodiff = AutoForwardDiff()); saveat = 0.01,
+                TOL...,
+            )
+            @test dual.t == got.t
+            @test everywhere(dual.u == got.u)
+            @test dual.stats.njacs == got.stats.njacs
+            @test same_everywhere(dual.stats.nf)
+            # The DM's three colours fit one call on dual numbers.
+            @test dual.stats.nf == got.stats.nf + dual.stats.njacs
             coloured = solve(dm_heat(), make(; dm = da, comm); saveat = 0.01, TOL...)
             @test coloured.stats.njacs == 0
             @test got.stats.nf < coloured.stats.nf
@@ -1185,6 +1195,13 @@ end
             )
             @test got.retcode == ReturnCode.Success
             @test got.stats.njacs > 0
+            dual = solve(
+                ODEProblem(grid_heat_dm!, u0, span, g),
+                make(; dm = g, autodiff = AutoForwardDiff()); saveat = 0.01, TOL...,
+            )
+            @test dual.t == got.t
+            @test everywhere(maxdiff(dual.u, got.u) <= ROUNDOFF)
+            @test dual.stats.nf == got.stats.nf + dual.stats.njacs
             coloured = solve(
                 ODEProblem(grid_heat_dm!, u0, span, g), make(; dm = g); saveat = 0.01, TOL...,
             )
@@ -1324,9 +1341,17 @@ end
             () -> solve(dm_heat(; jac_prototype = heat_proto(rows)), implicit(; dm = da)),
             "leave out `jac_prototype`",
         )
+        zygote = PETScDiffEq.ADTypes.AutoZygote()
         @test refused(
-            () -> solve(prob, TSImplicit("bdf"; dm = da, autodiff = AutoForwardDiff())),
-            "cannot use `AutoForwardDiff()`",
+            () -> solve(prob, TSImplicit("bdf"; dm = da, autodiff = zygote)),
+            "AutoZygote()` with a `dm`",
+        )
+        @test refused(
+            () -> solve(
+                ODEProblem(heat_dm!, heat0(rows), SPAN, stag),
+                TSImplicit("bdf"; dm = stag, autodiff = AutoForwardDiff()),
+            ),
+            "only on a DMDA so far",
         )
         n = length(rows)
         dense_mass = [i == j ? 2.0 : 0.0 for i in 1:n, j in 1:n]
