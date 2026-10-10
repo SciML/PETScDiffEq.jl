@@ -99,14 +99,19 @@ stay in force while the adjoint runs, so those PETSc reads only then, such as
 for example through `PETSC_OPTIONS`, do not reach the run.
 
 With an algorithm whose `comm` is not `MPI.COMM_SELF`, the adjoint runs distributed as the
-solve does, for the same methods on an `ODEProblem`. The `ODEFunction` then needs `jac`,
-filling this rank's rows of a sparse `jac_prototype` with global columns, and `paramjac`
-when there are parameters, filling this rank's rows; both are collective like `f`.
-`dgdu_discrete` gets this rank's rows of the state and writes their derivative, and
-`dgdp_discrete` gives this rank's share of the direct derivative, which the ranks add up.
-`du0` holds this rank's rows, and `dp` is the whole gradient on every rank. The cost times,
-`no_start`, the length of `p` and whether `dgdp_discrete` is given must agree across the
-ranks.
+solve does, for the same methods on an `ODEProblem`. `jac` then fills this rank's rows of a
+sparse `jac_prototype` with global columns, and `paramjac` fills this rank's rows; both are
+collective like `f`. A missing one is built with ForwardDiff and no other backend: `jac`
+from the sparse `jac_prototype`, coloured as a whole as the solve does under
+`autodiff = AutoForwardDiff()`, and `paramjac` by seeding `p`, every rank calling `f` once
+per chunk of parameters. `f` then runs on dual numbers, in `u` for `jac`, which its halo
+exchange has to carry, and in `p` for `paramjac`. An implicit method's `autodiff` defaults
+to `AutoFiniteDiff()` on such a `comm`, so pass `autodiff = AutoForwardDiff()` to have
+either built. `dgdu_discrete` gets this rank's rows of the state and writes their
+derivative, and `dgdp_discrete` gives this rank's share of the direct derivative, which the
+ranks add up. `du0` holds this rank's rows, and `dp` is the whole gradient on every rank.
+The cost times, `no_start`, the length of `p` and whether `dgdp_discrete`, `jac` and
+`paramjac` are given must agree across the ranks.
 
 With a `dm`, the adjoint runs on the DM as the solve does, for the same methods and discrete
 costs, and on a DM of a single rank for integral costs and a `SplitODEProblem` with
@@ -697,12 +702,25 @@ function _check_adjoint_problem(
             ),
         )
     end
-    comm === nothing || prob.f.jac !== nothing || throw(
-        ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `jac` $_NOT_SELF, where it builds none " *
-                "by automatic differentiation",
-        ),
-    )
+    backend = something(_autodiff(alg), AutoForwardDiff())
+    duals = ADTypes.dense_ad(backend) isa AutoForwardDiff
+    if comm !== nothing && prob.f.jac === nothing
+        duals || throw(
+            ArgumentError(
+                "PETScAdjoint cannot build the ODEFunction's `jac` with `$backend` " *
+                    "$_NOT_SELF, where `f` has to carry the derivatives to the other ranks " *
+                    "in its own halo exchange, as it does ForwardDiff's dual numbers; give " *
+                    "the problem a `jac`, or use `AutoForwardDiff()`",
+            ),
+        )
+        prob.f.jac_prototype isa SparseMatrixCSC || throw(
+            ArgumentError(
+                "without a `jac`, PETScAdjoint $_NOT_SELF needs a sparse `jac_prototype` " *
+                    "holding this rank's rows of the Jacobian, with global column indices, " *
+                    "to colour the whole pattern for ForwardDiff",
+            ),
+        )
+    end
     p = prob.p
     has_p = !(p === nothing || p isa SciMLBase.NullParameters)
     has_p && !(p isa AbstractVector{<:Real}) && throw(
@@ -727,10 +745,12 @@ function _check_adjoint_problem(
             ),
         )
     end
-    has_p && !isempty(p) && comm !== nothing && prob.f.paramjac === nothing && throw(
+    has_p && !isempty(p) && comm !== nothing && prob.f.paramjac === nothing && !duals && throw(
         ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `paramjac` $_NOT_SELF when the problem has " *
-                "parameters, where it builds none by automatic differentiation",
+            "PETScAdjoint cannot build the ODEFunction's `paramjac` with `$backend` " *
+                "$_NOT_SELF, where every rank has to call `f` the same number of times, " *
+                "which it does only with ForwardDiff's dual numbers in `p`; give the " *
+                "problem a `paramjac`, or use `AutoForwardDiff()`",
         ),
     )
     for (name, given) in (("dgdp_discrete", dgdp_discrete), ("dgdp_continuous", dgdp_continuous))
@@ -906,7 +926,7 @@ function _check_agreement(comm, args)
     throw(
         ArgumentError(
             "PETScAdjoint $_NOT_SELF needs the same cost times `t`, `no_start`, number of " *
-                "parameters and choice of `dgdp_discrete` on every rank",
+                "parameters and choice of `dgdp_discrete`, `jac` and `paramjac` on every rank",
         ),
     )
 end
@@ -1056,8 +1076,14 @@ function _discrete_adjoint_unlocked(
     np = has_p ? length(p) : 0
     cost_t = _unset(t) ? Float64[] : collect(Float64, t)
     integral = g !== nothing || dgdu_continuous !== nothing
-    comm === nothing ||
-        _check_agreement(comm, (cost_t, skip_start, np, dgdp_discrete === nothing))
+    # A rank building a Jacobian calls `f` where one with a `jac` or `paramjac` calls that.
+    comm === nothing || _check_agreement(
+        comm,
+        (
+            cost_t, skip_start, np, dgdp_discrete === nothing, prob.f.jac === nothing,
+            prob.f.paramjac === nothing,
+        ),
+    )
 
     h = _setup(
         prob, alg; solve_kwargs...,
@@ -1087,15 +1113,24 @@ function _discrete_adjoint_unlocked(
         if dm !== nothing
             (!implicit || is_split) && (jac = Ghosted(rhs.jac, pl, dm.ptr))
         elseif !implicit || is_split
-            jac = rhs.jac === nothing ?
+            jac = if rhs.jac !== nothing
+                user_jac(rhs.jac)
+            elseif comm === nothing
                 _ad_jacobian(
                     backend, f_rhs, rhs.jac_prototype, h.u0, p, user_t0, Ref(0),
                     _ADJOINT_JAC_ADVICE,
-                ) :
-                user_jac(rhs.jac)
+                )
+            else
+                # An explicit solve builds no Jacobian, so nothing has checked the prototype.
+                _checked_everywhere(() -> _check_local_rows(rhs.jac_prototype, n, N), comm)
+                _ad_comm_jacobian(
+                    backend, f_rhs, rhs.jac_prototype, h.u0, p, user_t0, Ref(0),
+                    _ADJOINT_JAC_ADVICE, comm, false,
+                )
+            end
             h.tdir < 0 && (jac = _reverse_jac(jac))
             proto = rhs.jac_prototype
-            J = proto isa SparseMatrixCSC ? SparseMatrixCSC{Float64, Int}(proto) : zeros(n, n)
+            J = proto isa SparseMatrixCSC ? _structure(Float64, proto) : zeros(n, n)
         end
         no_rows = (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
         rows = J isa SparseMatrixCSC && comm === nothing ? _row_structure(J, n) : no_rows
@@ -1106,9 +1141,12 @@ function _discrete_adjoint_unlocked(
         end
         paramjac(fun, f) = np == 0 ? nothing :
             dm !== nothing ? Ghosted(fun.paramjac, pl, dm.ptr) :
-            fun.paramjac === nothing ?
+            fun.paramjac !== nothing ? user_jac(fun.paramjac) :
+            comm === nothing ?
             _ad_paramjacobian(backend, f, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE) :
-            user_jac(fun.paramjac)
+            _ad_comm_paramjacobian(
+                backend, f, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE, comm,
+            )
         context(jac, J, rows, paramjac, pscale, coo) = AdjointContext(
             pl, h.tdir, p, jac, J, rows..., paramjac, zeros(n, np), pscale, dgdu_discrete,
             skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),

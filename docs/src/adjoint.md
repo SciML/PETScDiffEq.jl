@@ -124,10 +124,11 @@ direct solve to 2e-15, since ILU(0) of a tridiagonal matrix is exact. Passing
 difference in every case. For a problem too large to factor, tighten `-ksp_rtol` instead;
 `1e-10` brought the two larger grids to 1e-11 and 5e-11.
 
-It runs distributed over a `comm` and on a DMDA as well, needing a `jac` and `paramjac` that
-fill each rank's rows, as the [MPI](@ref) section describes. Callbacks, `tstops`, mass
-matrices and `DAEProblem` are refused, and so is differentiating `solve` with a reverse-mode
-AD package. Passing
+It runs distributed over a `comm` and on a DMDA as well, with a `jac` and `paramjac` that
+fill each rank's rows, as the [MPI](@ref) section describes. On a `comm` it builds a missing
+one with ForwardDiff, the `jac` from the sparse `jac_prototype`; on a DMDA both have to be
+given. Callbacks, `tstops`, mass matrices and `DAEProblem` are refused, and so is
+differentiating `solve` with a reverse-mode AD package. Passing
 `sensealg = PETScAdjoint()` to `solve` itself does nothing.
 
 `jac` and `paramjac` go into the gradient unchecked, so a wrong entry gives a wrong
