@@ -793,6 +793,8 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     linear::Bool
     mass_mat::Any
     relayout::Any
+    nsolve::Int
+    ncondition::Int
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -2398,6 +2400,40 @@ function _pivot_raises(pl, ts)
     return raises[] == LibPETSc.PETSC_TRUE || snes_raises[] == LibPETSc.PETSC_TRUE
 end
 
+const PRE_SOLVE_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
+function _pre_solve!(
+        ::LibPETSc.CKSP, ::LibPETSc.CVec, ::LibPETSc.CVec, ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    ctx.nsolve += 1
+    return LibPETSc.PetscErrorCode(0)
+end
+
+const _KSP_SOLVERS = ("", "newtonls", "newtontr", "ksponly", "ksptransposeonly")
+
+# KSPSolve calls the hook once. Other SNES types may solve elsewhere, and PETSc's
+# Eisenstat-Walker tolerances run in this hook, so those go uncounted.
+function _count_solves!(pl, ts, ctx, ctxptr)
+    snes, ksp = _snes(pl, ts), Ref{LibPETSc.CKSP}(C_NULL)
+    if !(_snes_type(pl, ts) in _KSP_SOLVERS) || _petsc_flag(pl, :SNESHasNPC, snes) ||
+            _petsc_flag(pl, :SNESKSPGetUseEW, snes)
+        ctx.nsolve = -1
+        return nothing
+    end
+    ccall(
+        _symbol(pl, :SNESGetKSP), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}), snes, ksp,
+    )
+    _check_code(
+        ccall(
+            _symbol(pl, :KSPSetPreSolve), LibPETSc.PetscErrorCode,
+            (LibPETSc.CKSP, Ptr{Cvoid}, Ptr{Cvoid}), ksp[], PRE_SOLVE_PTR[], ctxptr,
+        ),
+    )
+    return nothing
+end
+
 function _set_pc_type!(pl, ts, type)
     lib = Libdl.dlopen(pl.petsc_library)
     snes, ksp = Ref{LibPETSc.CSNES}(C_NULL), Ref{LibPETSc.CKSP}(C_NULL)
@@ -3702,6 +3738,10 @@ end
 # `@cfunction` pointers do not survive precompilation.
 function __init__()
     POST_STEP_PTR[] = @cfunction(_post_step!, LibPETSc.PetscErrorCode, (LibPETSc.CTS,))
+    PRE_SOLVE_PTR[] = @cfunction(
+        _pre_solve!, LibPETSc.PetscErrorCode,
+        (LibPETSc.CKSP, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+    )
     ZERO_PIVOT_HANDLER_PTR[] = @cfunction(
         _zero_pivot_handler,
         LibPETSc.PetscErrorCode,
@@ -4943,7 +4983,7 @@ function _setup(
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
-        false, false, Int(maxiters), false, nothing, nothing,
+        false, false, Int(maxiters), false, nothing, nothing, 0, 0,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -5170,6 +5210,7 @@ function _setup(
             # Only valid once TSSetFromOptions has reached the linear solve.
             h.pivot_raises = _pivot_raises(petsclib, ts) ||
                 _option_flag(effective_options, "ts_error_if_step_fails")
+            _count_solves!(petsclib, ts.ptr, ctx, ctxptr)
             fixed = LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
             adapts = _adapts(running)
             if !dt_given && !(adaptive && adapts === true)
@@ -5347,8 +5388,8 @@ function _assemble(
         "reports success or fails. Rescale the problem, or give it a Float64 span to solve " *
         "it in double precision"
     stats = SciMLBase.DEStats(
-        _nf(h), ctx.nf2, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
-        st.nsteps, st.nreject, 0.0,
+        _nf(h), ctx.nf2, -1, ctx.nsolve, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1,
+        ctx.ncondition, st.nsteps, st.nreject, 0.0,
     )
     ts, dus = _user_time(h)
     return SciMLBase.build_solution(
@@ -6079,6 +6120,7 @@ _ncond(::SciMLBase.ContinuousCallback) = 1
 _ncond(cb::SciMLBase.VectorContinuousCallback) = cb.len
 
 function _fill_conditions!(out, integ::PETScIntegrator, cb::SciMLBase.ContinuousCallback, t)
+    integ.h.ctx.ncondition += 1
     out[1] = cb.condition(_state_at(integ, t), t, integ)
     return out
 end
@@ -6086,6 +6128,7 @@ end
 function _fill_conditions!(
         out, integ::PETScIntegrator, cb::SciMLBase.VectorContinuousCallback, t,
     )
+    integ.h.ctx.ncondition += 1
     cb.condition(out, _state_at(integ, t), t, integ)
     return out
 end
@@ -6272,6 +6315,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
     ctx = h.ctx
     for cb in integ.callbacks
         integ.finished && return nothing
+        ctx.ncondition += 1
         _checked_anywhere(() -> cb.condition(integ.u, integ.t, integ), ctx.comm) || continue
         cb.save_positions[1] && !saved && _save_here!(integ)
         saved = false
@@ -6486,9 +6530,12 @@ function _initial_solution(prob, alg, h::TSHandles)
     ts, dus = _user_time(h)
     # The running `sol` shares these arrays, and `_record!` extends a reversed span's copies.
     h.tdir > 0 || ((h.ctx.user_ts, h.ctx.user_dus) = (ts, dus))
+    stats = SciMLBase.DEStats(0)
+    stats.nw = stats.nfpiter = stats.nfpconvfail = -1
+    stats.nsolve = h.ctx.nsolve
     return SciMLBase.build_solution(
         prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
-        dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = SciMLBase.DEStats(0),
+        dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = stats,
     )
 end
 
@@ -6498,6 +6545,7 @@ function _live_stats!(integ::PETScIntegrator)
     stats = integ.sol.stats
     stats isa SciMLBase.DEStats || return nothing
     stats.nf, stats.nf2, stats.njacs = _nf(integ.h), ctx.nf2, ctx.njacs
+    stats.nsolve, stats.ncondition = ctx.nsolve, ctx.ncondition
     stats.nnonliniter, stats.nnonlinconvfail = st.nnonliniter, st.nnonlinfail
     stats.naccept, stats.nreject = st.nsteps, st.nreject
     return nothing
