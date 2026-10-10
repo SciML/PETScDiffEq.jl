@@ -793,6 +793,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     linear::Bool
     mass_mat::Any
     relayout::Any
+    own_matchstep::Bool
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -1836,6 +1837,7 @@ function _post_step_serial!(ctx, ts)
         _undo_failed_irk!(ctx, pl, ts.ptr) && return LibPETSc.PetscErrorCode(0)
         reason = Int(LibPETSc.TSGetConvergedReason(pl, ts))
         reason < 0 && return LibPETSc.PetscErrorCode(0)
+        ctx.own_matchstep && _matchstep!(pl, ts)
         s = LibPETSc.TSGetTime(pl, ts)
         smax = LibPETSc.TSGetMaxTime(pl, ts)
         s >= smax - _near(smax) && return LibPETSc.PetscErrorCode(0)
@@ -1877,7 +1879,9 @@ function _post_step_collective!(ctx, ts_ptr)
         small = unstable = nonfinite = false
         s = LibPETSc.TSGetTime(pl, ts)
         smax = LibPETSc.TSGetMaxTime(pl, ts)
-        if Int(LibPETSc.TSGetConvergedReason(pl, ts)) >= 0 && s < smax - _near(smax)
+        accepted = Int(LibPETSc.TSGetConvergedReason(pl, ts)) >= 0
+        ctx.own_matchstep && accepted && _matchstep!(pl, ts)
+        if accepted && s < smax - _near(smax)
             hnext = LibPETSc.TSGetTimeStep(pl, ts)
             small = ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
             if !small && (ctx.unstable !== nothing || ctx.halt_nonfinite)
@@ -4770,7 +4774,7 @@ function _setup(
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
-        false, false, Int(maxiters), false, nothing, nothing,
+        false, false, Int(maxiters), false, nothing, nothing, false,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -5244,6 +5248,7 @@ function _solve_unlocked(
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
         fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
+        _match_steps_here!(h)
         ctx.halt_stalled = ctx.comm === nothing
         if fixed || ctx.halt_stalled
             ctx.halt_nonfinite = fixed
@@ -5252,6 +5257,7 @@ function _solve_unlocked(
         raised, failure = false, nothing
         while true
             _release_work_vec!(ctx)
+            ctx.own_matchstep && _cut_first_step!(pl, h.ts)
             failure = _run!(h) do
                 LibPETSc.TSSolve(pl, h.ts, _solution_vec(h))
             end
@@ -6513,11 +6519,49 @@ function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near
     return length(ctx.ts) > n && _last_recorded(ctx, integ.tdir * upto)
 end
 
+# PETSc 3.22's build for 32-bit x86 fails MATCHSTEP's `bad hmax` check on long spans.
+_bad_hmax() = Sys.ARCH === :i686
+
+# PETSc's steps for these never reach TSAdaptChoose, which is where MATCHSTEP acts.
+const _SKIPS_MATCHSTEP = ("basicsymplectic", "glle", "mprk")
+
+# PETSc then steps over the final time, and `_matchstep!` applies its rule after each step.
+function _take_matchstep!(h::TSHandles)
+    pl, ts = h.petsclib, h.ts
+    LibPETSc.TSGetType(pl, ts) in _SKIPS_MATCHSTEP && return nothing
+    LibPETSc.TSSetExactFinalTime(pl, ts, LibPETSc.TS_EXACTFINALTIME_STEPOVER)
+    h.ctx.own_matchstep = true
+    return nothing
+end
+
+# The MATCHSTEP block of PETSc 3.22's TSAdaptChoose, without its `bad hmax` check.
+function _matchstep!(pl, ts)
+    t, p = LibPETSc.TSGetTime(pl, ts), LibPETSc.TSGetTimeStep(pl, ts)
+    tmax = LibPETSc.TSGetMaxTime(pl, ts)
+    t < tmax || return nothing
+    tend, hmax, q = t + p, tmax - t, p
+    tend > tmax && (q = hmax)
+    tend < tmax && 2p > hmax && (q = hmax / 2)
+    tend < tmax && p * oftype(p, 1.01) > hmax && (q = hmax)
+    q == p || LibPETSc.TSSetTimeStep(pl, ts, q)
+    return nothing
+end
+
+# TSSolve's cut of the first step under MATCHSTEP.
+function _cut_first_step!(pl, ts)
+    p = LibPETSc.TSGetTimeStep(pl, ts)
+    left = LibPETSc.TSGetMaxTime(pl, ts) - LibPETSc.TSGetTime(pl, ts)
+    p != left && (p >= left || left - p <= 10 * eps(typeof(p)) * left) &&
+        LibPETSc.TSSetTimeStep(pl, ts, left)
+    return nothing
+end
+
 # MATCHSTEP refuses a step leaving under 10 eps (1.2e-6 in Float32) before a stop.
 function _match_steps_here!(h::TSHandles{<:Any, <:Any, R}) where {R}
     pl, ts = h.petsclib, h.ts
-    R === Float32 && _exact_final_time(pl, ts) == LibPETSc.TS_EXACTFINALTIME_MATCHSTEP ||
-        return nothing
+    (R === Float32 || _bad_hmax()) &&
+        _exact_final_time(pl, ts) == LibPETSc.TS_EXACTFINALTIME_MATCHSTEP || return nothing
+    R === Float32 || return _take_matchstep!(h)
     LibPETSc.TSSetExactFinalTime(pl, ts, LibPETSc.TS_EXACTFINALTIME_STEPOVER)
     h.matches = true
     h.fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, ts)) == "none"
@@ -6605,6 +6649,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         _finish!(integ)
         return nothing
     end
+    ctx.own_matchstep && _matchstep!(pl, h.ts)
     copyto!(integ.uprev, integ.u)
     integ.tprev = start
     if stop === nothing

@@ -857,32 +857,29 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test sol.t == kw.saveat
                 @test [u[1] for u in sol.u] == sol.t
             end
-            # On i686 the double build can hit PETSc's `bad hmax` over these spans.
-            if single_build
-                osc!(du, u, p, t) = (du[1] = u[2]; du[2] = -u[1]; nothing)
-                ring = SciMLBase.ODEProblem(osc!, Float32[0, 1], (0.0f0, 1000.0f0))
-                tight = (; reltol = 1.0f-6, abstol = 1.0f-6)
-                want = Float32[0.001, 0.005, 0.5, 999.995]
-                final = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tight...).u[end]
-                for kw in ((;), (; save_start = false, save_end = false), (; tstops = [500.0f0]))
-                    sol = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tight..., saveat = want, kw...)
-                    @test sol.t == want
-                    @test maximum(k -> abs(sol.u[k][1] - sin(Float64(want[k]))), 1:3) < 2.0e-6
-                    @test sol.u[end] != final
-                end
-                fired = Float32[]
-                kick = SciMLBase.DiscreteCallback((u, t, i) -> t == 999.995f0, i -> push!(fired, i.t))
-                sol = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tstops = [999.995f0], callback = kick)
-                @test fired == [999.995f0]
-                @test 999.995f0 in sol.t
-                for span in ((100.0f0, 104.0f0), (0.0f0, 100.0f0)),
-                        alg in (PETScDiffEq.TSRK("3bs"), PETScDiffEq.TSRK("5dp"))
-                    crossings = Ref(0)
-                    cb = SciMLBase.ContinuousCallback((u, t, i) -> u[1], i -> (crossings[] += 1))
-                    start = Float32[sin(span[1]), cos(span[1])]
-                    SciMLBase.solve(SciMLBase.ODEProblem(osc!, start, span), alg; callback = cb)
-                    @test crossings[] == count(k -> span[1] < k * pi < span[2], 1:100)
-                end
+            osc!(du, u, p, t) = (du[1] = u[2]; du[2] = -u[1]; nothing)
+            ring = SciMLBase.ODEProblem(osc!, Float32[0, 1], (0.0f0, 1000.0f0))
+            tight = (; reltol = 1.0f-6, abstol = 1.0f-6)
+            want = Float32[0.001, 0.005, 0.5, 999.995]
+            final = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tight...).u[end]
+            for kw in ((;), (; save_start = false, save_end = false), (; tstops = [500.0f0]))
+                sol = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tight..., saveat = want, kw...)
+                @test sol.t == want
+                @test maximum(k -> abs(sol.u[k][1] - sin(Float64(want[k]))), 1:3) < 2.0e-6
+                @test sol.u[end] != final
+            end
+            fired = Float32[]
+            kick = SciMLBase.DiscreteCallback((u, t, i) -> t == 999.995f0, i -> push!(fired, i.t))
+            sol = SciMLBase.solve(ring, PETScDiffEq.TSRK("5dp"); tstops = [999.995f0], callback = kick)
+            @test fired == [999.995f0]
+            @test 999.995f0 in sol.t
+            for span in ((100.0f0, 104.0f0), (0.0f0, 100.0f0)),
+                    alg in (PETScDiffEq.TSRK("3bs"), PETScDiffEq.TSRK("5dp"))
+                crossings = Ref(0)
+                cb = SciMLBase.ContinuousCallback((u, t, i) -> u[1], i -> (crossings[] += 1))
+                start = Float32[sin(span[1]), cos(span[1])]
+                SciMLBase.solve(SciMLBase.ODEProblem(osc!, start, span), alg; callback = cb)
+                @test crossings[] == count(k -> span[1] < k * pi < span[2], 1:100)
             end
         end
 
@@ -2480,8 +2477,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
         end
 
-        # PETSc's absolute-eps step check fails these Robertson spans on 32-bit x86.
-        Sys.WORD_SIZE == 64 && @testset "BrownFullBasicInit solves for the algebraic variables" begin
+        @testset "BrownFullBasicInit solves for the algebraic variables" begin
             for (prob, alg) in (
                     ((mass(bad), alg) for alg in with_mass)...,
                     (dae(bad, zeros(3)), PETScDiffEq.TSDAE()),
@@ -2535,7 +2531,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
-        Sys.WORD_SIZE == 64 && @testset "ShampineCollocationInit takes one backward Euler step" begin
+        @testset "ShampineCollocationInit takes one backward Euler step" begin
             fbdf = [0.9961513330874654, 3.5651156852644935e-5, 0.0038130157556819193]
             for alg in with_mass
                 sol = SciMLBase.solve(mass(bad), alg; initializealg = shampine, tol...)
@@ -2595,7 +2591,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
-        Sys.WORD_SIZE == 64 && @testset "every source of the Jacobian gives the same start" begin
+        @testset "every source of the Jacobian gives the same start" begin
             proto = sparse(ones(3, 3))
             fd = PETScDiffEq.AutoFiniteDiff()
             for init in (brown, shampine)
@@ -2618,7 +2614,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
-        Sys.WORD_SIZE == 64 && @testset "Float32 and complex states" begin
+        @testset "Float32 and complex states" begin
             f32 = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(rober!; mass_matrix = Diagonal(Float32[1, 1, 0])),
                 Float32.(bad), (0.0f0, 100.0f0),
@@ -2694,7 +2690,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.terminate!(integ)
         end
 
-        Sys.WORD_SIZE == 64 && @testset "a consistent start is left as it is" begin
+        @testset "a consistent start is left as it is" begin
             for (prob, alg) in (
                     (mass(good), PETScDiffEq.TSRosW()),
                     (dae(good, [-0.04, 0.04, 0.0]), PETScDiffEq.TSDAE()),
@@ -2735,7 +2731,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
         end
 
-        Sys.WORD_SIZE == 64 && @testset "both solve on a communicator of one rank" begin
+        @testset "both solve on a communicator of one rank" begin
             comm = MPI.COMM_WORLD
             fd = PETScDiffEq.AutoFiniteDiff()
             proto = sparse(ones(3, 3))
@@ -2831,7 +2827,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.terminate!(integ)
         end
 
-        Sys.WORD_SIZE == 64 && @testset "the solve goes on from the initialized state" begin
+        @testset "the solve goes on from the initialized state" begin
             for (prob, from, alg) in (
                     (mass(good), mass(bad), PETScDiffEq.TSImplicit("bdf")),
                     (dae(good, [-0.04, 0.04, 0.0]), dae(bad, zeros(3)), PETScDiffEq.TSDAE()),
@@ -2847,7 +2843,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
-        Sys.WORD_SIZE == 64 && @testset "a callback's change is initialized again" begin
+        @testset "a callback's change is initialized again" begin
             once() = (fired = Ref(false); (u, t, integ) -> t >= 1.0 && !fired[] && (fired[] = true))
             unbalance!(integ) = (integ.u[3] += 0.1; nothing)
             keep!(integ) = (unbalance!(integ); SciMLBase.derivative_discontinuity!(integ, false))
@@ -3791,8 +3787,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
-        # PETSc's step check fails the t = 300 span on 32-bit x86 (#79).
-        Sys.WORD_SIZE == 64 && @testset "a successful solve makes no work vector at each stage" begin
+        @testset "a successful solve makes no work vector at each stage" begin
             pl = PETScDiffEq.PETSc.getlib(; PetscScalar = Float64)
             PETScDiffEq.PETSc.initialize(pl)
             function last_id()
@@ -5405,13 +5400,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @testset "Robertson solves as it does with the analytic one" begin
             ref = [0.2083340149701255e-7, 0.8333360770334713e-13, 0.999999979166505]
             span = (0.0, 1.0e11)
-            # On 32-bit, PETSc's `bad hmax` check can stop BDF and ARKIMEX at t = 1e11.
-            algs = Sys.WORD_SIZE == 64 ?
-                (
-                    PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW(),
-                    PETScDiffEq.TSARKIMEX("4"),
-                ) : (PETScDiffEq.TSRosW(),)
-            for alg in algs
+            for alg in (
+                    PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW(), PETScDiffEq.TSARKIMEX("4"),
+                )
                 withjac = SciMLBase.solve(
                     SciMLBase.ODEProblem(
                         SciMLBase.ODEFunction(rober!; jac = rober_jac!), [1.0, 0.0, 0.0], span,
@@ -10680,8 +10671,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test collect(integ.sol.u[end]) ≈ collect(fresh.u[end]) rtol = 1.0e-12
         end
 
-        # PETSc's absolute-eps step check fails a span this long on 32-bit x86.
-        Sys.WORD_SIZE == 64 && @testset "the energy error stays bounded" begin
+        @testset "the energy error stays bounded" begin
             energy(s) = s.x[1][1]^2 / 2 - cos(s.x[2][1])
             prob = SciMLBase.SecondOrderODEProblem(pend!, [0.0], [2.0], (0.0, 1000.0))
             function drift(alg)
