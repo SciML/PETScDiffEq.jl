@@ -71,9 +71,20 @@ end
 GROUP in ("All", "Core", "MPI") || error("GROUP is All, Core or MPI, not $GROUP")
 is_mpi(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") && s.args[3] == "MPI"
 
+# TEST_PART=k/n runs every n-th top-level testset from the k-th on, so n processes cover the file.
+const PART = let part = get(ENV, "TEST_PART", "")
+    isempty(part) ? (1, 1) : Tuple(parse.(Int, split(part, '/')))
+end
+length(PART) == 2 && 1 <= PART[1] <= PART[2] ||
+    error("TEST_PART is k/n with 1 <= k <= n, not $(ENV["TEST_PART"])")
+is_testset(s) = Meta.isexpr(s, :&&) ? is_testset(s.args[end]) :
+    Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset")
+
 # Julia compiles a block as one thunk before running any of it, so each testset stands alone.
 macro each_toplevel(ts, block)
     stmts = filter(s -> GROUP == "All" || (GROUP == "MPI") == is_mpi(s), block.args)
+    tests = findall(is_testset, stmts)
+    deleteat!(stmts, setdiff(tests, tests[PART[1]:PART[2]:end]))
     isdefined(Test, :push_testset) &&
         return esc(Expr(:toplevel, :(Test.push_testset($ts)), stmts..., :(Test.pop_testset())))
     wrap(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") ? :(Test.@with_testset $ts $s) : s
