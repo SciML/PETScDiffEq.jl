@@ -15,7 +15,7 @@ jobs:
   test:
     # Explicit arch axis so include:x86 adds a new cell instead of merging into
     # Julia 1 / ubuntu-latest (which would silently replace the x64 lane).
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ matrix.group }}${{ matrix.group == 'MPI' && format(', {0} ranks', matrix.ranks) || '' }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ matrix.group }}${{ matrix.group == 'MPI' && format(' -n {0}', matrix.ranks) || '' }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
