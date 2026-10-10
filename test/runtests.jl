@@ -6106,25 +6106,36 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         ref_prob(span) = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(heat!; jac = heat_jac!, jac_prototype = proto), u0, span,
         )
-        for (with_dm, alg) in (
-                (PETScDiffEq.TSImplicit("bdf"; dm = da), PETScDiffEq.TSImplicit("bdf")),
-                (PETScDiffEq.TSRosW(; dm = da), PETScDiffEq.TSRosW()),
+        generic = PETScDiffEq.TSGeneric
+        for (with_dm, alg, kw, gap) in (
+                (PETScDiffEq.TSImplicit("bdf"; dm = da), PETScDiffEq.TSImplicit("bdf"), tol, 1.0e-13),
+                (PETScDiffEq.TSRosW(; dm = da), PETScDiffEq.TSRosW(), tol, 1.0e-13),
+                (generic("alpha"; dm = da), generic("alpha"), (; dt = 1.0e-4), 1.0e-9),
+                (generic("dirk"; dm = da), generic("dirk"), (; dt = 1.0e-4, tol...), 1.0e-9),
             )
             empty!(seen)
-            got = SciMLBase.solve(dm_prob((0.0, 0.1)), with_dm; tol...)
-            ref = SciMLBase.solve(ref_prob((0.0, 0.1)), alg; tol...)
+            got = SciMLBase.solve(dm_prob((0.0, 0.1)), with_dm; kw...)
+            ref = SciMLBase.solve(ref_prob((0.0, 0.1)), alg; kw...)
             @test got.retcode == SciMLBase.ReturnCode.Success
             @test got.t == ref.t
             @test got.u == ref.u
             @test got.stats.njacs == ref.stats.njacs == length(seen) > 0
             @test all(==(N + 2), seen)
             coloured = SciMLBase.solve(
-                SciMLBase.ODEProblem(heat_dm!, u0, (0.0, 0.1), da), with_dm; tol...,
+                SciMLBase.ODEProblem(heat_dm!, u0, (0.0, 0.1), da), with_dm; kw...,
             )
             @test coloured.stats.njacs == 0
             @test got.stats.nf < coloured.stats.nf
-            # Measured 1.2e-14 for bdf and 4.4e-16 for rosw.
-            @test maximum(abs, got.u[end] - coloured.u[end]) <= 1.0e-13
+            # Measured 1.2e-14 for bdf, 4.4e-16 for rosw, 1.0e-11 for alpha, 4.0e-11 for dirk.
+            @test maximum(abs, got.u[end] - coloured.u[end]) <= gap
+        end
+        picked = PETScDiffEq.TSImplicit("bdf", ["-ts_type", "dirk"]; dm = da)
+        @test SciMLBase.solve(dm_prob((0.0, 0.1)), picked; dt = 1.0e-4, tol...).u ==
+            SciMLBase.solve(dm_prob((0.0, 0.1)), generic("dirk"; dm = da); dt = 1.0e-4, tol...).u
+        for type in ("irk", "glle")
+            @test_throws "TSGeneric(\"$type\") cannot run with a `dm`" SciMLBase.solve(
+                dm_prob((0.0, 0.1)), generic(type; dm = da); dt = 1.0e-3,
+            )
         end
         back = SciMLBase.solve(dm_prob((0.1, 0.0)), PETScDiffEq.TSImplicit("bdf"; dm = da); tol...)
         ref = SciMLBase.solve(ref_prob((0.1, 0.0)), PETScDiffEq.TSImplicit("bdf"); tol...)
@@ -10196,6 +10207,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 ("RK4", (; kw...) -> TSRK("4"; kw...)), ("backward Euler", beuler),
                 ("Crank-Nicolson", cn), ("theta 0.7", (; kw...) -> TSImplicit("theta", 0.7, exact; kw...)),
                 ("ARKIMEX l2", (; kw...) -> TSARKIMEX("l2", exact; kw...)),
+                ("TSGeneric cn", (; kw...) -> TSGeneric("cn", exact; kw...)),
             )
             # Measured: within 5.1e-16 of the adjoint without the DM and 1.2e-9 of the differences.
             @testset "matches the adjoint without the DM and finite differences: $name" for (

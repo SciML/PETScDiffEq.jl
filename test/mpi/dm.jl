@@ -695,6 +695,13 @@ end
         ref = solve(comm_heat(), ssp(; comm); FIXED...)
         @test got.t == ref.t
         @test everywhere(got.u == ref.u)
+        for type in ("alpha", "dirk")
+            generic(; kw...) = TSGeneric(type; kw...)
+            got = solve(dm_heat(), generic(; dm = da, comm); FIXED...)
+            ref = solve(comm_heat(), generic(; comm); FIXED...)
+            @test got.t == ref.t
+            @test everywhere(got.u == ref.u)
+        end
     end
 
     @testset "ghost points past the edge of the grid read zero on every call" begin
@@ -1277,7 +1284,7 @@ end
 
     @testset "refusals" begin
         prob = dm_heat()
-        for alg in (TSIRK(2; dm = da), TSMPRK([1]; dm = da), TSGeneric("alpha"; dm = da))
+        for alg in (TSIRK(2; dm = da), TSMPRK([1]; dm = da), TSGeneric("irk"; dm = da))
             @test refused(() -> solve(prob, alg; dt = 1.0e-3), "cannot run")
         end
         @test refused(

@@ -568,8 +568,9 @@ implicit `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`, `"arkimex"`, `"irk"`,
 `"dirk"` as [`TSImplicit`](@ref) runs, with `autodiff` defaulting to `AutoFiniteDiff()`. Other
 implicit types are refused there: `"glle"`'s step control follows the round-off of the
 distributed linear solve, so it takes other steps than a serial solve and ends with another
-error, larger or smaller. A `dm` runs an explicit type as it runs [`TSRK`](@ref) and refuses an
-implicit one.
+error, larger or smaller. A `dm` runs an explicit type as it runs [`TSRK`](@ref) and the same
+implicit types as it runs [`TSImplicit`](@ref), except `"irk"`, which it refuses as it does
+[`TSIRK`](@ref).
 """
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
@@ -4166,7 +4167,8 @@ end
 
 const _DISTRIBUTED_IMPLICIT =
     ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "irk", "alpha", "dirk")
-const _DM_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex")
+# PETSc's IRK takes an AIJ matrix made here, which would replace the DM's.
+const _DM_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "alpha", "dirk")
 const _WITH_DM = "with a `dm`"
 
 function _check_diagonal_mass(prob, is_dae, where, or = "")
@@ -4205,13 +4207,16 @@ function _check_local_mass(prob, is_dae, N)
 end
 
 function _refuse_dm(prob, alg, is_dae)
-    alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX} ||
-        alg isa TSGeneric && alg.explicit || throw(
+    alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX, TSGeneric} || throw(
         ArgumentError(
-            "PETScDiffEq cannot run " *
-                "$(alg isa TSGeneric ? "an implicit TSGeneric" : nameof(typeof(alg))) " *
-                "$_WITH_DM; TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX and " *
-                "TSGeneric(...; explicit = true) can",
+            "PETScDiffEq cannot run $(nameof(typeof(alg))) $_WITH_DM; TSRK, TSRosW, " *
+                "TSImplicit, TSDAE, TSARKIMEX and TSGeneric can",
+        ),
+    )
+    alg isa TSGeneric && !alg.explicit && !(alg.ts_type in _DM_IMPLICIT) && throw(
+        ArgumentError(
+            "TSGeneric(\"$(alg.ts_type)\") cannot run $_WITH_DM; only " *
+                "$(join(_DM_IMPLICIT, ", ")) can",
         ),
     )
     has_jac = prob.f.jac !== nothing
