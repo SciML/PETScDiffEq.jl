@@ -9801,7 +9801,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 adj_prob(θ[1:2], θ[3:6], tspan), alg;
                 dt = 6.0, adaptive = false, tstops = steps[2:(end - 1)],
             )
-            at = indexin(ts, steps)
+            at = [findfirst(==(t), steps) for t in ts]
             @test length(steps) > 2 * length(ts)
             @test !any(isnothing, at)
             @test stepped(vcat(u0, p0)).t == steps
