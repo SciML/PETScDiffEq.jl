@@ -3980,6 +3980,19 @@ const UNSUPPORTED_KWARGS = (
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2, :failfactor,
     :step_limiter, :stage_limiter,
 )
+const UNSUPPORTED_SWITCHES =
+    (:progress, :advance_to_tstop, :stop_at_next_tstop, :save_discretes)
+const UNSUPPORTED_UNLESS_NOTHING = (:maxtime, :rng)
+
+# An alias specifier permits aliasing, so only one asking for `u0` or `du0` goes unmet.
+_asks_alias(alias) = alias === true || any((:alias_u0, :alias_du0)) do k
+    hasfield(typeof(alias), k) && getfield(alias, k) === true
+end
+
+_drops(key, value) = key in UNSUPPORTED_KWARGS ||
+    key in UNSUPPORTED_SWITCHES && value === true ||
+    key in UNSUPPORTED_UNLESS_NOTHING && value !== nothing ||
+    key === :alias && _asks_alias(value)
 
 mutable struct TSHandles{CTX, L, R, S}
     ctx::CTX
@@ -4697,14 +4710,8 @@ function _setup(
         kwargs...,
     )
     prob = _summed(problem, alg)
-    for key in UNSUPPORTED_KWARGS
-        if haskey(kwargs, key)
-            @warn "PETScDiffEq does not support `$key` and is ignoring it"
-        end
-    end
-    for key in (:progress, :advance_to_tstop, :stop_at_next_tstop)
-        get(kwargs, key, false) === true &&
-            @warn "PETScDiffEq does not support `$key` and is ignoring it"
+    for (key, value) in pairs(kwargs)
+        _drops(key, value) && @warn "PETScDiffEq does not support `$key` and is ignoring it"
     end
     prob.u0 isa AbstractVector{<:Union{Real, Complex}} || throw(
         ArgumentError("PETScDiffEq requires an AbstractVector u0 of real or complex numbers"),
@@ -5396,6 +5403,7 @@ function _assemble(
     return SciMLBase.build_solution(
         prob, alg, ts, ctx.us; retcode = retcode, stats = stats,
         dense = ctx.dense, interp = _interp(ctx, ts, dus),
+        calculate_error = get(kwargs, :calculate_error, true),
         timeseries_errors = get(kwargs, :timeseries_errors, true),
         dense_errors = get(kwargs, :dense_errors, false),
     )
@@ -5886,6 +5894,7 @@ function _adopt_p!(integ::PETScIntegrator, p)
     integ.sol = SciMLBase.build_solution(
         integ.prob, integ.alg, sol.t, sol.u; retcode = sol.retcode, stats = sol.stats,
         dense = sol.dense, interp = sol.interp,
+        calculate_error = get(integ.kwargs, :calculate_error, true),
         timeseries_errors = get(integ.kwargs, :timeseries_errors, true),
         dense_errors = get(integ.kwargs, :dense_errors, false),
     )
@@ -6393,7 +6402,7 @@ function _init_unlocked(
         Vector{R}[fill(R(NaN), _ncond(cb)) for cb in continuous],
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
         stops, tstops, d_discontinuities, d_discontinuities, dt0,
-        _initial_solution(prob, alg, h), false, false, nothing, 0,
+        _initial_solution(prob, alg, h, kwargs), false, false, nothing, 0,
     )
     if h.init_failed
         integ.sol = _initial_failure(prob, alg, h, kwargs)
@@ -6527,7 +6536,7 @@ _user_time(h::TSHandles) = h.tdir > 0 ? (h.ctx.ts, h.ctx.dus) :
 
 _nf(h::TSHandles) = h.ctx.nf + (h.ad_calls === nothing ? 0 : h.ad_calls[])
 
-function _initial_solution(prob, alg, h::TSHandles)
+function _initial_solution(prob, alg, h::TSHandles, kwargs)
     ts, dus = _user_time(h)
     # The running `sol` shares these arrays, and `_record!` extends a reversed span's copies.
     h.tdir > 0 || ((h.ctx.user_ts, h.ctx.user_dus) = (ts, dus))
@@ -6537,6 +6546,7 @@ function _initial_solution(prob, alg, h::TSHandles)
     return SciMLBase.build_solution(
         prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
         dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = stats,
+        calculate_error = get(kwargs, :calculate_error, true),
     )
 end
 
@@ -6636,7 +6646,7 @@ function _reinit_unlocked(
         fill!(ev, NaN)
     end
     integ.derivative_discontinuity = false
-    integ.sol = _initial_solution(integ.prob, integ.alg, h)
+    integ.sol = _initial_solution(integ.prob, integ.alg, h, integ.kwargs)
     if h.init_failed
         integ.sol = _initial_failure(integ.prob, integ.alg, h, integ.kwargs)
         integ.finished = true
