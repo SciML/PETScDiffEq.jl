@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [Core, MPI]
+        group: [Core, MPI1, MPI2, MPI3]
     uses: "SciML/.github/.github/workflows/downgrade.yml@v1"
     with:
       mode: "deps"
