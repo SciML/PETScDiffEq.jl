@@ -10273,7 +10273,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 sol = SciMLBase.solve(
                     on_dm(), TSRK("4"; dm = da); dt = 1.0e-3, adaptive = false, saveat = times,
                 )
-                @test reverse(seen) == sol.u
+                @test reverse(seen)[1:(end - 1)] == sol.u[1:(end - 1)]
+                # On 32-bit x86 PETSc lands the adjoint's last step and the package lands `solve`'s.
+                @test Sys.ARCH === :i686 ? isapprox(seen[1], sol.u[end]; rtol = 4 * eps()) :
+                    seen[1] == sol.u[end]
             end
 
             @testset "integral costs, an adaptive solve and a split problem, as without it" begin
