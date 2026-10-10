@@ -695,6 +695,13 @@ end
         ref = solve(comm_heat(), ssp(; comm); FIXED...)
         @test got.t == ref.t
         @test everywhere(got.u == ref.u)
+        for type in ("alpha", "dirk")
+            generic(; kw...) = TSGeneric(type; kw...)
+            got = solve(dm_heat(), generic(; dm = da, comm); FIXED...)
+            ref = solve(comm_heat(), generic(; comm); FIXED...)
+            @test got.t == ref.t
+            @test everywhere(got.u == ref.u)
+        end
     end
 
     @testset "ghost points past the edge of the grid read zero on every call" begin
@@ -1094,6 +1101,16 @@ end
             )
             @test by_index.t == got.t
             @test everywhere(by_index.u == got.u)
+            dual = solve(
+                dm_heat(), make(; dm = da, comm, autodiff = AutoForwardDiff()); saveat = 0.01,
+                TOL...,
+            )
+            @test dual.t == got.t
+            @test everywhere(dual.u == got.u)
+            @test dual.stats.njacs == got.stats.njacs
+            @test same_everywhere(dual.stats.nf)
+            # The DM's three colours fit one call on dual numbers.
+            @test dual.stats.nf == got.stats.nf + dual.stats.njacs
             coloured = solve(dm_heat(), make(; dm = da, comm); saveat = 0.01, TOL...)
             @test coloured.stats.njacs == 0
             @test got.stats.nf < coloured.stats.nf
@@ -1155,6 +1172,13 @@ end
             )
             @test got.retcode == ReturnCode.Success
             @test got.stats.njacs > 0
+            dual = solve(
+                ODEProblem(grid_heat_dm!, u0, span, g),
+                make(; dm = g, autodiff = AutoForwardDiff()); saveat = 0.01, TOL...,
+            )
+            @test dual.t == got.t
+            @test everywhere(maxdiff(dual.u, got.u) <= ROUNDOFF)
+            @test dual.stats.nf == got.stats.nf + dual.stats.njacs
             coloured = solve(
                 ODEProblem(grid_heat_dm!, u0, span, g), make(; dm = g); saveat = 0.01, TOL...,
             )
@@ -1277,7 +1301,7 @@ end
 
     @testset "refusals" begin
         prob = dm_heat()
-        for alg in (TSIRK(2; dm = da), TSMPRK([1]; dm = da), TSGeneric("alpha"; dm = da))
+        for alg in (TSIRK(2; dm = da), TSMPRK([1]; dm = da), TSGeneric("irk"; dm = da))
             @test refused(() -> solve(prob, alg; dt = 1.0e-3), "cannot run")
         end
         @test refused(
@@ -1294,9 +1318,17 @@ end
             () -> solve(dm_heat(; jac_prototype = heat_proto(rows)), implicit(; dm = da)),
             "leave out `jac_prototype`",
         )
+        zygote = PETScDiffEq.ADTypes.AutoZygote()
         @test refused(
-            () -> solve(prob, TSImplicit("bdf"; dm = da, autodiff = AutoForwardDiff())),
-            "cannot use `AutoForwardDiff()`",
+            () -> solve(prob, TSImplicit("bdf"; dm = da, autodiff = zygote)),
+            "AutoZygote()` with a `dm`",
+        )
+        @test refused(
+            () -> solve(
+                ODEProblem(heat_dm!, heat0(rows), SPAN, stag),
+                TSImplicit("bdf"; dm = stag, autodiff = AutoForwardDiff()),
+            ),
+            "only on a DMDA so far",
         )
         n = length(rows)
         dense_mass = [i == j ? 2.0 : 0.0 for i in 1:n, j in 1:n]

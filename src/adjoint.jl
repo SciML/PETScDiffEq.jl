@@ -37,10 +37,10 @@ compare it against a gradient computed without it.
 
 `TSARKIMEX` takes a `SplitODEProblem` as well. The implicit part's `jac` and `paramjac` are
 the problem's, which a `SplitODEProblem` takes from `f1`, and the explicit part's are those
-of `f2`'s own `ODEFunction`; on `MPI.COMM_SELF` each is built by automatic differentiation
-when missing. PETSc's ARKIMEX adjoint has no quadrature, so an integral
-cost is refused, and `-ts_arkimex_fully_implicit` is refused on a `SplitODEProblem`, since
-the adjoint would still take `f2` explicitly.
+of `f2`'s own `ODEFunction`; each is built by automatic differentiation when missing.
+PETSc's ARKIMEX adjoint has no quadrature, so an integral cost is refused, and
+`-ts_arkimex_fully_implicit` is refused on a `SplitODEProblem`, since the adjoint would
+still take `f2` explicitly.
 
 A `DynamicalODEProblem` or `SecondOrderODEProblem` is differentiated as the first-order
 system on the flat `[v; u]` that these methods step. Its `jac` and `paramjac`, when given,
@@ -59,9 +59,13 @@ repeated as that `solve` was given it. A complex state is refused.
 Costs are discrete, integral or both. At each `t[i]`, `dgdu_discrete(out, u, p, t, i)`
 writes the cost's derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`,
 if given, its direct derivative with respect to `p`; `no_start = true` leaves out `t[1]`.
-PETSc's adjoint has no derivative of interpolation, so with fixed steps every cost time must
-be a time the solve steps to, such as `tspan[1]` plus a multiple of `dt`. An adaptive solve
-lands only on the ends of `tspan`, so its costs are limited to those, and its gradient
+PETSc's adjoint has no derivative of interpolation, so every cost time has to be the end of
+a step. With fixed steps it must be a time the solve steps to, such as `tspan[1]` plus a
+multiple of `dt`. An adaptive solve takes cost times anywhere in `tspan`: they are given to
+PETSc as its time span, `TSSetTimeSpan`, and its step-size controller ends a step on each
+one. Those steps are this run's own. `solve` with the same tolerances takes others and
+interpolates to its `saveat` times, so the gradient is that of the cost on the states this
+run steps to, which differ from the ones `solve` saves by the error of the two solves. It
 treats the accepted step sizes as constants rather than differentiating the controller.
 
 An integral cost, the integral of `g(u, p, t)` from `tspan[1]` to `tspan[2]`, is given as
@@ -84,7 +88,8 @@ trajectory is kept in memory, every stage of every step; `-ts_trajectory_solutio
 keeps only the states and recomputes each step during the adjoint, and
 `-ts_trajectory_type basic` writes one file per step to the working directory instead. For
 an adaptive solve the memory trajectory reserves 8 bytes for each of `maxiters` steps before
-starting, 8 MB at the default and 8 GB at `maxiters = 10^9`. `TSImplicit` and `TSARKIMEX`
+starting, 8 MB at the default and 8 GB at `maxiters = 10^9`, and PETSc's time span holds one
+more copy of the state for each cost time inside `tspan`. `TSImplicit` and `TSARKIMEX`
 solve transposed linear systems with the same Krylov solver and tolerances as their Newton
 steps, so with default options the gradient can be off by up to about their relative
 tolerance of 1e-5 while the forward states are far closer; pass
@@ -95,15 +100,20 @@ for example through `PETSC_OPTIONS`, do not reach the run.
 
 With an algorithm whose `comm` is not `MPI.COMM_SELF`, the adjoint runs distributed as the
 solve does, for the same methods on an `ODEProblem` and for `TSARKIMEX` on a
-`SplitODEProblem`. The `ODEFunction` then needs `jac`, filling this rank's rows of a sparse
-`jac_prototype` with global columns, and `paramjac` when there are parameters, filling this
-rank's rows; both are collective like `f`. A `SplitODEProblem` needs the same of `f2`'s
-`ODEFunction`, with a sparse `jac_prototype` of its own.
-`dgdu_discrete` gets this rank's rows of the state and writes their derivative, and
-`dgdp_discrete` gives this rank's share of the direct derivative, which the ranks add up.
-`du0` holds this rank's rows, and `dp` is the whole gradient on every rank. The cost times,
-`no_start`, the length of `p` and whether `dgdp_discrete` is given must agree across the
-ranks.
+`SplitODEProblem`. `jac` then fills this rank's rows of a sparse `jac_prototype` with global
+columns, and `paramjac` fills this rank's rows; both are collective like `f`. A missing one
+is built with ForwardDiff and no other backend: `jac` from the sparse `jac_prototype`,
+coloured as a whole as the solve does under `autodiff = AutoForwardDiff()`, and `paramjac`
+by seeding `p`, every rank calling `f` once per chunk of parameters. `f` then runs on dual
+numbers, in `u` for `jac`, which its halo exchange has to carry, and in `p` for `paramjac`.
+An implicit method's `autodiff` defaults to `AutoFiniteDiff()` on such a `comm`, so pass
+`autodiff = AutoForwardDiff()` to have either built. A `SplitODEProblem` takes the same of
+`f2`'s `ODEFunction`, whose sparse `jac_prototype` of this rank's rows is needed with or
+without a `jac`. `dgdu_discrete` gets this rank's rows of the state and writes their
+derivative, and `dgdp_discrete` gives this rank's share of the direct derivative, which the
+ranks add up. `du0` holds this rank's rows, and `dp` is the whole gradient on every rank.
+The cost times, `no_start`, the length of `p` and whether `dgdp_discrete`, `jac` and
+`paramjac` are given must agree across the ranks.
 
 With a `dm`, the adjoint runs on the DM as the solve does, for the same methods and discrete
 costs, and on a DM of a single rank for integral costs and a `SplitODEProblem` with
@@ -119,8 +129,28 @@ of the state as this rank's rows: the cost functions get that block as `solve` s
 not the ghosted array. The `dm` has to belong to PETSc's double real build.
 
 Returns `(du0, dp')`, where `dp` is `nothing` when `p` is `nothing` or
-`SciMLBase.NullParameters()`. Differentiating `solve` itself with a reverse-mode AD package
-is not supported.
+`SciMLBase.NullParameters()`.
+
+Given to `solve` as its `sensealg`, it is also what Zygote, or another reverse-mode package
+that takes its rules from ChainRules, differentiates that `solve` with:
+
+```julia
+using Zygote
+loss(p) = sum(abs2, Array(solve(prob, alg; p, saveat = ts, sensealg = PETScAdjoint())) .- data)
+Zygote.gradient(loss, p)
+```
+
+`solve` returns what it returns without the `sensealg`. The pullback runs the adjoint above
+with the keywords `solve` was given, the times it saved as cost times and the loss's
+derivative with respect to each saved state as `dgdu_discrete`, and gives the gradients with
+respect to `u0` and `p`. Saved times the loss does not depend on are left out, and
+`save_idxs` is taken. With fixed steps the saved times have to be step ends. In an adaptive
+solve the saved states are interpolated while the adjoint's run steps to their times, so the
+gradient is off by about the error of the solve, and the times of steps saved without
+`saveat` are held fixed. A loss that calls `sol(t)` or reads `sol.prob` is refused, since
+only the saved states carry a derivative, and so are a `Float32` problem, a
+`DynamicalODEProblem` or `SecondOrderODEProblem`, a `comm` other than `MPI.COMM_SELF`, a
+`dm`, and Enzyme, ReverseDiff, Tracker and Mooncake, which it has not been verified with.
 """
 struct PETScAdjoint <: SciMLBase.AbstractAdjointSensitivityAlgorithm{0, false, Val{:central}}
     petsc_options::Vector{String}
@@ -598,8 +628,9 @@ const _ADJOINT_REFUSED_KWARGS = (
         "between PETSc steps, where the saved trajectory does not see what they change; " *
         "remove the callback from the call and from the problem",
     tstops = "PETScAdjoint does not support `tstops`: a solve with stops is stepped " *
-        "outside PETSc's own loop, which saves no trajectory; remove them and choose a " *
-        "`dt` whose steps land on the cost times",
+        "outside PETSc's own loop, which saves no trajectory; remove them, and choose a " *
+        "`dt` whose steps land on the cost times or solve adaptively, which ends a step " *
+        "on each cost time",
     d_discontinuities = "PETScAdjoint does not support `d_discontinuities`; remove them",
     isoutofdomain = "PETScAdjoint does not support `isoutofdomain`: its forward solve is " *
         "PETSc's own, which does not take a step again that leaves the domain; remove it",
@@ -635,6 +666,12 @@ function _check_adjoint_problem(
     )
     prob isa SciMLBase.AbstractODEProblem ||
         throw(ArgumentError("PETScAdjoint supports an ODEProblem, not a DAEProblem"))
+    prob.u0 isa AbstractVector || throw(
+        ArgumentError(
+            "PETScAdjoint supports a vector `u0`, not an array-shaped one; pass `vec(u0)` " *
+                "and reshape the state inside `f` and the cost functions",
+        ),
+    )
     is_split = prob.f isa SciMLBase.SplitFunction
     is_split && !(alg isa TSARKIMEX) && throw(
         ArgumentError(
@@ -694,11 +731,24 @@ function _check_adjoint_problem(
             ),
         )
     end
+    backend = something(_autodiff(alg), AutoForwardDiff())
+    duals = ADTypes.dense_ad(backend) isa AutoForwardDiff
     for (whose, fun) in parts
-        comm === nothing || fun.jac !== nothing || throw(
+        comm === nothing || fun.jac !== nothing || duals || throw(
             ArgumentError(
-                "PETScAdjoint needs $whose `jac` $_NOT_SELF, where it builds none " *
-                    "by automatic differentiation",
+                "PETScAdjoint cannot build $whose `jac` with `$backend` " *
+                    "$_NOT_SELF, where `f` has to carry the derivatives to the other ranks " *
+                    "in its own halo exchange, as it does ForwardDiff's dual numbers; give " *
+                    "the problem a `jac`, or use `AutoForwardDiff()`",
+            ),
+        )
+    end
+    if comm !== nothing && prob.f.jac === nothing
+        prob.f.jac_prototype isa SparseMatrixCSC || throw(
+            ArgumentError(
+                "without a `jac`, PETScAdjoint $_NOT_SELF needs a sparse `jac_prototype` " *
+                    "holding this rank's rows of the Jacobian, with global column indices, " *
+                    "to colour the whole pattern for ForwardDiff",
             ),
         )
     end
@@ -727,10 +777,12 @@ function _check_adjoint_problem(
         )
     end
     for (whose, fun) in parts
-        has_p && !isempty(p) && comm !== nothing && fun.paramjac === nothing && throw(
+        has_p && !isempty(p) && comm !== nothing && fun.paramjac === nothing && !duals && throw(
             ArgumentError(
-                "PETScAdjoint needs $whose `paramjac` $_NOT_SELF when the problem has " *
-                    "parameters, where it builds none by automatic differentiation",
+                "PETScAdjoint cannot build $whose `paramjac` with `$backend` " *
+                    "$_NOT_SELF, where every rank has to call `f` the same number of times, " *
+                    "which it does only with ForwardDiff's dual numbers in `p`; give the " *
+                    "problem a `paramjac`, or use `AutoForwardDiff()`",
             ),
         )
     end
@@ -824,14 +876,14 @@ function _check_explicit_prototype(proto, n, N)
     proto isa SparseMatrixCSC && size(proto) == (n, N) && return nothing
     throw(
         ArgumentError(
-            "PETScAdjoint needs `f2`'s `jac` $_NOT_SELF to come with a sparse " *
-                "`jac_prototype` holding this rank's rows, with global column indices, so " *
+            "PETScAdjoint needs `f2` $_NOT_SELF to come with a sparse `jac_prototype` " *
+                "holding this rank's rows of its Jacobian, with global column indices, so " *
                 "$n x $N here",
         ),
     )
 end
 
-function _check_adjoint_ts(h::TSHandles, alg, cost_s, integral, is_split)
+function _check_adjoint_ts(h::TSHandles, alg, integral, is_split)
     pl, ts = h.petsclib, h.ts
     implicit = _uses_ifunction(alg)
     ts_type = LibPETSc.TSGetType(pl, ts)
@@ -885,17 +937,28 @@ function _check_adjoint_ts(h::TSHandles, alg, cost_s, integral, is_split)
                 "`-ts_trajectory_type basic`, but this solve's is `$traj`; use one of those",
         ),
     )
-    if LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, ts)) != "none"
-        tol = 100 * eps(max(1.0, abs(h.t0), abs(h.tf)))
-        all(s -> abs(s - h.t0) <= tol || abs(s - h.tf) <= tol, cost_s) || throw(
-            ArgumentError(
-                "an adaptive solve steps onto no time but tspan's ends, so its cost " *
-                    "times can only be those; pass `adaptive = false` and a `dt` whose " *
-                    "steps land on every cost time, to `solve` as well as here",
-            ),
-        )
+    adaptive = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, ts)) != "none"
+    return implicit, ts_type == "arkimex", adaptive
+end
+
+# PETSc's adaptor ends a step on each time of the span, which the trajectory then holds.
+function _set_time_span!(h::TSHandles{<:Any, <:Any, R}, cost_s) where {R}
+    # Closer than this to a time of the span, a cost time is matched to that step instead.
+    near(s) = 100 * Float64(eps(R(max(1.0, abs(s)))))
+    span = R[h.t0]
+    for s in sort(cost_s)
+        last(span) + near(s) < s < h.tf - near(s) && push!(span, s)
     end
-    return implicit, ts_type == "arkimex"
+    length(span) == 1 && return nothing
+    # TSSetTimeSpan passes its last time to TSSetMaxTime, which reads -1 as PETSC_DETERMINE.
+    push!(span, h.tf == -1 ? nextfloat(h.tf) : h.tf)
+    code = ccall(
+        _symbol(h.petsclib, :TSSetTimeSpan), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, LibPETSc.PetscInt, Ptr{R}),
+        h.ts, LibPETSc.PetscInt(length(span)), span,
+    )
+    _check_code(code, "TSSetTimeSpan")
+    return nothing
 end
 
 _throw_callback_error(ctx, adj, comm = nothing, q = nothing, ex = nothing) = _throw_anywhere(
@@ -909,7 +972,7 @@ function _check_agreement(comm, args)
     throw(
         ArgumentError(
             "PETScAdjoint $_NOT_SELF needs the same cost times `t`, `no_start`, number of " *
-                "parameters and choice of `dgdp_discrete` on every rank",
+                "parameters and choice of `dgdp_discrete`, `jac` and `paramjac` on every rank",
         ),
     )
 end
@@ -1059,8 +1122,15 @@ function _discrete_adjoint_unlocked(
     np = has_p ? length(p) : 0
     cost_t = _unset(t) ? Float64[] : collect(Float64, t)
     integral = g !== nothing || dgdu_continuous !== nothing
-    comm === nothing ||
-        _check_agreement(comm, (cost_t, skip_start, np, dgdp_discrete === nothing))
+    # A rank building a Jacobian calls `f` where one with a `jac` or `paramjac` calls that.
+    comm === nothing || _check_agreement(
+        comm,
+        (
+            cost_t, skip_start, np, dgdp_discrete === nothing, prob.f.jac === nothing,
+            prob.f.paramjac === nothing, is_split && prob.f.f2.jac === nothing,
+            is_split && prob.f.f2.paramjac === nothing,
+        ),
+    )
 
     h = _setup(
         prob, alg; solve_kwargs...,
@@ -1075,10 +1145,12 @@ function _discrete_adjoint_unlocked(
     local du0, dp
     try
         cost_s = h.tdir .* cost_t
-        implicit, arkimex = _check_adjoint_ts(h, alg, cost_s, integral, is_split)
+        implicit, arkimex, adaptive = _check_adjoint_ts(h, alg, integral, is_split)
         is_split && comm !== nothing && dm === nothing && _checked_everywhere(comm) do
             _check_explicit_prototype(prob.f.f2.jac_prototype, n, N)
         end
+        # PETSc 3.22 allocates the span's states in TSSetUp, which the solve below is first to call.
+        adaptive && _set_time_span!(h, cost_s)
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
         inplace(fun) = _as_inplace(SciMLBase.unwrapped_f(fun.f), iip)
@@ -1091,15 +1163,24 @@ function _discrete_adjoint_unlocked(
         if dm !== nothing
             (!implicit || is_split) && (jac = Ghosted(rhs.jac, pl, dm.ptr))
         elseif !implicit || is_split
-            jac = rhs.jac === nothing ?
+            jac = if rhs.jac !== nothing
+                user_jac(rhs.jac)
+            elseif comm === nothing
                 _ad_jacobian(
                     backend, f_rhs, rhs.jac_prototype, h.u0, p, user_t0, Ref(0),
                     _ADJOINT_JAC_ADVICE,
-                ) :
-                user_jac(rhs.jac)
+                )
+            else
+                # An explicit solve builds no Jacobian, so nothing has checked the prototype.
+                _checked_everywhere(() -> _check_local_rows(rhs.jac_prototype, n, N), comm)
+                _ad_comm_jacobian(
+                    backend, f_rhs, rhs.jac_prototype, h.u0, p, user_t0, Ref(0),
+                    _ADJOINT_JAC_ADVICE, comm, false,
+                )
+            end
             h.tdir < 0 && (jac = _reverse_jac(jac))
             proto = rhs.jac_prototype
-            J = proto isa SparseMatrixCSC ? SparseMatrixCSC{Float64, Int}(proto) : zeros(n, n)
+            J = proto isa SparseMatrixCSC ? _structure(Float64, proto) : zeros(n, n)
         end
         no_rows = (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
         rows = J isa SparseMatrixCSC && comm === nothing ? _row_structure(J, n) : no_rows
@@ -1110,9 +1191,12 @@ function _discrete_adjoint_unlocked(
         end
         paramjac(fun, f) = np == 0 ? nothing :
             dm !== nothing ? Ghosted(fun.paramjac, pl, dm.ptr) :
-            fun.paramjac === nothing ?
+            fun.paramjac !== nothing ? user_jac(fun.paramjac) :
+            comm === nothing ?
             _ad_paramjacobian(backend, f, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE) :
-            user_jac(fun.paramjac)
+            _ad_comm_paramjacobian(
+                backend, f, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE, comm,
+            )
         context(jac, J, rows, paramjac, pscale, coo) = AdjointContext(
             pl, h.tdir, p, jac, J, rows..., paramjac, zeros(n, np), pscale, dgdu_discrete,
             skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),
@@ -1322,16 +1406,16 @@ function _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs
     return _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; costs...))
 end
 
-function SciMLBase._concrete_solve_adjoint(
-        ::SupportedProblem, ::AnyPETScTS, ::PETScAdjoint, u0, p,
-        ::SciMLBase.ADOriginator, args...; kwargs...,
-    )
-    throw(
-        ArgumentError(
-            "PETScAdjoint is reached through `adjoint_sensitivities(sol, alg; sensealg = " *
-                "PETScAdjoint(), t, dgdu_discrete, ...)`; differentiating `solve` with it " *
-                "is not supported, since SciMLSensitivity's reverse-mode `solve` accepts " *
-                "only its own adjoint types",
-        ),
-    )
-end
+# The SciMLSensitivity extension has the method for a PETScAdjoint, built on ChainRulesCore.
+_solve_and_pullback(args...; kwargs...) = throw(
+    ArgumentError(
+        "differentiating `solve` with `sensealg = PETScAdjoint()` needs " *
+            "SciMLSensitivity, whose extension of this package holds the pullback; load " *
+            "it with `using SciMLSensitivity`",
+    ),
+)
+
+SciMLBase._concrete_solve_adjoint(
+    prob::SupportedProblem, alg::AnyPETScTS, sensealg::PETScAdjoint, u0, p,
+    originator::SciMLBase.ADOriginator, args...; kwargs...,
+) = _solve_and_pullback(prob, alg, sensealg, u0, p, originator, args...; kwargs...)

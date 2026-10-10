@@ -155,33 +155,55 @@ it is `length(u0)` by the length of the whole state, and `jac` fills it as it wo
 of the serial Jacobian. `TSAlpha2` needs each rank's `v` and `u` to have the same
 length, and builds the distributed matrix it factors, `shift_a I - shift_v df/dv - df/du`,
 from the `v` rows; without a `jac` PETSc colours that matrix and differences `f`, as for the
-other implicit algorithms. A `dm` is refused for these problems, and so are `PETScAdjoint` and
-any `autodiff` but `AutoFiniteDiff()` on a communicator. Split over 1 to 3 ranks, unevenly on more than one, a 1-D wave equation and a
+other implicit algorithms. `autodiff = AutoForwardDiff()` builds the first-order system's
+Jacobian from the prototype instead, for `TSAlpha2` and for the implicit algorithms on the
+first-order form, as it does for an `ODEProblem`: the columns are coloured in the prototype's
+order, and each rank seeds the entries of its own `[v; u]` that those columns stand for, so
+`f1` and `f2` have to exchange dual numbers as `f` does there. It needs the sparse prototype,
+and other backends are refused. A `dm` is refused for these problems, and so is `PETScAdjoint`
+on a communicator. Split over 1 to 3 ranks, unevenly on more than one, a 1-D wave equation and a
 chain of particles gave the serial solve's states to 3e-15 with `TSBasicSymplectic` and fixed
 steps of `TSRK`, the energy error included, and to 1.2e-9 with adaptive steps of `TSRK("5dp")`.
 `TSAlpha2` and `TSImplicit("bdf")` with a `jac` agreed to 2e-10 with `["-ksp_type", "preonly",
 "-pc_type", "redundant"]` in `petsc_options` and to 8e-8 with the default linear solver, and
-colouring, whose differences depend on the layout, moved `TSAlpha2` by up to 3e-6.
+colouring, whose differences depend on the layout, moved `TSAlpha2` by up to 3e-6. On 1 and 2
+ranks the ForwardDiff Jacobians of the wave equation and of the chain matched a `jac`'s entry by
+entry to 1e-12, and the solves took the `jac` solve's steps, with states within 1e-13 of its
+own on the wave equation under `TSAlpha2` and `TSImplicit("bdf")` and within 1e-10 on the chain
+under `TSImplicit("bdf")`.
 
 `PETScAdjoint` runs distributed too, for `TSRK`, `TSARKIMEX` and `TSImplicit`'s `"beuler"`,
-`"cn"` and `"theta"` on an `ODEProblem`, and for `TSARKIMEX` on a `SplitODEProblem`. It needs
+`"cn"` and `"theta"` on an `ODEProblem`, and for `TSARKIMEX` on a `SplitODEProblem`. It takes
 the problem's `jac`, filling this rank's rows of a sparse prototype as above, and when there
-are parameters a `paramjac` filling this rank's rows, since it builds neither by automatic
-differentiation there; both are collective like `f`. An explicit method takes such a `jac`
-in its own solve too, and ignores it there. A `SplitODEProblem` needs them for both parts:
-`f1`'s are the problem's, and `f2`'s `ODEFunction` carries its own `jac`, `paramjac` and
-sparse `jac_prototype` of this rank's rows, none of which `TSARKIMEX`'s own solve reads.
-`dgdu_discrete` gets this rank's rows of the
-state and writes their gradient, and `dgdp_discrete` gives this rank's share of the cost's
-direct derivative with respect to `p`, which the ranks add up. `du0` comes back as this
-rank's rows and `dp` as the whole gradient, the same on every rank. The cost times,
-`no_start`, the length of `p` and whether `dgdp_discrete` is given have to agree across the
-ranks. A `jac`, `paramjac`, cost function or `f` that throws on some ranks makes every rank
-throw, as in a solve. The transposed linear solves of `TSImplicit` and `TSARKIMEX` use the
-solver above; `["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves
-them directly. On 1 and 2 ranks a reaction-diffusion problem split into its diffusion and its
-reaction gave the gradient of the serial split adjoint to 7e-16 and that of central
-differences of the same fixed-step solve to 1.2e-9.
+are parameters a `paramjac` filling this rank's rows; both are collective like `f`. An
+explicit method takes such a `jac` in its own solve too, and ignores it there. Without a
+`jac` it builds one with ForwardDiff from the sparse prototype, coloured as above, so `f`'s
+buffers have to take `u`'s element type. An implicit method needs
+`autodiff = AutoForwardDiff()` for that, since the default on such a `comm`,
+`AutoFiniteDiff()`, leaves the adjoint no Jacobian to multiply by; `TSRK` has no `autodiff`
+and needs only the prototype. Without a `paramjac` it seeds `p` instead: every rank calls
+`f` once per chunk of parameters and keeps its own rows. `u` holds plain numbers in those
+calls, so a halo exchange of `u` goes through as in the solve, and only what `f` sends that
+depends on `p` has to travel in a buffer that takes dual numbers. Other backends are refused
+for both. On 1 and 2 ranks the gradients built this way were within 1.5e-15 relative of
+those from a hand-written `jac` and `paramjac` and of the serial adjoint's, for `TSRK`,
+`TSImplicit` and `TSARKIMEX`. A `SplitODEProblem` takes all of this for each part: `f1`'s
+`jac`, `paramjac` and prototype are the problem's, and `f2`'s `ODEFunction` carries its own
+`jac`, `paramjac` and sparse `jac_prototype` of this rank's rows, none of which
+`TSARKIMEX`'s own solve reads; the prototype is needed with or without the `jac`.
+`dgdu_discrete` gets this rank's rows of the state and writes their gradient, and
+`dgdp_discrete` gives this rank's share of the cost's direct derivative with respect to `p`,
+which the ranks add up. `du0` comes back as this rank's rows and `dp` as the whole gradient,
+the same on every rank. The cost times, `no_start`, the length of `p` and whether
+`dgdp_discrete`, `jac` and `paramjac` are given have to agree across the ranks. A `jac`,
+`paramjac`, cost function or `f` that throws on some ranks makes every rank throw, as in a
+solve. The transposed linear solves of `TSImplicit` and `TSARKIMEX` use the solver above;
+`["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
+On 1 and 2 ranks a reaction-diffusion problem split into its diffusion and its reaction gave
+the gradient of the serial split adjoint to 7e-16 and that of central differences of the
+same fixed-step solve to 1.2e-9. With `f2`'s `jac` and `paramjac` built the gradient was the
+same to the last digit, and with `f1`'s built it was within 8.2e-15, which is where building
+them puts it on `MPI.COMM_SELF` too.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
 which every algorithm that takes `comm` takes as well. The solve then runs on the DM's
@@ -224,10 +246,18 @@ sol_bdf = solve(prob, TSImplicit("bdf"; dm = da))
 
 With a `dm` the implicit algorithms need no `jac_prototype`. Their Jacobian is the DM's own
 matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil. Without a `jac` PETSc
-fills it by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()`
-and the other backends are refused; the stencil has to cover every point `f` reads. Colouring
-calls `f` once per colour at every Jacobian, and the colours grow with the stencil width and
-the degrees of freedom at a point, so a `jac(J, u, p, t)` can fill the matrix instead. It gets
+fills it by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()`;
+the stencil has to cover every point `f` reads. Colouring calls `f` once per colour at every
+Jacobian, and the colours grow with the stencil width and the degrees of freedom at a point.
+On a DMDA `autodiff = AutoForwardDiff()` builds the exact Jacobian instead: `f` runs on a
+ghosted array of dual numbers, each entry seeded by the colour of the grid point it belongs
+to, ghosts included, so one call fills up to 12 colours and a `chunksize` sets another count.
+The colours are the DM's own, or those of the matrix's pattern where PETSc has none or a wrong
+one for a periodic grid. On one rank, for grids in 1-D and 2-D with one and two degrees of
+freedom, star and box stencils and periodic and ghosted edges, the matrix matched a `jac`'s to
+7e-15 where PETSc's colouring was up to 4e-6 off, and the solves took the `jac`'s steps. `f`
+has to accept dual numbers, and a DMStag, a DMPlex, a `DAEProblem`, a complex state and the
+other backends are refused. A `jac(J, u, p, t)` can fill the matrix as well. It gets
 `u` ghosted, as `f` does, and `J` is the DM's matrix as a PETSc.jl `Mat`, zeroed before the
 call and assembled after it, so `jac` writes ``df/du`` into it through PETSc's matrix API,
 each rank its own rows: `set_stencil_values!(J, rows, cols, vals)` writes a block by grid
@@ -397,7 +427,7 @@ matched with a mass matrix exactly, as a `SplitODEProblem` in `TSARKIMEX` to 5.4
 adjoint without a DM exactly.
 
 The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
-`TSARKIMEX` and `TSGeneric(ts_type; explicit = true)`, `saveat`, dense output, callbacks and
+`TSARKIMEX` and `TSGeneric`, explicit or implicit, `saveat`, dense output, callbacks and
 the integrator interface, a `Diagonal` mass matrix, a `SplitODEProblem`, whose `f2` gets `u`
 ghosted as `f` does, and a `DAEProblem`, whose residual `f(r, du, u, p, t)` gets `u` ghosted
 and `du` owned. Everything else the package calls, such as a callback, `unstable_check` or
@@ -422,8 +452,9 @@ throws on some ranks makes every rank throw. On 1-D and 2-D DMDAs of 1 to 3 rank
 gradient agreed with the comm-mode and serial adjoints of the same discretization to 2e-15
 and with central differences of the same fixed-step solve to 1.4e-9.
 
-A solve with a `dm` refuses `TSIRK`, `TSMPRK` and an implicit `TSGeneric` with an
-`ArgumentError`. A distributed solve, with a `dm` or without, is refused off the root task
+A solve with a `dm` refuses `TSIRK`, `TSMPRK` and an implicit `TSGeneric` of type `"irk"`,
+or of a type refused on a `comm`, with an `ArgumentError`. A distributed solve, with a `dm`
+or without, is refused off the root task
 when Julia has more than one thread, whether inside `Threads.@threads` (as `EnsembleThreads`
 runs its trajectories) or from a `Threads.@spawn` task: nothing there keeps the ranks' solves
 in the same order, and ranks taking them in different orders run different solves as one and

@@ -22,6 +22,10 @@ const SERIAL_GAP = 1.0e-15
 const DM_GAP = 5.0e-15
 # Measured at 1 and 2 ranks: a split problem is within 7.0e-16 of its serial adjoint.
 const SPLIT_GAP = 5.0e-15
+# Measured at 1 and 2 ranks: with `jac` and `paramjac` built it is within 8.8e-16 of serial.
+const AD_GAP = 1.0e-14
+# Measured at 1 and 2 ranks: a split problem building `f1`'s `jac` is within 8.2e-15 of serial.
+const SPLIT_AD_GAP = 5.0e-14
 const FD_GAP = 2.0e-9
 const thrower = nranks - 1
 
@@ -65,7 +69,7 @@ heat0(idx) = sinpi.(x.(idx))
 function halo(u)
     left = rank == 0 ? MPI.PROC_NULL : rank - 1
     right = rank == nranks - 1 ? MPI.PROC_NULL : rank + 1
-    gl, gr = zeros(1), zeros(1)
+    gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
     MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
     MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
     return gl[1], gr[1]
@@ -150,16 +154,15 @@ end
 
 function split_problem(
         idx, ghosts; tspan = first(FORWARD), u0 = heat0(idx), p = copy(P),
-        jac = reaction_jac(idx), paramjac = reaction_paramjac(idx),
-        jac_prototype = reaction_proto(idx),
+        f2 = reaction(idx), jac = reaction_jac(idx), paramjac = reaction_paramjac(idx),
+        jac_prototype = reaction_proto(idx), f1_jac = diffusion_jac(idx),
+        f1_paramjac = diffusion_paramjac(idx, ghosts),
     )
     f1 = ODEFunction(
-        diffusion(idx, ghosts); jac = diffusion_jac(idx),
-        paramjac = diffusion_paramjac(idx, ghosts), jac_prototype = heat_proto(idx),
+        diffusion(idx, ghosts); jac = f1_jac, paramjac = f1_paramjac,
+        jac_prototype = heat_proto(idx),
     )
-    return SplitODEProblem(
-        f1, ODEFunction(reaction(idx); jac, paramjac, jac_prototype), u0, tspan, p,
-    )
+    return SplitODEProblem(f1, ODEFunction(f2; jac, paramjac, jac_prototype), u0, tspan, p)
 end
 
 cost(u, p, idx) = sum(abs2, u) / 2 + p[2] * sum(u .* x.(idx))
@@ -206,12 +209,12 @@ end
 exact(c) = vcat(EXACT, ["-pc_type", c == MPI.COMM_SELF ? "lu" : "redundant"])
 
 const METHODS = (
-    ("TSRK", c -> TSRK("4"; comm = c)),
-    ("backward Euler", c -> TSImplicit("beuler", exact(c); comm = c)),
-    ("Crank-Nicolson", c -> TSImplicit("cn", exact(c); comm = c)),
-    ("theta 0.7", c -> TSImplicit("theta", 0.7, exact(c); comm = c)),
-    ("ARKIMEX l2", c -> TSARKIMEX("l2", exact(c); comm = c)),
-    ("ARKIMEX 3", c -> TSARKIMEX("3", exact(c); comm = c)),
+    ("TSRK", (c; kw...) -> TSRK("4"; comm = c)),
+    ("backward Euler", (c; kw...) -> TSImplicit("beuler", exact(c); comm = c, kw...)),
+    ("Crank-Nicolson", (c; kw...) -> TSImplicit("cn", exact(c); comm = c, kw...)),
+    ("theta 0.7", (c; kw...) -> TSImplicit("theta", 0.7, exact(c); comm = c, kw...)),
+    ("ARKIMEX l2", (c; kw...) -> TSARKIMEX("l2", exact(c); comm = c, kw...)),
+    ("ARKIMEX 3", (c; kw...) -> TSARKIMEX("3", exact(c); comm = c, kw...)),
 )
 
 const GHOSTED = LibPETSc.DM_BOUNDARY_GHOSTED
@@ -351,6 +354,17 @@ end
             @test relerr(mine, reference) <= SERIAL_GAP
             @test relerr(mine, fd) <= FD_GAP
         end
+        dual = make(comm; autodiff = AutoForwardDiff())
+        for built in ((:jac, :paramjac), (:jac,), (:paramjac,))
+            bare = heat_problem(rows, halo; tspan, p, (key => nothing for key in built)...)
+            du0, dp = gradient(bare, dual, times, rows)
+            @test same_everywhere(dp)
+            auto = vcat(gathered(du0, counts), vec(dp))
+            if rank == 0
+                @test relerr(auto, reference) <= AD_GAP
+                @test relerr(auto, fd) <= FD_GAP
+            end
+        end
     end
 
     @testset "a SplitODEProblem matches the serial adjoint and finite differences: $name, $dir" for (
@@ -363,8 +377,23 @@ end
         fd = differenced(alg, tspan, times, p; problem = split_problem)
         if rank == 0
             serial = gradient(split_problem(1:N, walls; tspan, p), make(MPI.COMM_SELF), times, 1:N)
-            @test relerr(mine, vcat(serial[1], vec(serial[2]))) <= SPLIT_GAP
+            reference = vcat(serial[1], vec(serial[2]))
+            @test relerr(mine, reference) <= SPLIT_GAP
             @test relerr(mine, fd) <= FD_GAP
+        end
+        dual = make(comm; autodiff = AutoForwardDiff())
+        for built in (
+                (:jac, :paramjac, :f1_jac, :f1_paramjac), (:jac, :paramjac),
+                (:f1_jac, :f1_paramjac),
+            )
+            bare = split_problem(rows, halo; tspan, p, (key => nothing for key in built)...)
+            du0, dp = gradient(bare, dual, times, rows)
+            @test same_everywhere(dp)
+            auto = vcat(gathered(du0, counts), vec(dp))
+            if rank == 0
+                @test relerr(auto, reference) <= SPLIT_AD_GAP
+                @test relerr(auto, fd) <= FD_GAP
+            end
         end
     end
 
@@ -442,6 +471,11 @@ end
             ("f", "TSRK", TSRK("4"; comm), :forward),
             ("f", "backward Euler", TSImplicit("beuler", exact(comm); comm), :forward),
             ("f", "TSRK", TSRK("4", ["-ts_trajectory_solution_only", "1"]; comm), :adjoint),
+            ("f", "TSRK building both", TSRK("4"; comm), :adjoint),
+            (
+                "f", "Crank-Nicolson building both",
+                TSImplicit("cn", exact(comm); comm, autodiff = AutoForwardDiff()), :adjoint,
+            ),
             ("dgdu", "TSRK", TSRK("4"; comm), :adjoint),
             ("dgdp", "TSRK", TSRK("4"; comm), :after),
             ("jac", "TSRK with a dm", TSRK("4"; dm = da), :adjoint),
@@ -456,12 +490,14 @@ end
         when = pieces === :adjoint ? (args...) -> started[] :
             pieces === :forward ? (args...) -> args[end] > 0.05 : (args...) -> args[end] == 4
         pick(key, f) = key == what ? throwing(f, what, when) : f
+        built = endswith(name, "building both")
         du = pick("dgdu", cost_du(rows))
         dgdu = (args...) -> (started[] = true; du(args...))
         prob = if alg.dm === nothing
             heat_problem(
-                rows, halo; f = pick("f", heat(rows, halo)), jac = pick("jac", heat_jac(rows)),
-                paramjac = pick("paramjac", heat_paramjac(rows, halo)),
+                rows, halo; f = pick("f", heat(rows, halo)),
+                jac = built ? nothing : pick("jac", heat_jac(rows)),
+                paramjac = built ? nothing : pick("paramjac", heat_paramjac(rows, halo)),
             )
         else
             dm_problem(;
@@ -488,19 +524,34 @@ end
         @test raised(e, "$what threw")
     end
 
+    @testset "f2 throwing on one rank while its Jacobians are built raises on every rank" begin
+        started = Ref(false)
+        du = cost_du(rows)
+        prob = split_problem(
+            rows, halo; f2 = throwing(reaction(rows), "f2", (args...) -> started[]),
+            jac = nothing, paramjac = nothing,
+        )
+        alg = TSARKIMEX("l2", exact(comm); comm, autodiff = AutoForwardDiff())
+        dgdu = (args...) -> (started[] = true; du(args...))
+        e = caught(() -> gradient(prob, alg, FORWARD[2], rows; dgdu_discrete = dgdu))
+        @test raised(e, "f2 threw")
+    end
+
     @testset "refusals" begin
         times = FORWARD[2]
         rk = TSRK("4"; comm)
         heat_with(; kw...) = heat_problem(rows, halo; kw...)
-        @test refused(
-            () -> gradient(heat_with(jac = nothing), rk, times, rows), "needs the ODEFunction's `jac`",
-        )
-        for alg in (rk, TSImplicit("beuler"; comm, autodiff = AutoForwardDiff()))
+        zygote = TSImplicit("beuler"; comm, autodiff = PETScDiffEq.ADTypes.AutoZygote())
+        for what in ("jac", "paramjac")
             @test refused(
-                () -> gradient(heat_with(paramjac = nothing), alg, times, rows),
-                "needs the ODEFunction's `paramjac`",
+                () -> gradient(heat_with(; Symbol(what) => nothing), zygote, times, rows),
+                "cannot build the ODEFunction's `$what` with",
             )
         end
+        @test refused(
+            () -> gradient(heat_with(jac = nothing, jac_prototype = nothing), rk, times, rows),
+            "without a `jac`, PETScAdjoint",
+        )
         colouring = TSImplicit("beuler"; comm)
         for (prob, what) in (
                 (heat_with(jac = nothing), "`jac`"), (heat_with(paramjac = nothing), "`paramjac`"),
@@ -510,9 +561,14 @@ end
                 "$what under `autodiff = AutoFiniteDiff()`",
             )
         end
-        some = heat_with(paramjac = rank == thrower ? nothing : heat_paramjac(rows, halo))
-        e = caught(() -> gradient(some, rk, times, rows))
-        @test rank == thrower ? e isa ArgumentError && occursin("`paramjac`", e.msg) : remote(e)
+        for some in (
+                heat_with(jac = rank == thrower ? nothing : heat_jac(rows)),
+                heat_with(paramjac = rank == thrower ? nothing : heat_paramjac(rows, halo)),
+            )
+            nranks > 1 && @test refused(
+                () -> gradient(some, rk, times, rows), "`jac` and `paramjac` on every rank",
+            )
+        end
         @test refused(
             () -> gradient(heat_with(jac_prototype = nothing), rk, times, rows),
             "sparse `jac_prototype`",
@@ -522,12 +578,35 @@ end
             "integral cost on MPI.COMM_SELF only",
         )
         imex = TSARKIMEX("l2"; comm, autodiff = AutoForwardDiff())
-        for (kw, what) in (
-                ((; jac = nothing), "needs `f2`'s `jac` on a communicator"),
-                ((; paramjac = nothing), "needs `f2`'s `paramjac` on a communicator"),
-                ((; jac_prototype = nothing), "to come with a sparse `jac_prototype`"),
+        imex_zygote = TSARKIMEX("l2"; comm, autodiff = PETScDiffEq.ADTypes.AutoZygote())
+        imex_colouring = TSARKIMEX("l2"; comm)
+        split_with(; kw...) = split_problem(rows, halo; kw...)
+        for (alg, kw, what) in (
+                (imex_zygote, (; jac = nothing), "cannot build `f2`'s `jac` with"),
+                (imex_zygote, (; paramjac = nothing), "cannot build `f2`'s `paramjac` with"),
+                (
+                    imex_colouring, (; jac = nothing),
+                    "`f2`'s `jac` under `autodiff = AutoFiniteDiff()`",
+                ),
+                (
+                    imex_colouring, (; paramjac = nothing),
+                    "`f2`'s `paramjac` under `autodiff = AutoFiniteDiff()`",
+                ),
+                (imex, (; jac_prototype = nothing), "to come with a sparse `jac_prototype`"),
+                (
+                    imex, (; jac = nothing, jac_prototype = nothing),
+                    "to come with a sparse `jac_prototype`",
+                ),
             )
-            @test refused(() -> gradient(split_problem(rows, halo; kw...), imex, times, rows), what)
+            @test refused(() -> gradient(split_with(; kw...), alg, times, rows), what)
+        end
+        for some in (
+                split_with(jac = rank == thrower ? nothing : reaction_jac(rows)),
+                split_with(paramjac = rank == thrower ? nothing : reaction_paramjac(rows)),
+            )
+            nranks > 1 && @test refused(
+                () -> gradient(some, imex, times, rows), "`jac` and `paramjac` on every rank",
+            )
         end
         taller = rank == thrower ? [reaction_proto(rows); spzeros(1, N)] : reaction_proto(rows)
         e = caught(() -> gradient(split_problem(rows, halo; jac_prototype = taller), imex, times, rows))
@@ -541,8 +620,10 @@ end
             "SplitODEProblem with a `dm` on a DM of a single rank only",
         )
         wrong = rank == thrower ? [heat_proto(rows); spzeros(1, N)] : heat_proto(rows)
-        e = caught(() -> gradient(heat_with(jac_prototype = wrong), rk, times, rows))
-        @test rank == thrower ? e isa ArgumentError && occursin("must be", e.msg) : remote(e)
+        for jac in (heat_jac(rows), nothing)
+            e = caught(() -> gradient(heat_with(; jac, jac_prototype = wrong), rk, times, rows))
+            @test rank == thrower ? e isa ArgumentError && occursin("must be", e.msg) : remote(e)
+        end
         not_bool = rank == thrower ? nothing : false
         e = caught(() -> gradient(heat_with(), rk, times, rows; no_start = not_bool))
         @test rank == thrower ? e isa MethodError : remote(e)
