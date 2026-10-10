@@ -637,7 +637,8 @@ function _check_adjoint_problem(
     is_split && !(alg isa TSARKIMEX) && throw(
         ArgumentError(
             "PETScAdjoint supports a SplitODEProblem with TSARKIMEX only, the one method " *
-                "here that integrates its two parts differently",
+                "here that integrates its two parts differently; for another, give it the " *
+                "ODEProblem of their sum",
         ),
     )
     is_split && comm !== nothing && throw(
