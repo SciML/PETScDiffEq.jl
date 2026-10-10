@@ -155,13 +155,22 @@ it is `length(u0)` by the length of the whole state, and `jac` fills it as it wo
 of the serial Jacobian. `TSAlpha2` needs each rank's `v` and `u` to have the same
 length, and builds the distributed matrix it factors, `shift_a I - shift_v df/dv - df/du`,
 from the `v` rows; without a `jac` PETSc colours that matrix and differences `f`, as for the
-other implicit algorithms. A `dm` is refused for these problems, and so are `PETScAdjoint` and
-any `autodiff` but `AutoFiniteDiff()` on a communicator. Split over 1 to 3 ranks, unevenly on more than one, a 1-D wave equation and a
+other implicit algorithms. `autodiff = AutoForwardDiff()` builds the first-order system's
+Jacobian from the prototype instead, for `TSAlpha2` and for the implicit algorithms on the
+first-order form, as it does for an `ODEProblem`: the columns are coloured in the prototype's
+order, and each rank seeds the entries of its own `[v; u]` that those columns stand for, so
+`f1` and `f2` have to exchange dual numbers as `f` does there. It needs the sparse prototype,
+and other backends are refused. A `dm` is refused for these problems, and so is `PETScAdjoint`
+on a communicator. Split over 1 to 3 ranks, unevenly on more than one, a 1-D wave equation and a
 chain of particles gave the serial solve's states to 3e-15 with `TSBasicSymplectic` and fixed
 steps of `TSRK`, the energy error included, and to 1.2e-9 with adaptive steps of `TSRK("5dp")`.
 `TSAlpha2` and `TSImplicit("bdf")` with a `jac` agreed to 2e-10 with `["-ksp_type", "preonly",
 "-pc_type", "redundant"]` in `petsc_options` and to 8e-8 with the default linear solver, and
-colouring, whose differences depend on the layout, moved `TSAlpha2` by up to 3e-6.
+colouring, whose differences depend on the layout, moved `TSAlpha2` by up to 3e-6. On 1 and 2
+ranks the ForwardDiff Jacobians of the wave equation and of the chain matched a `jac`'s entry by
+entry to 1e-12, and the solves took the `jac` solve's steps, with states within 1e-13 of its
+own on the wave equation under `TSAlpha2` and `TSImplicit("bdf")` and within 1e-10 on the chain
+under `TSImplicit("bdf")`.
 
 `PETScAdjoint` runs distributed too, for `TSRK`, `TSARKIMEX` on an `ODEProblem` and
 `TSImplicit`'s `"beuler"`, `"cn"` and `"theta"`. It needs the problem's `jac`, filling this

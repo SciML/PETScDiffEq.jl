@@ -346,7 +346,11 @@ function (g::Guarded)(out, args...)
     return nothing
 end
 
-function _global_colours(backend, proto::SparseMatrixCSC, comm)
+_guarded(f, err) = Guarded(f, err)
+# Both parts run even when the first throws, since either may communicate.
+_guarded(d::Partitioned, err) = Partitioned(Guarded(d.f1, err), Guarded(d.f2, err), d.nv)
+
+function _global_colours(backend, proto::SparseMatrixCSC, comm, colmap)
     n, N = size(proto)
     rstart = MPI.Scan(n, +, comm) - n
     pairs = Vector{Int}(undef, 2 * SparseArrays.nnz(proto))
@@ -368,7 +372,10 @@ function _global_colours(backend, proto::SparseMatrixCSC, comm)
     end
     MPI.Bcast!(colours, comm)
     entry = [colours[j] for j in 1:N for _ in nzrange(proto, j)]
-    return colours[rstart .+ (1:n)], entry, maximum(colours; init = 0)
+    block = rstart .+ (1:n)
+    # A partitioned problem's columns are not in the state's order, so find this rank's.
+    own = colmap === nothing ? block : invperm(colmap)[block]
+    return colours[own], entry, maximum(colours; init = 0)
 end
 
 _batch(::AutoForwardDiff{C}, ncolours) where {C} =
@@ -441,11 +448,13 @@ function (j::CommJacobian)(J, du, u::AbstractVector{<:Complex}, p, gamma, t)
     )
 end
 
-function _ad_comm_jacobian(backend, f!, proto, u0, p, t, calls, advice, comm, dae)
-    own, entry, ncolours = _global_colours(backend, proto, comm)
+function _ad_comm_jacobian(
+        backend, f!, proto, u0, p, t, calls, advice, comm, dae, colmap = nothing,
+    )
+    own, entry, ncolours = _global_colours(backend, proto, comm, colmap)
     dense = ADTypes.dense_ad(backend)
     err = Ref{Any}(nothing)
-    g! = Counted(Guarded(f!, err), calls)
+    g! = Counted(_guarded(f!, err), calls)
     R, n = real(eltype(u0)), length(u0)
     split = eltype(u0) <: Complex
     x, y = split ? (real.(u0), imag.(u0)) : (copy(u0), R[])
