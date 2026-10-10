@@ -633,6 +633,12 @@ function _check_adjoint_problem(
     )
     prob isa SciMLBase.AbstractODEProblem ||
         throw(ArgumentError("PETScAdjoint supports an ODEProblem, not a DAEProblem"))
+    prob.u0 isa AbstractVector || throw(
+        ArgumentError(
+            "PETScAdjoint supports a vector `u0`, not an array-shaped one; pass `vec(u0)` " *
+                "and reshape the state inside `f` and the cost functions",
+        ),
+    )
     is_split = prob.f isa SciMLBase.SplitFunction
     is_split && !(alg isa TSARKIMEX) && throw(
         ArgumentError(
