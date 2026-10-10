@@ -7462,6 +7462,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test isapprox(sol.u[end][1], 1.5exp(-0.5) - 0.5exp(-1.0); atol = 1.0e-6)
             @test isapprox(sol.u[end][2], exp(-1.0); atol = 1.0e-6)
         end
+
+        @testset "a Diagonal or sparse mass matrix is not made dense" begin
+            band(n, l, d) = spdiagm(-1 => fill(l, n - 1), 0 => fill(d, n), 1 => fill(l, n - 1))
+            function run(M)
+                n = size(M, 1)
+                A = band(n, 1.0, -2.0)
+                f = SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (mul!(du, A, u); nothing);
+                    jac = (J, u, p, t) -> (copyto!(nonzeros(J), nonzeros(A)); nothing),
+                    jac_prototype = A, mass_matrix = M,
+                )
+                return SciMLBase.solve(
+                    SciMLBase.ODEProblem(f, sinpi.((1:n) ./ (n + 1)), (0.0, 0.1)),
+                    PETScDiffEq.TSImplicit("beuler"); dt = 0.01, adaptive = false,
+                )
+            end
+            lumped(n) = Diagonal(1 .+ (1:n) ./ n)
+            for M in (lumped(20), band(20, 1 / 6, 2 / 3))
+                @test run(M).u ≈ run(Matrix(M)).u rtol = 1.0e-12
+            end
+            for M in (lumped(2000), band(2000, 1 / 6, 2 / 3))
+                @test (@allocated run(M)) < 16_000_000
+            end
+        end
     end
 
     @testset "An operator-valued right-hand side is rejected" begin
