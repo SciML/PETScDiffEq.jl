@@ -10540,6 +10540,53 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(du0, central_differences(loss, u0)) < 1.0e-8
         end
 
+        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX on a split problem on a communicator of one rank" begin
+            world = MPI.COMM_WORLD
+            on_world = TSARKIMEX("3", exact; comm = world)
+            for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t))
+                prob = split_prob(copy(u0), copy(p0), tspan; kind = :sparse)
+                serial = grad(prob, TSARKIMEX("3", exact); t)
+                du0, dp = grad(prob, on_world; t)
+                @test du0 ≈ serial[1] rtol = 1.0e-13
+                @test dp ≈ serial[2] rtol = 1.0e-13
+            end
+            given = grad(split_prob(copy(u0), copy(p0), (0.0, 1.0)), TSARKIMEX("3", exact))
+            differentiating =
+                TSARKIMEX("3", exact; comm = world, autodiff = PETScDiffEq.AutoForwardDiff())
+            pattern = sparse(ones(2, 2))
+            bare = SciMLBase.SplitODEProblem(
+                SciMLBase.ODEFunction(implicit_part!; jac_prototype = pattern),
+                SciMLBase.ODEFunction(explicit_part!; jac_prototype = pattern),
+                copy(u0), (0.0, 1.0), copy(p0),
+            )
+            sparse_split(; kw...) =
+                split_prob(copy(u0), copy(p0), (0.0, 1.0); kind = :sparse, kw...)
+            for prob in (bare, sparse_split(f2_jac = nothing), sparse_split(f2_paramjac = nothing))
+                du0, dp = grad(prob, differentiating)
+                @test du0 ≈ given[1] rtol = 1.0e-12
+                @test dp ≈ given[2] rtol = 1.0e-12
+            end
+            zygote = PETScDiffEq.ADTypes.AutoZygote()
+            taped = TSARKIMEX("3", exact; comm = world, autodiff = zygote)
+            for (prob, what) in (
+                    (sparse_split(f2_jac = nothing), "cannot build `f2`'s `jac` with `$zygote`"),
+                    (sparse_split(f2_paramjac = nothing), "cannot build `f2`'s `paramjac` with `$zygote`"),
+                )
+                @test_throws what grad(prob, taped)
+            end
+            dense_f2 = SciMLBase.SplitODEProblem(
+                SciMLBase.ODEFunction(
+                    implicit_part!; jac = implicit_jac!, paramjac = implicit_paramjac!,
+                    jac_prototype = pattern,
+                ),
+                SciMLBase.ODEFunction(
+                    explicit_part!; jac = explicit_jac!, paramjac = explicit_paramjac!,
+                ),
+                copy(u0), (0.0, 1.0), copy(p0),
+            )
+            @test_throws "to come with a sparse `jac_prototype`" grad(dense_f2, on_world)
+        end
+
         @testset "an adaptive TSARKIMEX holds its accepted steps fixed: $name" for (
                 name, subtype, make, tspan,
             ) in (
