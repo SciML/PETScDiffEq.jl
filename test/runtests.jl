@@ -6157,7 +6157,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             dm_prob((0.0, 0.1); jac_prototype = proto), PETScDiffEq.TSImplicit("bdf"; dm = da),
         )
         algebraic(i) = i % 4 == 0
+        calls = Ref(0)
         function chain_dm!(du, u, da, t)
+            calls[] += 1
             U = PETScDiffEq.reshape_local_array(u, da)
             D = PETScDiffEq.reshape_local_array(du, da)
             for i in axes(D, 2)
@@ -6167,6 +6169,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             return nothing
         end
         function chain_jac_dm!(J, u, da, t)
+            push!(seen, length(u))
             U = PETScDiffEq.reshape_local_array(u, da)
             for i in 1:N
                 c = U[1, i]
@@ -6175,26 +6178,39 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             return nothing
         end
-        chain(; kw...) = SciMLBase.ODEProblem(
+        chain(x0 = u0, grid = da; kw...) = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(
-                chain_dm!; mass_matrix = Diagonal([algebraic(i) ? 0.0 : 1.0 for i in 1:N]), kw...,
-            ), u0, (0.0, 0.1), da,
+                chain_dm!; kw...,
+                mass_matrix = Diagonal([algebraic(i) ? 0.0 : 1.0 for i in eachindex(x0)]),
+            ), x0, (0.0, 0.1), grid,
         )
         bdf = PETScDiffEq.TSImplicit("bdf"; dm = da)
+        wide = PETSc.DMDA(pl, MPI.COMM_SELF, (ghosted,), (400,), 1, 1)
         for init in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            empty!(seen)
             with_jac = SciMLBase.init(
                 chain(; jac = chain_jac_dm!), bdf; initializealg = init, tol...,
             )
+            @test !isempty(seen)
             plain = SciMLBase.init(chain(), bdf; initializealg = init, tol...)
-            @test with_jac.u == plain.u != u0
+            @test with_jac.u != u0
+            @test maximum(abs, with_jac.u - plain.u) <= 1.0e-13
             for integ in (with_jac, plain)
                 SciMLBase.set_u!(integ, integ.u .+ 0.05)
                 SciMLBase.initialize_dae!(integ)
             end
-            @test with_jac.u == plain.u
+            @test maximum(abs, with_jac.u - plain.u) <= 1.0e-13
             SciMLBase.terminate!(with_jac)
             SciMLBase.terminate!(plain)
+            calls[] = 0
+            coloured = SciMLBase.init(
+                chain(fill(0.5, 400), wide), PETScDiffEq.TSImplicit("bdf"; dm = wide);
+                initializealg = init, tol...,
+            )
+            @test calls[] < 200
+            SciMLBase.terminate!(coloured)
         end
+        PETScDiffEq.PETScCompat.destroy!(wide)
         PETScDiffEq.PETScCompat.destroy!(da)
     end
 
