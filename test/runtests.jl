@@ -12152,7 +12152,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test collect(du0) ≈ collect(first(adjoint(PETScDiffEq.TSRK("4")))) rtol = 1.0e-12
                 @test dp === nothing
             else
-                @test_throws "sparse `jac_prototype`" adjoint(PETScDiffEq.TSRK("4"; comm = world))
+                # SciMLBase 3.1 drops the `jac` as well, which is refused in other words.
+                @test_throws ArgumentError adjoint(PETScDiffEq.TSRK("4"; comm = world))
             end
             line = PETScDiffEq.PETSc.DMDA(
                 PETScDiffEq.PETSc.getlib(; PetscScalar = Float64), MPI.COMM_SELF,
