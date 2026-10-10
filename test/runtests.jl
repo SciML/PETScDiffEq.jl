@@ -6587,6 +6587,13 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             plain = SciMLBase.init(chain(), bdf; initializealg = init, tol...)
             @test with_jac.u != u0
             @test maximum(abs, with_jac.u - plain.u) <= 1.0e-13
+            dual = SciMLBase.init(
+                chain(),
+                PETScDiffEq.TSImplicit("bdf"; dm = da, autodiff = PETScDiffEq.AutoForwardDiff());
+                initializealg = init, tol...,
+            )
+            @test dual.u == with_jac.u
+            SciMLBase.terminate!(dual)
             for integ in (with_jac, plain)
                 SciMLBase.set_u!(integ, integ.u .+ 0.05)
                 SciMLBase.initialize_dae!(integ)
@@ -6603,6 +6610,158 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.terminate!(coloured)
         end
         PETScDiffEq.PETScCompat.destroy!(wide)
+        PETScDiffEq.PETScCompat.destroy!(da)
+    end
+
+    @testset "ForwardDiff builds the Jacobian with a DMDA" begin
+        PETSc = PETScDiffEq.PETSc
+        LibPETSc = PETScDiffEq.LibPETSc
+        on_grid = PETScDiffEq.reshape_local_array
+        forward = PETScDiffEq.AutoForwardDiff
+        pl = PETSc.getlib(; PetscScalar = Float64)
+        PETScDiffEq.PETScCompat.isinitialized(pl) || PETSc.initialize(pl)
+        periodic, ghosted = LibPETSc.DM_BOUNDARY_PERIODIC, LibPETSc.DM_BOUNDARY_GHOSTED
+        tol = (abstol = 1.0e-8, reltol = 1.0e-8)
+        bdf(da; kw...) = PETScDiffEq.TSImplicit("bdf"; dm = da, kw...)
+        rosw(da; kw...) = PETScDiffEq.TSRosW(; dm = da, kw...)
+        start(n) = [0.7 + 0.3 * sin(1.7k) for k in 1:n]
+        # A Brusselator with two degrees of freedom at each point, stiff through its diffusion.
+        function line!(du, u, da, t)
+            U, D = on_grid(u, da), on_grid(du, da)
+            d = length(D)^2 / 4
+            for i in axes(D, 2)
+                x, y = U[1, i], U[2, i]
+                D[1, i] = 1 + x^2 * y - 4x + d * (U[1, i - 1] - 2x + U[1, i + 1])
+                D[2, i] = 3x - x^2 * y + d * (U[2, i - 1] - 2y + U[2, i + 1])
+            end
+            return nothing
+        end
+        function line_jac!(J, u, da, t)
+            U = on_grid(u, da)
+            N = length(U) ÷ 2 - 2
+            d = N^2
+            for i in 1:N
+                x, y = U[1, i], U[2, i]
+                set_stencil_values!(
+                    J, (1, i), ((1, i - 1), (1, i), (2, i), (1, i + 1)),
+                    (d, 2x * y - 4 - 2d, x^2, d),
+                )
+                set_stencil_values!(
+                    J, (2, i), ((2, i - 1), (1, i), (2, i), (2, i + 1)),
+                    (d, 3 - 2x * y, -x^2 - 2d, d),
+                )
+            end
+            return nothing
+        end
+        line(da, span = (0.0, 0.1); kw...) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(line!; kw...), start(PETScDiffEq._dm_local_size(pl, da)), span,
+            da,
+        )
+        # PETSc colours a periodic grid of 15 points with 6 colours and one of 16 not at all.
+        for (N, edge) in ((15, periodic), (16, periodic), (15, ghosted)), make in (bdf, rosw)
+            da = PETSc.DMDA(pl, MPI.COMM_SELF, (edge,), (N,), 2, 1)
+            hand = SciMLBase.solve(line(da; jac = line_jac!), make(da); tol...)
+            got = SciMLBase.solve(line(da), make(da; autodiff = forward()); tol...)
+            @test got.retcode == SciMLBase.ReturnCode.Success
+            @test got.t == hand.t
+            @test got.u == hand.u
+            @test got.stats.njacs == hand.stats.njacs > 0
+            @test got.stats.nf == hand.stats.nf + got.stats.njacs
+            PETScDiffEq.PETScCompat.destroy!(da)
+        end
+        da = PETSc.DMDA(pl, MPI.COMM_SELF, (periodic,), (15,), 2, 1)
+        hand = SciMLBase.solve(line(da; jac = line_jac!), bdf(da); tol...)
+        coloured = SciMLBase.solve(line(da), bdf(da); tol...)
+        @test coloured.stats.nf == hand.stats.nf + 6 * hand.stats.njacs
+        chunked = SciMLBase.solve(line(da), bdf(da; autodiff = forward(; chunksize = 2)); tol...)
+        @test chunked.u == hand.u
+        @test chunked.stats.nf == hand.stats.nf + 3 * chunked.stats.njacs
+        mass = Diagonal(1 .+ (1:30) ./ 30)
+        for (span, kw) in (((0.0, 0.1), (; mass_matrix = mass)), ((0.001, 0.0), (;))),
+                make in (bdf, rosw)
+
+            hand = SciMLBase.solve(line(da, span; jac = line_jac!, kw...), make(da); tol...)
+            got = SciMLBase.solve(line(da, span; kw...), make(da; autodiff = forward()); tol...)
+            @test got.t == hand.t
+            @test got.u == hand.u
+        end
+
+        # Two degrees of freedom on a grid with a corner coupling.
+        dims, d = Ref((6, 6)), 1.8
+        function grid!(du, u, da, t)
+            U, D = on_grid(u, da), on_grid(du, da)
+            for j in axes(D, 3), i in axes(D, 2), c in 1:2
+                x, y = U[1, i, j], U[2, i, j]
+                lap = U[c, i - 1, j] + U[c, i + 1, j] + U[c, i, j - 1] + U[c, i, j + 1] -
+                    4U[c, i, j]
+                D[c, i, j] = (3 - 2c) * (x^2 * y - x) + d * lap + sin(U[3 - c, i + 1, j + 1])
+            end
+            return nothing
+        end
+        function grid_jac!(J, u, da, t)
+            U = on_grid(u, da)
+            for j in 1:dims[][2], i in 1:dims[][1], c in 1:2
+                x, y = U[1, i, j], U[2, i, j]
+                s = 3 - 2c
+                cols = (
+                    (c, i - 1, j), (c, i + 1, j), (c, i, j - 1), (c, i, j + 1), (1, i, j),
+                    (2, i, j), (3 - c, i + 1, j + 1),
+                )
+                vals = (
+                    d, d, d, d, s * (2x * y - 1) - (c == 1) * 4d, s * x^2 - (c == 2) * 4d,
+                    cos(U[3 - c, i + 1, j + 1]),
+                )
+                set_stencil_values!(J, (c, i, j), cols, vals)
+            end
+            return nothing
+        end
+        # On the 8 by 7 periodic grid PETSc's own 18 colours are wrong, so the pattern's are used.
+        for (edges, size, calls) in (
+                    ((periodic, ghosted), (6, 6), 2), ((ghosted, ghosted), (6, 5), 2),
+                    ((periodic, periodic), (8, 7), nothing),
+                ), make in (bdf, rosw)
+
+            dims[] = size
+            box = PETSc.DMDA(pl, MPI.COMM_SELF, edges, size, 2, 1, LibPETSc.DMDA_STENCIL_BOX)
+            grid(; kw...) = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(grid!; kw...), start(2 * prod(size)), (0.0, 0.1), box,
+            )
+            hand = SciMLBase.solve(grid(; jac = grid_jac!), make(box); tol...)
+            got = SciMLBase.solve(grid(), make(box; autodiff = forward()); tol...)
+            @test got.retcode == SciMLBase.ReturnCode.Success
+            @test got.t == hand.t
+            # Measured 0.0.
+            @test maximum(maximum(abs, a - b) for (a, b) in zip(got.u, hand.u)) <= 1.0e-13
+            calls === nothing ||
+                @test got.stats.nf == hand.stats.nf + calls * got.stats.njacs
+            PETScDiffEq.PETScCompat.destroy!(box)
+        end
+
+        buffer = zeros(34)
+        function stored!(du, u, da, t)
+            copyto!(buffer, u)
+            return line!(du, u, da, t)
+        end
+        @test_throws "could not differentiate the problem's function" SciMLBase.solve(
+            SciMLBase.ODEProblem(stored!, start(30), (0.0, 0.1), da), bdf(da; autodiff = forward()),
+        )
+        residual!(r, du, u, da, t) = (line!(r, u, da, t); r .= du .- r; nothing)
+        @test_throws "on a DAEProblem so far" SciMLBase.solve(
+            SciMLBase.DAEProblem(residual!, zeros(30), start(30), (0.0, 0.1), da),
+            PETScDiffEq.TSDAE("bdf"; dm = da, autodiff = forward()),
+        )
+        zygote = PETScDiffEq.ADTypes.AutoZygote()
+        @test_throws "only `AutoForwardDiff()` is carried through it" SciMLBase.solve(
+            line(da), bdf(da; autodiff = zygote),
+        )
+        if Sys.WORD_SIZE == 64
+            stag = PETSc.DMStag(pl, MPI.COMM_SELF, (ghosted,), (4,), (1, 1), 1)
+            @test_throws "only on a DMDA so far, not on a DM of type `stag`" SciMLBase.solve(
+                SciMLBase.ODEProblem(line!, zeros(9), (0.0, 0.1), stag),
+                PETScDiffEq.TSImplicit("bdf"; dm = stag, autodiff = forward()),
+            )
+            PETScDiffEq.PETScCompat.destroy!(stag)
+        end
         PETScDiffEq.PETScCompat.destroy!(da)
     end
 
