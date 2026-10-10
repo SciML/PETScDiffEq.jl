@@ -515,9 +515,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
 
     @testset "precompile workload" begin
         made = PETScDiffEq.HANDLES_MADE[]
+        note = PETScDiffEq._note_skipped_workload
         withenv(PETScDiffEq._run_workload, "PMI_RANK" => "0")
         @test PETScDiffEq.HANDLES_MADE[] == made
+        @test PETScDiffEq.WORKLOAD_SKIPPED[]
+        @test_logs (:info, r"Base\.compilecache\(Base\.PkgId\(PETScDiffEq\)\)") note()
+        for launcher in ("PMI_RANK", "PMIX_RANK", "OMPI_COMM_WORLD_RANK")
+            @test_logs withenv(note, launcher => "0")
+        end
         @test PETScDiffEq._run_workload() === nothing
+        @test !PETScDiffEq.WORKLOAD_SKIPPED[]
+        @test_logs note()
     end
 
     @testset "several PETSc builds in one process" begin
@@ -4465,6 +4473,46 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 abstol = [1.0e-10, 1.0e-10],
             )
         end
+
+        @testset "a tolerance changed on the integrator is the one the next step takes" begin
+            function wide!(du, u, p, t)
+                du[1] = 0.0
+                du[2] = u[3]
+                return du[3] = -100 * u[2]
+            end
+            wide = SciMLBase.ODEProblem(wide!, [1000.0, 1.0e-3, 0.0], (0.0, 10.0))
+            tight() = fill(1.0e-12, 3)
+            changes = (
+                integ -> (integ.opts.abstol .= 1.0e-3), integ -> (integ.opts.abstol = 1.0e-3),
+                integ -> (integ.opts.abstol = fill(1.0e-3, 3)),
+            )
+            for rk in (alg, PETScDiffEq.TSRK("5dp"; comm = MPI.COMM_WORLD))
+                run(; kw...) = SciMLBase.solve(wide, rk; dt = 1.0e-3, reltol = 1.0e-6, kw...)
+                auto(abstol) = run(; abstol, callback = DiffEqCallbacks.AutoAbstol())
+                given = tight()
+                scalar, vector = auto(1.0e-12), auto(given)
+                @test 5 * scalar.stats.naccept < run(; abstol = 1.0e-12).stats.naccept
+                @test vector.t == scalar.t
+                @test vector.u == scalar.u
+                @test given == tight()
+                loose = run(; abstol = 1.0e-3)
+                for change! in changes
+                    integ = SciMLBase.init(wide, rk; dt = 1.0e-3, reltol = 1.0e-6, abstol = tight())
+                    change!(integ)
+                    @test SciMLBase.solve!(integ).t == loose.t
+                end
+                integ = SciMLBase.init(
+                    wide, rk; dt = 1.0e-3, reltol = fill(1.0e-6, 3), abstol = 1.0e-3,
+                )
+                integ.opts.reltol .= 1.0e-2
+                @test SciMLBase.solve!(integ).t == run(; reltol = 1.0e-2, abstol = 1.0e-3).t
+                SciMLBase.reinit!(integ)
+                @test integ.opts.reltol == fill(1.0e-6, 3)
+                integ.opts.reltol[2] = -1.0
+                @test_throws ArgumentError SciMLBase.step!(integ)
+                SciMLBase.terminate!(integ)
+            end
+        end
     end
 
     @testset "save_idxs" begin
@@ -6292,25 +6340,36 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         ref_prob(span) = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(heat!; jac = heat_jac!, jac_prototype = proto), u0, span,
         )
-        for (with_dm, alg) in (
-                (PETScDiffEq.TSImplicit("bdf"; dm = da), PETScDiffEq.TSImplicit("bdf")),
-                (PETScDiffEq.TSRosW(; dm = da), PETScDiffEq.TSRosW()),
+        generic = PETScDiffEq.TSGeneric
+        for (with_dm, alg, kw, gap) in (
+                (PETScDiffEq.TSImplicit("bdf"; dm = da), PETScDiffEq.TSImplicit("bdf"), tol, 1.0e-13),
+                (PETScDiffEq.TSRosW(; dm = da), PETScDiffEq.TSRosW(), tol, 1.0e-13),
+                (generic("alpha"; dm = da), generic("alpha"), (; dt = 1.0e-4), 1.0e-9),
+                (generic("dirk"; dm = da), generic("dirk"), (; dt = 1.0e-4, tol...), 1.0e-9),
             )
             empty!(seen)
-            got = SciMLBase.solve(dm_prob((0.0, 0.1)), with_dm; tol...)
-            ref = SciMLBase.solve(ref_prob((0.0, 0.1)), alg; tol...)
+            got = SciMLBase.solve(dm_prob((0.0, 0.1)), with_dm; kw...)
+            ref = SciMLBase.solve(ref_prob((0.0, 0.1)), alg; kw...)
             @test got.retcode == SciMLBase.ReturnCode.Success
             @test got.t == ref.t
             @test got.u == ref.u
             @test got.stats.njacs == ref.stats.njacs == length(seen) > 0
             @test all(==(N + 2), seen)
             coloured = SciMLBase.solve(
-                SciMLBase.ODEProblem(heat_dm!, u0, (0.0, 0.1), da), with_dm; tol...,
+                SciMLBase.ODEProblem(heat_dm!, u0, (0.0, 0.1), da), with_dm; kw...,
             )
             @test coloured.stats.njacs == 0
             @test got.stats.nf < coloured.stats.nf
-            # Measured 1.2e-14 for bdf and 4.4e-16 for rosw.
-            @test maximum(abs, got.u[end] - coloured.u[end]) <= 1.0e-13
+            # Measured 1.2e-14 for bdf, 4.4e-16 for rosw, 1.0e-11 for alpha, 4.0e-11 for dirk.
+            @test maximum(abs, got.u[end] - coloured.u[end]) <= gap
+        end
+        picked = PETScDiffEq.TSImplicit("bdf", ["-ts_type", "dirk"]; dm = da)
+        @test SciMLBase.solve(dm_prob((0.0, 0.1)), picked; dt = 1.0e-4, tol...).u ==
+            SciMLBase.solve(dm_prob((0.0, 0.1)), generic("dirk"; dm = da); dt = 1.0e-4, tol...).u
+        for type in ("irk", "glle")
+            @test_throws "TSGeneric(\"$type\") cannot run with a `dm`" SciMLBase.solve(
+                dm_prob((0.0, 0.1)), generic(type; dm = da); dt = 1.0e-3,
+            )
         end
         back = SciMLBase.solve(dm_prob((0.1, 0.0)), PETScDiffEq.TSImplicit("bdf"; dm = da); tol...)
         ref = SciMLBase.solve(ref_prob((0.1, 0.0)), PETScDiffEq.TSImplicit("bdf"); tol...)
@@ -7529,6 +7588,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 (; step_limiter = (u, integ, p, t) -> nothing),
                 (; stage_limiter = (u, integ, p, t) -> nothing),
                 (; advance_to_tstop = true), (; stop_at_next_tstop = true),
+                (; maxtime = 1.0e-9), (; save_discretes = true),
+                (; rng = SciMLBase.Random.default_rng()),
+                (; alias = SciMLBase.ODEAliasSpecifier(alias_u0 = true)),
+                (; alias = SciMLBase.ODEAliasSpecifier(alias = true)),
             )
             all(in(PETScDiffEq.DiffEqBase.allowedkeywords), keys(kw)) || continue
             @test_logs (:warn, r"does not support") SciMLBase.solve(prob, alg; dt = 0.1, kw...)
@@ -7537,6 +7600,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             prob, alg; dt = 0.1, progress = false, progress_steps = 10,
             advance_to_tstop = false, stop_at_next_tstop = false,
         )
+        for kw in (
+                (; maxtime = nothing), (; save_discretes = false), (; rng = nothing),
+                (; alias = SciMLBase.ODEAliasSpecifier()),
+                (; alias = SciMLBase.ODEAliasSpecifier(alias_u0 = false, alias_tstops = true)),
+            )
+            all(in(PETScDiffEq.DiffEqBase.allowedkeywords), keys(kw)) || continue
+            @test_logs min_level = Logging.Warn SciMLBase.solve(prob, alg; dt = 0.1, kw...)
+        end
     end
 
     @testset "error norms follow OrdinaryDiffEq's defaults and switches" begin
@@ -7551,6 +7622,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test norms() == [:final, :l2, :l∞]
             @test norms(timeseries_errors = false) == [:final]
             @test norms(dense_errors = true) == [:L2, :L∞, :final, :l2, :l∞]
+            @test isempty(norms(calculate_error = false))
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); kw..., calculate_error = false)
+            @test isempty(integ.sol.errors)
+            @test isempty(SciMLBase.solve!(integ).errors)
         end
     end
 
@@ -9717,6 +9792,25 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "a prototype entry jac never writes stays out of the gradient" begin
+            chain!(du, u, p, t) = (du[1] = -p[1] * u[1]; du[2] = p[1] * u[1] - u[2]^2; nothing)
+            # The derivative of the first row by `u[2]` is zero, and this leaves it unwritten.
+            chain_jac!(J, u, p, t) = (J[1, 1] = -p[1]; J[2, 1] = p[1]; J[2, 2] = -2u[2]; nothing)
+            chain_pjac!(pJ, u, p, t) = (pJ[1, 1] = -u[1]; pJ[2, 1] = u[1]; nothing)
+            with(proto) = PETScDiffEq._discrete_adjoint(
+                SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(
+                        chain!; jac = chain_jac!, paramjac = chain_pjac!, jac_prototype = proto,
+                    ), [1.0, 0.5], (0.0, 1.0), [0.7],
+                ), TSRK("4"), PETScAdjoint();
+                t = [1.0], dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing),
+                dt = 0.01, adaptive = false,
+            )
+            dense, filled = with(nothing), with(sparse(ones(2, 2)))
+            @test isapprox(filled[1], dense[1]; rtol = 1.0e-12)
+            @test isapprox(filled[2], dense[2]; rtol = 1.0e-12)
+        end
+
         @testset "dp is nothing without parameters and empty with no entries" begin
             function g!(du, u, p, t)
                 du[1] = -u[1] + 0.3 * u[1] * u[2]
@@ -10476,6 +10570,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 ("RK4", (; kw...) -> TSRK("4"; kw...)), ("backward Euler", beuler),
                 ("Crank-Nicolson", cn), ("theta 0.7", (; kw...) -> TSImplicit("theta", 0.7, exact; kw...)),
                 ("ARKIMEX l2", (; kw...) -> TSARKIMEX("l2", exact; kw...)),
+                ("TSGeneric cn", (; kw...) -> TSGeneric("cn", exact; kw...)),
             )
             # Measured: within 5.1e-16 of the adjoint without the DM and 1.2e-9 of the differences.
             @testset "matches the adjoint without the DM and finite differences: $name" for (
