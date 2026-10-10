@@ -11421,4 +11421,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 end
+# The 32-bit jobs run near their address space, so each run logs its peak.
+Sys.islinux() &&
+    foreach(println, filter(startswith(r"VmPeak|VmHWM"), readlines("/proc/self/status")))
 Test.finish(ALL_TESTS)
