@@ -1,0 +1,7 @@
+states,package,per_solve_us,per_step_us
+1,PETScDiffEq,240.47,5.372
+1,OrdinaryDiffEq,2.02,0.118
+100,PETScDiffEq,253.19,5.867
+100,OrdinaryDiffEq,3.63,0.275
+10000,PETScDiffEq,433.87,71.716
+10000,OrdinaryDiffEq,124.04,28.360
