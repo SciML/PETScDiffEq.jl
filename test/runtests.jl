@@ -71,9 +71,20 @@ end
 GROUP in ("All", "Core", "MPI") || error("GROUP is All, Core or MPI, not $GROUP")
 is_mpi(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") && s.args[3] == "MPI"
 
+# TEST_PART=k/n runs every n-th top-level testset from the k-th on, so n processes cover the file.
+const PART = let part = get(ENV, "TEST_PART", "")
+    isempty(part) ? (1, 1) : Tuple(parse.(Int, split(part, '/')))
+end
+length(PART) == 2 && 1 <= PART[1] <= PART[2] ||
+    error("TEST_PART is k/n with 1 <= k <= n, not $(ENV["TEST_PART"])")
+is_testset(s) = Meta.isexpr(s, :&&) ? is_testset(s.args[end]) :
+    Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset")
+
 # Julia compiles a block as one thunk before running any of it, so each testset stands alone.
 macro each_toplevel(ts, block)
     stmts = filter(s -> GROUP == "All" || (GROUP == "MPI") == is_mpi(s), block.args)
+    tests = findall(is_testset, stmts)
+    deleteat!(stmts, setdiff(tests, tests[PART[1]:PART[2]:end]))
     isdefined(Test, :push_testset) &&
         return esc(Expr(:toplevel, :(Test.push_testset($ts)), stmts..., :(Test.pop_testset())))
     wrap(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") ? :(Test.@with_testset $ts $s) : s
@@ -157,7 +168,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test all(o -> isapprox(o, 3; atol = 0.15), orders)
     end
 
-    Sys.WORD_SIZE == 64 && @testset "TSARKIMEX keeps order when tspan starts away from 0" begin
+    @testset "TSARKIMEX keeps order when tspan starts away from 0" begin
         f!(du, u, p, t) = (du[1] = cos(t); nothing)
         t0 = 1.0
         prob = SciMLBase.ODEProblem(f!, [sin(t0)], (t0, t0 + 1))
@@ -9256,7 +9267,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         )
     end
 
-    Sys.WORD_SIZE == 64 && @testset "PETScAdjoint" begin
+    @testset "PETScAdjoint" begin
         function adj_f!(du, u, p, t)
             du[1] = -p[1] * u[1] + p[2] * u[1] * u[2]
             du[2] = p[3] * u[1] - p[4] * u[2]^2 + p[1] * sin(t)
@@ -9692,7 +9703,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
         states_only = ["-ts_trajectory_solution_only", "1"]
 
-        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX matches finite differences of the same fixed-step solve: $name" for (
+        @testset "TSARKIMEX matches finite differences of the same fixed-step solve: $name" for (
                 name, subtype, tspan, ts, opts,
             ) in (
                 ("3", "3", (0.0, 1.0), forward_t, (;)),
@@ -9778,7 +9789,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 1.0e-8
         end
 
-        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX on a split problem reads f2's jac and paramjac" begin
+        @testset "TSARKIMEX on a split problem reads f2's jac and paramjac" begin
             alg = TSARKIMEX("3", exact)
             for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t))
                 given = grad(split_prob(copy(u0), copy(p0), tspan), alg; t)
@@ -9824,7 +9835,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(du0, central_differences(loss, u0)) < 1.0e-8
         end
 
-        Sys.WORD_SIZE == 64 && @testset "an adaptive TSARKIMEX holds its accepted steps fixed: $name" for (
+        @testset "an adaptive TSARKIMEX holds its accepted steps fixed: $name" for (
                 name, subtype, make, tspan,
             ) in (
                 ("3", "3", adj_prob, (0.0, 1.0)),
@@ -11390,6 +11401,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
     end
 
     @testset "MPI" begin
+        # MPI_RANKS, such as 2 or 1,3, narrows the rank counts, so CI runs each in its own job.
+        listed = get(ENV, "MPI_RANKS", "")
+        rank_counts = isempty(listed) ? [1, 2, 3] : tryparse.(Int, split(listed, ','))
+        allunique(rank_counts) && rank_counts ⊆ 1:3 ||
+            error("MPI_RANKS is a comma-separated list of distinct rank counts from 1, 2 and 3, not $listed")
         if Sys.WORD_SIZE == 64 && !Sys.iswindows()
             dir = joinpath(@__DIR__, "mpi")
             julia = Base.julia_cmd()
@@ -11408,7 +11424,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 ),
                 (2, ["ensemble.jl"]),
             )
-            for np in (1, 2, 3), (threads, scripts) in launches
+            for np in rank_counts, (threads, scripts) in launches
                 rank_cmd = `$julia --threads=$threads --project=$dir $(joinpath(dir, "all.jl")) $scripts`
                 cmd = `$(MPI.mpiexec()) -n $np $rank_cmd`
                 proc = run(pipeline(cmd; stdout, stderr); wait = false)
@@ -11426,4 +11442,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 end
+# The 32-bit jobs run near their address space, so each run logs its peak.
+Sys.islinux() &&
+    foreach(println, filter(startswith(r"VmPeak|VmHWM"), readlines("/proc/self/status")))
 Test.finish(ALL_TESTS)
