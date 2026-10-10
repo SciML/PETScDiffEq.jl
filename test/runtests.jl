@@ -4679,6 +4679,153 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "an array-shaped u0" begin
+        shape = (3, 2)
+        function grid!(du, u, p, t)
+            nx, ny = size(u)
+            for j in 1:ny, i in 1:nx
+                du[i, j] = -(i + 2j) * u[i, j] / 4 + p * u[mod1(i + 1, nx), j]
+            end
+            return nothing
+        end
+        grid(u, p, t) = (du = similar(u); grid!(du, u, p, t); du)
+        function grid_jac!(J, u, p, t)
+            at = LinearIndices(u)
+            for j in axes(u, 2), i in axes(u, 1)
+                J[at[i, j], at[i, j]] = -(i + 2j) / 4
+                J[at[i, j], at[mod1(i + 1, size(u, 1)), j]] = p
+            end
+            return nothing
+        end
+        decay_part!(du, u, p, t) = (du .= -u; nothing)
+        # The same problems written by hand on `vec(u0)`.
+        flat(f!) = (du, u, p, t) -> f!(reshape(du, shape), reshape(u, shape), p, t)
+        flat_oop(u, p, t) = vec(grid(reshape(u, shape), p, t))
+        flat_jac!(J, u, p, t) = grid_jac!(J, reshape(u, shape), p, t)
+        u0 = [1 + i / 10 + j / 20 for i in 1:3, j in 1:2]
+        proto = sparse((J = zeros(6, 6); grid_jac!(J, u0, 0.3, 0.0); J) .!= 0) .* 1.0
+        ode(f, u; kw...) = SciMLBase.ODEProblem(SciMLBase.ODEFunction(f; kw...), u, (0.0, 1.0), 0.3)
+        same(a, b) = a.t == b.t && length(a.u) == length(b.u) &&
+            all(vec(collect(x)) == y for (x, y) in zip(a.u, b.u))
+        rk, bdf = PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf")
+
+        @testset "$(nameof(typeof(alg))) matches the problem on vec(u0)" for alg in
+            (rk, PETScDiffEq.TSRosW("ra34pw2"), bdf)
+            sol = SciMLBase.solve(ode(grid!, u0), alg)
+            @test sol.u[end] isa Matrix{Float64} && size(sol(0.5)) == shape
+            @test same(sol, SciMLBase.solve(ode(flat(grid!), vec(u0)), alg))
+            @test same(
+                SciMLBase.solve(ode(grid, u0), alg), SciMLBase.solve(ode(flat_oop, vec(u0)), alg),
+            )
+        end
+        @test same(
+            SciMLBase.solve(ode(grid!, u0; jac = grid_jac!, jac_prototype = proto), bdf),
+            SciMLBase.solve(ode(flat(grid!), vec(u0); jac = flat_jac!, jac_prototype = proto), bdf),
+        )
+        mass = Diagonal(collect(1.0:6.0))
+        @test same(
+            SciMLBase.solve(ode(grid!, u0; mass_matrix = mass), bdf),
+            SciMLBase.solve(ode(flat(grid!), vec(u0); mass_matrix = mass), bdf),
+        )
+        for T in (ComplexF64, Float32)
+            sol = SciMLBase.solve(ode(grid!, T.(u0)), rk)
+            @test sol.u[end] isa Matrix{T}
+            @test same(sol, SciMLBase.solve(ode(flat(grid!), vec(T.(u0))), rk))
+        end
+        parts(f, u) = SciMLBase.SplitODEProblem(f(decay_part!), f(grid!), u, (0.0, 1.0), 0.3)
+        for alg in (PETScDiffEq.TSARKIMEX("3"), rk)
+            @test same(
+                SciMLBase.solve(parts(identity, u0), alg),
+                SciMLBase.solve(parts(flat, vec(u0)), alg),
+            )
+        end
+        cube = reshape(collect(1.0:12.0) ./ 10, 2, 3, 2)
+        rates = reshape(1:12, 2, 3, 2) ./ 6
+        cube!(du, u, p, t) = (du .= -rates .* u; nothing)
+        sol = SciMLBase.solve(SciMLBase.ODEProblem(cube!, cube, (0.0, 1.0)), bdf)
+        @test size(sol.u[end]) == (2, 3, 2)
+        @test same(
+            sol, SciMLBase.solve(
+                SciMLBase.ODEProblem(
+                    (du, u, p, t) -> (du .= -vec(rates) .* u; nothing), vec(cube), (0.0, 1.0),
+                ), bdf,
+            ),
+        )
+
+        @testset "saving, tolerances and the checks on the state" begin
+            kw = (saveat = 0.25, save_idxs = [5, 2])
+            @test same(
+                SciMLBase.solve(ode(grid!, u0), rk; kw...),
+                SciMLBase.solve(ode(flat(grid!), vec(u0)), rk; kw...),
+            )
+            tol = [1.0e-6 * k for k in 1:6]
+            by_vector = SciMLBase.solve(ode(grid!, u0), rk; abstol = tol)
+            @test same(by_vector, SciMLBase.solve(ode(flat(grid!), vec(u0)), rk; abstol = tol))
+            @test SciMLBase.solve(ode(grid!, u0), rk; abstol = reshape(tol, shape)).u == by_vector.u
+            @test_throws "an array of its size, (3, 2)" SciMLBase.solve(
+                ode(grid!, u0), rk; abstol = reshape(tol, 2, 3),
+            )
+            shaped = Ref(true)
+            SciMLBase.solve(
+                ode(grid!, u0), rk;
+                isoutofdomain = (u, p, t) -> (shaped[] &= size(u) == shape; false),
+                unstable_check = (dt, u, p, t) -> (shaped[] &= size(u) == shape; false),
+            )
+            @test shaped[]
+        end
+
+        @testset "callbacks and the integrator" begin
+            # `at` turns grid indices into what indexes the state of each formulation.
+            function run(f, u, at)
+                fired = [0, 0]
+                cross = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> u[at(2, 2)] - 1.0,
+                    integ -> (fired[1] += 1; integ.u[at(2, 2)] += 1.0),
+                )
+                double = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t == 0.5, integ -> (fired[2] += 1; integ.u[at(3, 1)] *= 2),
+                )
+                integ = SciMLBase.init(
+                    ode(f, u), rk; callback = SciMLBase.CallbackSet(cross, double), tstops = [0.5],
+                )
+                SciMLBase.step!(integ)
+                seen = (
+                    copy(integ.u), copy(integ.uprev), SciMLBase.get_du(integ), integ(integ.t / 2),
+                )
+                SciMLBase.set_u!(integ, 2 .* u)
+                SciMLBase.step!(integ)
+                stepped = copy(integ.u)
+                fill!(fired, 0)
+                SciMLBase.reinit!(integ, vec(u))
+                restarted = copy(integ.u)
+                return (; seen, stepped, restarted, sol = SciMLBase.solve!(integ), fired)
+            end
+            a = run(grid!, u0, CartesianIndex)
+            b = run(flat(grid!), vec(u0), (i, j) -> LinearIndices(u0)[i, j])
+            @test all(x -> x isa Matrix{Float64} && size(x) == shape, a.seen)
+            @test all(vec(x) == y for (x, y) in zip(a.seen, b.seen))
+            @test vec(a.stepped) == b.stepped
+            @test a.restarted == u0
+            @test same(a.sol, b.sol)
+            @test a.fired[1] > 0 && a.fired[2] == 1
+        end
+
+        @testset "what still needs vec(u0) says so" begin
+            residual!(r, du, u, p, t) = (r .= du .+ u; nothing)
+            dae = SciMLBase.DAEProblem(residual!, -u0, u0, (0.0, 1.0))
+            @test_throws "not for a DAEProblem; pass `vec(u0)`" SciMLBase.solve(
+                dae, PETScDiffEq.TSDAE("bdf"),
+            )
+            @test_throws "not on a communicator other than MPI.COMM_SELF" SciMLBase.solve(
+                ode(grid!, u0), PETScDiffEq.TSRK("5dp"; comm = MPI.COMM_WORLD),
+            )
+            @test_throws "PETScAdjoint supports a vector `u0`" PETScDiffEq._discrete_adjoint(
+                ode(grid!, u0), rk, PETScAdjoint(); t = [1.0],
+                dgdu_discrete = (out, u, p, t, i) -> (out .= 1; nothing),
+            )
+        end
+    end
+
     @testset "ContinuousCallback" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 2.0))
         jump(hits) = SciMLBase.ContinuousCallback(
