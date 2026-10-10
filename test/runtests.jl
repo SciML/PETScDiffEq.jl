@@ -65,10 +65,12 @@ function damped_oscillator_jac!(J, u, p, t)
 end
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
-const GROUP = let group = get(ENV, "GROUP", "")
-    isempty(group) ? "All" : group
+# GROUP=MPI2 is MPI on 2 ranks, for a workflow that passes only GROUP.
+const GROUP, GROUP_RANKS = let group = get(ENV, "GROUP", ""), ranks = match(r"^MPI([123])$", group)
+    isempty(group) ? ("All", "") : ranks === nothing ? (group, "") : ("MPI", String(ranks[1]))
 end
-GROUP in ("All", "Core", "MPI") || error("GROUP is All, Core or MPI, not $GROUP")
+GROUP in ("All", "Core", "MPI") ||
+    error("GROUP is All, Core, MPI, or MPI1, MPI2 or MPI3 for one rank count, not $GROUP")
 is_mpi(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") && s.args[3] == "MPI"
 
 # TEST_PART=k/n runs every n-th top-level testset from the k-th on, so n processes cover the file.
@@ -11386,7 +11388,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
 
     @testset "MPI" begin
         # MPI_RANKS, such as 2 or 1,3, narrows the rank counts, so CI runs each in its own job.
-        listed = get(ENV, "MPI_RANKS", "")
+        listed = isempty(GROUP_RANKS) ? get(ENV, "MPI_RANKS", "") : GROUP_RANKS
         rank_counts = isempty(listed) ? [1, 2, 3] : tryparse.(Int, split(listed, ','))
         allunique(rank_counts) && rank_counts ⊆ 1:3 ||
             error("MPI_RANKS is a comma-separated list of distinct rank counts from 1, 2 and 3, not $listed")
