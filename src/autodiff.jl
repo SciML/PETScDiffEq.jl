@@ -346,7 +346,11 @@ function (g::Guarded)(out, args...)
     return nothing
 end
 
-function _global_colours(backend, proto::SparseMatrixCSC, comm)
+_guarded(f, err) = Guarded(f, err)
+# Both parts run even when the first throws, since either may communicate.
+_guarded(d::Partitioned, err) = Partitioned(Guarded(d.f1, err), Guarded(d.f2, err), d.nv)
+
+function _global_colours(backend, proto::SparseMatrixCSC, comm, colmap)
     n, N = size(proto)
     rstart = MPI.Scan(n, +, comm) - n
     pairs = Vector{Int}(undef, 2 * SparseArrays.nnz(proto))
@@ -368,7 +372,10 @@ function _global_colours(backend, proto::SparseMatrixCSC, comm)
     end
     MPI.Bcast!(colours, comm)
     entry = [colours[j] for j in 1:N for _ in nzrange(proto, j)]
-    return colours[rstart .+ (1:n)], entry, maximum(colours; init = 0)
+    block = rstart .+ (1:n)
+    # A partitioned problem's columns are not in the state's order, so find this rank's.
+    own = colmap === nothing ? block : invperm(colmap)[block]
+    return colours[own], entry, maximum(colours; init = 0)
 end
 
 _batch(::AutoForwardDiff{C}, ncolours) where {C} =
@@ -441,11 +448,13 @@ function (j::CommJacobian)(J, du, u::AbstractVector{<:Complex}, p, gamma, t)
     )
 end
 
-function _ad_comm_jacobian(backend, f!, proto, u0, p, t, calls, advice, comm, dae)
-    own, entry, ncolours = _global_colours(backend, proto, comm)
+function _ad_comm_jacobian(
+        backend, f!, proto, u0, p, t, calls, advice, comm, dae, colmap = nothing,
+    )
+    own, entry, ncolours = _global_colours(backend, proto, comm, colmap)
     dense = ADTypes.dense_ad(backend)
     err = Ref{Any}(nothing)
-    g! = Counted(Guarded(f!, err), calls)
+    g! = Counted(_guarded(f!, err), calls)
     R, n = real(eltype(u0)), length(u0)
     split = eltype(u0) <: Complex
     x, y = split ? (real.(u0), imag.(u0)) : (copy(u0), R[])
@@ -478,6 +487,220 @@ function _ad_comm_jacobian(backend, f!, proto, u0, p, t, calls, advice, comm, da
     end
     return CommJacobian(
         fun, g!, dense, prep, x, y, out, tx, ty, w, own, entry, ncolours, err, advice,
+    )
+end
+
+# PETSC_USE_POINTER: the colouring keeps the index sets and frees them with itself.
+const _USE_POINTER = Cint(2)
+
+# The colour, counted from 1, of each entry this rank owns, and the number of colours.
+function _coloring_colours(pl, coloring, n, rstart)
+    nc, sets = Ref{_PetscInt}(0), Ref{Ptr{Ptr{Cvoid}}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :ISColoringGetIS), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Cint, _P, Ptr{Ptr{Ptr{Cvoid}}}), coloring, _USE_POINTER, nc, sets,
+        ),
+    )
+    colours = zeros(Int, n)
+    len, idx = Ref{_PetscInt}(0), Ref{_P}(C_NULL)
+    for c in 1:nc[]
+        is = unsafe_load(sets[], c)
+        _check_code(
+            ccall(
+                _symbol(pl, :ISGetLocalSize), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, _P), is, len,
+            ),
+        )
+        _check_code(
+            ccall(
+                _symbol(pl, :ISGetIndices), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{_P}), is,
+                idx,
+            ),
+        )
+        for q in 1:len[]
+            colours[unsafe_load(idx[], q) - rstart + 1] = c
+        end
+        _check_code(
+            ccall(
+                _symbol(pl, :ISRestoreIndices), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{_P}),
+                is, idx,
+            ),
+        )
+    end
+    _check_code(
+        ccall(
+            _symbol(pl, :ISColoringRestoreIS), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Cint, Ptr{Ptr{Ptr{Cvoid}}}), coloring, _USE_POINTER, sets,
+        ),
+    )
+    return colours, Int(nc[])
+end
+
+# This rank's rows of the DM's matrix, as global columns counted from 0.
+function _matrix_rows(pl, A, n, rstart)
+    len, ptr = Ref{_PetscInt}(0), Ref{_P}(C_NULL)
+    rows = Vector{Vector{_PetscInt}}(undef, n)
+    for r in 1:n
+        row = rstart + r - 1
+        _check_code(
+            ccall(
+                _symbol(pl, :MatGetRow), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, _PetscInt, _P, Ptr{_P}, Ptr{Cvoid}), A.ptr, row, len, ptr, C_NULL,
+            ),
+        )
+        rows[r] = copy(unsafe_wrap(Array, ptr[], len[]))
+        _check_code(
+            ccall(
+                _symbol(pl, :MatRestoreRow), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, _PetscInt, _P, Ptr{_P}, Ptr{Cvoid}), A.ptr, row, len, ptr, C_NULL,
+            ),
+        )
+    end
+    return rows
+end
+
+# This rank's rows of the DM's matrix and the DM's colouring of its entries, if it gives one.
+function _dm_pattern(pl, dm, n)
+    clone = _clone_dm(pl, dm)
+    A = nothing
+    try
+        A = LibPETSc.DMCreateMatrix(pl, clone)
+        rstart = Int(first(LibPETSc.MatGetOwnershipRange(pl, A)))
+        cols = _matrix_rows(pl, A, n, rstart)
+        own, ncolours = zeros(Int, n), 0
+        _dm_colours(pl, clone.ptr) do coloring
+            own, ncolours = _coloring_colours(pl, coloring, n, rstart)
+        end
+        return rstart, cols, own, ncolours
+    finally
+        A === nothing || PETScCompat.destroy!(A)
+        _check_code(
+            ccall(
+                _symbol(pl, :DMDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+                Ref(clone.ptr),
+            ),
+        )
+    end
+end
+
+# The global index of each entry of the DM's ghosted array, negative where it has none.
+function _dm_globals(pl, dm)
+    ltog = _dm_vec!(pl, :DMGetLocalToGlobalMapping, dm)[]
+    n, idx = Ref{_PetscInt}(0), Ref{_P}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :ISLocalToGlobalMappingGetSize), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, _P), ltog, n,
+        ),
+    )
+    _check_code(
+        ccall(
+            _symbol(pl, :ISLocalToGlobalMappingGetIndices), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{_P}), ltog, idx,
+        ),
+    )
+    globals = copy(unsafe_wrap(Array, idx[], n[]))
+    _check_code(
+        ccall(
+            _symbol(pl, :ISLocalToGlobalMappingRestoreIndices), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{_P}), ltog, idx,
+        ),
+    )
+    return globals
+end
+
+# `f` runs on the ghosted array with each entry seeded by its owner's colour, so the
+# partials of its output are this rank's rows, one column of each row per colour.
+struct DMJacobian{F, G, B, P, R, T}
+    fun::F
+    ghosts::G
+    backend::B
+    prep::P
+    x::Vector{R}
+    out::Vector{R}
+    tx::T
+    ty::T
+    seed::Vector{Int}
+    rstart::Int
+    row::Vector{_PetscInt}
+    cols::Vector{Vector{_PetscInt}}
+    colour::Vector{Vector{Int}}
+    vals::Vector{Vector{R}}
+    ncolours::Int
+    advice::String
+end
+
+function (j::DMJacobian)(J, u, p, t)
+    _ghosted(a -> copyto!(j.x, a), j.ghosts, u)
+    B = length(j.tx)
+    try
+        for b in 1:(B == 0 ? 0 : cld(j.ncolours, B))
+            lo = (b - 1) * B
+            for k in 1:B
+                j.tx[k] .= j.seed .== lo + k
+            end
+            DI.value_and_pushforward!(
+                j.fun, j.out, j.ty, j.prep, j.backend, j.x, j.tx, DI.Constant(p), DI.Constant(t),
+            )
+            for r in eachindex(j.vals), q in eachindex(j.vals[r])
+                k = j.colour[r][q] - lo
+                1 <= k <= B && (j.vals[r][q] = j.ty[k][r])
+            end
+        end
+    catch e
+        _dual_failure(e) && throw(_dual_error(e, j.backend, j.advice))
+        rethrow()
+    end
+    pl = j.ghosts.petsclib
+    for r in eachindex(j.vals)
+        _check_finite(() -> j.out, j.vals[r], t, j.advice)
+        j.row[1] = j.rstart + r - 1
+        _mat_set_values!(pl, J, j.row, j.cols[r], j.vals[r], LibPETSc.INSERT_VALUES)
+    end
+    return nothing
+end
+
+# Each ghosted entry's colour, as the DM's scatter brings it, and each stored column's.
+function _spread_colours(ghosts, globals, cols, own, R)
+    seed = Int[]
+    _ghosted(a -> append!(seed, round.(Int, a)), ghosts, R.(own))
+    of = Dict{_PetscInt, Int}()
+    for (g, c) in zip(globals, seed)
+        g >= 0 && c > 0 && (of[g] = c)
+    end
+    return seed, Vector{Int}[[get(of, c, 0) for c in row] for row in cols]
+end
+
+_proper(colour) = all(row -> allunique(c for c in row if c > 0), colour)
+
+function _ad_dm_jacobian(backend, f!, pl, dm, u0, p, t, calls, advice, comm, N)
+    dense = ADTypes.dense_ad(backend)
+    R, n = eltype(u0), length(u0)
+    ghosts = Ghosted(nothing, pl, dm)
+    rstart, cols, own, ncolours = _checked_everywhere(() -> _dm_pattern(pl, dm, n), comm)
+    globals = _dm_globals(pl, dm)
+    seed, colour = _spread_colours(ghosts, globals, cols, own, R)
+    # PETSc's DMDA colouring fails or is wrong on some periodic grids; colour the pattern then.
+    if !_everywhere(comm, ncolours > 0 && _proper(colour))
+        proto = sparse(
+            [r for r in 1:n for _ in cols[r]], [Int(c) + 1 for row in cols for c in row],
+            true, n, N,
+        )
+        own, _, ncolours = _global_colours(backend, proto, something(comm, MPI.COMM_SELF))
+        seed, colour = _spread_colours(ghosts, globals, cols, own, R)
+    end
+    g! = Counted(f!, calls)
+    x, out = zeros(R, length(seed)), zeros(R, n)
+    _ghosted(a -> copyto!(x, a), ghosts, u0)
+    B = ncolours == 0 ? 0 : _batch(dense, ncolours)
+    tx, ty = ntuple(_ -> zeros(R, length(x)), B), ntuple(_ -> zeros(R, n), B)
+    prepare() =
+        DI.prepare_pushforward(g!, out, dense, copy(x), tx, DI.Constant(p), DI.Constant(t))
+    prep = B == 0 ? nothing : _checked_everywhere(prepare, comm)
+    vals = Vector{R}[zeros(R, length(row)) for row in cols]
+    return DMJacobian(
+        g!, ghosts, dense, prep, x, out, tx, ty, seed, rstart, _PetscInt[0], cols, colour,
+        vals, ncolours, advice,
     )
 end
 
@@ -519,6 +742,54 @@ function _ad_paramjacobian(backend, f!, u0, p, t, advice)
         _with_p!, du, b, p, DI.Constant(f!), DI.Constant(copy(u0)), DI.Constant(t),
     )
     return ADParamJacobian(f!, b, prep, du, advice)
+end
+
+# Every rank seeds the same parameters, so each calls `f` once per chunk, on its own rows.
+struct CommParamJacobian{G, B, P, X, Y}
+    g!::G
+    backend::B
+    prep::P
+    out::Vector{Float64}
+    tx::X
+    ty::Y
+    err::Base.RefValue{Any}
+    advice::String
+end
+
+function (j::CommParamJacobian)(pJ, u, p, t)
+    j.err[] = nothing
+    B, np = length(j.tx), size(pJ, 2)
+    for lo in 0:B:(np - 1)
+        for k in 1:B
+            j.tx[k] .= (1:np) .== lo + k
+        end
+        DI.value_and_pushforward!(
+            _with_p!, j.out, j.ty, j.prep, j.backend, p, j.tx, DI.Constant(j.g!),
+            DI.Constant(u), DI.Constant(t),
+        )
+        for k in 1:min(B, np - lo)
+            pJ[:, lo + k] .= j.ty[k]
+        end
+    end
+    e = j.err[]
+    e === nothing || throw(_dual_failure(e) ? _dual_error(e, j.backend, j.advice) : e)
+    _check_finite(() -> j.out, pJ, t, j.advice)
+    return nothing
+end
+
+function _ad_comm_paramjacobian(backend, f!, u0, p, t, advice, comm)
+    dense = ADTypes.dense_ad(backend)
+    err = Ref{Any}(nothing)
+    g! = _guarded(f!, err)
+    out = zeros(length(u0))
+    B = _batch(dense, length(p))
+    tx = ntuple(_ -> zeros(eltype(p), length(p)), B)
+    ty = ntuple(_ -> zeros(length(u0)), B)
+    contexts = (DI.Constant(g!), DI.Constant(copy(u0)), DI.Constant(t))
+    prep = _checked_everywhere(comm) do
+        DI.prepare_pushforward(_with_p!, out, dense, p, tx, contexts...)
+    end
+    return CommParamJacobian(g!, dense, prep, out, tx, ty, err, advice)
 end
 
 struct ADCostGradient{G, B, P, W}

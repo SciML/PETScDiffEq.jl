@@ -1,6 +1,6 @@
 using MPI, PETScDiffEq, SciMLBase, SparseArrays, Test
 using PETScDiffEq: PETSc, LibPETSc, PETScCompat, PETScAdjoint, AutoForwardDiff, reshape_local_array
-using SciMLBase: ODEProblem, ODEFunction, solve
+using SciMLBase: ODEProblem, ODEFunction, SplitODEProblem, solve
 
 MPI.Init()
 const comm = MPI.COMM_WORLD
@@ -20,7 +20,14 @@ const SERIAL_GAP = 1.0e-15
 # Measured at 1 to 3 ranks: a dm adjoint is within 1.3e-16 of the comm-mode one in 1-D and
 # 1.1e-15 of a DMDA on MPI.COMM_SELF in 2-D.
 const DM_GAP = 5.0e-15
-# Measured at 2 ranks: a partitioned problem is within 3.1e-14 of its serial adjoint.
+# Measured at 1 and 2 ranks: a split problem is within 7.0e-16 of its serial adjoint.
+const SPLIT_GAP = 5.0e-15
+# Measured at 1 and 2 ranks: with `jac` and `paramjac` built it is within 8.8e-16 of serial.
+const AD_GAP = 1.0e-14
+# Measured at 1 and 2 ranks: a split problem building `f1`'s `jac` is within 8.2e-15 of serial.
+const SPLIT_AD_GAP = 5.0e-14
+# Measured at 2 ranks: a partitioned problem is within 3.1e-14 of its serial adjoint, and
+# within 3.3e-14 with `jac` and `paramjac` built.
 const WAVE_GAP = 2.0e-13
 const FD_GAP = 2.0e-9
 const thrower = nranks - 1
@@ -65,7 +72,7 @@ heat0(idx) = sinpi.(x.(idx))
 function halo(u)
     left = rank == 0 ? MPI.PROC_NULL : rank - 1
     right = rank == nranks - 1 ? MPI.PROC_NULL : rank + 1
-    gl, gr = zeros(1), zeros(1)
+    gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
     MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
     MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
     return gl[1], gr[1]
@@ -115,6 +122,52 @@ function heat_problem(
     return ODEProblem(ODEFunction(f; jac, paramjac, jac_prototype), u0, tspan, p)
 end
 
+# The heat problem as its stiff diffusion and the rest, each with its own Jacobians.
+diffusion(idx, ghosts) = function (du, u, p, t)
+    l, r = ghosts(u)
+    foreach(k -> du[k] = p[1] * laplacian(u, k, l, r), eachindex(idx))
+    return nothing
+end
+reaction(idx) = (du, u, p, t) -> (du .= p[2] .* source.(idx) .- p[3] .* u .^ 3; nothing)
+
+diffusion_jac(idx) = function (J, u, p, t)
+    for (k, i) in enumerate(idx), j in neighbours(i)
+        J[k, j] = p[1] * (i == j ? -2 : 1) / dx^2
+    end
+    return nothing
+end
+reaction_proto(idx) = sparse(1:length(idx), idx, 1.0, length(idx), N)
+reaction_jac(idx) = function (J, u, p, t)
+    foreach(k -> J[k, idx[k]] = -3 * p[3] * u[k]^2, eachindex(idx))
+    return nothing
+end
+
+diffusion_paramjac(idx, ghosts) = function (pJ, u, p, t)
+    l, r = ghosts(u)
+    fill!(pJ, 0.0)
+    foreach(k -> pJ[k, 1] = laplacian(u, k, l, r), eachindex(idx))
+    return nothing
+end
+reaction_paramjac(idx) = function (pJ, u, p, t)
+    fill!(pJ, 0.0)
+    pJ[:, 2] .= source.(idx)
+    pJ[:, 3] .= .-u .^ 3
+    return nothing
+end
+
+function split_problem(
+        idx, ghosts; tspan = first(FORWARD), u0 = heat0(idx), p = copy(P),
+        f2 = reaction(idx), jac = reaction_jac(idx), paramjac = reaction_paramjac(idx),
+        jac_prototype = reaction_proto(idx), f1_jac = diffusion_jac(idx),
+        f1_paramjac = diffusion_paramjac(idx, ghosts),
+    )
+    f1 = ODEFunction(
+        diffusion(idx, ghosts); jac = f1_jac, paramjac = f1_paramjac,
+        jac_prototype = heat_proto(idx),
+    )
+    return SplitODEProblem(f1, ODEFunction(f2; jac, paramjac, jac_prototype), u0, tspan, p)
+end
+
 cost(u, p, idx) = sum(abs2, u) / 2 + p[2] * sum(u .* x.(idx))
 cost_du(idx) = (out, u, p, t, i) -> (out .= u .+ p[2] .* x.(idx); nothing)
 cost_dp(idx) = (out, u, p, t, i) -> (fill!(out, 0.0); out[2] = sum(u .* x.(idx)); nothing)
@@ -126,12 +179,12 @@ function gradient(prob, alg, times, idx; kw...)
     )
 end
 
-function loss(alg, tspan, times, u0, p)
-    sol = solve(heat_problem(rows, halo; tspan, u0, p), alg; dt = DT, adaptive = false, saveat = times)
+function loss(alg, tspan, times, u0, p, problem)
+    sol = solve(problem(rows, halo; tspan, u0, p), alg; dt = DT, adaptive = false, saveat = times)
     return MPI.Allreduce(sum(cost(u, p, rows) for u in sol.u), +, comm)
 end
 
-function differenced(alg, tspan, times, p0; h = 1.0e-6)
+function differenced(alg, tspan, times, p0; h = 1.0e-6, problem = heat_problem)
     g = zeros(N + length(p0))
     for j in eachindex(g)
         function at(s)
@@ -141,7 +194,7 @@ function differenced(alg, tspan, times, p0; h = 1.0e-6)
             elseif j in rows
                 u0[j - first(rows) + 1] += s
             end
-            return loss(alg, tspan, times, u0, p)
+            return loss(alg, tspan, times, u0, p, problem)
         end
         g[j] = (at(h) - at(-h)) / 2h
     end
@@ -159,12 +212,12 @@ end
 exact(c) = vcat(EXACT, ["-pc_type", c == MPI.COMM_SELF ? "lu" : "redundant"])
 
 const METHODS = (
-    ("TSRK", c -> TSRK("4"; comm = c)),
-    ("backward Euler", c -> TSImplicit("beuler", exact(c); comm = c)),
-    ("Crank-Nicolson", c -> TSImplicit("cn", exact(c); comm = c)),
-    ("theta 0.7", c -> TSImplicit("theta", 0.7, exact(c); comm = c)),
-    ("ARKIMEX l2", c -> TSARKIMEX("l2", exact(c); comm = c)),
-    ("ARKIMEX 3", c -> TSARKIMEX("3", exact(c); comm = c)),
+    ("TSRK", (c; kw...) -> TSRK("4"; comm = c)),
+    ("backward Euler", (c; kw...) -> TSImplicit("beuler", exact(c); comm = c, kw...)),
+    ("Crank-Nicolson", (c; kw...) -> TSImplicit("cn", exact(c); comm = c, kw...)),
+    ("theta 0.7", (c; kw...) -> TSImplicit("theta", 0.7, exact(c); comm = c, kw...)),
+    ("ARKIMEX l2", (c; kw...) -> TSARKIMEX("l2", exact(c); comm = c, kw...)),
+    ("ARKIMEX 3", (c; kw...) -> TSARKIMEX("3", exact(c); comm = c, kw...)),
 )
 
 # A damped nonlinear wave as a DynamicalODEProblem, each rank holding its v and its u.
@@ -215,12 +268,10 @@ end
 
 function wave_problem(
         idx, ghosts; tspan = first(FORWARD), state = wave0(idx), p = copy(Q),
-        jac = wave_jac(idx), paramjac = wave_paramjac(idx, ghosts),
-        jac_prototype = wave_proto(idx),
+        f1 = kick(idx, ghosts), f2 = drift, jac = wave_jac(idx),
+        paramjac = wave_paramjac(idx, ghosts), jac_prototype = wave_proto(idx),
     )
-    fn = SciMLBase.DynamicalODEFunction{true}(
-        kick(idx, ghosts), drift; jac, paramjac, jac_prototype,
-    )
+    fn = SciMLBase.DynamicalODEFunction{true}(f1, f2; jac, paramjac, jac_prototype)
     return SciMLBase.DynamicalODEProblem(fn, state..., tspan, p)
 end
 
@@ -402,6 +453,47 @@ end
             @test relerr(mine, reference) <= SERIAL_GAP
             @test relerr(mine, fd) <= FD_GAP
         end
+        dual = make(comm; autodiff = AutoForwardDiff())
+        for built in ((:jac, :paramjac), (:jac,), (:paramjac,))
+            bare = heat_problem(rows, halo; tspan, p, (key => nothing for key in built)...)
+            du0, dp = gradient(bare, dual, times, rows)
+            @test same_everywhere(dp)
+            auto = vcat(gathered(du0, counts), vec(dp))
+            if rank == 0
+                @test relerr(auto, reference) <= AD_GAP
+                @test relerr(auto, fd) <= FD_GAP
+            end
+        end
+    end
+
+    @testset "a SplitODEProblem matches the serial adjoint and finite differences: $name, $dir" for (
+                name, make,
+            ) in METHODS[5:6], (dir, (tspan, times, p)) in (("forward", FORWARD), ("backward", BACKWARD))
+        alg = make(comm)
+        du0, dp = gradient(split_problem(rows, halo; tspan, p), alg, times, rows)
+        @test same_everywhere(dp)
+        mine = vcat(gathered(du0, counts), vec(dp))
+        fd = differenced(alg, tspan, times, p; problem = split_problem)
+        if rank == 0
+            serial = gradient(split_problem(1:N, walls; tspan, p), make(MPI.COMM_SELF), times, 1:N)
+            reference = vcat(serial[1], vec(serial[2]))
+            @test relerr(mine, reference) <= SPLIT_GAP
+            @test relerr(mine, fd) <= FD_GAP
+        end
+        dual = make(comm; autodiff = AutoForwardDiff())
+        for built in (
+                (:jac, :paramjac, :f1_jac, :f1_paramjac), (:jac, :paramjac),
+                (:f1_jac, :f1_paramjac),
+            )
+            bare = split_problem(rows, halo; tspan, p, (key => nothing for key in built)...)
+            du0, dp = gradient(bare, dual, times, rows)
+            @test same_everywhere(dp)
+            auto = vcat(gathered(du0, counts), vec(dp))
+            if rank == 0
+                @test relerr(auto, reference) <= SPLIT_AD_GAP
+                @test relerr(auto, fd) <= FD_GAP
+            end
+        end
     end
 
     @testset "a dm matches the comm-mode adjoint: $name, $dir" for (name, make) in METHODS,
@@ -479,8 +571,20 @@ end
         fd = wave_differenced(alg, tspan, times)
         if rank == 0
             serial = wave_gradient(wave_problem(1:N, walls; tspan), make(MPI.COMM_SELF), times, 1:N)
-            @test relerr(mine, vcat(collect(serial[1]), vec(serial[2]))) <= WAVE_GAP
+            reference = vcat(collect(serial[1]), vec(serial[2]))
+            @test relerr(mine, reference) <= WAVE_GAP
             @test relerr(mine, fd) <= FD_GAP
+        end
+        dual = make(comm; autodiff = AutoForwardDiff())
+        for built in ((:jac, :paramjac), (:jac,), (:paramjac,))
+            bare = wave_problem(rows, halo; tspan, (key => nothing for key in built)...)
+            du0, dp = wave_gradient(bare, dual, times, rows)
+            @test same_everywhere(dp)
+            auto = joined(du0, dp)
+            if rank == 0
+                @test relerr(auto, reference) <= WAVE_GAP
+                @test relerr(auto, fd) <= FD_GAP
+            end
         end
     end
 
@@ -501,6 +605,19 @@ end
         @test raised(e, "$what threw")
     end
 
+    @testset "a kick throwing on one rank while the Jacobians are built raises on every rank" begin
+        started = Ref(false)
+        dz = wave_cost_du(rows)
+        # The drift communicates too, so a rank that skipped it would leave the others waiting.
+        prob = wave_problem(
+            rows, halo; f1 = throwing(kick(rows, halo), "kick", (args...) -> started[]),
+            f2 = (du, v, u, p, t) -> (halo(v); du .= v; nothing), jac = nothing, paramjac = nothing,
+        )
+        dgdu = (args...) -> (started[] = true; dz(args...))
+        e = caught(() -> wave_gradient(prob, TSRK("4"; comm), FORWARD[2], rows; dgdu_discrete = dgdu))
+        @test raised(e, "kick threw")
+    end
+
     @testset "a function throwing on one rank raises on every rank: $what, $name" for (
             what, name, alg, pieces,
         ) in (
@@ -512,6 +629,11 @@ end
             ("f", "TSRK", TSRK("4"; comm), :forward),
             ("f", "backward Euler", TSImplicit("beuler", exact(comm); comm), :forward),
             ("f", "TSRK", TSRK("4", ["-ts_trajectory_solution_only", "1"]; comm), :adjoint),
+            ("f", "TSRK building both", TSRK("4"; comm), :adjoint),
+            (
+                "f", "Crank-Nicolson building both",
+                TSImplicit("cn", exact(comm); comm, autodiff = AutoForwardDiff()), :adjoint,
+            ),
             ("dgdu", "TSRK", TSRK("4"; comm), :adjoint),
             ("dgdp", "TSRK", TSRK("4"; comm), :after),
             ("jac", "TSRK with a dm", TSRK("4"; dm = da), :adjoint),
@@ -526,12 +648,14 @@ end
         when = pieces === :adjoint ? (args...) -> started[] :
             pieces === :forward ? (args...) -> args[end] > 0.05 : (args...) -> args[end] == 4
         pick(key, f) = key == what ? throwing(f, what, when) : f
+        built = endswith(name, "building both")
         du = pick("dgdu", cost_du(rows))
         dgdu = (args...) -> (started[] = true; du(args...))
         prob = if alg.dm === nothing
             heat_problem(
-                rows, halo; f = pick("f", heat(rows, halo)), jac = pick("jac", heat_jac(rows)),
-                paramjac = pick("paramjac", heat_paramjac(rows, halo)),
+                rows, halo; f = pick("f", heat(rows, halo)),
+                jac = built ? nothing : pick("jac", heat_jac(rows)),
+                paramjac = built ? nothing : pick("paramjac", heat_paramjac(rows, halo)),
             )
         else
             dm_problem(;
@@ -548,19 +672,44 @@ end
         @test raised(e, "$what threw")
     end
 
+    @testset "f2's $what throwing on one rank raises on every rank" for what in ("jac", "paramjac")
+        pick(key, f) = key == what ? throwing(f, what, (args...) -> true) : f
+        prob = split_problem(
+            rows, halo; jac = pick("jac", reaction_jac(rows)),
+            paramjac = pick("paramjac", reaction_paramjac(rows)),
+        )
+        e = caught(() -> gradient(prob, TSARKIMEX("l2", exact(comm); comm), FORWARD[2], rows))
+        @test raised(e, "$what threw")
+    end
+
+    @testset "f2 throwing on one rank while its Jacobians are built raises on every rank" begin
+        started = Ref(false)
+        du = cost_du(rows)
+        prob = split_problem(
+            rows, halo; f2 = throwing(reaction(rows), "f2", (args...) -> started[]),
+            jac = nothing, paramjac = nothing,
+        )
+        alg = TSARKIMEX("l2", exact(comm); comm, autodiff = AutoForwardDiff())
+        dgdu = (args...) -> (started[] = true; du(args...))
+        e = caught(() -> gradient(prob, alg, FORWARD[2], rows; dgdu_discrete = dgdu))
+        @test raised(e, "f2 threw")
+    end
+
     @testset "refusals" begin
         times = FORWARD[2]
         rk = TSRK("4"; comm)
         heat_with(; kw...) = heat_problem(rows, halo; kw...)
-        @test refused(
-            () -> gradient(heat_with(jac = nothing), rk, times, rows), "needs the ODEFunction's `jac`",
-        )
-        for alg in (rk, TSImplicit("beuler"; comm, autodiff = AutoForwardDiff()))
+        zygote = TSImplicit("beuler"; comm, autodiff = PETScDiffEq.ADTypes.AutoZygote())
+        for what in ("jac", "paramjac")
             @test refused(
-                () -> gradient(heat_with(paramjac = nothing), alg, times, rows),
-                "needs the ODEFunction's `paramjac`",
+                () -> gradient(heat_with(; Symbol(what) => nothing), zygote, times, rows),
+                "cannot build the ODEFunction's `$what` with",
             )
         end
+        @test refused(
+            () -> gradient(heat_with(jac = nothing, jac_prototype = nothing), rk, times, rows),
+            "without a `jac`, PETScAdjoint",
+        )
         colouring = TSImplicit("beuler"; comm)
         for (prob, what) in (
                 (heat_with(jac = nothing), "`jac`"), (heat_with(paramjac = nothing), "`paramjac`"),
@@ -570,9 +719,14 @@ end
                 "$what under `autodiff = AutoFiniteDiff()`",
             )
         end
-        some = heat_with(paramjac = rank == thrower ? nothing : heat_paramjac(rows, halo))
-        e = caught(() -> gradient(some, rk, times, rows))
-        @test rank == thrower ? e isa ArgumentError && occursin("`paramjac`", e.msg) : remote(e)
+        for some in (
+                heat_with(jac = rank == thrower ? nothing : heat_jac(rows)),
+                heat_with(paramjac = rank == thrower ? nothing : heat_paramjac(rows, halo)),
+            )
+            nranks > 1 && @test refused(
+                () -> gradient(some, rk, times, rows), "`jac` and `paramjac` on every rank",
+            )
+        end
         @test refused(
             () -> gradient(heat_with(jac_prototype = nothing), rk, times, rows),
             "sparse `jac_prototype`",
@@ -581,16 +735,53 @@ end
             () -> gradient(heat_with(), rk, times, rows; g = (u, p, t) -> sum(abs2, u)),
             "integral cost on MPI.COMM_SELF only",
         )
-        halves = SciMLBase.SplitODEProblem(
-            heat(rows, halo), (du, u, p, t) -> (du .= 0; nothing), heat0(rows), first(FORWARD), copy(P),
+        imex = TSARKIMEX("l2"; comm, autodiff = AutoForwardDiff())
+        imex_zygote = TSARKIMEX("l2"; comm, autodiff = PETScDiffEq.ADTypes.AutoZygote())
+        imex_colouring = TSARKIMEX("l2"; comm)
+        split_with(; kw...) = split_problem(rows, halo; kw...)
+        for (alg, kw, what) in (
+                (imex_zygote, (; jac = nothing), "cannot build `f2`'s `jac` with"),
+                (imex_zygote, (; paramjac = nothing), "cannot build `f2`'s `paramjac` with"),
+                (
+                    imex_colouring, (; jac = nothing),
+                    "`f2`'s `jac` under `autodiff = AutoFiniteDiff()`",
+                ),
+                (
+                    imex_colouring, (; paramjac = nothing),
+                    "`f2`'s `paramjac` under `autodiff = AutoFiniteDiff()`",
+                ),
+                (imex, (; jac_prototype = nothing), "to come with a sparse `jac_prototype`"),
+                (
+                    imex, (; jac = nothing, jac_prototype = nothing),
+                    "to come with a sparse `jac_prototype`",
+                ),
+            )
+            @test refused(() -> gradient(split_with(; kw...), alg, times, rows), what)
+        end
+        for some in (
+                split_with(jac = rank == thrower ? nothing : reaction_jac(rows)),
+                split_with(paramjac = rank == thrower ? nothing : reaction_paramjac(rows)),
+            )
+            nranks > 1 && @test refused(
+                () -> gradient(some, imex, times, rows), "`jac` and `paramjac` on every rank",
+            )
+        end
+        taller = rank == thrower ? [reaction_proto(rows); spzeros(1, N)] : reaction_proto(rows)
+        e = caught(() -> gradient(split_problem(rows, halo; jac_prototype = taller), imex, times, rows))
+        @test rank == thrower ? e isa ArgumentError && occursin("so $(length(rows)) x $N", e.msg) :
+            remote(e)
+        halves = SplitODEProblem(
+            dm_heat!, (du, u, p, t) -> (du .= 0; nothing), heat0(rows), first(FORWARD), copy(P),
         )
-        @test refused(
-            () -> gradient(halves, TSARKIMEX("l2"; comm), times, rows),
-            "SplitODEProblem on MPI.COMM_SELF only",
+        nranks > 1 && @test refused(
+            () -> gradient(halves, with_dm("ARKIMEX l2"), times, rows),
+            "SplitODEProblem with a `dm` on a DM of a single rank only",
         )
         wrong = rank == thrower ? [heat_proto(rows); spzeros(1, N)] : heat_proto(rows)
-        e = caught(() -> gradient(heat_with(jac_prototype = wrong), rk, times, rows))
-        @test rank == thrower ? e isa ArgumentError && occursin("must be", e.msg) : remote(e)
+        for jac in (heat_jac(rows), nothing)
+            e = caught(() -> gradient(heat_with(; jac, jac_prototype = wrong), rk, times, rows))
+            @test rank == thrower ? e isa ArgumentError && occursin("must be", e.msg) : remote(e)
+        end
         not_bool = rank == thrower ? nothing : false
         e = caught(() -> gradient(heat_with(), rk, times, rows; no_start = not_bool))
         @test rank == thrower ? e isa MethodError : remote(e)
@@ -636,12 +827,13 @@ end
             () -> gradient(dm_problem(), rk_dm, times, rows; g = (u, p, t) -> sum(abs2, u)),
             "integral cost on MPI.COMM_SELF only",
         )
-        for (kw, what) in (
-                ((; jac = nothing), "needs the ODEFunction's `jac`"),
-                ((; paramjac = nothing), "needs the ODEFunction's `paramjac`"),
-                ((; jac_prototype = nothing), "sparse `jac_prototype`"),
+        for (alg, kw, what) in (
+                (colouring, (; jac = nothing), "`jac` under `autodiff = AutoFiniteDiff()`"),
+                (colouring, (; paramjac = nothing), "`paramjac` under `autodiff = AutoFiniteDiff()`"),
+                (rk, (; jac_prototype = nothing), "sparse `jac_prototype`"),
+                (rk, (; jac = nothing, jac_prototype = nothing), "without a `jac`, PETScAdjoint"),
             )
-            @test refused(() -> wave_gradient(wave_problem(rows, halo; kw...), rk, times, rows), what)
+            @test refused(() -> wave_gradient(wave_problem(rows, halo; kw...), alg, times, rows), what)
         end
         @test refused(
             () -> wave_gradient(wave_problem(rows, halo), TSBasicSymplectic(; comm), times, rows),
