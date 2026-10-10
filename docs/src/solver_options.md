@@ -36,6 +36,18 @@ Rosenbrock methods do. A zero pivot in a Newton method still counts in
 solve ends at its first failed Newton or linear solve with `ConvergenceFailure`, as
 OrdinaryDiffEq's Newton-based methods do with `adaptive = false`.
 
+`stats.nsolve` counts the linear solves of the steps: one for each `KSPSolve` PETSc runs on
+the TS's Krylov solver, whatever number of Krylov iterations it takes, so 20 fixed steps of
+the four-stage `TSRosW("ra34pw2")` give 80 and an explicit method gives 0. It is -1 where
+that count could miss a solve or cannot be taken: with a `-snes_type` other than `newtonls`,
+`newtontr`, `ksponly` or `ksptransposeonly`, with a nonlinear preconditioner, and under
+`-snes_ksp_ew`, whose tolerances PETSc sets in the hook the count uses. `stats.ncondition`
+counts the calls of the callbacks' conditions, those of a `ContinuousCallback`'s root search
+included. An integrator's running `sol.stats` holds both as the steps go, and they start
+again at `reinit!`. `stats.nw` stays -1: PETSc counts no matrices `shift * M - J`, builds
+them itself under `AutoFiniteDiff()` and in `TSIRK`, and also asks the package's Jacobian
+for `J` alone. `stats.nfpiter` and `stats.nfpconvfail` stay -1 as well.
+
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
 state stops being finite, a step overflows, turns NaN or fails its Newton or linear solve at
 every size tried, with a warning, an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
