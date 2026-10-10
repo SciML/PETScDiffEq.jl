@@ -5141,7 +5141,9 @@ _underflows(h::TSHandles{<:Any, <:Any, Float32}, alg, uend, retcode) =
 _saves_early_end(h::TSHandles, tend, tol) =
     h.end_saveat === nothing || any(s -> abs(s - tend) <= tol, h.end_saveat)
 
-function _assemble(prob, alg, h::TSHandles, tend, uend, st, kwargs)
+function _assemble(
+        prob, alg, h::TSHandles, tend, uend, st, kwargs, verbose = get(kwargs, :verbose, true),
+    )
     ctx = h.ctx
     tf, t0, tol = h.tf, h.t0, _near(h.tf)
     # -ts_exact_final_time interpolate reports a point past tf mid-sequence.
@@ -5190,7 +5192,7 @@ function _assemble(prob, alg, h::TSHandles, tend, uend, st, kwargs)
     else
         SciMLBase.ReturnCode.Failure
     end
-    ctx.stuck === nothing || @warn "`$(_warn_name(alg))` ends here because $(ctx.stuck)"
+    ctx.stuck === nothing || _ends_early(alg, ctx.stuck, verbose)
     if h.jac_mat !== nothing && h.ad_calls === nothing && st.nsteps > 0 && ctx.njacs == 0
         @warn "`$(_ts_type(alg))` took $(st.nsteps) steps without ever calling the " *
             "Jacobian this package gave PETSc, so it is not solving implicitly and the " *
@@ -5217,7 +5219,6 @@ end
 
 # Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
 function _with_options(f, h::TSHandles)
-    h.ctx.comm === nothing && isempty(h.dms) && return f()
     push!(h.opts)
     try
         return f()
@@ -6185,7 +6186,7 @@ function _init_unlocked(
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = stops_given, kwargs...)
     prob = _with_p(prob, h.ctx.p)
-    LibPETSc.TSSetUp(h.petsclib, h.ts)
+    _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
     _match_steps_here!(h)
     _initial_save!(h)
     stops = _tstops(stops_given, h)
@@ -6388,7 +6389,7 @@ function _reinit_unlocked(
     end
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
     try
-        LibPETSc.TSSetUp(h.petsclib, h.ts)
+        _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
         _match_steps_here!(h)
         if !erase_sol
             append!(h.ctx.ts, old.ctx.ts)
@@ -6477,6 +6478,7 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
     integ.iter = st.iter
     sol = _assemble(
         integ.prob, integ.alg, h, integ.tdir * integ.t, copy(integ.u), st, integ.kwargs,
+        integ.opts.verbose,
     )
     integ.sol = retcode === nothing ? sol : SciMLBase.solution_new_retcode(sol, retcode)
     integ.finished = true
