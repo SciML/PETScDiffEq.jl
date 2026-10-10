@@ -186,10 +186,12 @@ function _consistent!(
     init isa SciMLBase.CheckInit &&
         throw(SciMLBase.CheckInitFailureError(_rms(r, comm), abstol, !is_dae))
     brown = init isa DiffEqBase.BrownFullBasicInit
-    if comm !== nothing
-        atol = _smallest(comm, Float64(tol isa Number ? tol : minimum(tol; init = Inf)))
+    # A one-rank DM runs as a serial solve, and its matrix and colouring still come from the DM.
+    on = comm === nothing && f isa Ghosted ? MPI.COMM_SELF : comm
+    if on !== nothing
+        atol = _smallest(on, Float64(tol isa Number ? tol : minimum(tol; init = Inf)))
         h = brown ? nothing : _collocation_step(init, is_dae, t0, tf, dt, dtmax)
-        return _consistent_on!(comm, u0, du0, prob, f, jac, pl, t0, atol, h, eqs, vars)
+        return _consistent_on!(on, u0, du0, prob, f, jac, pl, t0, atol, h, eqs, vars)
     end
     proto = prob.f.jac_prototype
     sp = jac === nothing ? proto isa SparseArrays.AbstractSparseMatrix :
@@ -356,12 +358,13 @@ function _consistent_on!(
     else
         LinearAlgebra.Diagonal(own ? Vector{S}(mass.diag) : ones(S, n))
     end
-    use_jac = dm === nothing && _everywhere(comm, jac !== nothing)
-    dvg = use_jac && is_dae && brown ? _global_flags(comm, dv, rstart, N) : nothing
+    use_jac = _everywhere(comm, jac !== nothing)
+    fills = use_jac && dm !== nothing
+    dvg = use_jac && !fills && is_dae && brown ? _global_flags(comm, dv, rstart, N) : nothing
     x = brown && is_dae ? ifelse.(dv, du0, u0) : copy(u0)
     a, b, start = similar(u0), similar(u0), copy(u0)
     R = real(S)
-    clone = xv = rv = A = mm = mv = snes = opts = nothing
+    clone = xv = rv = A = A1 = mm = mv = snes = opts = nothing
     try
         if dm === nothing
             xv = _state_vec(pl, comm, n)
@@ -378,6 +381,7 @@ function _consistent_on!(
             clone = _clone_dm(pl, dm)
             xv = _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(pl, clone), pl)
             A = LibPETSc.DMCreateMatrix(pl, clone)
+            fills && brown && is_dae && (A1 = LibPETSc.DMCreateMatrix(pl, clone))
         end
         rv = LibPETSc.VecDuplicate(pl, xv)
         if sparse_mass
@@ -413,7 +417,41 @@ function _consistent_on!(
             end
         end
         values! = nothing
-        if use_jac
+        if fills
+            # `jac` fills the DM's matrix, which these turn into the Jacobian of `residual!`.
+            values! = if brown && is_dae
+                function (s, B, x)
+                    @. a = ifelse(dv, x, du0)
+                    @. b = ifelse(dv, u0, x)
+                    _init_fill!(() -> jac(B, a, b, p, zero(t0), t0), s, B) &&
+                        _init_fill!(() -> jac(A1, a, b, p, one(t0), t0), s, A1) || return false
+                    _mat_axpy!(pl, A1, -one(S), B)
+                    _mat_diagonal_scale!(pl, A1, nothing, S.(dv))
+                    _mat_diagonal_scale!(pl, B, nothing, S.(.!dv))
+                    _mat_axpy!(pl, B, one(S), A1)
+                    return true
+                end
+            elseif brown
+                function (s, B, x)
+                    _init_fill!(() -> jac(B, x, p, t0), s, B) || return false
+                    _mat_diagonal_scale!(pl, B, S.(eqs), nothing)
+                    _mat_add_diagonal!(pl, B, S.(.!eqs))
+                    return true
+                end
+            elseif is_dae
+                function (s, B, x)
+                    @. a = (x - start) / h
+                    return _init_fill!(() -> jac(B, a, x, p, inv(h), t0), s, B)
+                end
+            else
+                function (s, B, x)
+                    _init_fill!(() -> jac(B, x, p, t0), s, B) || return false
+                    _mat_op!(pl, :MatScale, B, -one(S))
+                    _mat_add_diagonal!(pl, B, M.diag ./ h)
+                    return true
+                end
+            end
+        elseif use_jac
             src = coo.src
             entry = (J, k) -> src[k] == 0 ? zero(S) : J.nzval[src[k]]
             values! = if brown && is_dae
@@ -458,14 +496,14 @@ function _consistent_on!(
         end
         s = InitNewton(
             pl, residual!, values!, similar(x), similar(x), LibPETSc.PetscInt[], nothing, comm,
-            use_jac ? coo.vals : S[],
+            use_jac && !fills ? coo.vals : S[], fills,
         )
         snes = LibPETSc.SNESCreate(pl, comm)
         options = [
             "-pc_factor_nonzeros_along_diagonal", "-sub_pc_factor_nonzeros_along_diagonal",
             "-ksp_rtol", _option(sqrt(eps(R))),
         ]
-        dm === nothing || _everywhere(comm, _dm_colours(pl, clone.ptr)) ||
+        dm === nothing || fills || _everywhere(comm, _dm_colours(pl, clone.ptr)) ||
             push!(options, "-snes_fd_color_use_mat")
         opts = PETScCompat.PetscOptions(pl; PETSc.parse_options(options)...)
         GC.@preserve s begin
@@ -502,7 +540,7 @@ function _consistent_on!(
         snes === nothing || LibPETSc.SNESDestroy(pl, snes)
         opts === nothing || PETScCompat.destroy!(opts)
         mv === nothing || foreach(PETScCompat.destroy!, mv)
-        for obj in (mm, rv, A, xv)
+        for obj in (mm, rv, A1, A, xv)
             obj === nothing || PETScCompat.destroy!(obj)
         end
         clone === nothing || _check_code(
@@ -532,6 +570,24 @@ mutable struct InitNewton{L, S}
     err::Any
     comm::Union{Nothing, MPI.Comm}
     vals::Vector{S}
+    fills::Bool
+end
+
+# Assembly is collective, so every rank gives up once any rank's `fill` threw.
+function _init_fill!(fill, s::InitNewton, B)
+    _mat_zero!(s.petsclib, B)
+    err = nothing
+    try
+        fill()
+    catch e
+        err = e
+    end
+    if _anywhere(s.comm, err !== nothing)
+        s.err === nothing && (s.err = something(err, _remote_error()))
+        return false
+    end
+    PETSc.assemble!(B)
+    return true
 end
 
 # A rank whose function throws keeps making the collective calls, on NaN until the ranks agree.
@@ -574,6 +630,8 @@ function _init_jacobian!(
         _readvec!(s.x, pl, PETSc.VecPtr(pl, x_ptr, false))
         if s.comm === nothing
             _set_matrix!(pl, B, s.jacobian(s.x), s.idx)
+        elseif s.fills
+            s.jacobian(s, B, s.x) || return LibPETSc.PetscErrorCode(CALLBACK_THREW)
         else
             _init_call!(() -> s.jacobian(s.vals, s.x), s, s.vals)
             LibPETSc.MatSetValuesCOO(pl, B, s.vals, LibPETSc.INSERT_VALUES)
@@ -717,7 +775,7 @@ function _snes_solve!(x::Vector{S}, residual!, jacobian, pattern, pl, atol) wher
     m, R = length(x), real(S)
     s = InitNewton(
         pl, residual!, jacobian, similar(x), similar(x),
-        LibPETSc.PetscInt[i - 1 for i in 1:m], nothing, nothing, S[],
+        LibPETSc.PetscInt[i - 1 for i in 1:m], nothing, nothing, S[], false,
     )
     xv, rv = PETScCompat.PetscVec(pl, m), PETScCompat.PetscVec(pl, m)
     A = pattern === nothing ? PETScCompat.PetscMat(pl, zeros(S, m, m)) :
