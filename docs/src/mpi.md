@@ -392,7 +392,7 @@ matched with a mass matrix exactly, as a `SplitODEProblem` in `TSARKIMEX` to 5.4
 adjoint without a DM exactly.
 
 The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
-`TSARKIMEX` and `TSGeneric(ts_type; explicit = true)`, `saveat`, dense output, callbacks and
+`TSARKIMEX` and `TSGeneric`, explicit or implicit, `saveat`, dense output, callbacks and
 the integrator interface, a `Diagonal` mass matrix, a `SplitODEProblem`, whose `f2` gets `u`
 ghosted as `f` does, and a `DAEProblem`, whose residual `f(r, du, u, p, t)` gets `u` ghosted
 and `du` owned. Everything else the package calls, such as a callback, `unstable_check` or
@@ -417,8 +417,9 @@ throws on some ranks makes every rank throw. On 1-D and 2-D DMDAs of 1 to 3 rank
 gradient agreed with the comm-mode and serial adjoints of the same discretization to 2e-15
 and with central differences of the same fixed-step solve to 1.4e-9.
 
-A solve with a `dm` refuses `TSIRK`, `TSMPRK` and an implicit `TSGeneric` with an
-`ArgumentError`. A distributed solve, with a `dm` or without, is refused off the root task
+A solve with a `dm` refuses `TSIRK`, `TSMPRK` and an implicit `TSGeneric` of type `"irk"`,
+or of a type refused on a `comm`, with an `ArgumentError`. A distributed solve, with a `dm`
+or without, is refused off the root task
 when Julia has more than one thread, whether inside `Threads.@threads` (as `EnsembleThreads`
 runs its trajectories) or from a `Threads.@spawn` task: nothing there keeps the ranks' solves
 in the same order, and ranks taking them in different orders run different solves as one and
