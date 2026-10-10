@@ -2,7 +2,7 @@
 
 julia_version = "1.13.1"
 manifest_format = "2.1"
-project_hash = "bee5e3a359ada12c152c9a5ee7441a0beaf4c603"
+project_hash = "bbc629a72ee954a57b83002d07ae84390f4fd99d"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -958,9 +958,9 @@ version = "0.5.2"
 
 [[deps.PETScDiffEq]]
 deps = ["ADTypes", "DiffEqBase", "DifferentiationInterface", "ForwardDiff", "Libdl", "LinearAlgebra", "MPI", "PETSc", "PETSc_jll", "PrecompileTools", "SciMLBase", "SciMLLogging", "SciMLOperators", "SparseArrays", "SparseMatrixColorings"]
-path = "/home/runner/_work/PETScDiffEq.jl/PETScDiffEq.jl"
+path = "/home/runner/work/PETScDiffEq.jl/PETScDiffEq.jl"
 uuid = "0a65194f-a16f-47d0-900e-080c22068669"
-version = "0.9.29"
+version = "0.9.27"
 
     [deps.PETScDiffEq.extensions]
     PETScDiffEqSciMLSensitivityExt = "SciMLSensitivity"
