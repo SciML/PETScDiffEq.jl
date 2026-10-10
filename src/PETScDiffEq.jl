@@ -519,9 +519,9 @@ states, the saved velocities, `jac` and the callbacks stay those of the problem 
 
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for
 [`TSBasicSymplectic`](@ref), with this rank's velocity and position of the same length. There
-`autodiff` defaults to `AutoFiniteDiff()`, and a `jac` fills this rank's rows of a sparse
-`jac_prototype` of the first-order system, whose columns number the whole `[v; u]`; see the
-MPI section of the documentation.
+`autodiff` defaults to `AutoFiniteDiff()`, and a `jac` or `AutoForwardDiff()` fills this rank's
+rows of a sparse `jac_prototype` of the first-order system, whose columns number the whole
+`[v; u]`; see the MPI section of the documentation.
 """
 struct TSAlpha2 <: PETScTSAlgorithm
     radius::Union{Nothing, Float64}
@@ -4332,14 +4332,6 @@ function _check_dynamical(prob, alg, has_mass, comm, dm)
                 "SecondOrderODEProblem",
         ),
     )
-    comm === nothing || prob.f.jac !== nothing || !_uses_ifunction(alg) ||
-        _petsc_differences(alg) || throw(
-        ArgumentError(
-            "PETScDiffEq cannot use `$(_autodiff(alg))` on a DynamicalODEProblem or " *
-                "SecondOrderODEProblem $_NOT_SELF; give the problem a `jac`, or leave " *
-                "`autodiff` at its default there, `AutoFiniteDiff()`, for PETSc's colouring",
-        ),
-    )
     alg isa TSAlpha2 || return nothing
     prob.problem_type isa SciMLBase.SecondOrderODEProblem || throw(
         ArgumentError(
@@ -4838,6 +4830,8 @@ function _setup(
         f1 = Ghosted(f1, petsclib, dm.ptr)
         f2 = f2 === nothing ? nothing : Ghosted(f2, petsclib, dm.ptr)
     end
+    colmap = dyn && comm !== nothing && _uses_ifunction(alg) ? _flat_columns(nv, n, comm) :
+        nothing
     builds_jac = _uses_ifunction(alg) && prob.f.jac === nothing && !_petsc_differences(alg)
     has_jac = _uses_ifunction(alg) && (prob.f.jac !== nothing || builds_jac)
     dm_jac = dm !== nothing && has_jac
@@ -4851,8 +4845,8 @@ function _setup(
         advice = something(jac_advice, is_dae ? _DAE_ADVICE : _ODE_ADVICE)
         if comm !== nothing
             _ad_comm_jacobian(
-                _autodiff(alg), is_dae ? f_ad : _as_inplace(f_ad, iip), prob.f.jac_prototype,
-                u0, prob.p, user_t0, ad_calls, advice, comm, is_dae,
+                _autodiff(alg), is_dae || dyn ? f_ad : _as_inplace(f_ad, iip),
+                prob.f.jac_prototype, u0, prob.p, user_t0, ad_calls, advice, comm, is_dae, colmap,
             )
         elseif is_dae
             _ad_dae_jacobian(
@@ -5097,7 +5091,6 @@ function _setup(
                 rstart = first(LibPETSc.VecGetOwnershipRange(petsclib, u))
                 M isa SparseMatrixCSC && _mass_matrix!(ctx, petsclib, comm, M, rstart, N)
                 P = has_jac ? J0 : _structure(S, SparseMatrixCSC(prob.f.jac_prototype))
-                colmap = dyn ? _flat_columns(nv, n, comm) : nothing
                 rows, cols, coo = _coo_structure(P, rstart, M, colmap)
                 mat = LibPETSc.MatCreate(petsclib, comm)
                 has_jac ? (h.jac_mat = mat) : (h.fd_mat = mat)

@@ -11765,11 +11765,6 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test maximum(maximum(abs, collect(a) - collect(b)) for (a, b) in zip(sol.u, ref.u)) <=
                     1.0e-13
             end
-            @test_throws "on a DynamicalODEProblem or SecondOrderODEProblem on a communicator" SciMLBase.__solve(
-                springs(; jac_prototype = springs_proto),
-                PETScDiffEq.TSAlpha2(; comm = world, autodiff = PETScDiffEq.AutoForwardDiff());
-                dt = 0.05,
-            )
             @test_throws "SecondOrderODEProblem on MPI.COMM_SELF only" PETScDiffEq._discrete_adjoint(
                 springs(; jac = springs_jac!, jac_prototype = springs_proto),
                 PETScDiffEq.TSRK("4"; comm = world), PETScAdjoint(); t = [2.0],
@@ -11784,6 +11779,73 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 springs(), PETScDiffEq.TSRK("5dp"; dm = line),
             )
             PETScDiffEq.PETScCompat.destroy!(line)
+        end
+
+        Sys.WORD_SIZE == 64 && @testset "ForwardDiff on a communicator of one rank" begin
+            world, ad = MPI.COMM_WORLD, PETScDiffEq.AutoForwardDiff()
+            near(i) = max(1, i - 1):min(5, i + 1)
+            function damped!(ddu, du, u, p, t)
+                for i in 1:5
+                    l = i > 1 ? u[i - 1] : zero(eltype(u))
+                    r = i < 5 ? u[i + 1] : zero(eltype(u))
+                    ddu[i] = l - 2u[i] + r - u[i]^3 - 0.1 * (1 + u[i]^2) * du[i]
+                end
+                return nothing
+            end
+            function damped_jac!(J, x, p, t)
+                v, u = x.x
+                for i in 1:5
+                    J[i, i] = -0.1 * (1 + u[i]^2)
+                    for j in near(i)
+                        J[i, 5 + j] = i == j ? -2 - 3u[i]^2 - 0.2 * u[i] * v[i] : 1.0
+                    end
+                    J[5 + i, i] = 1.0
+                end
+                return nothing
+            end
+            proto = sparse(
+                vcat(1:5, [i for i in 1:5 for _ in near(i)], 6:10),
+                vcat(1:5, [5 + j for i in 1:5 for j in near(i)], 1:5), 1.0, 10, 10,
+            )
+            damped(; kw...) = SciMLBase.SecondOrderODEProblem(
+                SciMLBase.DynamicalODEFunction{true}(
+                    damped!, (du, v, u, p, t) -> (du .= v; nothing); kw...,
+                ), [0.3, -0.2, 0.1, 0.0, 0.2], [0.1, 0.5, 1.0, 0.5, 0.1], (0.0, 2.0),
+            )
+            direct(c) = ["-ksp_type", "preonly", "-pc_type", c == world ? "redundant" : "lu"]
+            x = collect(range(-0.4, 0.9; length = 10))
+            # The Jacobian at `x`, then the solve.
+            function run(pr, alg)
+                integ = SciMLBase.__init(pr, alg; dt = 0.05, adaptive = false)
+                ctx = integ.h.ctx
+                J = copy(ctx.J)
+                ctx.jac!(J, x, ctx.p, 0.5)
+                SciMLBase.solve!(integ)
+                return J, integ.sol
+            end
+            carries = damped(; jac_prototype = proto).f.jac_prototype isa SparseMatrixCSC
+            for make in (
+                    (c; kw...) -> PETScDiffEq.TSAlpha2(direct(c); comm = c, kw...),
+                    (c; kw...) -> PETScDiffEq.TSImplicit("bdf", direct(c); comm = c, kw...),
+                )
+                carries || continue
+                J, sol = run(damped(; jac_prototype = proto), make(world; autodiff = ad))
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                for (pr, alg) in (
+                        (damped(; jac = damped_jac!, jac_prototype = proto), make(world)),
+                        (damped(; jac_prototype = proto), make(MPI.COMM_SELF; autodiff = ad)),
+                    )
+                    Jref, ref = run(pr, alg)
+                    @test maximum(abs, J - Jref) <= 1.0e-13
+                    @test sol.t == ref.t
+                    @test sol.stats.njacs == ref.stats.njacs > 0
+                    @test maximum(maximum(abs, collect(a) - collect(b)) for (a, b) in zip(sol.u, ref.u)) <=
+                        1.0e-12
+                end
+            end
+            @test_throws "needs a sparse `jac_prototype`" SciMLBase.__solve(
+                damped(), PETScDiffEq.TSAlpha2(; comm = world, autodiff = ad); dt = 0.05,
+            )
         end
 
         @testset "what these algorithms refuse" begin
