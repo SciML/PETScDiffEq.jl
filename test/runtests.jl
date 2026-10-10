@@ -168,7 +168,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test all(o -> isapprox(o, 3; atol = 0.15), orders)
     end
 
-    Sys.WORD_SIZE == 64 && @testset "TSARKIMEX keeps order when tspan starts away from 0" begin
+    @testset "TSARKIMEX keeps order when tspan starts away from 0" begin
         f!(du, u, p, t) = (du[1] = cos(t); nothing)
         t0 = 1.0
         prob = SciMLBase.ODEProblem(f!, [sin(t0)], (t0, t0 + 1))
@@ -9251,7 +9251,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         )
     end
 
-    Sys.WORD_SIZE == 64 && @testset "PETScAdjoint" begin
+    @testset "PETScAdjoint" begin
         function adj_f!(du, u, p, t)
             du[1] = -p[1] * u[1] + p[2] * u[1] * u[2]
             du[2] = p[3] * u[1] - p[4] * u[2]^2 + p[1] * sin(t)
@@ -9687,7 +9687,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
         states_only = ["-ts_trajectory_solution_only", "1"]
 
-        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX matches finite differences of the same fixed-step solve: $name" for (
+        @testset "TSARKIMEX matches finite differences of the same fixed-step solve: $name" for (
                 name, subtype, tspan, ts, opts,
             ) in (
                 ("3", "3", (0.0, 1.0), forward_t, (;)),
@@ -9773,7 +9773,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 1.0e-8
         end
 
-        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX on a split problem reads f2's jac and paramjac" begin
+        @testset "TSARKIMEX on a split problem reads f2's jac and paramjac" begin
             alg = TSARKIMEX("3", exact)
             for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t))
                 given = grad(split_prob(copy(u0), copy(p0), tspan), alg; t)
@@ -9819,7 +9819,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(du0, central_differences(loss, u0)) < 1.0e-8
         end
 
-        Sys.WORD_SIZE == 64 && @testset "an adaptive TSARKIMEX holds its accepted steps fixed: $name" for (
+        @testset "an adaptive TSARKIMEX holds its accepted steps fixed: $name" for (
                 name, subtype, make, tspan,
             ) in (
                 ("3", "3", adj_prob, (0.0, 1.0)),
