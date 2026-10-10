@@ -1787,6 +1787,49 @@ function _mat_add_diagonal!(pl, A, d)
     return nothing
 end
 
+# Multiplies A's rows by `l` and its columns by `r`, this rank's entries of each or `nothing`.
+function _mat_diagonal_scale!(pl, A, l, r)
+    right, left = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :MatCreateVecs), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}), A.ptr, right, left,
+        ),
+    )
+    try
+        l === nothing || _writevec!(pl, PETSc.VecPtr(pl, left[], false), l)
+        r === nothing || _writevec!(pl, PETSc.VecPtr(pl, right[], false), r)
+        _check_code(
+            ccall(
+                _symbol(pl, :MatDiagonalScale), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), A.ptr,
+                l === nothing ? C_NULL : left[], r === nothing ? C_NULL : right[],
+            ),
+        )
+    finally
+        for v in (right, left)
+            _check_code(
+                ccall(_symbol(pl, :VecDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},), v),
+            )
+        end
+    end
+    return nothing
+end
+
+# Y += a * X for matrices of one pattern, as two from the same DM are.
+for S in (Float32, Float64, ComplexF32, ComplexF64)
+    @eval function _mat_axpy!(pl, Y, a::$S, X)
+        _check_code(
+            ccall(
+                _symbol(pl, :MatAXPY), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, $S, Ptr{Cvoid}, Cint), Y.ptr, a, X.ptr,
+                Cint(LibPETSc.SAME_NONZERO_PATTERN),
+            ),
+        )
+        return nothing
+    end
+end
+
 function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     full = Vector{S}(x)
     idxs = ctx.save_idxs
@@ -2533,6 +2576,18 @@ function _distributed_mass(::Type{S}, mass, n, N, comm) where {S}
     return sparse(1:n, rstart .+ (1:n), d, n, N)
 end
 
+# A serial solve keeps a copy of a Diagonal or sparse M as that; any other kind is made dense.
+_serial_mass(::Type{S}, M::LinearAlgebra.Diagonal) where {S} =
+    LinearAlgebra.Diagonal(Vector{S}(M.diag))
+_serial_mass(::Type{S}, M::SparseArrays.AbstractSparseMatrix) where {S} =
+    SparseArrays.dropzeros(SparseMatrixCSC{S, Int}(M))
+_serial_mass(::Type{S}, M) where {S} = Matrix{S}(M)
+
+# `findall` would visit all n^2 entries of a Diagonal.
+_mass_nonzeros(M::LinearAlgebra.Diagonal) =
+    [CartesianIndex(i, i) for i in eachindex(M.diag) if !iszero(M.diag[i])]
+_mass_nonzeros(M) = findall(!iszero, M)
+
 # Relies on SeqAIJ storing rows by ascending column, the order `_row_structure` builds.
 function _setrows!(ctx, A, n)
     vals = LibPETSc.MatSeqAIJGetArray(ctx.petsclib, A)
@@ -2561,7 +2616,7 @@ function _row_structure(J::SparseMatrixCSC, n, M = nothing, rstart = 0, colmap =
         push!(src[i], k)
     end
     shifted = [CartesianIndex(i, rstart + i) for i in 1:n]
-    M === nothing || append!(shifted, findall(!iszero, M))
+    M === nothing || append!(shifted, _mass_nonzeros(M))
     for ij in shifted
         i, j = ij[1], ij[2]
         j in cols[i] && continue
@@ -3309,6 +3364,20 @@ function _ijacobian!(
     return _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
+# `W[j, i] = shift * M[i, j] - J[i, j]` without searching M for each of the n^2 entries.
+function _sparse_mass_block!(W, J, M::SparseMatrixCSC, shift, n)
+    unset = shift * zero(eltype(M))
+    @inbounds for j in 1:n, i in 1:n
+        W[j, i] = unset - J[i, j]
+    end
+    rows, vals = rowvals(M), nonzeros(M)
+    @inbounds for j in 1:n, k in nzrange(M, j)
+        i = rows[k]
+        W[j, i] = shift * vals[k] - J[i, j]
+    end
+    return nothing
+end
+
 function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
@@ -3319,9 +3388,14 @@ function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         _call_jac!(ctx, xdot_ptr, shift, t)
         ctx.njacs += 1
         n = length(ctx.u)
-        # MatSetValues reads the block row-major, hence W[j, i].
-        @inbounds for j in 1:n, i in 1:n
-            ctx.W[j, i] = ctx.dae ? ctx.J[i, j] : shift * _mass(ctx, i, j) - ctx.J[i, j]
+        M = ctx.M
+        if M isa SparseMatrixCSC
+            _sparse_mass_block!(ctx.W, ctx.J, M, shift, n)
+        else
+            # MatSetValues reads the block row-major, hence W[j, i].
+            @inbounds for j in 1:n, i in 1:n
+                ctx.W[j, i] = ctx.dae ? ctx.J[i, j] : shift * _mass(ctx, i, j) - ctx.J[i, j]
+            end
         end
         _setblock!(ctx, B, n)
         PETSc.assemble!(B)
@@ -3678,7 +3752,7 @@ function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothi
     all_rows = vcat(rows, 1:n)
     all_cols = vcat(cols, 1:n)
     if M !== nothing
-        for ij in findall(!iszero, M)
+        for ij in _mass_nonzeros(M)
             push!(all_rows, ij[1])
             push!(all_cols, ij[2])
         end
@@ -4740,14 +4814,16 @@ function _setup(
         _check_tol(reltol, n, "reltol")
     end
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
+    # On a communicator the DM's colouring builds the initialization's Jacobian.
+    jac_init = dm_jac && comm !== nothing ? nothing : jac_fn
     p, initialized = _initialize!(
-        u0, prob, prob, initializealg, f1, dm_jac ? nothing : jac_fn, petsclib, comm,
+        u0, prob, prob, initializealg, f1, jac_init, petsclib, comm,
         R(prob.tspan[1]), R(prob.tspan[2]), real.(something(abstol, 1.0e-6)),
         real.(something(reltol, 1.0e-3)), dt, dtmax,
     )
     ad_calls === nothing || (ad_calls[] = ad_before)
     user_f1, user_f2 = f1, f2
-    f_init, jac_init = f1, dm_jac ? nothing : jac_fn
+    f_init = f1
     if tdir < 0
         f1 = is_dae ? _reverse_residual(f1) : _reverse_rhs(f1)
         f2 = f2 === nothing ? nothing : _reverse_rhs(f2)
@@ -4790,7 +4866,7 @@ function _setup(
     M = if !has_mass
         nothing
     elseif comm === nothing && dm === nothing
-        Matrix{S}(mass_matrix)
+        _serial_mass(S, mass_matrix)
     elseif sparse_mass
         _distributed_mass(S, own_mass ? mass_matrix : nothing, n, N, comm)
     else
@@ -5285,7 +5361,6 @@ end
 
 # Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
 function _with_options(f, h::TSHandles)
-    h.ctx.comm === nothing && isempty(h.dms) && return f()
     push!(h.opts)
     try
         return f()
@@ -6253,7 +6328,7 @@ function _init_unlocked(
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = stops_given, kwargs...)
     prob = _with_p(prob, h.ctx.p)
-    LibPETSc.TSSetUp(h.petsclib, h.ts)
+    _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
     _match_steps_here!(h)
     _initial_save!(h)
     stops = _tstops(stops_given, h)
@@ -6456,7 +6531,7 @@ function _reinit_unlocked(
     end
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
     try
-        LibPETSc.TSSetUp(h.petsclib, h.ts)
+        _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
         _match_steps_here!(h)
         if !erase_sol
             append!(h.ctx.ts, old.ctx.ts)

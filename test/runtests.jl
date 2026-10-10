@@ -6298,7 +6298,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             dm_prob((0.0, 0.1); jac_prototype = proto), PETScDiffEq.TSImplicit("bdf"; dm = da),
         )
         algebraic(i) = i % 4 == 0
+        calls = Ref(0)
         function chain_dm!(du, u, da, t)
+            calls[] += 1
             U = PETScDiffEq.reshape_local_array(u, da)
             D = PETScDiffEq.reshape_local_array(du, da)
             for i in axes(D, 2)
@@ -6308,6 +6310,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             return nothing
         end
         function chain_jac_dm!(J, u, da, t)
+            push!(seen, length(u))
             U = PETScDiffEq.reshape_local_array(u, da)
             for i in 1:N
                 c = U[1, i]
@@ -6316,26 +6319,39 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             return nothing
         end
-        chain(; kw...) = SciMLBase.ODEProblem(
+        chain(x0 = u0, grid = da; kw...) = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(
-                chain_dm!; mass_matrix = Diagonal([algebraic(i) ? 0.0 : 1.0 for i in 1:N]), kw...,
-            ), u0, (0.0, 0.1), da,
+                chain_dm!; kw...,
+                mass_matrix = Diagonal([algebraic(i) ? 0.0 : 1.0 for i in eachindex(x0)]),
+            ), x0, (0.0, 0.1), grid,
         )
         bdf = PETScDiffEq.TSImplicit("bdf"; dm = da)
+        wide = PETSc.DMDA(pl, MPI.COMM_SELF, (ghosted,), (400,), 1, 1)
         for init in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            empty!(seen)
             with_jac = SciMLBase.init(
                 chain(; jac = chain_jac_dm!), bdf; initializealg = init, tol...,
             )
+            @test !isempty(seen)
             plain = SciMLBase.init(chain(), bdf; initializealg = init, tol...)
-            @test with_jac.u == plain.u != u0
+            @test with_jac.u != u0
+            @test maximum(abs, with_jac.u - plain.u) <= 1.0e-13
             for integ in (with_jac, plain)
                 SciMLBase.set_u!(integ, integ.u .+ 0.05)
                 SciMLBase.initialize_dae!(integ)
             end
-            @test with_jac.u == plain.u
+            @test maximum(abs, with_jac.u - plain.u) <= 1.0e-13
             SciMLBase.terminate!(with_jac)
             SciMLBase.terminate!(plain)
+            calls[] = 0
+            coloured = SciMLBase.init(
+                chain(fill(0.5, 400), wide), PETScDiffEq.TSImplicit("bdf"; dm = wide);
+                initializealg = init, tol...,
+            )
+            @test calls[] < 200
+            SciMLBase.terminate!(coloured)
         end
+        PETScDiffEq.PETScCompat.destroy!(wide)
         PETScDiffEq.PETScCompat.destroy!(da)
     end
 
@@ -7625,6 +7641,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test isapprox(sol.u[end][1], 1.5exp(-0.5) - 0.5exp(-1.0); atol = 1.0e-6)
             @test isapprox(sol.u[end][2], exp(-1.0); atol = 1.0e-6)
         end
+
+        @testset "a Diagonal or sparse mass matrix is not made dense" begin
+            band(n, l, d) = spdiagm(-1 => fill(l, n - 1), 0 => fill(d, n), 1 => fill(l, n - 1))
+            function run(M)
+                n = size(M, 1)
+                A = band(n, 1.0, -2.0)
+                f = SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (mul!(du, A, u); nothing);
+                    jac = (J, u, p, t) -> (copyto!(nonzeros(J), nonzeros(A)); nothing),
+                    jac_prototype = A, mass_matrix = M,
+                )
+                return SciMLBase.solve(
+                    SciMLBase.ODEProblem(f, sinpi.((1:n) ./ (n + 1)), (0.0, 0.1)),
+                    PETScDiffEq.TSImplicit("beuler"); dt = 0.01, adaptive = false,
+                )
+            end
+            lumped(n) = Diagonal(1 .+ (1:n) ./ n)
+            for M in (lumped(20), band(20, 1 / 6, 2 / 3))
+                @test run(M).u ≈ run(Matrix(M)).u rtol = 1.0e-12
+            end
+            for M in (lumped(2000), band(2000, 1 / 6, 2 / 3))
+                @test (@allocated run(M)) < 16_000_000
+            end
+        end
     end
 
     @testset "An operator-valued right-hand side is rejected" begin
@@ -7700,6 +7740,49 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.retcode == SciMLBase.ReturnCode.Success
             @test sol.t == [1.0]
             @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-4
+        end
+
+        @testset "an option PETSc reads inside the solve is in force there" begin
+            n = 8
+            A = spdiagm(-1 => ones(n - 1), 0 => fill(-2.0, n), 1 => ones(n - 1))
+            lin = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction((du, u, p, t) -> mul!(du, A, u); jac_prototype = A),
+                ones(n), (0.0, 1.0),
+            )
+            coloured(opts) = PETScDiffEq.TSImplicit(
+                "beuler", opts; autodiff = PETScDiffEq.AutoFiniteDiff(),
+            )
+            sol = SciMLBase.solve(lin, coloured(String[]); dt = 0.1)
+            # One colour per column, where PETSc's default finds three.
+            natural = coloured(["-mat_coloring_type", "natural"])
+            more = SciMLBase.solve(lin, natural; dt = 0.1)
+            @test more.stats.nf - sol.stats.nf == (n - 3) * sol.stats.nnonliniter
+            @test more.u[end] ≈ sol.u[end]
+            stepped = SciMLBase.solve!(SciMLBase.init(lin, natural; dt = 0.1))
+            @test stepped.stats.nf == more.stats.nf
+        end
+
+        @testset "the integrator sets up under its options" begin
+            function stage_type(integ)
+                pl = integ.h.petsclib
+                stage, name = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+                ccall(
+                    PETScDiffEq._symbol(pl, :SNESGetFunction), Cint,
+                    (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Cvoid}, Ptr{Cvoid}),
+                    PETScDiffEq._snes(pl, integ.h.ts.ptr), stage, C_NULL, C_NULL,
+                )
+                ccall(
+                    PETScDiffEq._symbol(pl, :VecGetType), Cint,
+                    (Ptr{Cvoid}, Ptr{Ptr{Cchar}}), stage[], name,
+                )
+                return unsafe_string(name[])
+            end
+            # TSIRK creates its stage vector in TSSetUp, of the type `-vec_type` names.
+            integ = SciMLBase.init(prob, PETScDiffEq.TSIRK(2, ["-vec_type", "mpi"]); dt = 0.1)
+            @test stage_type(integ) == "mpi"
+            SciMLBase.reinit!(integ)
+            @test stage_type(integ) == "mpi"
+            SciMLBase.terminate!(integ)
         end
     end
 
@@ -9576,6 +9659,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
             end
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-9
+        end
+
+        @testset "an option PETSc reads while the adjoint runs is in force there" begin
+            cd(mktempdir()) do
+                view = ["-ts_adjoint_view_solution", "ascii:lambda.txt"]
+                grad(
+                    adj_prob(copy(u0), copy(p0), (0.0, 1.0)), TSRK("4");
+                    sensealg = PETScAdjoint(petsc_options = view),
+                )
+                @test isfile("lambda.txt")
+            end
         end
 
         @testset "dp is nothing without parameters and empty with no entries" begin

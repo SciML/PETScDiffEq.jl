@@ -88,10 +88,10 @@ starting, 8 MB at the default and 8 GB at `maxiters = 10^9`. `TSImplicit` and `T
 solve transposed linear systems with the same Krylov solver and tolerances as their Newton
 steps, so with default options the gradient can be off by up to about their relative
 tolerance of 1e-5 while the forward states are far closer; pass
-`-ksp_type preonly -pc_type lu`, or a tighter `-ksp_rtol`, when that matters. Options PETSc
-reads only while the adjoint runs, such as `-ts_trajectory_view` and
-`-ts_adjoint_view_solution`, have no effect in `petsc_options`, though they do when set
-globally, for example through `PETSC_OPTIONS`.
+`-ksp_type preonly -pc_type lu`, or a tighter `-ksp_rtol`, when that matters. The options
+stay in force while the adjoint runs, so those PETSc reads only then, such as
+`-ts_trajectory_view` and `-ts_adjoint_view_solution`, take effect; options set globally,
+for example through `PETSC_OPTIONS`, do not reach the run.
 
 With an algorithm whose `comm` is not `MPI.COMM_SELF`, the adjoint runs distributed as the
 solve does, for the same methods on an `ODEProblem`. The `ODEFunction` then needs `jac`,
@@ -1223,7 +1223,7 @@ function _discrete_adjoint_unlocked(
             _check_code(code, "TSSetCostGradients")
             try
                 _quiet_errors(h) do
-                    LibPETSc.TSAdjointSolve(pl, ts)
+                    _with_options(() -> LibPETSc.TSAdjointSolve(pl, ts), h)
                 end
             catch
                 ctx.err === nothing && adj.err === nothing &&
