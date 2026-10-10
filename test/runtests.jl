@@ -6537,8 +6537,42 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test maximum(maximum(abs, a - b) for (a, b) in zip(got.u, hand.u)) <= 1.0e-13
             calls === nothing ||
                 @test got.stats.nf == hand.stats.nf + calls * got.stats.njacs
+            coloured = SciMLBase.solve(grid(), make(box); tol...)
+            @test coloured.retcode == SciMLBase.ReturnCode.Success
+            # Measured 1.7e-14.
+            @test maximum(abs, coloured.u[end] - hand.u[end]) <= 1.0e-12
             PETScDiffEq.PETScCompat.destroy!(box)
         end
+        # There PETSc's finite differences get the matrix's own colouring, in the solve and in
+        # DAE initialization. One linear solve with the Jacobian: measured 1.1e-9 off a `jac`'s.
+        torus = PETSc.DMDA(
+            pl, MPI.COMM_SELF, (periodic, periodic), (8, 7), 2, 1, LibPETSc.DMDA_STENCIL_BOX,
+        )
+        on_torus(; kw...) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(grid!; kw...), start(112), (0.0, 0.1), torus,
+        )
+        newton = PETScDiffEq.TSImplicit("beuler", ["-snes_type", "ksponly"]; dm = torus)
+        stepped = [
+            SciMLBase.solve(on_torus(; kw...), newton; dt = 0.1, adaptive = false).u[end] for
+                kw in ((; jac = grid_jac!), (;))
+        ]
+        @test maximum(abs, stepped[1] - stepped[2]) <= 1.0e-7
+        singular = Diagonal(repeat([1.0, 0.0], 56))
+        for init in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            hand = SciMLBase.solve(
+                on_torus(; jac = grid_jac!, mass_matrix = singular), bdf(torus);
+                initializealg = init, tol...,
+            )
+            coloured = SciMLBase.solve(
+                on_torus(; mass_matrix = singular), bdf(torus); initializealg = init, tol...,
+            )
+            @test coloured.retcode == SciMLBase.ReturnCode.Success
+            @test coloured.u[1] != start(112)
+            # Measured 1.3e-15 at the start and 1.6e-14 at the end.
+            @test maximum(abs, coloured.u[1] - hand.u[1]) <= 1.0e-12
+            @test maximum(abs, coloured.u[end] - hand.u[end]) <= 1.0e-12
+        end
+        PETScDiffEq.PETScCompat.destroy!(torus)
 
         buffer = zeros(34)
         function stored!(du, u, da, t)

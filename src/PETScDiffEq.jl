@@ -5173,7 +5173,7 @@ function _setup(
                 ],
             )
             clone !== nothing && _uses_ifunction(alg) && !has_jac &&
-                !_everywhere(comm, _dm_colours(petsclib, clone.ptr)) &&
+                !_dm_coloured(petsclib, clone.ptr, h.fd_mat, n, comm, S) &&
                 append!(effective_options, ["-snes_fd_color_use_mat"])
             append!(effective_options, alg.petsc_options)
             append!(effective_options, extra_options)
