@@ -7327,6 +7327,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 (; step_limiter = (u, integ, p, t) -> nothing),
                 (; stage_limiter = (u, integ, p, t) -> nothing),
                 (; advance_to_tstop = true), (; stop_at_next_tstop = true),
+                (; maxtime = 1.0e-9), (; save_discretes = true),
+                (; rng = SciMLBase.Random.default_rng()),
+                (; alias = SciMLBase.ODEAliasSpecifier(alias_u0 = true)),
+                (; alias = SciMLBase.ODEAliasSpecifier(alias = true)),
             )
             all(in(PETScDiffEq.DiffEqBase.allowedkeywords), keys(kw)) || continue
             @test_logs (:warn, r"does not support") SciMLBase.solve(prob, alg; dt = 0.1, kw...)
@@ -7335,6 +7339,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             prob, alg; dt = 0.1, progress = false, progress_steps = 10,
             advance_to_tstop = false, stop_at_next_tstop = false,
         )
+        for kw in (
+                (; maxtime = nothing), (; save_discretes = false), (; rng = nothing),
+                (; alias = SciMLBase.ODEAliasSpecifier()),
+                (; alias = SciMLBase.ODEAliasSpecifier(alias_u0 = false, alias_tstops = true)),
+            )
+            all(in(PETScDiffEq.DiffEqBase.allowedkeywords), keys(kw)) || continue
+            @test_logs min_level = Logging.Warn SciMLBase.solve(prob, alg; dt = 0.1, kw...)
+        end
     end
 
     @testset "error norms follow OrdinaryDiffEq's defaults and switches" begin
@@ -7349,6 +7361,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test norms() == [:final, :l2, :l∞]
             @test norms(timeseries_errors = false) == [:final]
             @test norms(dense_errors = true) == [:L2, :L∞, :final, :l2, :l∞]
+            @test isempty(norms(calculate_error = false))
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); kw..., calculate_error = false)
+            @test isempty(integ.sol.errors)
+            @test isempty(SciMLBase.solve!(integ).errors)
         end
     end
 
