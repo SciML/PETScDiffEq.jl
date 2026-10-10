@@ -286,7 +286,7 @@ end
 function _shampine!(u0::Vector{S}, prob, f, jac, pl, t0, atol, pattern, h) where {S}
     p, n = prob.p, length(u0)
     is_dae = prob isa SciMLBase.AbstractDAEProblem
-    M = is_dae ? nothing : Matrix{S}(prob.f.mass_matrix)
+    M = is_dae ? nothing : _serial_mass(S, prob.f.mass_matrix)
     start, slope, fx = copy(u0), similar(u0), similar(u0)
     function residual!(out, x)
         @. slope = (x - start) / h
@@ -300,7 +300,9 @@ function _shampine!(u0::Vector{S}, prob, f, jac, pl, t0, atol, pattern, h) where
         return nothing
     end
     J = _jac_buffer(S, pattern, n)
-    shifted = is_dae ? nothing : (pattern === nothing ? M : SparseMatrixCSC(M)) ./ h
+    # A zero on a Diagonal M is no entry of the shift.
+    shifted = is_dae ? nothing : pattern === nothing ? convert(Matrix, M) ./ h :
+        SparseArrays.dropzeros!(SparseMatrixCSC(M)) ./ h
     function jacobian(x)
         @. slope = (x - start) / h
         is_dae && (jac(J, slope, x, p, inv(h), t0); return J)

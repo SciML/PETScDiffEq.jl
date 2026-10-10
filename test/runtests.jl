@@ -65,10 +65,12 @@ function damped_oscillator_jac!(J, u, p, t)
 end
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
-const GROUP = let group = get(ENV, "GROUP", "")
-    isempty(group) ? "All" : group
+# GROUP=MPI2 is MPI on 2 ranks, for a workflow that passes only GROUP.
+const GROUP, GROUP_RANKS = let group = get(ENV, "GROUP", ""), ranks = match(r"^MPI([123])$", group)
+    isempty(group) ? ("All", "") : ranks === nothing ? (group, "") : ("MPI", String(ranks[1]))
 end
-GROUP in ("All", "Core", "MPI") || error("GROUP is All, Core or MPI, not $GROUP")
+GROUP in ("All", "Core", "MPI") ||
+    error("GROUP is All, Core, MPI, or MPI1, MPI2 or MPI3 for one rank count, not $GROUP")
 is_mpi(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") && s.args[3] == "MPI"
 
 # TEST_PART=k/n runs every n-th top-level testset from the k-th on, so n processes cover the file.
@@ -3522,6 +3524,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             for verbose in (false, logging.None(), quiet)
                 integ = SciMLBase.init(breaks, PETScDiffEq.TSRK("5dp"))
+                integ.opts.verbose = verbose
+                @test_logs min_level = Logging.Warn SciMLBase.solve!(integ)
+            end
+            # An implicit solve gives up on its Newton solve, which it reports at the end.
+            bdf = PETScDiffEq.TSImplicit("bdf")
+            for verbose in (false, quiet)
+                sol = @test_logs min_level = Logging.Warn SciMLBase.solve(breaks, bdf; verbose)
+                @test sol.retcode == SciMLBase.ReturnCode.Unstable
+                integ = SciMLBase.init(breaks, bdf)
                 integ.opts.verbose = verbose
                 @test_logs min_level = Logging.Warn SciMLBase.solve!(integ)
             end
@@ -7489,6 +7500,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test isapprox(sol.u[end][1], 1.5exp(-0.5) - 0.5exp(-1.0); atol = 1.0e-6)
             @test isapprox(sol.u[end][2], exp(-1.0); atol = 1.0e-6)
         end
+
+        @testset "a Diagonal or sparse mass matrix is not made dense" begin
+            band(n, l, d) = spdiagm(-1 => fill(l, n - 1), 0 => fill(d, n), 1 => fill(l, n - 1))
+            function run(M)
+                n = size(M, 1)
+                A = band(n, 1.0, -2.0)
+                f = SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (mul!(du, A, u); nothing);
+                    jac = (J, u, p, t) -> (copyto!(nonzeros(J), nonzeros(A)); nothing),
+                    jac_prototype = A, mass_matrix = M,
+                )
+                return SciMLBase.solve(
+                    SciMLBase.ODEProblem(f, sinpi.((1:n) ./ (n + 1)), (0.0, 0.1)),
+                    PETScDiffEq.TSImplicit("beuler"); dt = 0.01, adaptive = false,
+                )
+            end
+            lumped(n) = Diagonal(1 .+ (1:n) ./ n)
+            for M in (lumped(20), band(20, 1 / 6, 2 / 3))
+                @test run(M).u ≈ run(Matrix(M)).u rtol = 1.0e-12
+            end
+            for M in (lumped(2000), band(2000, 1 / 6, 2 / 3))
+                @test (@allocated run(M)) < 16_000_000
+            end
+        end
     end
 
     @testset "An operator-valued right-hand side is rejected" begin
@@ -7564,6 +7599,49 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.retcode == SciMLBase.ReturnCode.Success
             @test sol.t == [1.0]
             @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-4
+        end
+
+        @testset "an option PETSc reads inside the solve is in force there" begin
+            n = 8
+            A = spdiagm(-1 => ones(n - 1), 0 => fill(-2.0, n), 1 => ones(n - 1))
+            lin = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction((du, u, p, t) -> mul!(du, A, u); jac_prototype = A),
+                ones(n), (0.0, 1.0),
+            )
+            coloured(opts) = PETScDiffEq.TSImplicit(
+                "beuler", opts; autodiff = PETScDiffEq.AutoFiniteDiff(),
+            )
+            sol = SciMLBase.solve(lin, coloured(String[]); dt = 0.1)
+            # One colour per column, where PETSc's default finds three.
+            natural = coloured(["-mat_coloring_type", "natural"])
+            more = SciMLBase.solve(lin, natural; dt = 0.1)
+            @test more.stats.nf - sol.stats.nf == (n - 3) * sol.stats.nnonliniter
+            @test more.u[end] ≈ sol.u[end]
+            stepped = SciMLBase.solve!(SciMLBase.init(lin, natural; dt = 0.1))
+            @test stepped.stats.nf == more.stats.nf
+        end
+
+        @testset "the integrator sets up under its options" begin
+            function stage_type(integ)
+                pl = integ.h.petsclib
+                stage, name = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+                ccall(
+                    PETScDiffEq._symbol(pl, :SNESGetFunction), Cint,
+                    (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Cvoid}, Ptr{Cvoid}),
+                    PETScDiffEq._snes(pl, integ.h.ts.ptr), stage, C_NULL, C_NULL,
+                )
+                ccall(
+                    PETScDiffEq._symbol(pl, :VecGetType), Cint,
+                    (Ptr{Cvoid}, Ptr{Ptr{Cchar}}), stage[], name,
+                )
+                return unsafe_string(name[])
+            end
+            # TSIRK creates its stage vector in TSSetUp, of the type `-vec_type` names.
+            integ = SciMLBase.init(prob, PETScDiffEq.TSIRK(2, ["-vec_type", "mpi"]); dt = 0.1)
+            @test stage_type(integ) == "mpi"
+            SciMLBase.reinit!(integ)
+            @test stage_type(integ) == "mpi"
+            SciMLBase.terminate!(integ)
         end
     end
 
@@ -9440,6 +9518,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
             end
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-9
+        end
+
+        @testset "an option PETSc reads while the adjoint runs is in force there" begin
+            cd(mktempdir()) do
+                view = ["-ts_adjoint_view_solution", "ascii:lambda.txt"]
+                grad(
+                    adj_prob(copy(u0), copy(p0), (0.0, 1.0)), TSRK("4");
+                    sensealg = PETScAdjoint(petsc_options = view),
+                )
+                @test isfile("lambda.txt")
+            end
         end
 
         @testset "dp is nothing without parameters and empty with no entries" begin
@@ -11402,7 +11491,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
 
     @testset "MPI" begin
         # MPI_RANKS, such as 2 or 1,3, narrows the rank counts, so CI runs each in its own job.
-        listed = get(ENV, "MPI_RANKS", "")
+        listed = isempty(GROUP_RANKS) ? get(ENV, "MPI_RANKS", "") : GROUP_RANKS
         rank_counts = isempty(listed) ? [1, 2, 3] : tryparse.(Int, split(listed, ','))
         allunique(rank_counts) && rank_counts ⊆ 1:3 ||
             error("MPI_RANKS is a comma-separated list of distinct rank counts from 1, 2 and 3, not $listed")
