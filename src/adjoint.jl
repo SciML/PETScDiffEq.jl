@@ -1111,7 +1111,7 @@ function _discrete_adjoint_unlocked(
             end
             h.tdir < 0 && (jac = _reverse_jac(jac))
             proto = rhs.jac_prototype
-            J = proto isa SparseMatrixCSC ? SparseMatrixCSC{Float64, Int}(proto) : zeros(n, n)
+            J = proto isa SparseMatrixCSC ? _structure(Float64, proto) : zeros(n, n)
         end
         no_rows = (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
         rows = J isa SparseMatrixCSC && comm === nothing ? _row_structure(J, n) : no_rows
