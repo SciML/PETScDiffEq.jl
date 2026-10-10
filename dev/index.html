@@ -14,15 +14,15 @@ tspan = (0.0, 100.0)
 prob = SciMLBase.ODEProblem(lorenz, u0, tspan)
 sol = SciMLBase.solve(prob, TSRK(&quot;5dp&quot;); dt = 0.01, abstol = 1e-8, reltol = 1e-8)</code></pre><p><code>dt</code> sets the first step. An adaptive solve can leave it out, and the first step is then Hairer and Wanner&#39;s estimate as OrdinaryDiffEq uses it, taken with the <code>abstol</code> and <code>reltol</code> keywords (SciML&#39;s defaults, <code>abstol = 1e-6</code> and <code>reltol = 1e-3</code>, when not given). DAE and mass-matrix problems start from a small step instead. A solve PETSc steps at a fixed size needs <code>dt</code>: <code>adaptive = false</code>, <code>-ts_adapt_type none</code>, the fixed-step families (<code>TSImplicit</code> and <code>TSDAE</code> other than <code>bdf</code>, <code>TSIRK</code>, <code>TSMPRK</code>), and subtypes registered without an embedded error estimate. What counts is the type PETSc runs after <code>petsc_options</code>: <code>TSImplicit(&quot;beuler&quot;, [&quot;-ts_type&quot;, &quot;bdf&quot;])</code> runs without <code>dt</code> and <code>TSImplicit(&quot;bdf&quot;, [&quot;-ts_type&quot;, &quot;beuler&quot;])</code> needs it. A <code>TSGeneric</code> naming a type no other constructor covers needs it too, since whether that type adapts is not known here.</p><h2 id="Reproducibility"><a class="docs-heading-anchor" href="#Reproducibility">Reproducibility</a><a id="Reproducibility-1"></a><a class="docs-heading-anchor-permalink" href="#Reproducibility" title="Permalink"></a></h2><details><summary>The documentation of this SciML package was built using these direct dependencies,</summary><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Status `~/_work/PETScDiffEq.jl/PETScDiffEq.jl/docs/Project.toml`
   [e30172f5] Documenter v1.19.0
-  [0a65194f] PETScDiffEq v0.9.33 `~/_work/PETScDiffEq.jl/PETScDiffEq.jl`</code></pre></details><details><summary>and using this machine and Julia version.</summary><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Julia Version 1.13.1
+  [0a65194f] PETScDiffEq v0.9.32 `~/_work/PETScDiffEq.jl/PETScDiffEq.jl`</code></pre></details><details><summary>and using this machine and Julia version.</summary><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Julia Version 1.13.1
 Commit 96ca370cf0e (2026-09-25 19:34 UTC)
 Build Info:
   Official https://julialang.org release
 Platform Info:
   OS: Linux (x86_64-linux-gnu)
-  CPU: 192 × AMD EPYC 9455 48-Core Processor
+  CPU: 112 × AMD EPYC 7663 56-Core Processor
   WORD_SIZE: 64
-  LLVM: libLLVM-20.1.8 (ORCJIT, znver5)
+  LLVM: libLLVM-20.1.8 (ORCJIT, znver3)
   GC: Built with stock GC
 Threads: 1 default, 1 interactive, 1 GC (on 4 virtual cores)
 Environment:
@@ -84,7 +84,7 @@ Environment:
   [6fe1bfb0] OffsetArrays v1.17.0
   [bac558e1] OrderedCollections v2.0.2
   [ace2c81b] PETSc v0.5.2
-  [0a65194f] PETScDiffEq v0.9.33 `~/_work/PETScDiffEq.jl/PETScDiffEq.jl`
+  [0a65194f] PETScDiffEq v0.9.32 `~/_work/PETScDiffEq.jl/PETScDiffEq.jl`
   [69de0a69] Parsers v3.0.0
   [eebad327] PkgVersion v0.3.3
   [d236fae5] PreallocationTools v1.7.1
@@ -206,4 +206,4 @@ Environment:
   [8e850b90] libblastrampoline_jll v5.15.0+0
   [8e850ede] nghttp2_jll v1.67.1+0
   [3f19e933] p7zip_jll v17.8.2+0
-Info Packages marked with ⌅ have new versions available but compatibility constraints restrict them from upgrading. To see why use `status --outdated -m`</code></pre></details></article><nav class="docs-footer"><a class="docs-footer-nextpage" href="solver_options/">Solver Options »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Saturday 10 October 2026 23:14">Saturday 10 October 2026</span>. Using Julia version 1.13.1.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
+Info Packages marked with ⌅ have new versions available but compatibility constraints restrict them from upgrading. To see why use `status --outdated -m`</code></pre></details></article><nav class="docs-footer"><a class="docs-footer-nextpage" href="solver_options/">Solver Options »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Saturday 10 October 2026 23:15">Saturday 10 October 2026</span>. Using Julia version 1.13.1.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
