@@ -3574,6 +3574,7 @@ function __init__()
     )
     _init_adjoint_pointers!()
     _init_initialization_pointers!()
+    _note_skipped_workload()
     return nothing
 end
 

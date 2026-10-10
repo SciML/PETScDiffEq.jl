@@ -517,9 +517,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
 
     @testset "precompile workload" begin
         made = PETScDiffEq.HANDLES_MADE[]
+        note = PETScDiffEq._note_skipped_workload
         withenv(PETScDiffEq._run_workload, "PMI_RANK" => "0")
         @test PETScDiffEq.HANDLES_MADE[] == made
+        @test PETScDiffEq.WORKLOAD_SKIPPED[]
+        @test_logs (:info, r"Base\.compilecache\(Base\.PkgId\(PETScDiffEq\)\)") note()
+        for launcher in ("PMI_RANK", "PMIX_RANK", "OMPI_COMM_WORLD_RANK")
+            @test_logs withenv(note, launcher => "0")
+        end
         @test PETScDiffEq._run_workload() === nothing
+        @test !PETScDiffEq.WORKLOAD_SKIPPED[]
+        @test_logs note()
     end
 
     @testset "several PETSc builds in one process" begin
