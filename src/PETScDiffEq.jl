@@ -5196,7 +5196,6 @@ end
 
 # Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
 function _with_options(f, h::TSHandles)
-    h.ctx.comm === nothing && isempty(h.dms) && return f()
     push!(h.opts)
     try
         return f()
@@ -6165,7 +6164,7 @@ function _init_unlocked(
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = stops_given, kwargs...)
     prob = _with_p(prob, h.ctx.p)
-    LibPETSc.TSSetUp(h.petsclib, h.ts)
+    _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
     _match_steps_here!(h)
     _initial_save!(h)
     stops = _tstops(stops_given, h)
@@ -6369,7 +6368,7 @@ function _reinit_unlocked(
     end
     h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
     try
-        LibPETSc.TSSetUp(h.petsclib, h.ts)
+        _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
         _match_steps_here!(h)
         if !erase_sol
             append!(h.ctx.ts, old.ctx.ts)
