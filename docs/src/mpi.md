@@ -219,10 +219,18 @@ sol_bdf = solve(prob, TSImplicit("bdf"; dm = da))
 
 With a `dm` the implicit algorithms need no `jac_prototype`. Their Jacobian is the DM's own
 matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil. Without a `jac` PETSc
-fills it by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()`
-and the other backends are refused; the stencil has to cover every point `f` reads. Colouring
-calls `f` once per colour at every Jacobian, and the colours grow with the stencil width and
-the degrees of freedom at a point, so a `jac(J, u, p, t)` can fill the matrix instead. It gets
+fills it by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()`;
+the stencil has to cover every point `f` reads. Colouring calls `f` once per colour at every
+Jacobian, and the colours grow with the stencil width and the degrees of freedom at a point.
+On a DMDA `autodiff = AutoForwardDiff()` builds the exact Jacobian instead: `f` runs on a
+ghosted array of dual numbers, each entry seeded by the colour of the grid point it belongs
+to, ghosts included, so one call fills up to 12 colours and a `chunksize` sets another count.
+The colours are the DM's own, or those of the matrix's pattern where PETSc has none or a wrong
+one for a periodic grid. On one rank, for grids in 1-D and 2-D with one and two degrees of
+freedom, star and box stencils and periodic and ghosted edges, the matrix matched a `jac`'s to
+7e-15 where PETSc's colouring was up to 4e-6 off, and the solves took the `jac`'s steps. `f`
+has to accept dual numbers, and a DMStag, a DMPlex, a `DAEProblem`, a complex state and the
+other backends are refused. A `jac(J, u, p, t)` can fill the matrix as well. It gets
 `u` ghosted, as `f` does, and `J` is the DM's matrix as a PETSc.jl `Mat`, zeroed before the
 call and assembled after it, so `jac` writes ``df/du`` into it through PETSc's matrix API,
 each rank its own rows: `set_stencil_values!(J, rows, cols, vals)` writes a block by grid

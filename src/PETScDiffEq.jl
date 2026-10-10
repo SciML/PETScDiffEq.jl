@@ -98,9 +98,9 @@ There `autodiff` defaults to `AutoFiniteDiff()`, `AutoForwardDiff()` colours the
 a sparse `jac_prototype` holding this rank's rows with global columns, and a `jac` fills those
 rows; see the MPI section of the documentation.
 With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
-`jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
-differences `f` into when there is none, with `autodiff` then at its default there,
-`AutoFiniteDiff()`.
+`jac` fills through PETSc's matrix API from the ghosted `u`. Without one `autodiff` defaults
+there to `AutoFiniteDiff()`, PETSc colouring the matrix and differencing `f` into it, and on a
+DMDA `AutoForwardDiff()` fills it from `f` run on dual numbers, seeded by the same colours.
 """
 struct TSRosW <: PETScTSAlgorithm
     subtype::String
@@ -149,9 +149,9 @@ There `autodiff` defaults to `AutoFiniteDiff()`, `AutoForwardDiff()` colours the
 a sparse `jac_prototype` holding this rank's rows with global columns, and a `jac` fills those
 rows; see the MPI section of the documentation.
 With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
-`jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
-differences `f` into when there is none, with `autodiff` then at its default there,
-`AutoFiniteDiff()`.
+`jac` fills through PETSc's matrix API from the ghosted `u`. Without one `autodiff` defaults
+there to `AutoFiniteDiff()`, PETSc colouring the matrix and differencing `f` into it, and on a
+DMDA `AutoForwardDiff()` fills it from `f` run on dual numbers, seeded by the same colours.
 """
 struct TSImplicit <: PETScTSAlgorithm
     subtype::String
@@ -329,9 +329,9 @@ There `autodiff` defaults to `AutoFiniteDiff()`, `AutoForwardDiff()` colours the
 a sparse `jac_prototype` holding this rank's rows with global columns, and a `jac` fills those
 rows; see the MPI section of the documentation.
 With a `dm` the Jacobian is the DM's own matrix, with the pattern of its stencil, which a
-`jac` fills through PETSc's matrix API from the ghosted `u`, or which PETSc colours and
-differences `f` into when there is none, with `autodiff` then at its default there,
-`AutoFiniteDiff()`.
+`jac` fills through PETSc's matrix API from the ghosted `u`. Without one `autodiff` defaults
+there to `AutoFiniteDiff()`, PETSc colouring the matrix and differencing `f` into it, and on a
+DMDA `AutoForwardDiff()` fills it from `f` run on dual numbers, seeded by the same colours.
 """
 struct TSARKIMEX <: PETScTSAlgorithm
     subtype::String
@@ -2458,7 +2458,9 @@ function _set_pc_type!(pl, ts, type)
 end
 
 # PETSc's DMDA colouring refuses a periodic axis whose size its colour count does not divide.
-function _dm_colours(pl, dm)
+_dm_colours(pl, dm) = _dm_colours(Returns(nothing), pl, dm)
+
+function _dm_colours(read, pl, dm)
     coloring = Ref{Ptr{Cvoid}}(C_NULL)
     ccall(
         _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
@@ -2469,13 +2471,18 @@ function _dm_colours(pl, dm)
         (Ptr{Cvoid}, Cint, Ptr{Ptr{Cvoid}}), dm, Cint(LibPETSc.IS_COLORING_GLOBAL), coloring,
     )
     ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ())
-    code == 0 && _check_code(
-        ccall(
-            _symbol(pl, :ISColoringDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
-            coloring,
-        ),
-    )
-    return code == 0
+    code == 0 || return false
+    try
+        read(coloring[])
+    finally
+        _check_code(
+            ccall(
+                _symbol(pl, :ISColoringDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+                coloring,
+            ),
+        )
+    end
+    return true
 end
 
 function _colour_jacobian!(pl, ts, mat)
@@ -4382,6 +4389,33 @@ function _check_local_mass(prob, is_dae, N)
     return nothing
 end
 
+function _refuse_dm_autodiff(prob, alg, is_dae)
+    ad, dm = _autodiff(alg), _alg_dm(alg)
+    other = "give the problem a `jac`, or leave `autodiff` at its default there, " *
+        "`AutoFiniteDiff()`, for the DM's colouring"
+    ADTypes.dense_ad(ad) isa AutoForwardDiff || throw(
+        ArgumentError(
+            "PETScDiffEq cannot use `$ad` $_WITH_DM, where `f` takes the ghosted array " *
+                "PETSc fills and only `AutoForwardDiff()` is carried through it; use that, " *
+                "or $other",
+        ),
+    )
+    type = _dm_type(_dm_lib(dm), dm)
+    type == "da" || throw(
+        ArgumentError(
+            "PETScDiffEq can use `$ad` $_WITH_DM only on a DMDA so far, not on a DM of " *
+                "type `$type`; $other",
+        ),
+    )
+    (is_dae || eltype(prob.u0) <: Complex) && throw(
+        ArgumentError(
+            "PETScDiffEq cannot use `$ad` $_WITH_DM on " *
+                "$(is_dae ? "a DAEProblem" : "a complex state") so far; $other",
+        ),
+    )
+    return nothing
+end
+
 function _refuse_dm(prob, alg, is_dae)
     alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX} ||
         alg isa TSGeneric && alg.explicit || throw(
@@ -4403,13 +4437,7 @@ function _refuse_dm(prob, alg, is_dae)
         ArgumentError("the `dm` gives the Jacobian's pattern, so leave out `jac_prototype`"),
     )
     _uses_ifunction(alg) || return nothing
-    has_jac || _petsc_differences(alg) || throw(
-        ArgumentError(
-            "PETScDiffEq cannot use `$(_autodiff(alg))` $_WITH_DM, since `f` then takes " *
-                "the ghosted array PETSc fills; leave `autodiff` at its default there, " *
-                "`AutoFiniteDiff()`, for the DM's colouring",
-        ),
-    )
+    has_jac || _petsc_differences(alg) || _refuse_dm_autodiff(prob, alg, is_dae)
     _check_diagonal_mass(prob, is_dae, _WITH_DM)
     return nothing
 end
@@ -4826,7 +4854,12 @@ function _setup(
         f_ad = dyn ? f1 : SciMLBase.unwrapped_f(is_split ? prob.f.f1.f : prob.f.f)
         user_t0 = R(prob.tspan[1])
         advice = something(jac_advice, is_dae ? _DAE_ADVICE : _ODE_ADVICE)
-        if comm !== nothing
+        if dm !== nothing
+            _ad_dm_jacobian(
+                _autodiff(alg), _as_inplace(f_ad, iip), petsclib, dm.ptr, u0, prob.p, user_t0,
+                ad_calls, advice, comm, N,
+            )
+        elseif comm !== nothing
             _ad_comm_jacobian(
                 _autodiff(alg), is_dae ? f_ad : _as_inplace(f_ad, iip), prob.f.jac_prototype,
                 u0, prob.p, user_t0, ad_calls, advice, comm, is_dae,
