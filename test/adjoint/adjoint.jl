@@ -243,16 +243,83 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
             sol, TSRK("4"); sensealg = PETScAdjoint(), dt = 0.01, adaptive = false,
             t = TS, dgdu_discrete = dg!, dgdp_continuous = gp!,
         )
-        @test_throws "ArgumentError: PETScAdjoint is reached through" Zygote.gradient(
-            p -> sum(
-                Array(
-                    solve(
-                        prob, TSRK("4"); p, dt = 0.01, adaptive = false, saveat = TS,
-                        sensealg = PETScAdjoint(),
-                    ),
-                ),
-            ),
-            P0,
+    end
+
+    # Measured for the fit and the last state: 1.1e-8 and 7.2e-9 for 5dp, 1.5e-7 and 7.6e-8
+    # for ARKIMEX 3, 1.6e-7 and 8.6e-8 on the split problem; with fixed steps 2.1e-10.
+    @testset "Zygote differentiates solve" begin
+        tight = (abstol = 1.0e-13, reltol = 1.0e-13)
+        fitted = remake(prob; p = [0.77, 0.27, 0.48, 0.16])
+        data = Array(solve(fitted, Tsit5(); saveat = TS, tight...))
+        fit(problem, alg, u0, p; kwargs...) =
+            sum(abs2, Array(solve(problem, alg; u0, p, saveat = TS, kwargs...)) .- data)
+        final(problem, alg, u0, p; kwargs...) =
+            sum(abs2, solve(problem, alg; u0, p, kwargs...).u[end])
+        row(problem, alg, u0, p; kwargs...) = sum(
+            abs2,
+            Array(solve(problem, alg; u0, p, saveat = TS, kwargs...))[end:end, :] .- data[2:2, :],
+        )
+        gradient(loss, problem, alg; kwargs...) = reduce(
+            vcat, Zygote.gradient((u0, p) -> loss(problem, alg, u0, p; kwargs...), U0, P0),
+        )
+        gauss = (sensealg = GaussAdjoint(), tight...)
+        mine = (sensealg = PETScAdjoint(), abstol = 1.0e-8, reltol = 1.0e-8)
+        references = map(loss -> gradient(loss, prob, Tsit5(); gauss...), (fit, final, row))
+        for (problem, alg, bound) in (
+                (prob, TSRK("5dp"), 1.0e-7), (prob, TSARKIMEX("3", EXACT), 1.0e-6),
+                (parts, TSARKIMEX("3", EXACT), 1.0e-6),
+            )
+            for (loss, reference) in zip((fit, final), references)
+                @test relerr(gradient(loss, problem, alg; mine...), reference) < bound
+            end
+        end
+        @test relerr(
+            gradient(row, prob, TSRK("5dp"); save_idxs = [2], mine...), references[3],
+        ) < 1.0e-7
+        only_p = Zygote.gradient(p -> fit(prob, TSRK("5dp"), U0, p; mine...), P0)[1]
+        @test relerr(only_p, references[1][3:6]) < 1.0e-7
+        @test Zygote.gradient(p -> 0 * fit(prob, TSRK("5dp"), U0, p; mine...), P0)[1] == zeros(4)
+        primal, = SciMLBase._concrete_solve_adjoint(
+            prob, TSRK("5dp"), PETScAdjoint(), U0, P0, SciMLBase.ChainRulesOriginator();
+            saveat = TS, mine...,
+        )
+        @test primal.u == solve(prob, TSRK("5dp"); saveat = TS, mine...).u
+
+        # With fixed steps the gradient is that of the loss as `solve` computes it.
+        fixed = (dt = 0.01, adaptive = false)
+        x = vcat(U0, P0)
+        for alg in (TSRK("4"), TSImplicit("cn", EXACT))
+            loss(x) = fit(prob, alg, x[1:2], x[3:6]; fixed...)
+            differences = map(eachindex(x)) do i
+                h = 1.0e-5 .* (eachindex(x) .== i)
+                (loss(x + h) - loss(x - h)) / 2.0e-5
+            end
+            @test relerr(
+                gradient(fit, prob, alg; sensealg = PETScAdjoint(), fixed...), differences,
+            ) < 2.0e-9
+        end
+
+        summed(problem, alg; kwargs...) =
+            p -> sum(Array(solve(problem, alg; p, sensealg = PETScAdjoint(), kwargs...)))
+        never = SciMLBase.DiscreteCallback((u, t, integrator) -> false, integrator -> nothing)
+        single = remake(prob; u0 = Float32.(U0), tspan = (0.0f0, 1.0f0), p = Float32.(P0))
+        @test_throws "ArgumentError: cost time t[2] = 0.1 is not a time the solve stepped to" Zygote.gradient(
+            summed(prob, TSRK("4"); dt = 0.03, adaptive = false, saveat = TS), P0,
+        )
+        @test_throws "ArgumentError: PETScAdjoint does not support callbacks" Zygote.gradient(
+            summed(prob, TSRK("5dp"); callback = never), P0,
+        )
+        @test_throws "ArgumentError: PETSc has no adjoint for TSRosW" Zygote.gradient(
+            summed(prob, TSRosW()), P0,
+        )
+        @test_throws "ArgumentError: PETScAdjoint differentiates `solve` of a Float64 problem only" Zygote.gradient(
+            summed(single, TSRK("4"); dt = 0.01f0, adaptive = false), Float32.(P0),
+        )
+        @test_throws "ArgumentError: the loss depends on the solution's `interp`" Zygote.gradient(
+            p -> sum(solve(prob, TSRK("5dp"); p, sensealg = PETScAdjoint())(0.33)), P0,
+        )
+        @test_throws "ArgumentError: PETScAdjoint differentiates `solve` for Zygote" SciMLBase._concrete_solve_adjoint(
+            prob, TSRK("4"), PETScAdjoint(), U0, P0, SciMLBase.ReverseDiffOriginator(),
         )
     end
 
