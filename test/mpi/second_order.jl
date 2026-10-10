@@ -86,7 +86,7 @@ end
 function halo(u)
     left = rank == 0 ? MPI.PROC_NULL : rank - 1
     right = rank == nranks - 1 ? MPI.PROC_NULL : rank + 1
-    gl, gr = zeros(1), zeros(1)
+    gl, gr = zeros(eltype(u), 1), zeros(eltype(u), 1)
     MPI.Sendrecv!(u[1:1], gr, comm; dest = left, source = right)
     MPI.Sendrecv!(u[end:end], gl, comm; dest = right, source = left)
     return gl[1], gr[1]
@@ -149,6 +149,20 @@ chain_problem(idx, alg; span = (0.0, 50.0)) = DynamicalODEProblem(
     parallel(alg) ? kick! : kick_serial!, drift!, zeros(length(idx)),
     0.4 .* sinpi.(idx ./ (N + 1)) .+ 0.1 .* sinpi.(2 .* idx ./ (N + 1)), span, masses(idx),
 )
+# The kick's rows and then the drift's, in `wave_proto`'s pattern.
+chain_jac(idx) = function (J, x, m, t)
+    q, n = x.x[2], length(idx)
+    left, right = halo(q)
+    for (k, i) in enumerate(idx)
+        a = (k == n ? right : q[k + 1]) - q[k]
+        b = q[k] - (k == 1 ? left : q[k - 1])
+        i > 1 && (J[k, N + i - 1] = 1 + 3 * BETA * b^2)
+        J[k, N + i] = -2 - 3 * BETA * (a^2 + b^2)
+        i < N && (J[k, N + i + 1] = 1 + 3 * BETA * a^2)
+        J[n + k, i] = 1 / m[k]
+    end
+    return nothing
+end
 function chain_energy(x)
     p, q = x[1:N], x[(N + 1):end]
     d = diff(vcat(0.0, q, 0.0))
@@ -255,6 +269,66 @@ end
         end
     end
 
+    @testset "ForwardDiff seeds each rank's [v; u] block" begin
+        forward = AutoForwardDiff()
+        # This rank's rows of the Jacobian at `x`, then the solve.
+        function jac_and_solve(pr, alg, x; kw...)
+            integ = SciMLBase.__init(pr, alg; kw...)
+            ctx = integ.h.ctx
+            J = copy(ctx.J)
+            ctx.jac!(J, x, ctx.p, 0.5)
+            solve!(integ)
+            return J, integ.sol
+        end
+        state(idx) = vcat(cospi.(idx .* dx), wave0(idx))
+        entries(J, Jref) = maximum(abs, nonzeros(J) - nonzeros(Jref); init = 0.0)
+        cases = (
+            (c -> TSAlpha2(direct(comm); comm, c...), TSAlpha2, (; dt = 0.02, adaptive = false), EXACT, ALPHA2_ERR["fixed"]),
+            (c -> TSAlpha2(direct(comm); comm, c...), TSAlpha2, (; abstol = 1.0e-6, reltol = 1.0e-6), STEPPED, ALPHA2_ERR["adaptive"]),
+            (
+                c -> TSImplicit("bdf", direct(comm); comm, c...), o -> TSImplicit("bdf", o),
+                (; abstol = 1.0e-7, reltol = 1.0e-7), STEPPED, BDF_ERR,
+            ),
+        )
+        for (make, serial, kw, gap, err) in cases, span in ((0.0, 1.0), (1.0, 0.0))
+            alg = make((; autodiff = forward))
+            jacs = Dict{Bool, Any}()
+            sol, ref, us = against_serial(alg, serial(direct(MPI.COMM_SELF))) do idx, a
+                jacs[parallel(a)], s = jac_and_solve(wave_problem(idx, a; span, proto = true), a, state(idx); kw...)
+                s
+            end
+            @test sol.retcode == ReturnCode.Success
+            @test sol.stats.njacs > 0
+            @test matches(sol, ref, us, gap)
+            if rank == 0
+                @test maximum(abs, us[end] - wave_exact(span[2] - span[1])) <= err
+                # The serial ForwardDiff Jacobian holds this rank's rows among its own.
+                @test entries(jacs[true], jacs[false][vcat(rows, N .+ rows), :]) <= 1.0e-12
+            end
+            Jref, given = jac_and_solve(wave_problem(rows, alg; span, jac = true), make((;)), state(rows); kw...)
+            @test entries(jacs[true], Jref) <= 1.0e-12
+            @test sol.t == given.t
+            @test sol.stats.njacs == given.stats.njacs
+            @test maxdiff(sol.u, given.u) <= EXACT.u
+        end
+
+        # A DynamicalODEProblem, whose kick is nonlinear and whose drift divides by the masses.
+        base = chain_problem(rows, TSRK(; comm); span = (0.0, 1.0))
+        chain(; kw...) = DynamicalODEProblem(
+            DynamicalODEFunction{true}(kick!, drift!; jac_prototype = wave_proto(rows), kw...),
+            base.u0.x..., base.tspan, base.p,
+        )
+        x = vcat(0.3 .* cospi.(rows ./ 5), 0.4 .* sinpi.(rows ./ 9))
+        fixed = (; dt = 0.05, adaptive = false)
+        J, sol = jac_and_solve(chain(), TSImplicit("bdf", direct(comm); comm, autodiff = forward), x; fixed...)
+        Jref, given = jac_and_solve(chain(; jac = chain_jac(rows)), TSImplicit("bdf", direct(comm); comm), x; fixed...)
+        @test entries(J, Jref) <= 1.0e-12
+        @test sol.retcode == given.retcode == ReturnCode.Success
+        @test sol.t == given.t
+        @test sol.stats.njacs == given.stats.njacs > 0
+        @test maxdiff(sol.u, given.u) <= 1.0e-10
+    end
+
     @testset "callbacks and the integrator: $(nameof(typeof(alg)))" for (alg, serial_alg, kw) in (
             (TSBasicSymplectic(; comm), TSBasicSymplectic(), (; dt = 0.02)),
             (
@@ -334,12 +408,12 @@ end
             end
             return nothing
         end
-        function springs(idx)
+        function springs(idx; jac = true)
             n = length(idx)
             proto = sparse([1:n; n .+ (1:n)], [N .+ idx; idx], ones(2n), 2n, 2N)
-            fn = DynamicalODEFunction{true}(
-                spring!, velocity!; jac = spring_jac(idx), jac_prototype = proto,
-            )
+            fn = jac ?
+                DynamicalODEFunction{true}(spring!, velocity!; jac = spring_jac(idx), jac_prototype = proto) :
+                DynamicalODEFunction{true}(spring!, velocity!; jac_prototype = proto)
             return SecondOrderODEProblem(fn, zeros(n), ones(n), (0.0, 1.0), stiffness(idx))
         end
         root = sqrt.(stiffness(1:N))
@@ -359,6 +433,13 @@ end
             @test matches(sol, ref, us, haskey(kw, :abstol) ? STEPPED : EXACT)
             rank == 0 && @test maximum(abs, us[end] - exact) <= SPRING_ERR
         end
+        forward = TSAlpha2(direct(comm); comm, autodiff = AutoForwardDiff())
+        sol, ref, us = against_serial(forward, TSAlpha2(direct(MPI.COMM_SELF)); layout, idx) do i, a
+            SciMLBase.__solve(springs(i; jac = false), a; dt = 0.01, adaptive = false)
+        end
+        @test sol.retcode == ReturnCode.Success
+        @test sol.stats.njacs > 0
+        @test matches(sol, ref, us, EXACT)
     end
 
     @testset "f1, f2 or jac throwing on one rank raises on every rank" begin
@@ -376,6 +457,7 @@ end
             ),
         )
         fixed = (; dt = 0.02, adaptive = false)
+        forward = AutoForwardDiff()
         for alg in (TSBasicSymplectic(; comm), TSRK("5dp"; comm))
             @test raised(thrown(late(wave!, "f1"), exchanging!, alg; dt = 0.02), "f1 threw")
             @test raised(thrown(wave!, late(exchanging!, "f2"), alg; dt = 0.02), "f2 threw")
@@ -384,6 +466,10 @@ end
             alg = TSAlpha2(; comm)
             e = caught(() -> SciMLBase.__solve(wave_problem(rows, alg; proto = true, f = late(wave!, "f1")), alg; kw...))
             @test raised(e, "f1 threw")
+            for ad_alg in (TSAlpha2(; comm, autodiff = forward), TSImplicit("bdf"; comm, autodiff = forward))
+                pr = wave_problem(rows, alg; proto = true, f = late(wave!, "f1"))
+                @test raised(caught(() -> SciMLBase.__solve(pr, ad_alg; kw...)), "f1 threw")
+            end
             fn = DynamicalODEFunction{true}(
                 wave!, velocity!; jac = late(wave_jac(rows), "jac"), jac_prototype = wave_proto(rows),
             )
@@ -399,10 +485,15 @@ end
         n = length(rows)
         alg = TSAlpha2(; comm)
         forward = AutoForwardDiff()
-        for ad_alg in (TSAlpha2(; comm, autodiff = forward), TSImplicit("bdf"; comm, autodiff = forward))
+        zygote = PETScDiffEq.ADTypes.AutoZygote()
+        for make in (c -> TSAlpha2(; comm, c...), c -> TSImplicit("bdf"; comm, c...))
             @test refused(
-                () -> SciMLBase.__solve(wave_problem(rows, alg; proto = true), ad_alg; dt = 0.02),
-                "cannot use `AutoForwardDiff()` on a DynamicalODEProblem or SecondOrderODEProblem",
+                () -> SciMLBase.__solve(wave_problem(rows, alg), make((; autodiff = forward)); dt = 0.02),
+                "needs a sparse `jac_prototype`",
+            )
+            @test refused(
+                () -> SciMLBase.__solve(wave_problem(rows, alg; proto = true), make((; autodiff = zygote)); dt = 0.02),
+                "AutoZygote()` on a communicator",
             )
         end
         dense_jac = SecondOrderODEProblem(

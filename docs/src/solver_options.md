@@ -95,7 +95,10 @@ the Jacobian, which then costs Newton iterations. Passing
 `autodiff = PETScDiffEq.AutoFiniteDiff()` to the algorithm leaves the Jacobian to PETSc's
 finite differences, coloured by a sparse prototype too. On a badly scaled stiff problem such as
 Robertson's, those are far enough off that the solve reports success with an answer
-wrong in its first digit, so keep them for a right-hand side ForwardDiff cannot run.
+wrong in its first digit, so keep them for a right-hand side ForwardDiff cannot run. They are
+the default with a `dm` or on a communicator, where `autodiff = PETScDiffEq.AutoForwardDiff()`
+asks for the exact Jacobian: with a DMDA as the `dm` it is seeded by the DM's colouring, and
+on a communicator by the colouring of a sparse `jac_prototype`.
 
 `DiscreteCallback`, `ContinuousCallback`, `VectorContinuousCallback` and `CallbackSet`
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`,
