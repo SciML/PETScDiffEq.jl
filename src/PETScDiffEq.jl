@@ -1,6 +1,7 @@
 module PETScDiffEq
 
 using ADTypes: ADTypes, AutoFiniteDiff, AutoForwardDiff
+using ConstructionBase: ConstructionBase
 using DiffEqBase: DiffEqBase
 using DifferentiationInterface: DifferentiationInterface as DI
 using ForwardDiff: ForwardDiff
@@ -4035,8 +4036,7 @@ const UNSUPPORTED_KWARGS = (
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2, :failfactor,
     :step_limiter, :stage_limiter,
 )
-const UNSUPPORTED_SWITCHES =
-    (:progress, :advance_to_tstop, :stop_at_next_tstop, :save_discretes)
+const UNSUPPORTED_SWITCHES = (:progress, :advance_to_tstop, :stop_at_next_tstop)
 const UNSUPPORTED_UNLESS_NOTHING = (:maxtime, :rng)
 
 # An alias specifier permits aliasing, so only one asking for `u0` or `du0` goes unmet.
@@ -5703,6 +5703,7 @@ mutable struct PETScIntegratorOpts{H, R}
     save_everystep::Bool
     save_start::Bool
     save_end::Bool
+    save_discretes::Bool
     dense::Bool
     save_idxs::Union{Nothing, Vector{Int}}
     calck::Bool
@@ -5788,10 +5789,11 @@ integrator as an `Array` of its size.
 
 `iter` counts every step attempted, accepted, rejected or failed, as `maxiters` does. `opts`
 carries the options OrdinaryDiffEq's integrator exposes where PETSc has them. Assigning
-`maxiters`, `save_everystep`, `save_start`, `save_end`, `unstable_check` or `isoutofdomain`
-takes effect at once; `tstops` and `saveat` are the live queues keyed by `tdir * t`, with
-`saveat` keeping the times already passed; `unstable_check` and `isoutofdomain` are `nothing`
-unless given; `dense`, `save_idxs`, `calck`, `internalnorm` and `callback` are fixed at `init`.
+`maxiters`, `save_everystep`, `save_start`, `save_end`, `save_discretes`, `unstable_check` or
+`isoutofdomain` takes effect at once; `tstops` and `saveat` are the live queues keyed by
+`tdir * t`, with `saveat` keeping the times already passed; `unstable_check` and
+`isoutofdomain` are `nothing` unless given; `dense`, `save_idxs`, `calck`, `internalnorm` and
+`callback` are fixed at `init`.
 """
 mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractArray{S}} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, UT, R}
@@ -5910,7 +5912,8 @@ function _make_opts(
         R(something(get(kwargs, :dtmax, nothing), Inf)),
         get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
         get(kwargs, :save_on, true) === true,
-        ctx.maxiters, ctx.save_everystep, h.save_start, h.save_end, ctx.dense, ctx.save_idxs,
+        ctx.maxiters, ctx.save_everystep, h.save_start, h.save_end,
+        get(kwargs, :save_discretes, true) === true, ctx.dense, ctx.save_idxs,
         ctx.hermite || ctx.interpolates === true, _internalnorm(ctx.comm),
         ctx.unstable, ctx.domain,
         callback isa SciMLBase.CallbackSet ? callback : SciMLBase.CallbackSet(callback),
@@ -5995,13 +5998,14 @@ function _adopt_p!(integ::PETScIntegrator, p)
     p === integ.prob.p && return nothing
     integ.prob = _with_p(integ.prob, p)
     sol = integ.sol
-    integ.sol = SciMLBase.build_solution(
+    rebuilt = SciMLBase.build_solution(
         integ.prob, integ.alg, sol.t, sol.u; retcode = sol.retcode, stats = sol.stats,
         dense = sol.dense, interp = sol.interp,
         calculate_error = get(integ.kwargs, :calculate_error, true),
         timeseries_errors = get(integ.kwargs, :timeseries_errors, true),
         dense_errors = get(integ.kwargs, :dense_errors, false),
     )
+    integ.sol = _with_discretes(rebuilt, _discretes(sol))
     return nothing
 end
 
@@ -6119,6 +6123,26 @@ SciMLBase.change_t_via_interpolation!(
 
 function _save_here!(integ::PETScIntegrator)
     integ.opts.save_on && _record!(integ.h.ctx, integ.tdir * integ.t, integ.u)
+    return nothing
+end
+
+_discretes(sol::SciMLBase.ODESolution) = sol.discretes
+_discretes(_) = nothing
+
+# `build_solution` starts an empty collection, so a rebuilt solution takes the one saved into.
+_with_discretes(sol, discretes) = discretes === nothing ? sol :
+    ConstructionBase.setproperties(sol, (; discretes))
+
+# The partitions OrdinaryDiffEq saves after an affect!: a vector callback's fired events only.
+function _save_discretes!(integ::PETScIntegrator, cb, crossing = nothing)
+    integ.opts.save_discretes && _discretes(integ.sol) !== nothing || return nothing
+    if cb isa SciMLBase.VectorContinuousCallback
+        for i in eachindex(crossing)
+            crossing[i] == 0 || SciMLBase.save_discretes!(integ, cb, i)
+        end
+    else
+        SciMLBase.save_discretes!(integ, cb)
+    end
     return nothing
 end
 
@@ -6414,13 +6438,18 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
         _checked_everywhere(() -> _fire!(integ, best_cb, best_crossing), ctx.comm)
     end
     integ.finished && return true
-    stop === nothing || (_stop!(integ, best_cb, stop, pre); return true)
-    _anywhere(ctx.comm, integ.derivative_discontinuity) &&
-        _reinitialize!(integ, best_cb.initializealg, before)
+    # OrdinaryDiffEq saves no discretes after an affect! that clears the discontinuity.
+    modified = _anywhere(ctx.comm, integ.derivative_discontinuity)
+    stop === nothing ||
+        (_stop!(integ, best_cb, stop, pre, best_crossing, modified); return true)
+    modified && _reinitialize!(integ, best_cb.initializealg, before)
     integ.finished && return true
     _rollback!(integ, integ.t, dt, false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
-    best_cb.save_positions[2] && _save_here!(integ)
+    if best_cb.save_positions[2]
+        _save_here!(integ)
+        modified && _save_discretes!(integ, best_cb, best_crossing)
+    end
     return true
 end
 
@@ -6446,7 +6475,10 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
             _dirty!(ctx)
         end
-        cb.save_positions[2] && _save_here!(integ)
+        if cb.save_positions[2]
+            _save_here!(integ)
+            _save_discretes!(integ, cb)
+        end
     end
     return nothing
 end
@@ -6466,6 +6498,8 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     integ.derivative_discontinuity = false
     _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, before)
     integ.finished && return nothing
+    initialize_save && _discretes(integ.sol) !== nothing &&
+        SciMLBase.save_discretes_if_enabled!(integ, integ.opts.callback; skip_duplicates = true)
     _everywhere(h.ctx.comm, integ.u == before) && return nothing
     copyto!(integ.uprev, integ.u)
     _write_state!(h, integ.u)
@@ -6764,7 +6798,8 @@ function _reinit_unlocked(
         fill!(ev, NaN)
     end
     integ.derivative_discontinuity = false
-    integ.sol = _initial_solution(integ.prob, integ.alg, h, integ.kwargs)
+    sol = _initial_solution(integ.prob, integ.alg, h, integ.kwargs)
+    integ.sol = erase_sol ? sol : _with_discretes(sol, _discretes(integ.sol))
     if h.init_failed
         integ.sol = _initial_failure(integ.prob, integ.alg, h, integ.kwargs)
         integ.finished = true
@@ -6799,11 +6834,16 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
     end
     st = _read_stats(h)
     integ.iter = st.iter
+    s = integ.tdir * integ.t
+    unsaved = !_last_recorded(h.ctx, s)
     sol = _assemble(
-        integ.prob, integ.alg, h, integ.tdir * integ.t, copy(integ.u), st, integ.kwargs,
-        integ.opts.verbose,
+        integ.prob, integ.alg, h, s, copy(integ.u), st, integ.kwargs, integ.opts.verbose,
     )
+    sol = _with_discretes(sol, _discretes(integ.sol))
     integ.sol = retcode === nothing ? sol : SciMLBase.solution_new_retcode(sol, retcode)
+    # As in OrdinaryDiffEq, a finalizer's discretes are saved with an end point added here.
+    unsaved && _last_recorded(h.ctx, s) && _discretes(sol) !== nothing &&
+        SciMLBase.save_final_discretes!(integ, integ.opts.callback)
     integ.finished = true
     _destroy!(h)
     h.ctx.comm === nothing || _throw_if_threw!(h.ctx)
@@ -6836,9 +6876,12 @@ function _affect!(f, integ::PETScIntegrator)
     return stop
 end
 
-function _stop!(integ::PETScIntegrator, cb, retcode, pre)
+function _stop!(integ::PETScIntegrator, cb, retcode, pre, crossing = nothing, modified = true)
     pre === nothing || _record!(integ.h.ctx, integ.tdir * integ.t, pre)
-    cb.save_positions[2] && _save_here!(integ)
+    if cb.save_positions[2]
+        _save_here!(integ)
+        modified && _save_discretes!(integ, cb, crossing)
+    end
     _finish!(integ, retcode)
     return nothing
 end
