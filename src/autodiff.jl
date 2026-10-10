@@ -686,7 +686,7 @@ function _ad_dm_jacobian(backend, f!, pl, dm, u0, p, t, calls, advice, comm, N)
             [r for r in 1:n for _ in cols[r]], [Int(c) + 1 for row in cols for c in row],
             true, n, N,
         )
-        own, _, ncolours = _global_colours(backend, proto, something(comm, MPI.COMM_SELF))
+        own, _, ncolours = _global_colours(backend, proto, something(comm, MPI.COMM_SELF), nothing)
         seed, colour = _spread_colours(ghosts, globals, cols, own, R)
     end
     g! = Counted(f!, calls)
