@@ -149,6 +149,31 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
         end
     end
 
+    # Measured: 2.5e-8 and 8.4e-10 for 5dp, 4.7e-6 and 5.0e-8 for ARKIMEX 3.
+    @testset "interior cost times of an adaptive solve agree with GaussAdjoint" begin
+        times = [0.25, 0.5, 0.75, 1.0]
+        # A dense reference: one saved at these times alone left GaussAdjoint 2e-7 off.
+        dense = solve(prob, Tsit5(); abstol = 1.0e-13, reltol = 1.0e-13)
+        reference = flat(
+            adjoint_sensitivities(
+                dense, Tsit5(); t = times, dgdu_discrete = dg!, sensealg = GaussAdjoint(),
+                abstol = 1.0e-13, reltol = 1.0e-13,
+            ),
+        )
+        for (alg, bounds) in (
+                (TSRK("5dp"), (1.0e-7, 5.0e-9)), (TSARKIMEX("3", EXACT), (2.0e-5, 2.0e-7)),
+            )
+            for (tol, bound) in zip((1.0e-6, 1.0e-8), bounds)
+                sol = solve(prob, alg; abstol = tol, reltol = tol, saveat = times)
+                mine = adjoint_sensitivities(
+                    sol, alg; sensealg = PETScAdjoint(), t = times, dgdu_discrete = dg!,
+                    abstol = tol, reltol = tol,
+                )
+                @test relerr(flat(mine), reference) < bound
+            end
+        end
+    end
+
     @testset "integral costs agree with QuadratureAdjoint and InterpolatingAdjoint" begin
         tight = (abstol = 1.0e-13, reltol = 1.0e-13)
         dense = solve(prob, Tsit5(); tight...)
