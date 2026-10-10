@@ -4015,7 +4015,7 @@ mutable struct TSHandles{CTX, L, R, S}
     matches::Bool
     fixed::Bool
     tolvecs::Vector{Any}
-    tolbufs::Vector{Vector{S}}
+    tolbufs::Vector{Union{Nothing, Vector{S}}}
     destroyed::Bool
     solution::Any
     dms::Vector{Ptr{Cvoid}}
@@ -4133,8 +4133,8 @@ function _set_tolerances!(h::TSHandles{<:Any, <:Any, R}, abstol, reltol) where {
         abstol, reltol = _fold_second_order(abstol, n), _fold_second_order(reltol, n)
     end
     novec = LibPETSc.PetscVec{typeof(pl)}()
-    avec = _tolvec(h, pl, abstol, n, "abstol")
-    rvec = _tolvec(h, pl, reltol, n, "reltol")
+    avec = _tolvec(h, pl, 1, abstol, n)
+    rvec = _tolvec(h, pl, 2, reltol, n)
     LibPETSc.TSSetTolerances(
         pl, h.ts, _tolscalar(R, abstol, 1.0e-6), avec === nothing ? novec : avec,
         _tolscalar(R, reltol, 1.0e-3), rvec === nothing ? novec : rvec,
@@ -4142,11 +4142,15 @@ function _set_tolerances!(h::TSHandles{<:Any, <:Any, R}, abstol, reltol) where {
     return nothing
 end
 
-function _tolvec(h::TSHandles{<:Any, <:Any, R, S}, petsclib, tol, n, name) where {R, S}
+# PETSc keeps a tolerance vector once set and reads its buffer every step, so write there.
+function _tolvec(h::TSHandles{<:Any, <:Any, R, S}, petsclib, slot, tol, n) where {R, S}
+    buf = h.tolbufs[slot]
+    if buf !== nothing
+        tol isa AbstractVector ? copyto!(buf, tol) : fill!(buf, tol)
+        return nothing
+    end
     tol isa AbstractVector || return nothing
-    # PETSc borrows `buf` and reads it every step, so the handle keeps it alive.
-    buf = Vector{S}(collect(tol))
-    push!(h.tolbufs, buf)
+    buf = h.tolbufs[slot] = Vector{S}(collect(tol))
     comm = h.ctx.comm
     v = comm === nothing ? PETScCompat.PetscVec(petsclib, buf) :
         LibPETSc.VecCreateMPIWithArray(
@@ -4997,7 +5001,8 @@ function _setup(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, save_start, save_end, end_saveat, false, 0, false,
         false,
-        Any[], Vector{S}[], false, nothing, dms, !initialized, f_init, jac_init,
+        Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
+        !initialized, f_init, jac_init,
     )
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -5795,6 +5800,10 @@ SciMLBase.set_proposed_dt!(integ::PETScIntegrator, dt) =
     _locked(() -> _set_proposed_dt_unlocked(integ, dt))
 SciMLBase.set_proposed_dt!(integ::PETScIntegrator, other::SciMLBase.DEIntegrator) =
     SciMLBase.set_proposed_dt!(integ, SciMLBase.get_proposed_dt(other))
+
+# AutoAbstol writes into a tolerance vector, so the options hold their own copy.
+_own_tol(tol) = tol isa AbstractVector ? copy(tol) : tol
+
 function _make_opts(
         h::TSHandles{<:Any, <:Any, R}, kwargs;
         tstops = R[], d_discontinuities = R[], callback = nothing,
@@ -5802,7 +5811,7 @@ function _make_opts(
     ctx = h.ctx
     return PETScIntegratorOpts(
         h, get(kwargs, :adaptive, true) === true,
-        get(kwargs, :abstol, 1.0e-6), get(kwargs, :reltol, 1.0e-3),
+        _own_tol(get(kwargs, :abstol, 1.0e-6)), _own_tol(get(kwargs, :reltol, 1.0e-3)),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
         get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
@@ -6465,6 +6474,19 @@ end
 # PETSc needs dt_max strictly above dt_min.
 _above(hi, lo) = hi > lo ? hi : nextfloat(lo)
 
+# No setter sees a tolerance vector written in place, so each step takes it as it stands.
+function _take_written_tolerances!(integ::PETScIntegrator)
+    h = integ.h
+    abstol, reltol = getfield(integ.opts, :abstol), getfield(integ.opts, :reltol)
+    abstol isa AbstractVector || reltol isa AbstractVector || return nothing
+    _checked_everywhere(h.ctx.comm) do
+        _check_tol(abstol, length(h.u0), :abstol)
+        _check_tol(reltol, length(h.u0), :reltol)
+    end
+    _set_tolerances!(h, abstol, reltol)
+    return nothing
+end
+
 function _take_written_state!(integ::PETScIntegrator)
     h = integ.h
     _everywhere(h.ctx.comm, _read_state!(integ.ucache, h.ctx, h.u) == integ.u) &&
@@ -6788,6 +6810,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         return nothing
     end
     outer === nothing && _take_written_state!(integ)
+    outer === nothing && _take_written_tolerances!(integ)
     dtprev = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     before = (
         Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty,

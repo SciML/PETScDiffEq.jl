@@ -4478,6 +4478,46 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 abstol = [1.0e-10, 1.0e-10],
             )
         end
+
+        @testset "a tolerance changed on the integrator is the one the next step takes" begin
+            function wide!(du, u, p, t)
+                du[1] = 0.0
+                du[2] = u[3]
+                return du[3] = -100 * u[2]
+            end
+            wide = SciMLBase.ODEProblem(wide!, [1000.0, 1.0e-3, 0.0], (0.0, 10.0))
+            tight() = fill(1.0e-12, 3)
+            changes = (
+                integ -> (integ.opts.abstol .= 1.0e-3), integ -> (integ.opts.abstol = 1.0e-3),
+                integ -> (integ.opts.abstol = fill(1.0e-3, 3)),
+            )
+            for rk in (alg, PETScDiffEq.TSRK("5dp"; comm = MPI.COMM_WORLD))
+                run(; kw...) = SciMLBase.solve(wide, rk; dt = 1.0e-3, reltol = 1.0e-6, kw...)
+                auto(abstol) = run(; abstol, callback = DiffEqCallbacks.AutoAbstol())
+                given = tight()
+                scalar, vector = auto(1.0e-12), auto(given)
+                @test 5 * scalar.stats.naccept < run(; abstol = 1.0e-12).stats.naccept
+                @test vector.t == scalar.t
+                @test vector.u == scalar.u
+                @test given == tight()
+                loose = run(; abstol = 1.0e-3)
+                for change! in changes
+                    integ = SciMLBase.init(wide, rk; dt = 1.0e-3, reltol = 1.0e-6, abstol = tight())
+                    change!(integ)
+                    @test SciMLBase.solve!(integ).t == loose.t
+                end
+                integ = SciMLBase.init(
+                    wide, rk; dt = 1.0e-3, reltol = fill(1.0e-6, 3), abstol = 1.0e-3,
+                )
+                integ.opts.reltol .= 1.0e-2
+                @test SciMLBase.solve!(integ).t == run(; reltol = 1.0e-2, abstol = 1.0e-3).t
+                SciMLBase.reinit!(integ)
+                @test integ.opts.reltol == fill(1.0e-6, 3)
+                integ.opts.reltol[2] = -1.0
+                @test_throws ArgumentError SciMLBase.step!(integ)
+                SciMLBase.terminate!(integ)
+            end
+        end
     end
 
     @testset "save_idxs" begin
