@@ -568,8 +568,9 @@ implicit `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`, `"arkimex"`, `"irk"`,
 `"dirk"` as [`TSImplicit`](@ref) runs, with `autodiff` defaulting to `AutoFiniteDiff()`. Other
 implicit types are refused there: `"glle"`'s step control follows the round-off of the
 distributed linear solve, so it takes other steps than a serial solve and ends with another
-error, larger or smaller. A `dm` runs an explicit type as it runs [`TSRK`](@ref) and refuses an
-implicit one.
+error, larger or smaller. A `dm` runs an explicit type as it runs [`TSRK`](@ref) and the same
+implicit types as it runs [`TSImplicit`](@ref), except `"irk"`, which it refuses as it does
+[`TSIRK`](@ref).
 """
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
@@ -3752,6 +3753,7 @@ function __init__()
     )
     _init_adjoint_pointers!()
     _init_initialization_pointers!()
+    _note_skipped_workload()
     return nothing
 end
 
@@ -3979,6 +3981,19 @@ const UNSUPPORTED_KWARGS = (
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2, :failfactor,
     :step_limiter, :stage_limiter,
 )
+const UNSUPPORTED_SWITCHES =
+    (:progress, :advance_to_tstop, :stop_at_next_tstop, :save_discretes)
+const UNSUPPORTED_UNLESS_NOTHING = (:maxtime, :rng)
+
+# An alias specifier permits aliasing, so only one asking for `u0` or `du0` goes unmet.
+_asks_alias(alias) = alias === true || any((:alias_u0, :alias_du0)) do k
+    hasfield(typeof(alias), k) && getfield(alias, k) === true
+end
+
+_drops(key, value) = key in UNSUPPORTED_KWARGS ||
+    key in UNSUPPORTED_SWITCHES && value === true ||
+    key in UNSUPPORTED_UNLESS_NOTHING && value !== nothing ||
+    key === :alias && _asks_alias(value)
 
 mutable struct TSHandles{CTX, L, R, S}
     ctx::CTX
@@ -4001,7 +4016,7 @@ mutable struct TSHandles{CTX, L, R, S}
     matches::Bool
     fixed::Bool
     tolvecs::Vector{Any}
-    tolbufs::Vector{Vector{S}}
+    tolbufs::Vector{Union{Nothing, Vector{S}}}
     destroyed::Bool
     solution::Any
     dms::Vector{Ptr{Cvoid}}
@@ -4119,8 +4134,8 @@ function _set_tolerances!(h::TSHandles{<:Any, <:Any, R}, abstol, reltol) where {
         abstol, reltol = _fold_second_order(abstol, n), _fold_second_order(reltol, n)
     end
     novec = LibPETSc.PetscVec{typeof(pl)}()
-    avec = _tolvec(h, pl, abstol, n, "abstol")
-    rvec = _tolvec(h, pl, reltol, n, "reltol")
+    avec = _tolvec(h, pl, 1, abstol, n)
+    rvec = _tolvec(h, pl, 2, reltol, n)
     LibPETSc.TSSetTolerances(
         pl, h.ts, _tolscalar(R, abstol, 1.0e-6), avec === nothing ? novec : avec,
         _tolscalar(R, reltol, 1.0e-3), rvec === nothing ? novec : rvec,
@@ -4128,11 +4143,15 @@ function _set_tolerances!(h::TSHandles{<:Any, <:Any, R}, abstol, reltol) where {
     return nothing
 end
 
-function _tolvec(h::TSHandles{<:Any, <:Any, R, S}, petsclib, tol, n, name) where {R, S}
+# PETSc keeps a tolerance vector once set and reads its buffer every step, so write there.
+function _tolvec(h::TSHandles{<:Any, <:Any, R, S}, petsclib, slot, tol, n) where {R, S}
+    buf = h.tolbufs[slot]
+    if buf !== nothing
+        tol isa AbstractVector ? copyto!(buf, tol) : fill!(buf, tol)
+        return nothing
+    end
     tol isa AbstractVector || return nothing
-    # PETSc borrows `buf` and reads it every step, so the handle keeps it alive.
-    buf = Vector{S}(collect(tol))
-    push!(h.tolbufs, buf)
+    buf = h.tolbufs[slot] = Vector{S}(collect(tol))
     comm = h.ctx.comm
     v = comm === nothing ? PETScCompat.PetscVec(petsclib, buf) :
         LibPETSc.VecCreateMPIWithArray(
@@ -4344,7 +4363,8 @@ end
 
 const _DISTRIBUTED_IMPLICIT =
     ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "irk", "alpha", "dirk")
-const _DM_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex")
+# PETSc's IRK takes an AIJ matrix made here, which would replace the DM's.
+const _DM_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "alpha", "dirk")
 const _WITH_DM = "with a `dm`"
 
 function _check_diagonal_mass(prob, is_dae, where, or = "")
@@ -4383,13 +4403,16 @@ function _check_local_mass(prob, is_dae, N)
 end
 
 function _refuse_dm(prob, alg, is_dae)
-    alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX} ||
-        alg isa TSGeneric && alg.explicit || throw(
+    alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX, TSGeneric} || throw(
         ArgumentError(
-            "PETScDiffEq cannot run " *
-                "$(alg isa TSGeneric ? "an implicit TSGeneric" : nameof(typeof(alg))) " *
-                "$_WITH_DM; TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX and " *
-                "TSGeneric(...; explicit = true) can",
+            "PETScDiffEq cannot run $(nameof(typeof(alg))) $_WITH_DM; TSRK, TSRosW, " *
+                "TSImplicit, TSDAE, TSARKIMEX and TSGeneric can",
+        ),
+    )
+    alg isa TSGeneric && !alg.explicit && !(alg.ts_type in _DM_IMPLICIT) && throw(
+        ArgumentError(
+            "TSGeneric(\"$(alg.ts_type)\") cannot run $_WITH_DM; only " *
+                "$(join(_DM_IMPLICIT, ", ")) can",
         ),
     )
     has_jac = prob.f.jac !== nothing
@@ -4696,14 +4719,8 @@ function _setup(
         kwargs...,
     )
     prob = _summed(problem, alg)
-    for key in UNSUPPORTED_KWARGS
-        if haskey(kwargs, key)
-            @warn "PETScDiffEq does not support `$key` and is ignoring it"
-        end
-    end
-    for key in (:progress, :advance_to_tstop, :stop_at_next_tstop)
-        get(kwargs, key, false) === true &&
-            @warn "PETScDiffEq does not support `$key` and is ignoring it"
+    for (key, value) in pairs(kwargs)
+        _drops(key, value) && @warn "PETScDiffEq does not support `$key` and is ignoring it"
     end
     prob.u0 isa AbstractVector{<:Union{Real, Complex}} || throw(
         ArgumentError("PETScDiffEq requires an AbstractVector u0 of real or complex numbers"),
@@ -4989,7 +5006,8 @@ function _setup(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, save_start, save_end, end_saveat, false, 0, false,
         false,
-        Any[], Vector{S}[], false, nothing, dms, !initialized, f_init, jac_init,
+        Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
+        !initialized, f_init, jac_init,
     )
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -5395,6 +5413,7 @@ function _assemble(
     return SciMLBase.build_solution(
         prob, alg, ts, ctx.us; retcode = retcode, stats = stats,
         dense = ctx.dense, interp = _interp(ctx, ts, dus),
+        calculate_error = get(kwargs, :calculate_error, true),
         timeseries_errors = get(kwargs, :timeseries_errors, true),
         dense_errors = get(kwargs, :dense_errors, false),
     )
@@ -5786,6 +5805,10 @@ SciMLBase.set_proposed_dt!(integ::PETScIntegrator, dt) =
     _locked(() -> _set_proposed_dt_unlocked(integ, dt))
 SciMLBase.set_proposed_dt!(integ::PETScIntegrator, other::SciMLBase.DEIntegrator) =
     SciMLBase.set_proposed_dt!(integ, SciMLBase.get_proposed_dt(other))
+
+# AutoAbstol writes into a tolerance vector, so the options hold their own copy.
+_own_tol(tol) = tol isa AbstractVector ? copy(tol) : tol
+
 function _make_opts(
         h::TSHandles{<:Any, <:Any, R}, kwargs;
         tstops = R[], d_discontinuities = R[], callback = nothing,
@@ -5793,7 +5816,7 @@ function _make_opts(
     ctx = h.ctx
     return PETScIntegratorOpts(
         h, get(kwargs, :adaptive, true) === true,
-        get(kwargs, :abstol, 1.0e-6), get(kwargs, :reltol, 1.0e-3),
+        _own_tol(get(kwargs, :abstol, 1.0e-6)), _own_tol(get(kwargs, :reltol, 1.0e-3)),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
         get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
@@ -5885,6 +5908,7 @@ function _adopt_p!(integ::PETScIntegrator, p)
     integ.sol = SciMLBase.build_solution(
         integ.prob, integ.alg, sol.t, sol.u; retcode = sol.retcode, stats = sol.stats,
         dense = sol.dense, interp = sol.interp,
+        calculate_error = get(integ.kwargs, :calculate_error, true),
         timeseries_errors = get(integ.kwargs, :timeseries_errors, true),
         dense_errors = get(integ.kwargs, :dense_errors, false),
     )
@@ -6392,7 +6416,7 @@ function _init_unlocked(
         Vector{R}[fill(R(NaN), _ncond(cb)) for cb in continuous],
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
         stops, tstops, d_discontinuities, d_discontinuities, dt0,
-        _initial_solution(prob, alg, h), false, false, nothing, 0,
+        _initial_solution(prob, alg, h, kwargs), false, false, nothing, 0,
     )
     if h.init_failed
         integ.sol = _initial_failure(prob, alg, h, kwargs)
@@ -6454,6 +6478,19 @@ end
 
 # PETSc needs dt_max strictly above dt_min.
 _above(hi, lo) = hi > lo ? hi : nextfloat(lo)
+
+# No setter sees a tolerance vector written in place, so each step takes it as it stands.
+function _take_written_tolerances!(integ::PETScIntegrator)
+    h = integ.h
+    abstol, reltol = getfield(integ.opts, :abstol), getfield(integ.opts, :reltol)
+    abstol isa AbstractVector || reltol isa AbstractVector || return nothing
+    _checked_everywhere(h.ctx.comm) do
+        _check_tol(abstol, length(h.u0), :abstol)
+        _check_tol(reltol, length(h.u0), :reltol)
+    end
+    _set_tolerances!(h, abstol, reltol)
+    return nothing
+end
 
 function _take_written_state!(integ::PETScIntegrator)
     h = integ.h
@@ -6526,7 +6563,7 @@ _user_time(h::TSHandles) = h.tdir > 0 ? (h.ctx.ts, h.ctx.dus) :
 
 _nf(h::TSHandles) = h.ctx.nf + (h.ad_calls === nothing ? 0 : h.ad_calls[])
 
-function _initial_solution(prob, alg, h::TSHandles)
+function _initial_solution(prob, alg, h::TSHandles, kwargs)
     ts, dus = _user_time(h)
     # The running `sol` shares these arrays, and `_record!` extends a reversed span's copies.
     h.tdir > 0 || ((h.ctx.user_ts, h.ctx.user_dus) = (ts, dus))
@@ -6536,6 +6573,7 @@ function _initial_solution(prob, alg, h::TSHandles)
     return SciMLBase.build_solution(
         prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
         dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = stats,
+        calculate_error = get(kwargs, :calculate_error, true),
     )
 end
 
@@ -6635,7 +6673,7 @@ function _reinit_unlocked(
         fill!(ev, NaN)
     end
     integ.derivative_discontinuity = false
-    integ.sol = _initial_solution(integ.prob, integ.alg, h)
+    integ.sol = _initial_solution(integ.prob, integ.alg, h, integ.kwargs)
     if h.init_failed
         integ.sol = _initial_failure(integ.prob, integ.alg, h, integ.kwargs)
         integ.finished = true
@@ -6777,6 +6815,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         return nothing
     end
     outer === nothing && _take_written_state!(integ)
+    outer === nothing && _take_written_tolerances!(integ)
     dtprev = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     before = (
         Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty,
