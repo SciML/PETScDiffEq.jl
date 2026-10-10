@@ -11374,6 +11374,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
     end
 
     @testset "MPI" begin
+        # MPI_RANKS, such as 2 or 1,3, narrows the rank counts, so CI runs each in its own job.
+        listed = get(ENV, "MPI_RANKS", "")
+        rank_counts = isempty(listed) ? [1, 2, 3] : tryparse.(Int, split(listed, ','))
+        allunique(rank_counts) && rank_counts ⊆ 1:3 ||
+            error("MPI_RANKS is a comma-separated list of distinct rank counts from 1, 2 and 3, not $listed")
         if Sys.WORD_SIZE == 64 && !Sys.iswindows()
             dir = joinpath(@__DIR__, "mpi")
             julia = Base.julia_cmd()
@@ -11392,7 +11397,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 ),
                 (2, ["ensemble.jl"]),
             )
-            for np in (1, 2, 3), (threads, scripts) in launches
+            for np in rank_counts, (threads, scripts) in launches
                 rank_cmd = `$julia --threads=$threads --project=$dir $(joinpath(dir, "all.jl")) $scripts`
                 cmd = `$(MPI.mpiexec()) -n $np $rank_cmd`
                 proc = run(pipeline(cmd; stdout, stderr); wait = false)
