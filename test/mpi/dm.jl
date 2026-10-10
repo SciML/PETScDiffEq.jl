@@ -25,6 +25,8 @@ const ROUNDOFF = 5.0e-14
 const JAC_SERIAL_TOL = (bdf = 5.0e-13, rosw = 2.0e-8)
 const COLOUR_TOL = 1.0e-13
 const INIT_GAP = 1.0e-14
+# Measured at 1 and 2 ranks: a start from a `jac` is within 1.5e-14 of the coloured one.
+const INIT_JAC_GAP = 1.0e-12
 # Measured at 1 to 3 ranks with direct linear solves: DMStag solves are within 8.0e-15 of the
 # serial ones and 1.1e-14 of colouring, steps and DAE initialization within 1.1e-19, and the
 # adjoint within 1.8e-15 relative.
@@ -960,7 +962,9 @@ end
             end
             return nothing
         end
+        seen = Ref(0)
         function chain_jac_dm!(J, u, da, gamma)
+            seen[] += 1
             U = reshape_local_array(u, da)
             for (k, i) in enumerate(rows)
                 c = U[1, i]
@@ -1007,17 +1011,36 @@ end
             ref = solve(without, method(form; comm); initializealg = ia, TOL...)
             @test got.retcode == ref.retcode == ReturnCode.Success
             @test anywhere(maximum(abs, got.u[1] - heat0(rows)) > 0.1)
-            @test everywhere(maximum(abs, got.u[1] - ref.u[1]) <= INIT_GAP)
+            gap = jac ? INIT_JAC_GAP : INIT_GAP
+            @test everywhere(maximum(abs, got.u[1] - ref.u[1]) <= gap)
+            seen[] = 0
             integ = init(with_dm, method(form; dm = da, comm); initializealg = ia, TOL...)
+            # Initialization fills the DM's matrix from the `jac` on a communicator too.
+            @test (seen[] > 0) == jac
             SciMLBase.set_u!(integ, integ.u .+ 0.05)
             SciMLBase.initialize_dae!(integ)
             plain = init(without, method(form; comm); initializealg = ia, TOL...)
             SciMLBase.set_u!(plain, plain.u .+ 0.05)
             SciMLBase.initialize_dae!(plain)
-            @test everywhere(maximum(abs, integ.u - plain.u) <= INIT_GAP)
+            @test everywhere(maximum(abs, integ.u - plain.u) <= gap)
             terminate!(integ)
             terminate!(plain)
         end
+        function throwing_jac!(J, u, da, t)
+            rank == thrower && error("jac threw on rank $rank")
+            return ode_jac_dm!(J, u, da, t)
+        end
+        fn = ODEFunction(chain_dm!; jac = throwing_jac!, mass_matrix = Diagonal(m))
+        for ia in (DiffEqBase.BrownFullBasicInit(), DiffEqBase.ShampineCollocationInit())
+            e = caught(
+                () -> init(
+                    ODEProblem(fn, heat0(rows), SPAN, da), TSImplicit("bdf"; dm = da, comm);
+                    initializealg = ia, TOL...,
+                ),
+            )
+            @test raised(e, "jac threw")
+        end
+        @test everywhere(refs(da.ptr) == 1)
     end
 
     @testset "TSARKIMEX takes its first stage at the step's start" begin
