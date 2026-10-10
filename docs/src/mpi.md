@@ -164,19 +164,28 @@ steps of `TSRK`, the energy error included, and to 1.2e-9 with adaptive steps of
 colouring, whose differences depend on the layout, moved `TSAlpha2` by up to 3e-6.
 
 `PETScAdjoint` runs distributed too, for `TSRK`, `TSARKIMEX` on an `ODEProblem` and
-`TSImplicit`'s `"beuler"`, `"cn"` and `"theta"`. It needs the problem's `jac`, filling this
+`TSImplicit`'s `"beuler"`, `"cn"` and `"theta"`. It takes the problem's `jac`, filling this
 rank's rows of a sparse prototype as above, and when there are parameters a `paramjac`
-filling this rank's rows, since it builds neither by automatic differentiation there; both
-are collective like `f`. An explicit method takes such a `jac` in its own solve too, and
-ignores it there. `dgdu_discrete` gets this rank's rows of the
-state and writes their gradient, and `dgdp_discrete` gives this rank's share of the cost's
-direct derivative with respect to `p`, which the ranks add up. `du0` comes back as this
-rank's rows and `dp` as the whole gradient, the same on every rank. The cost times,
-`no_start`, the length of `p` and whether `dgdp_discrete` is given have to agree across the
-ranks. A `jac`, `paramjac`, cost function or `f` that throws on some ranks makes every rank
-throw, as in a solve. The transposed linear solves of `TSImplicit` and `TSARKIMEX` use the
-solver above; `["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves
-them directly.
+filling this rank's rows; both are collective like `f`. An explicit method takes such a
+`jac` in its own solve too, and ignores it there. Without a `jac` it builds one with
+ForwardDiff from the sparse prototype, coloured as above, so `f`'s buffers have to take
+`u`'s element type. An implicit method needs `autodiff = AutoForwardDiff()` for that, since
+the default on such a `comm`, `AutoFiniteDiff()`, leaves the adjoint no Jacobian to multiply
+by; `TSRK` has no `autodiff` and needs only the prototype. Without a `paramjac` it seeds `p`
+instead: every rank calls `f` once per chunk of parameters and keeps its own rows. `u` holds
+plain numbers in those calls, so a halo exchange of `u` goes through as in the solve, and
+only what `f` sends that depends on `p` has to travel in a buffer that takes dual numbers.
+Other backends are refused for both. On 1 and 2 ranks the gradients built this way were
+within 1.5e-15 relative of those from a hand-written `jac` and `paramjac` and of the serial
+adjoint's, for `TSRK`, `TSImplicit` and `TSARKIMEX`. `dgdu_discrete` gets this rank's rows
+of the state and writes their gradient, and `dgdp_discrete` gives this rank's share of the
+cost's direct derivative with respect to `p`, which the ranks add up. `du0` comes back as
+this rank's rows and `dp` as the whole gradient, the same on every rank. The cost times,
+`no_start`, the length of `p` and whether `dgdp_discrete`, `jac` and `paramjac` are given
+have to agree across the ranks. A `jac`, `paramjac`, cost function or `f` that throws on
+some ranks makes every rank throw, as in a solve. The transposed linear solves of
+`TSImplicit` and `TSARKIMEX` use the solver above; `["-ksp_type", "preonly", "-pc_type",
+"redundant"]` in `petsc_options` solves them directly.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
 which every algorithm that takes `comm` takes as well. The solve then runs on the DM's

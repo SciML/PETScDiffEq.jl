@@ -4495,14 +4495,16 @@ function _refuse_distributed(prob, alg, is_dae, N)
             ),
         )
     end
-    size(proto) == (n, N) || throw(
-        ArgumentError(
-            "the `jac_prototype` is $(join(size(proto), " x ")), but $_NOT_SELF it holds " *
-                "this rank's rows, so it must be $n x $N",
-        ),
-    )
+    _check_local_rows(proto, n, N)
     return nothing
 end
+
+_check_local_rows(proto, n, N) = size(proto) == (n, N) || throw(
+    ArgumentError(
+        "the `jac_prototype` is $(join(size(proto), " x ")), but $_NOT_SELF it holds " *
+            "this rank's rows, so it must be $n x $N",
+    ),
+)
 
 # On i686 PETSc_jll's single builds fail BDF and ARKIMEX at stops.
 const _SINGLE_BUILDS = Sys.ARCH !== :i686

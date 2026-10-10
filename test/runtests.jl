@@ -10243,6 +10243,60 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test chunked[2] ≈ grad(eight, TSImplicit("beuler", exact))[2] rtol = 1.0e-12
         end
 
+        Sys.WORD_SIZE == 64 && @testset "a communicator of one rank differentiates both too" begin
+            world = MPI.COMM_WORLD
+            direct = [exact[1:6]; "-pc_type"; "redundant"]
+            ad = PETScDiffEq.AutoForwardDiff()
+            costs = (; dgdu_discrete = coupled_du!, dgdp_discrete = coupled_dp!)
+            bare(; jac = nothing, paramjac = nothing, jac_prototype = sparse(ones(2, 2))) =
+                SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction{true}(adj_f!; jac, paramjac, jac_prototype), copy(u0),
+                (0.0, 1.0), copy(p0),
+            )
+            given = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+            for (on_world, alone) in (
+                    (TSRK("4"; comm = world), TSRK("4")),
+                    (TSImplicit("cn", direct; comm = world, autodiff = ad), TSImplicit("cn", exact)),
+                    (
+                        TSImplicit(
+                            "beuler", direct; comm = world,
+                            autodiff = PETScDiffEq.AutoForwardDiff(; chunksize = 3),
+                        ), TSImplicit("beuler", exact),
+                    ),
+                    (TSARKIMEX("l2", direct; comm = world, autodiff = ad), TSARKIMEX("l2", exact)),
+                )
+                ref = grad(given, alone; costs...)
+                for prob in (bare(), bare(; jac = adj_jac!), bare(; paramjac = adj_paramjac!))
+                    du0, dp = grad(prob, on_world; costs...)
+                    @test du0 ≈ ref[1] rtol = 1.0e-12
+                    @test dp ≈ ref[2] rtol = 1.0e-12
+                end
+            end
+            zygote = PETScDiffEq.ADTypes.AutoZygote()
+            for (prob, alg, why) in (
+                    (bare(; jac_prototype = nothing), TSRK("4"; comm = world), "sparse `jac_prototype`"),
+                    (
+                        bare(; jac_prototype = sparse(ones(2, 3))), TSRK("4"; comm = world),
+                        "so it must be 2 x 2",
+                    ),
+                    (bare(), TSImplicit("cn"; comm = world), "`jac` under `autodiff = AutoFiniteDiff()`"),
+                    (
+                        bare(; jac = adj_jac!), TSImplicit("cn"; comm = world),
+                        "`paramjac` under `autodiff = AutoFiniteDiff()`",
+                    ),
+                    (
+                        bare(), TSImplicit("cn"; comm = world, autodiff = zygote),
+                        "cannot build the ODEFunction's `jac` with `$zygote`",
+                    ),
+                    (
+                        bare(; jac = adj_jac!), TSImplicit("cn"; comm = world, autodiff = zygote),
+                        "cannot build the ODEFunction's `paramjac` with `$zygote`",
+                    ),
+                )
+                @test_throws why grad(prob, alg)
+            end
+        end
+
         @testset "a user exception reaches the caller and leaves nothing behind" begin
             live() = count(h -> !h.destroyed, keys(PETScDiffEq.LIVE_HANDLES))
             before = live()
