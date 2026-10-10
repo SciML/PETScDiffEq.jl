@@ -793,6 +793,8 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     linear::Bool
     mass_mat::Any
     relayout::Any
+    nsolve::Int
+    ncondition::Int
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -1787,6 +1789,49 @@ function _mat_add_diagonal!(pl, A, d)
     return nothing
 end
 
+# Multiplies A's rows by `l` and its columns by `r`, this rank's entries of each or `nothing`.
+function _mat_diagonal_scale!(pl, A, l, r)
+    right, left = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :MatCreateVecs), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}), A.ptr, right, left,
+        ),
+    )
+    try
+        l === nothing || _writevec!(pl, PETSc.VecPtr(pl, left[], false), l)
+        r === nothing || _writevec!(pl, PETSc.VecPtr(pl, right[], false), r)
+        _check_code(
+            ccall(
+                _symbol(pl, :MatDiagonalScale), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), A.ptr,
+                l === nothing ? C_NULL : left[], r === nothing ? C_NULL : right[],
+            ),
+        )
+    finally
+        for v in (right, left)
+            _check_code(
+                ccall(_symbol(pl, :VecDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},), v),
+            )
+        end
+    end
+    return nothing
+end
+
+# Y += a * X for matrices of one pattern, as two from the same DM are.
+for S in (Float32, Float64, ComplexF32, ComplexF64)
+    @eval function _mat_axpy!(pl, Y, a::$S, X)
+        _check_code(
+            ccall(
+                _symbol(pl, :MatAXPY), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, $S, Ptr{Cvoid}, Cint), Y.ptr, a, X.ptr,
+                Cint(LibPETSc.SAME_NONZERO_PATTERN),
+            ),
+        )
+        return nothing
+    end
+end
+
 function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     full = Vector{S}(x)
     idxs = ctx.save_idxs
@@ -2355,6 +2400,40 @@ function _pivot_raises(pl, ts)
     return raises[] == LibPETSc.PETSC_TRUE || snes_raises[] == LibPETSc.PETSC_TRUE
 end
 
+const PRE_SOLVE_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
+function _pre_solve!(
+        ::LibPETSc.CKSP, ::LibPETSc.CVec, ::LibPETSc.CVec, ctx_ptr::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    ctx.nsolve += 1
+    return LibPETSc.PetscErrorCode(0)
+end
+
+const _KSP_SOLVERS = ("", "newtonls", "newtontr", "ksponly", "ksptransposeonly")
+
+# KSPSolve calls the hook once. Other SNES types may solve elsewhere, and PETSc's
+# Eisenstat-Walker tolerances run in this hook, so those go uncounted.
+function _count_solves!(pl, ts, ctx, ctxptr)
+    snes, ksp = _snes(pl, ts), Ref{LibPETSc.CKSP}(C_NULL)
+    if !(_snes_type(pl, ts) in _KSP_SOLVERS) || _petsc_flag(pl, :SNESHasNPC, snes) ||
+            _petsc_flag(pl, :SNESKSPGetUseEW, snes)
+        ctx.nsolve = -1
+        return nothing
+    end
+    ccall(
+        _symbol(pl, :SNESGetKSP), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}), snes, ksp,
+    )
+    _check_code(
+        ccall(
+            _symbol(pl, :KSPSetPreSolve), LibPETSc.PetscErrorCode,
+            (LibPETSc.CKSP, Ptr{Cvoid}, Ptr{Cvoid}), ksp[], PRE_SOLVE_PTR[], ctxptr,
+        ),
+    )
+    return nothing
+end
+
 function _set_pc_type!(pl, ts, type)
     lib = Libdl.dlopen(pl.petsc_library)
     snes, ksp = Ref{LibPETSc.CSNES}(C_NULL), Ref{LibPETSc.CKSP}(C_NULL)
@@ -2533,6 +2612,18 @@ function _distributed_mass(::Type{S}, mass, n, N, comm) where {S}
     return sparse(1:n, rstart .+ (1:n), d, n, N)
 end
 
+# A serial solve keeps a copy of a Diagonal or sparse M as that; any other kind is made dense.
+_serial_mass(::Type{S}, M::LinearAlgebra.Diagonal) where {S} =
+    LinearAlgebra.Diagonal(Vector{S}(M.diag))
+_serial_mass(::Type{S}, M::SparseArrays.AbstractSparseMatrix) where {S} =
+    SparseArrays.dropzeros(SparseMatrixCSC{S, Int}(M))
+_serial_mass(::Type{S}, M) where {S} = Matrix{S}(M)
+
+# `findall` would visit all n^2 entries of a Diagonal.
+_mass_nonzeros(M::LinearAlgebra.Diagonal) =
+    [CartesianIndex(i, i) for i in eachindex(M.diag) if !iszero(M.diag[i])]
+_mass_nonzeros(M) = findall(!iszero, M)
+
 # Relies on SeqAIJ storing rows by ascending column, the order `_row_structure` builds.
 function _setrows!(ctx, A, n)
     vals = LibPETSc.MatSeqAIJGetArray(ctx.petsclib, A)
@@ -2561,7 +2652,7 @@ function _row_structure(J::SparseMatrixCSC, n, M = nothing, rstart = 0, colmap =
         push!(src[i], k)
     end
     shifted = [CartesianIndex(i, rstart + i) for i in 1:n]
-    M === nothing || append!(shifted, findall(!iszero, M))
+    M === nothing || append!(shifted, _mass_nonzeros(M))
     for ij in shifted
         i, j = ij[1], ij[2]
         j in cols[i] && continue
@@ -2674,6 +2765,70 @@ _stored(A::SparseMatrixCSC, i, j) = any(==(i), @view A.rowval[A.colptr[j]:(A.col
 _as_inplace(f, iip::Bool) = iip ? f : (du, u, p, t) -> (du .= f(u, p, t); nothing)
 _as_inplace_jac(j, iip::Bool) = iip ? j :
     (J, u, p, t) -> (_copy_jac!(J, j(u, p, t)); nothing)
+
+function _buffer!(box, like)
+    buf = box[]
+    buf isa typeof(like) && axes(buf) == axes(like) && return buf
+    return box[] = similar(like)
+end
+
+# The second part runs even when the first throws, since on a communicator either may
+# communicate.
+function _sum_rhs(f1, f2, iip::Bool)
+    if !iip
+        return function (u, p, t)
+            local a, b
+            try
+                a = f1(u, p, t)
+            finally
+                b = f2(u, p, t)
+            end
+            return a + b
+        end
+    end
+    box = Ref{Any}(nothing)
+    return function (du, u, p, t)
+        tmp = _buffer!(box, du)
+        try
+            f1(du, u, p, t)
+        finally
+            f2(tmp, u, p, t)
+        end
+        du .+= tmp
+        return nothing
+    end
+end
+
+_jac_part(J, proto) =
+    proto isa SparseMatrixCSC ? _structure(eltype(J), proto) : zeros(eltype(J), size(J))
+
+# Each in-place `jac` fills a matrix of its own pattern, as it would on its own.
+function _sum_jac(j1, j2, proto1, proto2, iip::Bool)
+    iip || return (u, p, t) -> j1(u, p, t) + j2(u, p, t)
+    parts = Ref{Any}(nothing)
+    return function (J, u, p, t)
+        parts[] === nothing && (parts[] = (_jac_part(J, proto1), _jac_part(J, proto2)))
+        A, B = parts[]
+        j1(A, u, p, t)
+        j2(B, u, p, t)
+        _copy_jac!(J, A + B)
+        return nothing
+    end
+end
+
+function _pattern_union(P1, P2)
+    size(P1) == size(P2) || throw(
+        ArgumentError(
+            "the `jac_prototype`s of a SplitODEProblem's two parts are " *
+                "$(join(size(P1), " x ")) and $(join(size(P2), " x ")), but the Jacobian " *
+                "of their sum takes the entries of both, so they have to be one size",
+        ),
+    )
+    rows1, cols1, _ = findnz(SparseMatrixCSC(P1))
+    rows2, cols2, _ = findnz(SparseMatrixCSC(P2))
+    rows, cols = vcat(rows1, rows2), vcat(cols1, cols2)
+    return sparse(rows, cols, ones(length(rows)), size(P1)...)
+end
 
 # PETSc only steps forward, so a reversed span runs in s = -t: dv/ds = -f(v, p, -s)
 # and G(t, u, u') becomes G(-s, v, -dv/ds). `dv` is negated in place and restored.
@@ -3245,6 +3400,20 @@ function _ijacobian!(
     return _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
+# `W[j, i] = shift * M[i, j] - J[i, j]` without searching M for each of the n^2 entries.
+function _sparse_mass_block!(W, J, M::SparseMatrixCSC, shift, n)
+    unset = shift * zero(eltype(M))
+    @inbounds for j in 1:n, i in 1:n
+        W[j, i] = unset - J[i, j]
+    end
+    rows, vals = rowvals(M), nonzeros(M)
+    @inbounds for j in 1:n, k in nzrange(M, j)
+        i = rows[k]
+        W[j, i] = shift * vals[k] - J[i, j]
+    end
+    return nothing
+end
+
 function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
@@ -3255,9 +3424,14 @@ function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         _call_jac!(ctx, xdot_ptr, shift, t)
         ctx.njacs += 1
         n = length(ctx.u)
-        # MatSetValues reads the block row-major, hence W[j, i].
-        @inbounds for j in 1:n, i in 1:n
-            ctx.W[j, i] = ctx.dae ? ctx.J[i, j] : shift * _mass(ctx, i, j) - ctx.J[i, j]
+        M = ctx.M
+        if M isa SparseMatrixCSC
+            _sparse_mass_block!(ctx.W, ctx.J, M, shift, n)
+        else
+            # MatSetValues reads the block row-major, hence W[j, i].
+            @inbounds for j in 1:n, i in 1:n
+                ctx.W[j, i] = ctx.dae ? ctx.J[i, j] : shift * _mass(ctx, i, j) - ctx.J[i, j]
+            end
         end
         _setblock!(ctx, B, n)
         PETSc.assemble!(B)
@@ -3564,6 +3738,10 @@ end
 # `@cfunction` pointers do not survive precompilation.
 function __init__()
     POST_STEP_PTR[] = @cfunction(_post_step!, LibPETSc.PetscErrorCode, (LibPETSc.CTS,))
+    PRE_SOLVE_PTR[] = @cfunction(
+        _pre_solve!, LibPETSc.PetscErrorCode,
+        (LibPETSc.CKSP, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
+    )
     ZERO_PIVOT_HANDLER_PTR[] = @cfunction(
         _zero_pivot_handler,
         LibPETSc.PetscErrorCode,
@@ -3574,6 +3752,7 @@ function __init__()
     )
     _init_adjoint_pointers!()
     _init_initialization_pointers!()
+    _note_skipped_workload()
     return nothing
 end
 
@@ -3614,7 +3793,7 @@ function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothi
     all_rows = vcat(rows, 1:n)
     all_cols = vcat(cols, 1:n)
     if M !== nothing
-        for ij in findall(!iszero, M)
+        for ij in _mass_nonzeros(M)
             push!(all_rows, ij[1])
             push!(all_cols, ij[2])
         end
@@ -3801,6 +3980,19 @@ const UNSUPPORTED_KWARGS = (
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2, :failfactor,
     :step_limiter, :stage_limiter,
 )
+const UNSUPPORTED_SWITCHES =
+    (:progress, :advance_to_tstop, :stop_at_next_tstop, :save_discretes)
+const UNSUPPORTED_UNLESS_NOTHING = (:maxtime, :rng)
+
+# An alias specifier permits aliasing, so only one asking for `u0` or `du0` goes unmet.
+_asks_alias(alias) = alias === true || any((:alias_u0, :alias_du0)) do k
+    hasfield(typeof(alias), k) && getfield(alias, k) === true
+end
+
+_drops(key, value) = key in UNSUPPORTED_KWARGS ||
+    key in UNSUPPORTED_SWITCHES && value === true ||
+    key in UNSUPPORTED_UNLESS_NOTHING && value !== nothing ||
+    key === :alias && _asks_alias(value)
 
 mutable struct TSHandles{CTX, L, R, S}
     ctx::CTX
@@ -4455,8 +4647,47 @@ end
 # PETSc cannot parse Julia's Float32 printing (`1.0f-5`).
 _option(x::Real) = string(Float64(x))
 
+_operator_rhs() = ArgumentError(
+    "PETScDiffEq does not support an operator-valued right-hand side; " *
+        "supply a function f!(du, u, p, t)",
+)
+
+const _SplitProblem =
+    SciMLBase.ODEProblem{<:Any, <:Any, <:Any, <:Any, <:SciMLBase.SplitFunction}
+
+# Every algorithm but TSARKIMEX takes a SplitODEProblem as the ODE of the sum of its parts.
+_summed(prob, alg) = prob
+_summed(prob::_SplitProblem, ::TSARKIMEX) = prob
+function _summed(prob::_SplitProblem, alg)
+    f, iip = prob.f, SciMLBase.isinplace(prob)
+    f1, f2 = SciMLBase.unwrapped_f(f.f1.f), SciMLBase.unwrapped_f(f.f2.f)
+    any(g -> g isa SciMLOperators.AbstractSciMLOperator, (f1, f2)) && throw(_operator_rhs())
+    proto1, proto2 = f.jac_prototype, f.f2.jac_prototype
+    sums_jac = _uses_ifunction(alg) && f.jac !== nothing && f.f2.jac !== nothing
+    sums_jac && _alg_dm(alg) !== nothing && throw(
+        ArgumentError(
+            "PETScDiffEq cannot add the `jac`s of a SplitODEProblem's two parts " *
+                "$_WITH_DM, where each fills the DM's matrix; leave them out for the DM's " *
+                "colouring, or solve the ODEProblem of the summed parts with its one `jac`",
+        ),
+    )
+    sparse_sum = proto1 isa SparseArrays.AbstractSparseMatrix &&
+        proto2 isa SparseArrays.AbstractSparseMatrix
+    g = SciMLBase.ODEFunction{iip, SciMLBase.FullSpecialize}(
+        _sum_rhs(f1, f2, iip);
+        jac = sums_jac ? _sum_jac(
+                SciMLBase.unwrapped_f(f.jac), SciMLBase.unwrapped_f(f.f2.jac), proto1,
+                proto2, iip,
+            ) : nothing,
+        jac_prototype = sparse_sum ? _pattern_union(proto1, proto2) : nothing,
+        mass_matrix = f.mass_matrix, sys = f.sys,
+        initialization_data = f.initialization_data,
+    )
+    return SciMLBase.ODEProblem{iip}(g, prob.u0, prob.tspan, prob.p; prob.kwargs...)
+end
+
 function _setup(
-        prob::SupportedProblem,
+        problem::SupportedProblem,
         alg::AnyPETScTS;
         dt = nothing,
         reltol = nothing,
@@ -4478,18 +4709,13 @@ function _setup(
         tstops = (),
         extra_options = String[],
         jac_advice = nothing,
-        eltypes = _eltypes(prob),
+        eltypes = _eltypes(problem),
         initializealg = DiffEqBase.DefaultInit(),
         kwargs...,
     )
-    for key in UNSUPPORTED_KWARGS
-        if haskey(kwargs, key)
-            @warn "PETScDiffEq does not support `$key` and is ignoring it"
-        end
-    end
-    for key in (:progress, :advance_to_tstop, :stop_at_next_tstop)
-        get(kwargs, key, false) === true &&
-            @warn "PETScDiffEq does not support `$key` and is ignoring it"
+    prob = _summed(problem, alg)
+    for (key, value) in pairs(kwargs)
+        _drops(key, value) && @warn "PETScDiffEq does not support `$key` and is ignoring it"
     end
     prob.u0 isa AbstractVector{<:Union{Real, Complex}} || throw(
         ArgumentError("PETScDiffEq requires an AbstractVector u0 of real or complex numbers"),
@@ -4501,8 +4727,6 @@ function _setup(
     end
     dt_given = dt !== nothing
     is_split = prob.f isa SciMLBase.SplitFunction
-    is_split && !(alg isa TSARKIMEX) &&
-        throw(ArgumentError("PETScDiffEq only supports SplitODEProblem with TSARKIMEX"))
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     comm = _distributed(alg) ? alg.comm : nothing
     mass_matrix = is_dae ? nothing : prob.f.mass_matrix
@@ -4595,12 +4819,7 @@ function _setup(
         throw(ArgumentError("PETScDiffEq requires an in-place DAEProblem residual"))
     f2 = is_split ? unwrap(prob.f.f2.f) : nothing
     for g in (f1, f2)
-        g isa SciMLOperators.AbstractSciMLOperator && throw(
-            ArgumentError(
-                "PETScDiffEq does not support an operator-valued right-hand side; " *
-                    "supply a function f!(du, u, p, t)",
-            ),
-        )
+        g isa SciMLOperators.AbstractSciMLOperator && throw(_operator_rhs())
     end
     f1 = is_dae || dyn ? f1 : _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
@@ -4647,14 +4866,16 @@ function _setup(
         _check_tol(reltol, n, "reltol")
     end
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
+    # On a communicator the DM's colouring builds the initialization's Jacobian.
+    jac_init = dm_jac && comm !== nothing ? nothing : jac_fn
     p, initialized = _initialize!(
-        u0, prob, prob, initializealg, f1, dm_jac ? nothing : jac_fn, petsclib, comm,
+        u0, prob, prob, initializealg, f1, jac_init, petsclib, comm,
         R(prob.tspan[1]), R(prob.tspan[2]), real.(something(abstol, 1.0e-6)),
         real.(something(reltol, 1.0e-3)), dt, dtmax,
     )
     ad_calls === nothing || (ad_calls[] = ad_before)
     user_f1, user_f2 = f1, f2
-    f_init, jac_init = f1, dm_jac ? nothing : jac_fn
+    f_init = f1
     if tdir < 0
         f1 = is_dae ? _reverse_residual(f1) : _reverse_rhs(f1)
         f2 = f2 === nothing ? nothing : _reverse_rhs(f2)
@@ -4697,7 +4918,7 @@ function _setup(
     M = if !has_mass
         nothing
     elseif comm === nothing && dm === nothing
-        Matrix{S}(mass_matrix)
+        _serial_mass(S, mass_matrix)
     elseif sparse_mass
         _distributed_mass(S, own_mass ? mass_matrix : nothing, n, N, comm)
     else
@@ -4774,7 +4995,7 @@ function _setup(
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
-        false, false, Int(maxiters), false, nothing, nothing,
+        false, false, Int(maxiters), false, nothing, nothing, 0, 0,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -5002,6 +5223,7 @@ function _setup(
             # Only valid once TSSetFromOptions has reached the linear solve.
             h.pivot_raises = _pivot_raises(petsclib, ts) ||
                 _option_flag(effective_options, "ts_error_if_step_fails")
+            _count_solves!(petsclib, ts.ptr, ctx, ctxptr)
             fixed = LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
             adapts = _adapts(running)
             if !dt_given && !(adaptive && adapts === true)
@@ -5179,13 +5401,14 @@ function _assemble(
         "reports success or fails. Rescale the problem, or give it a Float64 span to solve " *
         "it in double precision"
     stats = SciMLBase.DEStats(
-        _nf(h), ctx.nf2, -1, -1, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1, -1,
-        st.nsteps, st.nreject, 0.0,
+        _nf(h), ctx.nf2, -1, ctx.nsolve, ctx.njacs, st.nnonliniter, st.nnonlinfail, -1, -1,
+        ctx.ncondition, st.nsteps, st.nreject, 0.0,
     )
     ts, dus = _user_time(h)
     return SciMLBase.build_solution(
         prob, alg, ts, ctx.us; retcode = retcode, stats = stats,
         dense = ctx.dense, interp = _interp(ctx, ts, dus),
+        calculate_error = get(kwargs, :calculate_error, true),
         timeseries_errors = get(kwargs, :timeseries_errors, true),
         dense_errors = get(kwargs, :dense_errors, false),
     )
@@ -5680,6 +5903,7 @@ function _adopt_p!(integ::PETScIntegrator, p)
     integ.sol = SciMLBase.build_solution(
         integ.prob, integ.alg, sol.t, sol.u; retcode = sol.retcode, stats = sol.stats,
         dense = sol.dense, interp = sol.interp,
+        calculate_error = get(integ.kwargs, :calculate_error, true),
         timeseries_errors = get(integ.kwargs, :timeseries_errors, true),
         dense_errors = get(integ.kwargs, :dense_errors, false),
     )
@@ -5688,7 +5912,7 @@ end
 
 function _initialize_state!(integ::PETScIntegrator, init)
     h = integ.h
-    prob = _with_p(integ.prob, integ.p)
+    prob = _with_p(_summed(integ.prob, integ.alg), integ.p)
     u = integ.u isa Vector ? integ.u : Vector(integ.u)
     before = h.ad_calls === nothing ? 0 : h.ad_calls[]
     p, ok = _initialize!(
@@ -5915,6 +6139,7 @@ _ncond(::SciMLBase.ContinuousCallback) = 1
 _ncond(cb::SciMLBase.VectorContinuousCallback) = cb.len
 
 function _fill_conditions!(out, integ::PETScIntegrator, cb::SciMLBase.ContinuousCallback, t)
+    integ.h.ctx.ncondition += 1
     out[1] = cb.condition(_state_at(integ, t), t, integ)
     return out
 end
@@ -5922,6 +6147,7 @@ end
 function _fill_conditions!(
         out, integ::PETScIntegrator, cb::SciMLBase.VectorContinuousCallback, t,
     )
+    integ.h.ctx.ncondition += 1
     cb.condition(out, _state_at(integ, t), t, integ)
     return out
 end
@@ -6108,6 +6334,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
     ctx = h.ctx
     for cb in integ.callbacks
         integ.finished && return nothing
+        ctx.ncondition += 1
         _checked_anywhere(() -> cb.condition(integ.u, integ.t, integ), ctx.comm) || continue
         cb.save_positions[1] && !saved && _save_here!(integ)
         saved = false
@@ -6184,7 +6411,7 @@ function _init_unlocked(
         Vector{R}[fill(R(NaN), _ncond(cb)) for cb in continuous],
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
         stops, tstops, d_discontinuities, d_discontinuities, dt0,
-        _initial_solution(prob, alg, h), false, false, nothing, 0,
+        _initial_solution(prob, alg, h, kwargs), false, false, nothing, 0,
     )
     if h.init_failed
         integ.sol = _initial_failure(prob, alg, h, kwargs)
@@ -6331,13 +6558,17 @@ _user_time(h::TSHandles) = h.tdir > 0 ? (h.ctx.ts, h.ctx.dus) :
 
 _nf(h::TSHandles) = h.ctx.nf + (h.ad_calls === nothing ? 0 : h.ad_calls[])
 
-function _initial_solution(prob, alg, h::TSHandles)
+function _initial_solution(prob, alg, h::TSHandles, kwargs)
     ts, dus = _user_time(h)
     # The running `sol` shares these arrays, and `_record!` extends a reversed span's copies.
     h.tdir > 0 || ((h.ctx.user_ts, h.ctx.user_dus) = (ts, dus))
+    stats = SciMLBase.DEStats(0)
+    stats.nw = stats.nfpiter = stats.nfpconvfail = -1
+    stats.nsolve = h.ctx.nsolve
     return SciMLBase.build_solution(
         prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
-        dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = SciMLBase.DEStats(0),
+        dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = stats,
+        calculate_error = get(kwargs, :calculate_error, true),
     )
 end
 
@@ -6347,6 +6578,7 @@ function _live_stats!(integ::PETScIntegrator)
     stats = integ.sol.stats
     stats isa SciMLBase.DEStats || return nothing
     stats.nf, stats.nf2, stats.njacs = _nf(integ.h), ctx.nf2, ctx.njacs
+    stats.nsolve, stats.ncondition = ctx.nsolve, ctx.ncondition
     stats.nnonliniter, stats.nnonlinconvfail = st.nnonliniter, st.nnonlinfail
     stats.naccept, stats.nreject = st.nsteps, st.nreject
     return nothing
@@ -6436,7 +6668,7 @@ function _reinit_unlocked(
         fill!(ev, NaN)
     end
     integ.derivative_discontinuity = false
-    integ.sol = _initial_solution(integ.prob, integ.alg, h)
+    integ.sol = _initial_solution(integ.prob, integ.alg, h, integ.kwargs)
     if h.init_failed
         integ.sol = _initial_failure(integ.prob, integ.alg, h, integ.kwargs)
         integ.finished = true

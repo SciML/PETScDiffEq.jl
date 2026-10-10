@@ -21,8 +21,23 @@ _under_mpi_launcher() = any(
     keys(ENV),
 )
 
+# Saved in the package image: whether a launcher kept the workload out of it.
+const WORKLOAD_SKIPPED = Ref(false)
+
+# Outside a launcher the image can be rebuilt, so that is where a session is told.
+function _note_skipped_workload()
+    WORKLOAD_SKIPPED[] && ccall(:jl_generating_output, Cint, ()) == 0 &&
+        !_under_mpi_launcher() || return nothing
+    @info "PETScDiffEq was precompiled under an MPI launcher, which leaves out its " *
+        "precompile workload, so the first solves of each session compile more. To " *
+        "rebuild it with the workload, run `Base.compilecache(Base.PkgId(PETScDiffEq))` " *
+        "in a session started without the launcher, such as this one, and restart Julia."
+    return nothing
+end
+
 function _run_workload()
-    _under_mpi_launcher() && return nothing
+    WORKLOAD_SKIPPED[] = _under_mpi_launcher()
+    WORKLOAD_SKIPPED[] && return nothing
     builds = _loaded_builds()
     if Float64 in builds
         u0, tspan = [1.0, 0.5], (0.0, 1.0)

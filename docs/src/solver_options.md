@@ -36,6 +36,18 @@ Rosenbrock methods do. A zero pivot in a Newton method still counts in
 solve ends at its first failed Newton or linear solve with `ConvergenceFailure`, as
 OrdinaryDiffEq's Newton-based methods do with `adaptive = false`.
 
+`stats.nsolve` counts the linear solves of the steps: one for each `KSPSolve` PETSc runs on
+the TS's Krylov solver, whatever number of Krylov iterations it takes, so 20 fixed steps of
+the four-stage `TSRosW("ra34pw2")` give 80 and an explicit method gives 0. It is -1 where
+that count could miss a solve or cannot be taken: with a `-snes_type` other than `newtonls`,
+`newtontr`, `ksponly` or `ksptransposeonly`, with a nonlinear preconditioner, and under
+`-snes_ksp_ew`, whose tolerances PETSc sets in the hook the count uses. `stats.ncondition`
+counts the calls of the callbacks' conditions, those of a `ContinuousCallback`'s root search
+included. An integrator's running `sol.stats` holds both as the steps go, and they start
+again at `reinit!`. `stats.nw` stays -1: PETSc counts no matrices `shift * M - J`, builds
+them itself under `AutoFiniteDiff()` and in `TSIRK`, and also asks the package's Jacobian
+for `J` alone. `stats.nfpiter` and `stats.nfpconvfail` stay -1 as well.
+
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
 state stops being finite, a step overflows, turns NaN or fails its Newton or linear solve at
 every size tried, with a warning, an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
@@ -63,6 +75,17 @@ OrdinaryDiffEq's integrator does.
 `SecondOrderODEProblem` are supported, in place or out of place, along with
 `ODEFunction`'s `jac`, `jac_prototype` and `mass_matrix`. Supply a `jac_prototype` for
 anything sparse: without one the Jacobian is dense and forces a dense factorization.
+
+`TSARKIMEX` integrates the `f1` of a `SplitODEProblem` implicitly and its `f2` explicitly.
+Every other algorithm solves it as the `ODEProblem` of `f1 + f2` and returns that problem's
+states bit for bit. `stats.nf` then counts the evaluations of the sum and `stats.nf2` stays
+zero, as with an OrdinaryDiffEq method that is not IMEX. A `SplitFunction`'s own `jac` and
+`jac_prototype` are those of `f1`, and `f2` carries its own as an `ODEFunction`. The Jacobian
+of the sum is the sum of the two `jac`s when both parts have one; a `jac` on one part alone
+is not used, and the Jacobian is built as for an `ODEProblem` without one. Its pattern is the
+union of the two `jac_prototype`s when both are sparse, and it is dense when either part has
+none. The `mass_matrix` of the `SplitFunction` applies to the sum. An operator as either
+part is refused, as it is with `TSARKIMEX`.
 
 Without a `jac`, the implicit algorithms build the Jacobian with ForwardDiff, as
 OrdinaryDiffEq does, and colour a sparse `jac_prototype`, so a tridiagonal problem costs
