@@ -1549,6 +1549,51 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         ).retcode == SciMLBase.ReturnCode.Success
     end
 
+    @testset "maxiters takes Inf and a fraction, as OrdinaryDiffEq's does" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        rk = PETScDiffEq.TSRK("5dp")
+        fixed = (dt = 0.01, adaptive = false)
+        counts(sol) = (sol.retcode, sol.stats.naccept)
+        for maxiters in (Inf, 1.0e5 + 0.5, 1.0e7, typemax(Int), 2.0^63, big(10)^30)
+            @test counts(SciMLBase.solve(prob, rk; maxiters, fixed...)) ==
+                (SciMLBase.ReturnCode.Success, 100)
+            @test SciMLBase.solve(prob, rk; maxiters).retcode == SciMLBase.ReturnCode.Success
+        end
+        # OrdinaryDiffEq stops once `iter > maxiters`, so 5.999 allows five steps.
+        for maxiters in (5, 5.0, 5.5, 5.999, 11 // 2)
+            ours = SciMLBase.solve(prob, rk; maxiters, fixed...)
+            theirs = Logging.with_logger(Logging.NullLogger()) do
+                SciMLBase.solve(prob, Tsit5(); maxiters, fixed...)
+            end
+            @test counts(ours) == counts(theirs) == (SciMLBase.ReturnCode.MaxIters, 5)
+            integ = SciMLBase.init(prob, rk; maxiters, fixed...)
+            @test integ.opts.maxiters == 5
+            @test counts(SciMLBase.solve!(integ)) == counts(ours)
+            SciMLBase.reinit!(integ)
+            @test counts(SciMLBase.solve!(integ)) == counts(ours)
+        end
+        integ = SciMLBase.init(prob, rk; maxiters = Inf, fixed...)
+        @test integ.opts.maxiters == typemax(Int)
+        integ.opts.maxiters = 3.5
+        @test counts(SciMLBase.solve!(integ)) == (SciMLBase.ReturnCode.MaxIters, 3)
+        @test PETScDiffEq._maxsteps(PETScDiffEq._step_limit(Inf)) ==
+            typemax(PETScDiffEq.LibPETSc.PetscInt)
+        @test PETScDiffEq._step_limit(-Inf) == typemin(Int)
+        @test_throws "`maxiters` is NaN" SciMLBase.solve(prob, rk; maxiters = NaN, fixed...)
+        # With no limit PETSc's trajectory grows as the steps come, so the adjoint takes it too.
+        gradient(; kw...) = PETScDiffEq._discrete_adjoint(
+            prob, rk, PETScAdjoint(); t = [1.0],
+            dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing), kw...,
+        )
+        for kw in (fixed, (; abstol = 1.0e-8, reltol = 1.0e-8))
+            @test gradient(; maxiters = Inf, kw...) == gradient(; kw...)
+            @test gradient(; maxiters = 1.0e5 + 0.5, kw...) == gradient(; kw...)
+        end
+        @test_throws "the forward solve stopped with TS_CONVERGED_ITS" gradient(;
+            maxiters = 5.5, fixed...,
+        )
+    end
+
     @testset "the loaded PETSc has the index width the wrappers assume" begin
         lib = PETScDiffEq.PETSc.getlib(PetscScalar = Float64)
         @test PETScDiffEq._check_inttype(lib) === nothing
