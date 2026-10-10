@@ -58,9 +58,28 @@ keywords that set the steps, `dt`, `adaptive`, `abstol`, `reltol`, `dtmin`, `dtm
 `maxiters`, have to be passed to `adjoint_sensitivities` exactly as they were to `solve`.
 
 With fixed steps every cost time must be a time the solve steps to, since PETSc's adjoint
-has no derivative of interpolation. An adaptive solve can take costs only at the ends of
-`tspan`, and its gradient holds the accepted step sizes fixed rather than differentiating
-the step-size controller.
+has no derivative of interpolation. An adaptive solve takes cost times anywhere in `tspan`.
+`PETScAdjoint` gives them to PETSc as its time span, `TSSetTimeSpan`, and the step-size
+controller ends a step on each one, so a loss summed over data times needs only the
+tolerances repeated:
+
+```julia
+data_t = [0.25, 0.5, 0.75, 1.0]
+sol = solve(prob, TSRK("5dp"); abstol = 1e-8, reltol = 1e-8, saveat = data_t)
+du0, dp = adjoint_sensitivities(
+    sol, TSRK("5dp"); sensealg = PETScAdjoint(),
+    t = data_t, dgdu_discrete = dg!, abstol = 1e-8, reltol = 1e-8,
+)
+```
+
+The gradient holds the accepted step sizes fixed rather than differentiating the step-size
+controller: it agreed to within 2e-9 with central differences of a solve repeating those
+steps at fixed size, for `TSRK` and `TSARKIMEX` alike. The steps are those of the adjoint's
+own forward solve. `solve` with the same tolerances does not end a step on its `saveat`
+times but interpolates to them, so the states it saves differ from the ones the cost is
+taken on by the error of the two solves; at tolerances of 1e-5 the two sums of
+`|u|^2 / 2` over eleven times differed by 1.2e-7 of their value. `tstops` do not make
+`solve` take the adjoint's steps either, since `solve` steps to them in its own loop.
 
 `TSARKIMEX` is the one stiff family `PETScAdjoint` takes that has an error estimate, so the
 one stiff method whose adaptive solve it differentiates. It takes a `SplitODEProblem` as
@@ -105,10 +124,11 @@ direct solve to 2e-15, since ILU(0) of a tridiagonal matrix is exact. Passing
 difference in every case. For a problem too large to factor, tighten `-ksp_rtol` instead;
 `1e-10` brought the two larger grids to 1e-11 and 5e-11.
 
-It runs distributed over a `comm` and on a DMDA as well, needing a `jac` and `paramjac` that
-fill each rank's rows, as the [MPI](@ref) section describes. Callbacks, `tstops`, mass
-matrices and `DAEProblem` are refused, and so is differentiating `solve` with a reverse-mode
-AD package. Passing
+It runs distributed over a `comm` and on a DMDA as well, with a `jac` and `paramjac` that
+fill each rank's rows, as the [MPI](@ref) section describes. On a `comm` it builds a missing
+one with ForwardDiff, the `jac` from the sparse `jac_prototype`; on a DMDA both have to be
+given. Callbacks, `tstops`, mass matrices and `DAEProblem` are refused, and so is
+differentiating `solve` with a reverse-mode AD package. Passing
 `sensealg = PETScAdjoint()` to `solve` itself does nothing.
 
 `jac` and `paramjac` go into the gradient unchecked, so a wrong entry gives a wrong

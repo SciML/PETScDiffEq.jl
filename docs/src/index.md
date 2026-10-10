@@ -22,7 +22,18 @@ set_preferences!(PETScDiffEq, "precompile_workload" => false; force = true)
 
 Precompiling under `mpiexec` or `srun` skips these solves, and later sessions reuse that
 build until the package or one of its dependencies changes, so load the package once
-without the launcher before the first parallel run.
+without the launcher before the first parallel run. A build made under a launcher says so
+when the package is next loaded outside one, once per session and never on the ranks of a
+parallel run. To rebuild it with the solves, in a session started without the launcher:
+
+```julia
+using PETScDiffEq
+Base.compilecache(Base.PkgId(PETScDiffEq))
+```
+
+Sessions started after that load the new build. The note is an `@info` record, so a logger
+that drops `Info` hides it, and a build made with `precompile_workload` set to `false` never
+gives it.
 
 ## Common API Usage
 
