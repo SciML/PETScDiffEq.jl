@@ -797,6 +797,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     nsolve::Int
     ncondition::Int
     own_matchstep::Bool
+    shape::Union{Nothing, Dims}
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -1835,7 +1836,7 @@ for S in (Float32, Float64, ComplexF32, ComplexF64)
 end
 
 function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
-    full = Vector{S}(x)
+    full = Vector{S}(vec(x))
     idxs = ctx.save_idxs
     push!(ctx.ts, R(t))
     ctx.user_ts === nothing || push!(ctx.user_ts, _user_t(ctx.tdir, R(t)))
@@ -1848,8 +1849,8 @@ function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     return du
 end
 
-_kept(ctx::TSContext{R, S, A}, x) where {R, S, A} =
-    A <: Vector ? x : A((x[1:ctx.f!.nv], x[(ctx.f!.nv + 1):end]))
+_kept(ctx::TSContext{R, S, A}, x) where {R, S, A} = A <: Vector ? x :
+    A <: Array ? reshape(x, ctx.shape) : A((x[1:ctx.f!.nv], x[(ctx.f!.nv + 1):end]))
 
 function _record_end!(ctx, t, x)
     du = _record!(ctx, t, x, ctx.fend)
@@ -1904,7 +1905,7 @@ function _post_step_serial!(ctx, ts)
             u = _read_state!(ctx.u, ctx, flat)
             ctx.partitioned_u === nothing || (u = copyto!(ctx.partitioned_u, u))
             ctx.unstable !== nothing &&
-                ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s)) &&
+                ctx.unstable(ctx.tdir * hnext, _as_u0(ctx, u), ctx.p, _user_t(ctx.tdir, s)) &&
                 (ctx.unstable_hit = stop = true)
             ctx.halt_nonfinite && !all(isfinite, u) && (stop = true)
         end
@@ -2000,7 +2001,7 @@ _select(u, ::Nothing) = u
 _select(u, idxs::Vector{Int}) = u[idxs]
 
 function _derivative(ctx::TSContext{R, S}, t, u) where {R, S}
-    u = convert(Vector{S}, u)
+    u = convert(Vector{S}, vec(u))
     du = similar(u)
     _call_f!(ctx, du, u, t)
     if ctx.f2! !== nothing
@@ -2013,7 +2014,7 @@ function _derivative(ctx::TSContext{R, S}, t, u) where {R, S}
 end
 
 _saved(ctx::TSContext{R, S, A}, u) where {R, S, A} = ctx.save_idxs === nothing ?
-    Vector{eltype(A)}(u) : eltype(A)[u[i] for i in ctx.save_idxs]
+    _as_u0(ctx, Vector{eltype(A)}(vec(u))) : eltype(A)[u[i] for i in ctx.save_idxs]
 
 _interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, dus) :
     SciMLBase.LinearInterpolation(ts, ctx.us)
@@ -2021,10 +2022,15 @@ _interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, d
 function _hermite!(out, ctx, s, s0, u0, s1, u1, ::Type{Val{N}} = Val{0}) where {N}
     ctx.fstart === nothing && (ctx.fstart = _derivative(ctx, s0, u0))
     ctx.fend === nothing && (ctx.fend = _derivative(ctx, s1, u1))
-    f0, f1 = ctx.fstart, ctx.fend
+    _hermite_flat!(
+        vec(out), ctx.fstart, ctx.fend, ctx.tdir, s, s0, vec(u0), s1, vec(u1), Val{N},
+    )
+    return out
+end
+
+function _hermite_flat!(out, f0, f1, tdir, s, s0, u0, s1, u1, ::Type{Val{N}}) where {N}
     dt = s1 - s0
     Θ = (s - s0) / dt
-    tdir = ctx.tdir
     if N == 0
         @. out = (1 - Θ) * u0 + Θ * u1 +
             Θ * (Θ - 1) * ((1 - 2Θ) * (u1 - u0) + (Θ - 1) * dt * f0 + Θ * dt * f1)
@@ -2770,6 +2776,43 @@ _stored(A::SparseMatrixCSC, i, j) = any(==(i), @view A.rowval[A.colptr[j]:(A.col
 _as_inplace(f, iip::Bool) = iip ? f : (du, u, p, t) -> (du .= f(u, p, t); nothing)
 _as_inplace_jac(j, iip::Bool) = iip ? j :
     (J, u, p, t) -> (_copy_jac!(J, j(u, p, t)); nothing)
+
+# An array-shaped state is stepped as PETSc's flat vector, which `f` and `jac` get reshaped.
+_shaped(f, ::Nothing) = f
+_shaped(::Nothing, ::Dims) = nothing
+_shaped(f, shape::Dims) = (du, u, p, t) -> f(reshape(du, shape), reshape(u, shape), p, t)
+_shaped_jac(j, ::Nothing) = j
+_shaped_jac(j, shape::Dims) = (J, u, p, t) -> j(J, reshape(u, shape), p, t)
+
+_as_u0(ctx, u) = ctx.shape === nothing ? u : reshape(u, ctx.shape)
+
+function _refuse_shaped(is_dae, comm, dm)
+    is_dae || dm !== nothing || comm !== nothing || return nothing
+    throw(
+        ArgumentError(
+            "PETScDiffEq takes an array-shaped `u0` for an ODEProblem or a SplitODEProblem " *
+                "on MPI.COMM_SELF, not " * (
+                is_dae ? "for a DAEProblem; pass `vec(u0)` and `vec(du0)` and reshape them " *
+                    "inside the residual" :
+                    dm !== nothing ? "$_WITH_DM; pass `vec(u0)` and index the grid with " *
+                    "`PETScDiffEq.reshape_local_array`" :
+                    "$_NOT_SELF; pass `vec(u0)`, this rank's rows, and reshape it inside `f`"
+            ),
+        ),
+    )
+end
+
+# A tolerance per component is a vector in `vec(u0)`'s order or an array of `u0`'s shape.
+function _flat_tol(tol, dims::Dims, name)
+    tol isa AbstractArray && !(tol isa AbstractVector) || return tol
+    size(tol) == dims || throw(
+        ArgumentError(
+            "`$name` is an array of size $(size(tol)), but a tolerance for each component " *
+                "has to be a vector of the state's length or an array of its size, $dims",
+        ),
+    )
+    return vec(tol)
+end
 
 function _buffer!(box, like)
     buf = box[]
@@ -4720,9 +4763,12 @@ function _setup(
     for (key, value) in pairs(kwargs)
         _drops(key, value) && @warn "PETScDiffEq does not support `$key` and is ignoring it"
     end
-    prob.u0 isa AbstractVector{<:Union{Real, Complex}} || throw(
-        ArgumentError("PETScDiffEq requires an AbstractVector u0 of real or complex numbers"),
+    prob.u0 isa AbstractArray{<:Union{Real, Complex}} || throw(
+        ArgumentError("PETScDiffEq requires an AbstractArray u0 of real or complex numbers"),
     )
+    shape = prob.u0 isa AbstractVector ? nothing : size(prob.u0)
+    abstol = _flat_tol(abstol, size(prob.u0), "abstol")
+    reltol = _flat_tol(reltol, size(prob.u0), "reltol")
     for (name, value) in (
             (:dt, dt), (:dtmin, dtmin), (:dtmax, dtmax), (:saveat, saveat), (:tstops, tstops),
         )
@@ -4732,6 +4778,7 @@ function _setup(
     is_split = prob.f isa SciMLBase.SplitFunction
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     comm = _distributed(alg) ? alg.comm : nothing
+    shape === nothing || _refuse_shaped(is_dae, comm, _alg_dm(alg))
     mass_matrix = is_dae ? nothing : prob.f.mass_matrix
     own_mass = !(mass_matrix === nothing || mass_matrix == LinearAlgebra.I)
     has_mass = _anywhere(comm, own_mass)
@@ -4815,8 +4862,8 @@ function _setup(
 
     iip = SciMLBase.isinplace(prob)
     # SciMLBase's wrapper is typed for the problem's types, so unwrap where PETSc's differ.
-    unwrap = eltype(prob.u0) === S && eltype(prob.tspan) === R ? identity :
-        SciMLBase.unwrapped_f
+    unwrap = prob.u0 isa Array && eltype(prob.u0) === S && eltype(prob.tspan) === R ?
+        identity : SciMLBase.unwrapped_f
     f1 = dyn ? _partitioned(prob.f, iip, nv) : unwrap(is_split ? prob.f.f1.f : prob.f.f)
     is_dae && !iip &&
         throw(ArgumentError("PETScDiffEq requires an in-place DAEProblem residual"))
@@ -4826,6 +4873,7 @@ function _setup(
     end
     f1 = is_dae || dyn ? f1 : _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
+    f1, f2 = _shaped(f1, shape), _shaped(f2, shape)
     if dm !== nothing
         f1 = Ghosted(f1, petsclib, dm.ptr)
         f2 = f2 === nothing ? nothing : Ghosted(f2, petsclib, dm.ptr)
@@ -4855,8 +4903,8 @@ function _setup(
             )
         else
             _ad_jacobian(
-                _autodiff(alg), dyn ? f_ad : _as_inplace(f_ad, iip), prob.f.jac_prototype, u0,
-                prob.p, user_t0, ad_calls, advice,
+                _autodiff(alg), dyn ? f_ad : _shaped(_as_inplace(f_ad, iip), shape),
+                prob.f.jac_prototype, u0, prob.p, user_t0, ad_calls, advice,
             )
         end
     elseif dm_jac
@@ -4864,7 +4912,8 @@ function _setup(
     elseif dyn
         _partitioned_jac(prob.f.jac, prob.u0, iip)
     else
-        is_dae ? unwrap(prob.f.jac) : _as_inplace_jac(unwrap(prob.f.jac), iip)
+        is_dae ? unwrap(prob.f.jac) :
+            _shaped_jac(_as_inplace_jac(unwrap(prob.f.jac), iip), shape)
     end
     _checked_everywhere(comm) do
         _check_tol(abstol, n, "abstol")
@@ -4977,7 +5026,8 @@ function _setup(
     clone = dm === nothing ? nothing : _clone_dm(petsclib, dm)
     uvec = clone === nothing ? _state_vec(petsclib, comm, n) :
         _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib)
-    A = dyn && kept === nothing ? typeof(similar(prob.u0, U)) : Vector{U}
+    A = kept !== nothing ? Vector{U} : dyn ? typeof(similar(prob.u0, U)) :
+        Array{U, ndims(prob.u0)}
     # f scatters through the caller's DM, so the handle holds a reference to it.
     dms = clone === nothing ? Ptr{Cvoid}[] : [clone.ptr, _referenced(petsclib, dm.ptr)]
     ctx = TSContext(
@@ -5000,7 +5050,7 @@ function _setup(
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
-        false, false, Int(maxiters), false, nothing, nothing, 0, 0, false,
+        false, false, Int(maxiters), false, nothing, nothing, 0, 0, false, shape,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -5512,6 +5562,8 @@ end
 
 _solution_vec(h::TSHandles) = something(h.solution, h.u)
 
+_state_size(h::TSHandles) = something(h.ctx.shape, size(h.u0))
+
 # PETSc's alpha2 weighs the velocity and the position with one tolerance vector of the
 # position's length, so a tolerance on `[v; u]` takes the tighter of each pair.
 function _fold_second_order(tol, nv)
@@ -5639,6 +5691,7 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
     name in FIXED_OPTS && throw(
         ArgumentError("`$name` cannot change on a live integrator; pass it to `init`"),
     )
+    name in (:abstol, :reltol) && (v = _flat_tol(v, _state_size(h), name))
     name in (:abstol, :reltol) &&
         _checked_everywhere(() -> _check_tol(v, length(h.u0), name), h.ctx.comm)
     setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : name === :maxiters ? Int(v) : v)
@@ -5697,7 +5750,8 @@ otherwise, whatever the span's type. The state is the problem's own, except that
 whole-number one is stepped in `Float64` and a single-precision one with a `Float64` span in
 double precision, while the solution it saves stays in single. For a `DynamicalODEProblem` or
 `SecondOrderODEProblem` the state is an `ArrayPartition` of the velocity and the position, as
-in OrdinaryDiffEq.
+in OrdinaryDiffEq. An array-shaped `u0` gives `u`, `uprev` and every state read from the
+integrator as an `Array` of its size.
 
 `iter` counts every step attempted, accepted, rejected or failed, as `maxiters` does. `opts`
 carries the options OrdinaryDiffEq's integrator exposes where PETSc has them. Assigning
@@ -5706,7 +5760,7 @@ takes effect at once; `tstops` and `saveat` are the live queues keyed by `tdir *
 `saveat` keeping the times already passed; `unstable_check` and `isoutofdomain` are `nothing`
 unless given; `dense`, `save_idxs`, `calck`, `internalnorm` and `callback` are fixed at `init`.
 """
-mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractVector{S}} <:
+mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractArray{S}} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, UT, R}
     alg::Alg
     u::UT
@@ -5817,7 +5871,8 @@ function _make_opts(
     ctx = h.ctx
     return PETScIntegratorOpts(
         h, get(kwargs, :adaptive, true) === true,
-        _own_tol(get(kwargs, :abstol, 1.0e-6)), _own_tol(get(kwargs, :reltol, 1.0e-3)),
+        _own_tol(_flat_tol(get(kwargs, :abstol, 1.0e-6), _state_size(h), "abstol")),
+        _own_tol(_flat_tol(get(kwargs, :reltol, 1.0e-3), _state_size(h), "reltol")),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
         get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
@@ -5864,7 +5919,8 @@ function _checked_du(integ::PETScIntegrator)
 end
 
 _integ_state(prob, x, f = copy) =
-    prob.f isa SciMLBase.DynamicalODEFunction ? _partition(prob.u0, x) : f(x)
+    prob.f isa SciMLBase.DynamicalODEFunction ? _partition(prob.u0, x) :
+    prob.u0 isa AbstractVector ? f(x) : reshape(f(x), size(prob.u0))
 
 SciMLBase.get_du(integ::PETScIntegrator) = _checked_du(integ)
 function SciMLBase.get_du!(out, integ::PETScIntegrator)
@@ -5919,7 +5975,7 @@ end
 function _initialize_state!(integ::PETScIntegrator, init)
     h = integ.h
     prob = _with_p(_summed(integ.prob, integ.alg), integ.p)
-    u = integ.u isa Vector ? integ.u : Vector(integ.u)
+    u = integ.u isa Array ? vec(integ.u) : Vector(integ.u)
     before = h.ad_calls === nothing ? 0 : h.ad_calls[]
     p, ok = _initialize!(
         u, prob, integ, init, h.f_init, h.jac_init, h.petsclib, h.ctx.comm, integ.t,
@@ -6605,6 +6661,7 @@ function _reinit_unlocked(
     if integ.prob.f isa SciMLBase.DynamicalODEFunction && !hasproperty(u0, :x)
         u0 = _partition(integ.prob.u0, u0)
     end
+    u0 = _in_shape(integ.prob.u0, u0)
     old = integ.h
     dt = reset_dt === false ? _proposed_dt_unlocked(integ) : nothing
     prob = SciMLBase.remake(
@@ -6686,6 +6743,10 @@ function _reinit_unlocked(
 end
 
 _retype(old, new) = eltype(old) <: Union{AbstractFloat, Complex} ? eltype(old).(new) : new
+
+# `f` keeps seeing the problem's shape, so a state of another shape is read in linear order.
+_in_shape(old, new) = !(new isa AbstractArray) || size(new) == size(old) ||
+    (old isa AbstractVector && new isa AbstractVector) ? new : reshape(new, size(old))
 
 SciMLBase.reinit!(integ::PETScIntegrator, u0 = integ.prob.u0; kwargs...) =
     _locked(() -> _reinit_unlocked(integ, u0; kwargs...))
@@ -7036,7 +7097,8 @@ function _auto_dt_unlocked(integ::PETScIntegrator)
     integ.finished && return nothing
     h = integ.h
     _use_dt!(
-        integ, _estimate_dt(h, integ.opts, integ.u, integ.tdir * integ.t, integ.tstops), true,
+        integ, _estimate_dt(h, integ.opts, vec(integ.u), integ.tdir * integ.t, integ.tstops),
+        true,
     )
     _live_stats!(integ)
     return nothing
