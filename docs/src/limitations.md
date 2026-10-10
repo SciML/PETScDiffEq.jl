@@ -1,7 +1,7 @@
 # Limitations
 
-A `DynamicalODEProblem` or `SecondOrderODEProblem` runs distributed over a `comm` but not
-with a `dm`, and `PETScAdjoint` takes one on `MPI.COMM_SELF` only. PETSc TS is built for large
+A `DynamicalODEProblem` or `SecondOrderODEProblem` runs distributed over a `comm`, in a solve
+and under `PETScAdjoint`, but not with a `dm`. PETSc TS is built for large
 distributed problems, and reaching it from the SciML interface is what this package is for;
 use OrdinaryDiffEq.jl for serial problems where it applies.
 

@@ -47,8 +47,7 @@ system on the flat `[v; u]` that these methods step. Its `jac` and `paramjac`, w
 are that system's, taking the state as an `ArrayPartition(v, u)` as the forward solve's
 `jac` does, and are otherwise built from `f1` and `f2`. The cost functions are handed the
 state as an `ArrayPartition` and write its derivative into one, and `du0` comes back as
-one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused, and so
-is a `comm` other than `MPI.COMM_SELF` for these problems.
+one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused.
 
 The adjoint runs in PETSc's double real build. A `Float32` problem is solved there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
@@ -101,7 +100,10 @@ when there are parameters, filling this rank's rows; both are collective like `f
 `dgdp_discrete` gives this rank's share of the direct derivative, which the ranks add up.
 `du0` holds this rank's rows, and `dp` is the whole gradient on every rank. The cost times,
 `no_start`, the length of `p` and whether `dgdp_discrete` is given must agree across the
-ranks.
+ranks. A `DynamicalODEProblem` or `SecondOrderODEProblem` runs there too: its
+`jac_prototype` holds this rank's `v` rows and then its `u` rows, with the columns of the
+whole `[v; u]` as in its solve, `paramjac` fills the same rows, and the costs and `du0` are
+this rank's `ArrayPartition(v, u)`.
 
 With a `dm`, the adjoint runs on the DM as the solve does, for the same methods and discrete
 costs, and on a DM of a single rank for integral costs and a `SplitODEProblem` with
@@ -647,12 +649,6 @@ function _check_adjoint_problem(
                 "solve the summed problem as an ODEProblem",
         ),
     )
-    prob.f isa SciMLBase.DynamicalODEFunction && comm !== nothing && throw(
-        ArgumentError(
-            "PETScAdjoint supports a DynamicalODEProblem or SecondOrderODEProblem on " *
-                "MPI.COMM_SELF only",
-        ),
-    )
     eltype(prob.u0) <: Real || throw(
         ArgumentError(
             "PETScAdjoint supports a real state only; it runs in PETSc's double real " *
@@ -1083,7 +1079,8 @@ function _discrete_adjoint_unlocked(
         coo_rows, coo_cols, coo = if comm === nothing || implicit || dm !== nothing
             nothing, nothing, nothing
         else
-            _coo_structure(J, first(LibPETSc.VecGetOwnershipRange(pl, h.u)), nothing)
+            colmap = dyn ? _flat_columns(length(prob.u0.x[1]), n, comm) : nothing
+            _coo_structure(J, first(LibPETSc.VecGetOwnershipRange(pl, h.u)), nothing, colmap)
         end
         paramjac(fun, f) = np == 0 ? nothing :
             dm !== nothing ? Ghosted(fun.paramjac, pl, dm.ptr) :

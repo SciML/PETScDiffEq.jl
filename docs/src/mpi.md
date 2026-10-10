@@ -155,8 +155,8 @@ it is `length(u0)` by the length of the whole state, and `jac` fills it as it wo
 of the serial Jacobian. `TSAlpha2` needs each rank's `v` and `u` to have the same
 length, and builds the distributed matrix it factors, `shift_a I - shift_v df/dv - df/du`,
 from the `v` rows; without a `jac` PETSc colours that matrix and differences `f`, as for the
-other implicit algorithms. A `dm` is refused for these problems, and so are `PETScAdjoint` and
-any `autodiff` but `AutoFiniteDiff()` on a communicator. Split over 1 to 3 ranks, unevenly on more than one, a 1-D wave equation and a
+other implicit algorithms. A `dm` is refused for these problems, and so is any `autodiff` but
+`AutoFiniteDiff()` on a communicator. Split over 1 to 3 ranks, unevenly on more than one, a 1-D wave equation and a
 chain of particles gave the serial solve's states to 3e-15 with `TSBasicSymplectic` and fixed
 steps of `TSRK`, the energy error included, and to 1.2e-9 with adaptive steps of `TSRK("5dp")`.
 `TSAlpha2` and `TSImplicit("bdf")` with a `jac` agreed to 2e-10 with `["-ksp_type", "preonly",
@@ -177,6 +177,14 @@ ranks. A `jac`, `paramjac`, cost function or `f` that throws on some ranks makes
 throw, as in a solve. The transposed linear solves of `TSImplicit` and `TSARKIMEX` use the
 solver above; `["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves
 them directly.
+
+A `DynamicalODEProblem` or `SecondOrderODEProblem` is differentiated there too, with the same
+methods on its first-order form. Its `jac` fills the prototype described above, this rank's
+`v` rows and then its `u` rows with the columns of the whole `[v; u]`, and `paramjac` fills
+the same rows. The cost functions get this rank's `ArrayPartition(v, u)` and write their
+derivative into one, and `du0` comes back as one. On 2 ranks a damped nonlinear wave gave the
+serial adjoint's gradient to 3.1e-14 with each of the six methods, and on one rank that of
+central differences of the same fixed-step solve to 2e-10.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
 which every algorithm that takes `comm` takes as well. The solve then runs on the DM's
