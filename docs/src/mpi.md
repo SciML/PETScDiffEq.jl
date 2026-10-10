@@ -240,6 +240,12 @@ matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil. Without
 fills it by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()`;
 the stencil has to cover every point `f` reads. Colouring calls `f` once per colour at every
 Jacobian, and the colours grow with the stencil width and the degrees of freedom at a point.
+The colours are the DM's own where they fit its matrix. PETSc's DMDA colouring repeats along
+an axis with period `2s + 1` for stencil width `s`, or 5 for the 2-D star of width 1, so on a
+periodic axis whose number of points is not a multiple of the period PETSc refuses to colour
+in 1-D and 3-D and returns colours that do not fit the matrix in 2-D. There PETSc colours the
+matrix's own pattern instead, as under `-snes_fd_color_use_mat`, which took about twice the
+DM's number of colours on grids up to 256 by 256 points, and 2.8 times at most.
 On a DMDA `autodiff = AutoForwardDiff()` builds the exact Jacobian instead: `f` runs on a
 ghosted array of dual numbers, each entry seeded by the colour of the grid point it belongs
 to, ghosts included, so one call fills up to 12 colours and a `chunksize` sets another count.

@@ -663,7 +663,7 @@ end
 # Each ghosted entry's colour, as the DM's scatter brings it, and each stored column's.
 function _spread_colours(ghosts, globals, cols, own, R)
     seed = Int[]
-    _ghosted(a -> append!(seed, round.(Int, a)), ghosts, R.(own))
+    _ghosted(a -> append!(seed, round.(Int, real.(a))), ghosts, R.(own))
     of = Dict{_PetscInt, Int}()
     for (g, c) in zip(globals, seed)
         g >= 0 && c > 0 && (of[g] = c)
@@ -672,6 +672,19 @@ function _spread_colours(ghosts, globals, cols, own, R)
 end
 
 _proper(colour) = all(row -> allunique(c for c in row if c > 0), colour)
+
+# Whether the DM's colouring fits its matrix `A`: a 2-D DMDA's does not check a periodic axis.
+function _dm_coloured(pl, dm, A, n, comm, ::Type{S}) where {S}
+    rstart = Int(first(LibPETSc.MatGetOwnershipRange(pl, A)))
+    own = zeros(Int, n)
+    made = _dm_colours(pl, dm) do coloring
+        copyto!(own, first(_coloring_colours(pl, coloring, n, rstart)))
+    end
+    _everywhere(comm, made) || return false
+    cols = _matrix_rows(pl, A, n, rstart)
+    _, colour = _spread_colours(Ghosted(nothing, pl, dm), _dm_globals(pl, dm), cols, own, S)
+    return _everywhere(comm, _proper(colour))
+end
 
 function _ad_dm_jacobian(backend, f!, pl, dm, u0, p, t, calls, advice, comm, N)
     dense = ADTypes.dense_ad(backend)
