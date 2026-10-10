@@ -65,10 +65,12 @@ function damped_oscillator_jac!(J, u, p, t)
 end
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
-const GROUP = let group = get(ENV, "GROUP", "")
-    isempty(group) ? "All" : group
+# GROUP=MPI2 is MPI on 2 ranks, for a workflow that passes only GROUP.
+const GROUP, GROUP_RANKS = let group = get(ENV, "GROUP", ""), ranks = match(r"^MPI([123])$", group)
+    isempty(group) ? ("All", "") : ranks === nothing ? (group, "") : ("MPI", String(ranks[1]))
 end
-GROUP in ("All", "Core", "MPI") || error("GROUP is All, Core or MPI, not $GROUP")
+GROUP in ("All", "Core", "MPI") ||
+    error("GROUP is All, Core, MPI, or MPI1, MPI2 or MPI3 for one rank count, not $GROUP")
 is_mpi(s) = Meta.isexpr(s, :macrocall) && s.args[1] === Symbol("@testset") && s.args[3] == "MPI"
 
 # TEST_PART=k/n runs every n-th top-level testset from the k-th on, so n processes cover the file.
@@ -3576,6 +3578,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             for verbose in (false, logging.None(), quiet)
                 integ = SciMLBase.init(breaks, PETScDiffEq.TSRK("5dp"))
+                integ.opts.verbose = verbose
+                @test_logs min_level = Logging.Warn SciMLBase.solve!(integ)
+            end
+            # An implicit solve gives up on its Newton solve, which it reports at the end.
+            bdf = PETScDiffEq.TSImplicit("bdf")
+            for verbose in (false, quiet)
+                sol = @test_logs min_level = Logging.Warn SciMLBase.solve(breaks, bdf; verbose)
+                @test sol.retcode == SciMLBase.ReturnCode.Unstable
+                integ = SciMLBase.init(breaks, bdf)
                 integ.opts.verbose = verbose
                 @test_logs min_level = Logging.Warn SciMLBase.solve!(integ)
             end
@@ -11439,6 +11450,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
     end
 
     @testset "MPI" begin
+        # MPI_RANKS, such as 2 or 1,3, narrows the rank counts, so CI runs each in its own job.
+        listed = isempty(GROUP_RANKS) ? get(ENV, "MPI_RANKS", "") : GROUP_RANKS
+        rank_counts = isempty(listed) ? [1, 2, 3] : tryparse.(Int, split(listed, ','))
+        allunique(rank_counts) && rank_counts ⊆ 1:3 ||
+            error("MPI_RANKS is a comma-separated list of distinct rank counts from 1, 2 and 3, not $listed")
         if Sys.WORD_SIZE == 64 && !Sys.iswindows()
             dir = joinpath(@__DIR__, "mpi")
             julia = Base.julia_cmd()
@@ -11457,7 +11473,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 ),
                 (2, ["ensemble.jl"]),
             )
-            for np in (1, 2, 3), (threads, scripts) in launches
+            for np in rank_counts, (threads, scripts) in launches
                 rank_cmd = `$julia --threads=$threads --project=$dir $(joinpath(dir, "all.jl")) $scripts`
                 cmd = `$(MPI.mpiexec()) -n $np $rank_cmd`
                 proc = run(pipeline(cmd; stdout, stderr); wait = false)
