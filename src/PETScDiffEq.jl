@@ -2730,6 +2730,70 @@ _as_inplace(f, iip::Bool) = iip ? f : (du, u, p, t) -> (du .= f(u, p, t); nothin
 _as_inplace_jac(j, iip::Bool) = iip ? j :
     (J, u, p, t) -> (_copy_jac!(J, j(u, p, t)); nothing)
 
+function _buffer!(box, like)
+    buf = box[]
+    buf isa typeof(like) && axes(buf) == axes(like) && return buf
+    return box[] = similar(like)
+end
+
+# The second part runs even when the first throws, since on a communicator either may
+# communicate.
+function _sum_rhs(f1, f2, iip::Bool)
+    if !iip
+        return function (u, p, t)
+            local a, b
+            try
+                a = f1(u, p, t)
+            finally
+                b = f2(u, p, t)
+            end
+            return a + b
+        end
+    end
+    box = Ref{Any}(nothing)
+    return function (du, u, p, t)
+        tmp = _buffer!(box, du)
+        try
+            f1(du, u, p, t)
+        finally
+            f2(tmp, u, p, t)
+        end
+        du .+= tmp
+        return nothing
+    end
+end
+
+_jac_part(J, proto) =
+    proto isa SparseMatrixCSC ? _structure(eltype(J), proto) : zeros(eltype(J), size(J))
+
+# Each in-place `jac` fills a matrix of its own pattern, as it would on its own.
+function _sum_jac(j1, j2, proto1, proto2, iip::Bool)
+    iip || return (u, p, t) -> j1(u, p, t) + j2(u, p, t)
+    parts = Ref{Any}(nothing)
+    return function (J, u, p, t)
+        parts[] === nothing && (parts[] = (_jac_part(J, proto1), _jac_part(J, proto2)))
+        A, B = parts[]
+        j1(A, u, p, t)
+        j2(B, u, p, t)
+        _copy_jac!(J, A + B)
+        return nothing
+    end
+end
+
+function _pattern_union(P1, P2)
+    size(P1) == size(P2) || throw(
+        ArgumentError(
+            "the `jac_prototype`s of a SplitODEProblem's two parts are " *
+                "$(join(size(P1), " x ")) and $(join(size(P2), " x ")), but the Jacobian " *
+                "of their sum takes the entries of both, so they have to be one size",
+        ),
+    )
+    rows1, cols1, _ = findnz(SparseMatrixCSC(P1))
+    rows2, cols2, _ = findnz(SparseMatrixCSC(P2))
+    rows, cols = vcat(rows1, rows2), vcat(cols1, cols2)
+    return sparse(rows, cols, ones(length(rows)), size(P1)...)
+end
+
 # PETSc only steps forward, so a reversed span runs in s = -t: dv/ds = -f(v, p, -s)
 # and G(t, u, u') becomes G(-s, v, -dv/ds). `dv` is negated in place and restored.
 _reverse_rhs(f) = (du, u, p, s) -> (f(du, u, p, _user_t(-one(s), s)); du .*= -1; nothing)
@@ -4525,8 +4589,47 @@ end
 # PETSc cannot parse Julia's Float32 printing (`1.0f-5`).
 _option(x::Real) = string(Float64(x))
 
+_operator_rhs() = ArgumentError(
+    "PETScDiffEq does not support an operator-valued right-hand side; " *
+        "supply a function f!(du, u, p, t)",
+)
+
+const _SplitProblem =
+    SciMLBase.ODEProblem{<:Any, <:Any, <:Any, <:Any, <:SciMLBase.SplitFunction}
+
+# Every algorithm but TSARKIMEX takes a SplitODEProblem as the ODE of the sum of its parts.
+_summed(prob, alg) = prob
+_summed(prob::_SplitProblem, ::TSARKIMEX) = prob
+function _summed(prob::_SplitProblem, alg)
+    f, iip = prob.f, SciMLBase.isinplace(prob)
+    f1, f2 = SciMLBase.unwrapped_f(f.f1.f), SciMLBase.unwrapped_f(f.f2.f)
+    any(g -> g isa SciMLOperators.AbstractSciMLOperator, (f1, f2)) && throw(_operator_rhs())
+    proto1, proto2 = f.jac_prototype, f.f2.jac_prototype
+    sums_jac = _uses_ifunction(alg) && f.jac !== nothing && f.f2.jac !== nothing
+    sums_jac && _alg_dm(alg) !== nothing && throw(
+        ArgumentError(
+            "PETScDiffEq cannot add the `jac`s of a SplitODEProblem's two parts " *
+                "$_WITH_DM, where each fills the DM's matrix; leave them out for the DM's " *
+                "colouring, or solve the ODEProblem of the summed parts with its one `jac`",
+        ),
+    )
+    sparse_sum = proto1 isa SparseArrays.AbstractSparseMatrix &&
+        proto2 isa SparseArrays.AbstractSparseMatrix
+    g = SciMLBase.ODEFunction{iip, SciMLBase.FullSpecialize}(
+        _sum_rhs(f1, f2, iip);
+        jac = sums_jac ? _sum_jac(
+                SciMLBase.unwrapped_f(f.jac), SciMLBase.unwrapped_f(f.f2.jac), proto1,
+                proto2, iip,
+            ) : nothing,
+        jac_prototype = sparse_sum ? _pattern_union(proto1, proto2) : nothing,
+        mass_matrix = f.mass_matrix, sys = f.sys,
+        initialization_data = f.initialization_data,
+    )
+    return SciMLBase.ODEProblem{iip}(g, prob.u0, prob.tspan, prob.p; prob.kwargs...)
+end
+
 function _setup(
-        prob::SupportedProblem,
+        problem::SupportedProblem,
         alg::AnyPETScTS;
         dt = nothing,
         reltol = nothing,
@@ -4548,10 +4651,11 @@ function _setup(
         tstops = (),
         extra_options = String[],
         jac_advice = nothing,
-        eltypes = _eltypes(prob),
+        eltypes = _eltypes(problem),
         initializealg = DiffEqBase.DefaultInit(),
         kwargs...,
     )
+    prob = _summed(problem, alg)
     for key in UNSUPPORTED_KWARGS
         if haskey(kwargs, key)
             @warn "PETScDiffEq does not support `$key` and is ignoring it"
@@ -4571,8 +4675,6 @@ function _setup(
     end
     dt_given = dt !== nothing
     is_split = prob.f isa SciMLBase.SplitFunction
-    is_split && !(alg isa TSARKIMEX) &&
-        throw(ArgumentError("PETScDiffEq only supports SplitODEProblem with TSARKIMEX"))
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     comm = _distributed(alg) ? alg.comm : nothing
     mass_matrix = is_dae ? nothing : prob.f.mass_matrix
@@ -4665,12 +4767,7 @@ function _setup(
         throw(ArgumentError("PETScDiffEq requires an in-place DAEProblem residual"))
     f2 = is_split ? unwrap(prob.f.f2.f) : nothing
     for g in (f1, f2)
-        g isa SciMLOperators.AbstractSciMLOperator && throw(
-            ArgumentError(
-                "PETScDiffEq does not support an operator-valued right-hand side; " *
-                    "supply a function f!(du, u, p, t)",
-            ),
-        )
+        g isa SciMLOperators.AbstractSciMLOperator && throw(_operator_rhs())
     end
     f1 = is_dae || dyn ? f1 : _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
@@ -5755,7 +5852,7 @@ end
 
 function _initialize_state!(integ::PETScIntegrator, init)
     h = integ.h
-    prob = _with_p(integ.prob, integ.p)
+    prob = _with_p(_summed(integ.prob, integ.alg), integ.p)
     u = integ.u isa Vector ? integ.u : Vector(integ.u)
     before = h.ad_calls === nothing ? 0 : h.ad_calls[]
     p, ok = _initialize!(
