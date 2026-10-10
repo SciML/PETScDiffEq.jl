@@ -64,10 +64,11 @@ the step-size controller.
 
 `TSARKIMEX` is the one stiff family `PETScAdjoint` takes that has an error estimate, so the
 one stiff method whose adaptive solve it differentiates. It takes a `SplitODEProblem` as
-well, on `MPI.COMM_SELF`: the implicit part's `jac` and `paramjac` are the problem's, which
-a `SplitODEProblem` takes from `f1`, and the explicit part's are those of `f2`'s own
-`ODEFunction`, each built by automatic differentiation when missing. Two things are
-refused, because PETSc's ARKIMEX adjoint cannot do them. It has no quadrature, so an
+well: the implicit part's `jac` and `paramjac` are the problem's, which a `SplitODEProblem`
+takes from `f1`, and the explicit part's are those of `f2`'s own `ODEFunction`. On
+`MPI.COMM_SELF` each is built by automatic differentiation when missing; on another
+communicator both parts have to give them, as the [MPI](@ref) section describes. Two things
+are refused, because PETSc's ARKIMEX adjoint cannot do them. It has no quadrature, so an
 integral cost stops with "No method adjointintegral". And with `-ts_arkimex_fully_implicit`
 on a `SplitODEProblem` the solve takes `f2` implicitly while the adjoint still takes it
 explicitly, which put the gradient 24% off in the test problem. With any other algorithm,

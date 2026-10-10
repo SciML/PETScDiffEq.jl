@@ -35,10 +35,10 @@ which therefore has to be a vector of real numbers. A hand-written `jac` or `par
 goes into the gradient unchecked, so a wrong one gives a wrong gradient without an error;
 compare it against a gradient computed without it.
 
-`TSARKIMEX` takes a `SplitODEProblem` as well, on `MPI.COMM_SELF`. The implicit part's
-`jac` and `paramjac` are the problem's, which a `SplitODEProblem` takes from `f1`, and the
-explicit part's are those of `f2`'s own `ODEFunction`; each is built by automatic
-differentiation when missing. PETSc's ARKIMEX adjoint has no quadrature, so an integral
+`TSARKIMEX` takes a `SplitODEProblem` as well. The implicit part's `jac` and `paramjac` are
+the problem's, which a `SplitODEProblem` takes from `f1`, and the explicit part's are those
+of `f2`'s own `ODEFunction`; on `MPI.COMM_SELF` each is built by automatic differentiation
+when missing. PETSc's ARKIMEX adjoint has no quadrature, so an integral
 cost is refused, and `-ts_arkimex_fully_implicit` is refused on a `SplitODEProblem`, since
 the adjoint would still take `f2` explicitly.
 
@@ -94,9 +94,11 @@ stay in force while the adjoint runs, so those PETSc reads only then, such as
 for example through `PETSC_OPTIONS`, do not reach the run.
 
 With an algorithm whose `comm` is not `MPI.COMM_SELF`, the adjoint runs distributed as the
-solve does, for the same methods on an `ODEProblem`. The `ODEFunction` then needs `jac`,
-filling this rank's rows of a sparse `jac_prototype` with global columns, and `paramjac`
-when there are parameters, filling this rank's rows; both are collective like `f`.
+solve does, for the same methods on an `ODEProblem` and for `TSARKIMEX` on a
+`SplitODEProblem`. The `ODEFunction` then needs `jac`, filling this rank's rows of a sparse
+`jac_prototype` with global columns, and `paramjac` when there are parameters, filling this
+rank's rows; both are collective like `f`. A `SplitODEProblem` needs the same of `f2`'s
+`ODEFunction`, with a sparse `jac_prototype` of its own.
 `dgdu_discrete` gets this rank's rows of the state and writes their derivative, and
 `dgdp_discrete` gives this rank's share of the direct derivative, which the ranks add up.
 `du0` holds this rank's rows, and `dp` is the whole gradient on every rank. The cost times,
@@ -641,10 +643,11 @@ function _check_adjoint_problem(
                 "ODEProblem of their sum",
         ),
     )
-    is_split && comm !== nothing && throw(
+    is_split && comm !== nothing && dm !== nothing && throw(
         ArgumentError(
-            "PETScAdjoint supports a SplitODEProblem on MPI.COMM_SELF only; $_NOT_SELF " *
-                "solve the summed problem as an ODEProblem",
+            "PETScAdjoint supports a SplitODEProblem $_WITH_DM on a DM of a single rank " *
+                "only; on more ranks give the communicator as `comm` in place of the `dm`, " *
+                "or solve the summed problem as an ODEProblem",
         ),
     )
     prob.f isa SciMLBase.DynamicalODEFunction && comm !== nothing && throw(
@@ -691,12 +694,14 @@ function _check_adjoint_problem(
             ),
         )
     end
-    comm === nothing || prob.f.jac !== nothing || throw(
-        ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `jac` $_NOT_SELF, where it builds none " *
-                "by automatic differentiation",
-        ),
-    )
+    for (whose, fun) in parts
+        comm === nothing || fun.jac !== nothing || throw(
+            ArgumentError(
+                "PETScAdjoint needs $whose `jac` $_NOT_SELF, where it builds none " *
+                    "by automatic differentiation",
+            ),
+        )
+    end
     p = prob.p
     has_p = !(p === nothing || p isa SciMLBase.NullParameters)
     has_p && !(p isa AbstractVector{<:Real}) && throw(
@@ -721,12 +726,14 @@ function _check_adjoint_problem(
             ),
         )
     end
-    has_p && !isempty(p) && comm !== nothing && prob.f.paramjac === nothing && throw(
-        ArgumentError(
-            "PETScAdjoint needs the ODEFunction's `paramjac` $_NOT_SELF when the problem has " *
-                "parameters, where it builds none by automatic differentiation",
-        ),
-    )
+    for (whose, fun) in parts
+        has_p && !isempty(p) && comm !== nothing && fun.paramjac === nothing && throw(
+            ArgumentError(
+                "PETScAdjoint needs $whose `paramjac` $_NOT_SELF when the problem has " *
+                    "parameters, where it builds none by automatic differentiation",
+            ),
+        )
+    end
     for (name, given) in (("dgdp_discrete", dgdp_discrete), ("dgdp_continuous", dgdp_continuous))
         !has_p && given !== nothing && throw(
             ArgumentError(
@@ -811,6 +818,19 @@ function _check_adjoint_dm(prob, dm, parts)
     end
     return nothing
 end
+
+# The forward solve checks `f1`'s prototype and never reads `f2`'s.
+function _check_explicit_prototype(proto, n, N)
+    proto isa SparseMatrixCSC && size(proto) == (n, N) && return nothing
+    throw(
+        ArgumentError(
+            "PETScAdjoint needs `f2`'s `jac` $_NOT_SELF to come with a sparse " *
+                "`jac_prototype` holding this rank's rows, with global column indices, so " *
+                "$n x $N here",
+        ),
+    )
+end
+
 function _check_adjoint_ts(h::TSHandles, alg, cost_s, integral, is_split)
     pl, ts = h.petsclib, h.ts
     implicit = _uses_ifunction(alg)
@@ -1056,6 +1076,9 @@ function _discrete_adjoint_unlocked(
     try
         cost_s = h.tdir .* cost_t
         implicit, arkimex = _check_adjoint_ts(h, alg, cost_s, integral, is_split)
+        is_split && comm !== nothing && dm === nothing && _checked_everywhere(comm) do
+            _check_explicit_prototype(prob.f.f2.jac_prototype, n, N)
+        end
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
         inplace(fun) = _as_inplace(SciMLBase.unwrapped_f(fun.f), iip)
@@ -1080,7 +1103,7 @@ function _discrete_adjoint_unlocked(
         end
         no_rows = (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
         rows = J isa SparseMatrixCSC && comm === nothing ? _row_structure(J, n) : no_rows
-        coo_rows, coo_cols, coo = if comm === nothing || implicit || dm !== nothing
+        coo_rows, coo_cols, coo = if comm === nothing || (implicit && !is_split) || dm !== nothing
             nothing, nothing, nothing
         else
             _coo_structure(J, first(LibPETSc.VecGetOwnershipRange(pl, h.u)), nothing)
@@ -1103,7 +1126,7 @@ function _discrete_adjoint_unlocked(
             context(jac, J, rows, paramjac(prob.f, f_ad), h.tdir, coo)
         # PETSc's ARKIMEX adjoint segfaults without an explicit part's parameter Jacobian.
         if is_split
-            ex = context(jac, J, rows, paramjac(rhs, f_rhs), h.tdir, nothing)
+            ex = context(jac, J, rows, paramjac(rhs, f_rhs), h.tdir, coo)
         elseif arkimex && np > 0
             ex = context(nothing, zeros(0, 0), no_rows, _zero_paramjac, h.tdir, nothing)
         end
@@ -1127,7 +1150,7 @@ function _discrete_adjoint_unlocked(
                     _set_dm_rhs_jacobian!(adj, ts)
             )
             is_split && (
-                dm === nothing ? _set_rhs_jacobian!(ex, ts, n, N, nothing, nothing) :
+                dm === nothing ? _set_rhs_jacobian!(ex, ts, n, N, coo_rows, coo_cols) :
                     _set_dm_rhs_jacobian!(ex, ts)
             )
             if np > 0

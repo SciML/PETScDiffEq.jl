@@ -10119,6 +10119,38 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(du0, central_differences(loss, u0)) < 1.0e-8
         end
 
+        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX on a split problem on a communicator of one rank" begin
+            world = MPI.COMM_WORLD
+            on_world = TSARKIMEX("3", exact; comm = world)
+            for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t))
+                prob = split_prob(copy(u0), copy(p0), tspan; kind = :sparse)
+                serial = grad(prob, TSARKIMEX("3", exact); t)
+                du0, dp = grad(prob, on_world; t)
+                @test du0 ≈ serial[1] rtol = 1.0e-13
+                @test dp ≈ serial[2] rtol = 1.0e-13
+            end
+            differentiating =
+                TSARKIMEX("3", exact; comm = world, autodiff = PETScDiffEq.AutoForwardDiff())
+            for (kw, what) in (
+                    ((; f2_jac = nothing), "needs `f2`'s `jac` on a communicator"),
+                    ((; f2_paramjac = nothing), "needs `f2`'s `paramjac` on a communicator"),
+                )
+                prob = split_prob(copy(u0), copy(p0), (0.0, 1.0); kind = :sparse, kw...)
+                @test_throws what grad(prob, differentiating)
+            end
+            dense_f2 = SciMLBase.SplitODEProblem(
+                SciMLBase.ODEFunction(
+                    implicit_part!; jac = implicit_jac!, paramjac = implicit_paramjac!,
+                    jac_prototype = sparse(ones(2, 2)),
+                ),
+                SciMLBase.ODEFunction(
+                    explicit_part!; jac = explicit_jac!, paramjac = explicit_paramjac!,
+                ),
+                copy(u0), (0.0, 1.0), copy(p0),
+            )
+            @test_throws "to come with a sparse `jac_prototype`" grad(dense_f2, on_world)
+        end
+
         @testset "an adaptive TSARKIMEX holds its accepted steps fixed: $name" for (
                 name, subtype, make, tspan,
             ) in (
