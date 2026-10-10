@@ -3,8 +3,7 @@ module PETScDiffEqSciMLSensitivityExt
 using PETScDiffEq: PETScDiffEq, PETScAdjoint
 using SciMLBase: SciMLBase
 using SciMLSensitivity: SciMLSensitivity
-
-const ChainRulesCore = SciMLSensitivity.ChainRulesCore
+using ChainRulesCore: ChainRulesCore
 
 function SciMLSensitivity._adjoint_sensitivities(
         sol, sensealg::PETScAdjoint, alg::PETScDiffEq.AnyPETScTS;
