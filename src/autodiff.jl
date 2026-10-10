@@ -346,7 +346,11 @@ function (g::Guarded)(out, args...)
     return nothing
 end
 
-function _global_colours(backend, proto::SparseMatrixCSC, comm)
+_guarded(f, err) = Guarded(f, err)
+# Both parts run even when the first throws, since either may communicate.
+_guarded(d::Partitioned, err) = Partitioned(Guarded(d.f1, err), Guarded(d.f2, err), d.nv)
+
+function _global_colours(backend, proto::SparseMatrixCSC, comm, colmap)
     n, N = size(proto)
     rstart = MPI.Scan(n, +, comm) - n
     pairs = Vector{Int}(undef, 2 * SparseArrays.nnz(proto))
@@ -368,7 +372,10 @@ function _global_colours(backend, proto::SparseMatrixCSC, comm)
     end
     MPI.Bcast!(colours, comm)
     entry = [colours[j] for j in 1:N for _ in nzrange(proto, j)]
-    return colours[rstart .+ (1:n)], entry, maximum(colours; init = 0)
+    block = rstart .+ (1:n)
+    # A partitioned problem's columns are not in the state's order, so find this rank's.
+    own = colmap === nothing ? block : invperm(colmap)[block]
+    return colours[own], entry, maximum(colours; init = 0)
 end
 
 _batch(::AutoForwardDiff{C}, ncolours) where {C} =
@@ -441,11 +448,13 @@ function (j::CommJacobian)(J, du, u::AbstractVector{<:Complex}, p, gamma, t)
     )
 end
 
-function _ad_comm_jacobian(backend, f!, proto, u0, p, t, calls, advice, comm, dae)
-    own, entry, ncolours = _global_colours(backend, proto, comm)
+function _ad_comm_jacobian(
+        backend, f!, proto, u0, p, t, calls, advice, comm, dae, colmap = nothing,
+    )
+    own, entry, ncolours = _global_colours(backend, proto, comm, colmap)
     dense = ADTypes.dense_ad(backend)
     err = Ref{Any}(nothing)
-    g! = Counted(Guarded(f!, err), calls)
+    g! = Counted(_guarded(f!, err), calls)
     R, n = real(eltype(u0)), length(u0)
     split = eltype(u0) <: Complex
     x, y = split ? (real.(u0), imag.(u0)) : (copy(u0), R[])
@@ -690,7 +699,7 @@ function _ad_dm_jacobian(backend, f!, pl, dm, u0, p, t, calls, advice, comm, N)
             [r for r in 1:n for _ in cols[r]], [Int(c) + 1 for row in cols for c in row],
             true, n, N,
         )
-        own, _, ncolours = _global_colours(backend, proto, something(comm, MPI.COMM_SELF))
+        own, _, ncolours = _global_colours(backend, proto, something(comm, MPI.COMM_SELF), nothing)
         seed, colour = _spread_colours(ghosts, globals, cols, own, R)
     end
     g! = Counted(f!, calls)
@@ -746,6 +755,54 @@ function _ad_paramjacobian(backend, f!, u0, p, t, advice)
         _with_p!, du, b, p, DI.Constant(f!), DI.Constant(copy(u0)), DI.Constant(t),
     )
     return ADParamJacobian(f!, b, prep, du, advice)
+end
+
+# Every rank seeds the same parameters, so each calls `f` once per chunk, on its own rows.
+struct CommParamJacobian{G, B, P, X, Y}
+    g!::G
+    backend::B
+    prep::P
+    out::Vector{Float64}
+    tx::X
+    ty::Y
+    err::Base.RefValue{Any}
+    advice::String
+end
+
+function (j::CommParamJacobian)(pJ, u, p, t)
+    j.err[] = nothing
+    B, np = length(j.tx), size(pJ, 2)
+    for lo in 0:B:(np - 1)
+        for k in 1:B
+            j.tx[k] .= (1:np) .== lo + k
+        end
+        DI.value_and_pushforward!(
+            _with_p!, j.out, j.ty, j.prep, j.backend, p, j.tx, DI.Constant(j.g!),
+            DI.Constant(u), DI.Constant(t),
+        )
+        for k in 1:min(B, np - lo)
+            pJ[:, lo + k] .= j.ty[k]
+        end
+    end
+    e = j.err[]
+    e === nothing || throw(_dual_failure(e) ? _dual_error(e, j.backend, j.advice) : e)
+    _check_finite(() -> j.out, pJ, t, j.advice)
+    return nothing
+end
+
+function _ad_comm_paramjacobian(backend, f!, u0, p, t, advice, comm)
+    dense = ADTypes.dense_ad(backend)
+    err = Ref{Any}(nothing)
+    g! = Guarded(f!, err)
+    out = zeros(length(u0))
+    B = _batch(dense, length(p))
+    tx = ntuple(_ -> zeros(eltype(p), length(p)), B)
+    ty = ntuple(_ -> zeros(length(u0)), B)
+    contexts = (DI.Constant(g!), DI.Constant(copy(u0)), DI.Constant(t))
+    prep = _checked_everywhere(comm) do
+        DI.prepare_pushforward(_with_p!, out, dense, p, tx, contexts...)
+    end
+    return CommParamJacobian(g!, dense, prep, out, tx, ty, err, advice)
 end
 
 struct ADCostGradient{G, B, P, W}

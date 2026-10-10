@@ -58,9 +58,28 @@ keywords that set the steps, `dt`, `adaptive`, `abstol`, `reltol`, `dtmin`, `dtm
 `maxiters`, have to be passed to `adjoint_sensitivities` exactly as they were to `solve`.
 
 With fixed steps every cost time must be a time the solve steps to, since PETSc's adjoint
-has no derivative of interpolation. An adaptive solve can take costs only at the ends of
-`tspan`, and its gradient holds the accepted step sizes fixed rather than differentiating
-the step-size controller.
+has no derivative of interpolation. An adaptive solve takes cost times anywhere in `tspan`.
+`PETScAdjoint` gives them to PETSc as its time span, `TSSetTimeSpan`, and the step-size
+controller ends a step on each one, so a loss summed over data times needs only the
+tolerances repeated:
+
+```julia
+data_t = [0.25, 0.5, 0.75, 1.0]
+sol = solve(prob, TSRK("5dp"); abstol = 1e-8, reltol = 1e-8, saveat = data_t)
+du0, dp = adjoint_sensitivities(
+    sol, TSRK("5dp"); sensealg = PETScAdjoint(),
+    t = data_t, dgdu_discrete = dg!, abstol = 1e-8, reltol = 1e-8,
+)
+```
+
+The gradient holds the accepted step sizes fixed rather than differentiating the step-size
+controller: it agreed to within 2e-9 with central differences of a solve repeating those
+steps at fixed size, for `TSRK` and `TSARKIMEX` alike. The steps are those of the adjoint's
+own forward solve. `solve` with the same tolerances does not end a step on its `saveat`
+times but interpolates to them, so the states it saves differ from the ones the cost is
+taken on by the error of the two solves; at tolerances of 1e-5 the two sums of
+`|u|^2 / 2` over eleven times differed by 1.2e-7 of their value. `tstops` do not make
+`solve` take the adjoint's steps either, since `solve` steps to them in its own loop.
 
 `TSARKIMEX` is the one stiff family `PETScAdjoint` takes that has an error estimate, so the
 one stiff method whose adaptive solve it differentiates. It takes a `SplitODEProblem` as
@@ -105,11 +124,12 @@ direct solve to 2e-15, since ILU(0) of a tridiagonal matrix is exact. Passing
 difference in every case. For a problem too large to factor, tighten `-ksp_rtol` instead;
 `1e-10` brought the two larger grids to 1e-11 and 5e-11.
 
-It runs distributed over a `comm` and on a DMDA as well, needing a `jac` and `paramjac` that
-fill each rank's rows, as the [MPI](@ref) section describes. Callbacks, `tstops`, mass
-matrices and `DAEProblem` are refused, and so is differentiating `solve` with a reverse-mode
-AD package. Passing
-`sensealg = PETScAdjoint()` to `solve` itself does nothing.
+It runs distributed over a `comm` and on a DMDA as well, with a `jac` and `paramjac` that
+fill each rank's rows, as the [MPI](@ref) section describes. On a `comm` it builds a missing
+one with ForwardDiff, the `jac` from the sparse `jac_prototype`; on a DMDA both have to be
+given. Callbacks, `tstops`, mass matrices and `DAEProblem` are refused. Passing
+`sensealg = PETScAdjoint()` to `solve` itself does nothing until a reverse-mode AD package
+differentiates that `solve`, which the last section of this page describes.
 
 `jac` and `paramjac` go into the gradient unchecked, so a wrong entry gives a wrong
 gradient. Compare them against central differences of `f!` at a representative point
@@ -143,3 +163,68 @@ jacobian_errors(f!, jac!, paramjac!, [1.0, 0.5], [0.7, 0.3, 0.4, 0.2], 0.3)
 
 Both errors should be near round-off, around 1e-10 here; a wrong entry shows up at its own
 size.
+
+## Differentiating `solve`
+
+`PETScAdjoint` is also the `sensealg` of `solve` itself for Zygote, and for other
+reverse-mode packages that take their rules from ChainRules, so a fitting loss needs no cost
+functions:
+
+```julia
+using Zygote
+
+data_t = 0.0:0.1:1.0
+truth = remake(prob; p = [0.77, 0.27, 0.48, 0.16])
+data = Array(solve(truth, TSRK("5dp"); abstol = 1e-10, reltol = 1e-10, saveat = data_t))
+function loss(p)
+    sol = solve(
+        prob, TSRK("5dp"); p, saveat = data_t, abstol = 1e-8, reltol = 1e-8,
+        sensealg = PETScAdjoint(),
+    )
+    return sum(abs2, Array(sol) .- data)
+end
+Zygote.gradient(loss, [0.7, 0.3, 0.4, 0.2])
+```
+
+`solve` runs as it does without the `sensealg` and returns the same solution. When the
+gradient is taken, the times `solve` saved become the cost times, the loss's derivative with
+respect to each saved state becomes `dgdu_discrete`, and the adjoint described above runs
+with the keywords `solve` was given: its own forward solve, then PETSc's adjoint. A gradient
+took 3.1 times as long as the solve with `TSRK("5dp")` and 2.7 times with `TSARKIMEX("3")`
+in the test problem. Gradients come back for `u0` and `p`. The loss can be written on
+`Array(sol)`, `sol.u[i]`, `sol[:, i]` or `sol[i, j]`, with `saveat`, `save_start`,
+`save_end`, `save_everystep` and `save_idxs` as `solve` takes them, and saved times it does
+not depend on are left out of the adjoint's run.
+
+With fixed steps the saved times have to be step ends, and the gradient is that of the loss
+as `solve` computes it: it agreed with central differences of the loss to 3e-10 for
+`TSRK("4")`, Crank-Nicolson, backward Euler, the theta method and `TSARKIMEX("3")` on a
+`SplitODEProblem`.
+
+For an adaptive solve the two runs differ. `solve` interpolates to its `saveat` times and
+the adjoint's forward solve ends a step on each, so the gradient pairs the loss's derivative
+at the first states with the sensitivities of the second. In the test problem, at tolerances
+of 1e-4, 1e-6, 1e-8 and 1e-10, the two sets of states were at most 2.1e-6, 3.1e-7, 9.8e-9
+and 2.0e-10 apart over eleven save times for `TSRK("5dp")`, and 1.2e-4, 5.6e-7, 1.1e-9 and
+2.9e-12 for `TSARKIMEX("3")`. The gradient of the fitting loss was then within 3.5e-6,
+3.6e-7, 1.1e-8 and 3.0e-11 of a reference, relative to its norm, for `TSRK("5dp")`, and
+within 4.4e-4, 1.3e-5, 1.5e-7 and 1.6e-9 for `TSARKIMEX("3")`, the reference being
+ForwardDiff through `Tsit5` at tolerances of 1e-13. Central differences of the same loss
+were as far from that reference, 3.8e-6, 4.1e-7, 1.7e-8 and 3.7e-9 for `TSRK("5dp")` and
+1.1e-3, 1.5e-5, 1.5e-7 and 1.5e-9 for `TSARKIMEX("3")`, so the mismatch stays at the size of
+the solve's own error. The saved states could be taken from the adjoint's stepping instead,
+by having `solve` end a step on each `saveat` time, but a differentiated `solve` would then
+return other states than a plain one, so `solve` is left as it is.
+
+Without `saveat` an adaptive solve saves its own steps, whose times move with `p`. The
+gradient holds those times fixed, as it holds the step sizes. A loss on the last state is
+unaffected, but for a loss summed over every step the gradient is that of the states at
+those times, 3e-9 from the reference, while central differences of the loss, which let the
+times move, were 5% away. Give `saveat` for a loss over several times.
+
+A loss that calls `sol(t)` or reads `u0` or `p` from `sol.prob` is refused, since only the
+saved states carry a derivative. A `Float32` problem, a `DynamicalODEProblem` or
+`SecondOrderODEProblem`, a `comm` other than `MPI.COMM_SELF` and a `dm` are refused here
+though `adjoint_sensitivities` takes them, and so are Enzyme, ReverseDiff, Tracker and
+Mooncake, none of which this has been verified with. Everything `adjoint_sensitivities`
+refuses is refused as well.
