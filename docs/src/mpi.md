@@ -455,19 +455,31 @@ DMShell, is refused with an `ArgumentError`.
 
 `PETScAdjoint` runs with a `dm` too, for the methods and discrete costs it takes on a `comm`,
 and on a DM of a single rank for integral costs and a `SplitODEProblem` with `TSARKIMEX` as
-well. It needs the problem's `jac`, filling the DM's matrix as above, and when there are
+well. It takes the problem's `jac`, filling the DM's matrix as above, and when there are
 parameters a `paramjac(pJ, u, p, t)` that gets `u` ghosted and fills this rank's rows of `pJ`
 in the DM's order, a column per entry of `p`, which
 `PETScDiffEq.reshape_local_array(view(pJ, :, k), dm)` indexes by grid point; a
-`SplitODEProblem` needs `f2`'s as well. Neither is built when missing: automatic
-differentiation would not see the ghosted array, and colouring only approximates the
-Jacobian, which moved the gradient by up to 3.5e-9 in a reaction-diffusion test and which
-PETSc's `TSARKIMEX` adjoint cannot use at all. The rest follows the distributed adjoint above:
+`SplitODEProblem` takes `f2`'s as well. On a DMDA a missing one is built with ForwardDiff.
+The `jac` is the one a solve builds under `autodiff = AutoForwardDiff()`, `f` on the ghosted
+array of dual numbers, one call for up to 12 colours; an implicit method's solve has built it
+already, and an explicit one's adjoint builds its own. The `paramjac` seeds `p` instead: `u`
+is the ghosted array of plain numbers, so nothing but the DM's usual scatter travels, and
+every rank calls `f` once per chunk of up to 12 parameters and keeps its own rows. `TSRK` has
+no `autodiff` and builds both as it is. An implicit method needs `autodiff = AutoForwardDiff()`, since the
+default with a `dm`, `AutoFiniteDiff()`, colours the Jacobian, which only approximates it,
+moved the gradient by up to 3.5e-9 in a reaction-diffusion test, and which PETSc's
+`TSARKIMEX` adjoint cannot use at all; it is refused with an `ArgumentError` that says so, as
+are the other backends, and a DMStag or a DMPlex without a `jac` and `paramjac`. The rest
+follows the distributed adjoint above:
 the cost functions get this rank's block of the state as `solve` saves it, not the ghosted
 array, `du0` comes back as that block and `dp` whole on every rank, and a function that
 throws on some ranks makes every rank throw. On 1-D and 2-D DMDAs of 1 to 3 ranks the
 gradient agreed with the comm-mode and serial adjoints of the same discretization to 2e-15
-and with central differences of the same fixed-step solve to 1.4e-9.
+and with central differences of the same fixed-step solve to 1.4e-9. With `jac` and `paramjac`
+both built, on 1 and 2 ranks, it was within 8.8e-16 relative of those adjoints, and on one rank,
+on 1-D and 2-D grids with one and two degrees of freedom and ghosted and periodic edges, within
+2.9e-16 of the gradient from a hand-written `jac` and `paramjac`, for `TSRK`, `TSImplicit` and
+`TSARKIMEX` in both time directions.
 
 A solve with a `dm` refuses `TSIRK`, `TSMPRK` and an implicit `TSGeneric` of type `"irk"`,
 or of a type refused on a `comm`, with an `ArgumentError`. A distributed solve, with a `dm`
