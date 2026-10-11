@@ -1539,8 +1539,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
     end
 
     @testset "maxiters that no PetscInt can hold" begin
-        @test PETScDiffEq._maxsteps(typemax(Int)) ==
-            min(typemax(Int), typemax(PETScDiffEq.LibPETSc.PetscInt))
+        @test PETScDiffEq._maxsteps(typemax(Int)) == typemax(PETScDiffEq.LibPETSc.PetscInt)
         @test PETScDiffEq._maxsteps(100) == 100
         @test PETScDiffEq._maxsteps(typemax(Int)) isa PETScDiffEq.LibPETSc.PetscInt
         @test SciMLBase.solve(
