@@ -53,5 +53,5 @@ describes, though not with a `dm`. Both algorithms take a reversed `tspan`. PETS
 forward, so `TSAlpha2` then integrates `w(s) = u(-s)`, whose velocity is `-u'`, and gives back
 `u'`: the states, `jac` and callbacks are those of the problem as written. `PETScAdjoint`
 differentiates them through the first-order form with `TSRK`, `TSARKIMEX` or `TSImplicit`'s
-`"beuler"`, `"cn"` or `"theta"`, on `MPI.COMM_SELF` only; PETSc has no adjoint for
+`"beuler"`, `"cn"` or `"theta"`, on a `comm` as well; PETSc has no adjoint for
 `TSBasicSymplectic` or `TSAlpha2`.

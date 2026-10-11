@@ -4,8 +4,8 @@ The options available in `solve` are documented
 [at the common solver options page](https://docs.sciml.ai/DiffEqDocs/stable/basics/common_solver_opts/).
 This package supports `dt`, `adaptive`, `dtmin`, `force_dtmin`, `dtmax`, `reltol` and
 `abstol` (either may be a vector of per-component tolerances), `saveat`, `save_everystep`,
-`save_start`, `save_end`, `save_on`, `save_idxs`, `dense`, `callback`, `tstops`,
-`d_discontinuities`, `unstable_check`, `isoutofdomain`, `timeseries_errors`,
+`save_start`, `save_end`, `save_on`, `save_idxs`, `save_discretes`, `dense`, `callback`,
+`tstops`, `d_discontinuities`, `unstable_check`, `isoutofdomain`, `timeseries_errors`,
 `dense_errors`, `verbose` and `initializealg`. The warning a solve that ends early gives is logged at the
 `instability` level of a `DEVerbosity`, so `verbose = DEVerbosity(SciMLLogging.None())`
 silences it, as do `SciMLLogging.None()` and `false`. Keywords it cannot honour emit a
@@ -124,3 +124,19 @@ otherwise turn it on, since a partial state gives no derivative to interpolate w
 saves the new end when `save_everystep` asks for every step. `resize!`, `deleteat!` and
 `addat!` raise an `ArgumentError`, since PETSc sizes its vectors and solvers when the
 integrator is made.
+
+A callback that names timeseries partitions in `saved_clock_partitions`, as the callbacks
+ModelingToolkit builds for discrete variables do, has those parameters saved where
+OrdinaryDiffEq saves them, so `sol.ps` and `sol(t; idxs)` give a discrete parameter's
+history. A callback with `save_positions[2]` has its partitions saved at the start, unless
+it sets `initialize_save_discretes = false` or `init` is given `initialize_save = false`,
+and after each `affect!`, a `VectorContinuousCallback` saving the partitions of the events
+that fired and a `ContinuousCallback` none after an `affect!` that clears the derivative
+discontinuity. One with a `finalize` has them saved at the end when the end point is added
+there, as under `save_everystep = false`. `save_discretes = false` leaves out the saves
+after an `affect!` and keeps the others, and an integrator's `opts.save_discretes` can
+change between steps. `save_on = false` does not affect them. `reinit!` starts the history
+again, where OrdinaryDiffEq's keeps the earlier values, and goes on from it with
+`erase_sol = false`. On a communicator or with a `dm` each rank saves from its own
+parameters. A `DAEProblem`'s solution has no storage for them in SciMLBase, so none are
+saved there.
