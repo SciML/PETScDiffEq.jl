@@ -719,12 +719,15 @@ function _check_adjoint_problem(
     differences = _petsc_differences(alg)
     parts = (("the ODEFunction's", prob.f), (is_split ? (("`f2`'s", prob.f.f2),) : ())...)
     dm === nothing || _check_adjoint_dm(prob, dm, parts)
+    # An implicit method is under `AutoFiniteDiff()` on a communicator unless told otherwise.
+    forward = "pass `autodiff = AutoForwardDiff()` to the algorithm to have it built" *
+        (comm === nothing ? "" : ", since `AutoFiniteDiff()` is its default $_NOT_SELF")
     for (whose, fun) in parts
         differences && fun.jac === nothing && throw(
             ArgumentError(
                 "PETScAdjoint needs $whose `jac` under `autodiff = AutoFiniteDiff()`: " *
                     "PETSc's adjoint step multiplies by the Jacobian it is given and has no " *
-                    "other source for it",
+                    "other source for it; give the problem a `jac`, or $forward",
             ),
         )
     end
@@ -769,7 +772,8 @@ function _check_adjoint_problem(
             ArgumentError(
                 "PETScAdjoint needs $whose `paramjac` under " *
                     "`autodiff = AutoFiniteDiff()` when the problem has parameters: PETSc " *
-                    "builds the parameter gradient from it",
+                    "builds the parameter gradient from it; give the problem a `paramjac`, " *
+                    "or $forward",
             ),
         )
     end

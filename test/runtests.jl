@@ -10894,10 +10894,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         bare(; jac_prototype = sparse(ones(2, 3))), TSRK("4"; comm = world),
                         "so it must be 2 x 2",
                     ),
-                    (bare(), TSImplicit("cn"; comm = world), "`jac` under `autodiff = AutoFiniteDiff()`"),
+                    (
+                        bare(), TSImplicit("cn"; comm = world),
+                        [
+                            "`jac` under `autodiff = AutoFiniteDiff()`",
+                            "give the problem a `jac`, or pass `autodiff = AutoForwardDiff()`",
+                            "is its default on a communicator other than MPI.COMM_SELF",
+                        ],
+                    ),
                     (
                         bare(; jac = adj_jac!), TSImplicit("cn"; comm = world),
-                        "`paramjac` under `autodiff = AutoFiniteDiff()`",
+                        [
+                            "`paramjac` under `autodiff = AutoFiniteDiff()`",
+                            "give the problem a `paramjac`, or pass `autodiff = AutoForwardDiff()`",
+                            "is its default on a communicator other than MPI.COMM_SELF",
+                        ],
                     ),
                     (
                         bare(), TSImplicit("cn"; comm = world, autodiff = zygote),
