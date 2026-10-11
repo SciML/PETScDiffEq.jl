@@ -3841,7 +3841,9 @@ function _check_inttype(petsclib)
 end
 
 # TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
-_maxsteps(maxiters) = LibPETSc.PetscInt(clamp(maxiters, 0, typemax(LibPETSc.PetscInt)))
+# No limit has to be PETSc's own largest count, which is wider than `Int` on 32-bit.
+_maxsteps(maxiters) = maxiters == typemax(Int) ? typemax(LibPETSc.PetscInt) :
+    LibPETSc.PetscInt(clamp(maxiters, 0, typemax(LibPETSc.PetscInt)))
 
 # OrdinaryDiffEq stops once `iter > maxiters`, so a fraction counts as its floor and `Inf`
 # never stops, as `typemax(Int)` never does here.
