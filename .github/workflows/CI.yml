@@ -54,6 +54,15 @@ jobs:
             arch: x86
             group: All
             part: 3/3
+          # Apple silicon, where PETSc_jll and MPI come from other builds than on Linux.
+          - version: '1.10'
+            os: macos-latest
+            arch: aarch64
+            group: Core
+          - version: '1'
+            os: macos-latest
+            arch: aarch64
+            group: Core
     steps:
       - uses: actions/checkout@v7
       - name: Install 32-bit runtime libraries (i386)
