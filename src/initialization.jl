@@ -505,7 +505,7 @@ function _consistent_on!(
             "-pc_factor_nonzeros_along_diagonal", "-sub_pc_factor_nonzeros_along_diagonal",
             "-ksp_rtol", _option(sqrt(eps(R))),
         ]
-        dm === nothing || fills || _everywhere(comm, _dm_colours(pl, clone.ptr)) ||
+        dm === nothing || fills || _dm_coloured(pl, clone.ptr, A, n, comm, S) ||
             push!(options, "-snes_fd_color_use_mat")
         opts = PETScCompat.PetscOptions(pl; PETSc.parse_options(options)...)
         GC.@preserve s begin
