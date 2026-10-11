@@ -3843,6 +3843,15 @@ end
 # TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
 _maxsteps(maxiters) = LibPETSc.PetscInt(clamp(maxiters, 0, typemax(LibPETSc.PetscInt)))
 
+# OrdinaryDiffEq stops once `iter > maxiters`, so a fraction counts as its floor and `Inf`
+# never stops, as `typemax(Int)` never does here.
+function _step_limit(maxiters::Real)
+    isnan(maxiters) && throw(ArgumentError("`maxiters` is NaN; pass `Inf` for no limit"))
+    maxiters >= typemax(Int) && return typemax(Int)
+    maxiters <= typemin(Int) && return typemin(Int)
+    return floor(Int, maxiters)
+end
+
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothing)
     rows, cols, _ = findnz(jac_prototype)
     all_rows = vcat(rows, 1:n)
@@ -4791,6 +4800,7 @@ function _setup(
     for (key, value) in pairs(kwargs)
         _drops(key, value) && @warn "PETScDiffEq does not support `$key` and is ignoring it"
     end
+    step_limit = _step_limit(maxiters)
     prob.u0 isa AbstractArray{<:Union{Real, Complex}} || throw(
         ArgumentError("PETScDiffEq requires an AbstractArray u0 of real or complex numbers"),
     )
@@ -5083,7 +5093,7 @@ function _setup(
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
-        false, false, Int(maxiters), false, nothing, nothing, 0, 0, false, shape,
+        false, false, step_limit, false, nothing, nothing, 0, 0, false, shape,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -5212,7 +5222,7 @@ function _setup(
             LibPETSc.TSSetTime(petsclib, ts, t0)
             dt_given && _set_first_step!(h, dt, dtmin, force_dtmin)
             LibPETSc.TSSetMaxTime(petsclib, ts, tf)
-            LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(maxiters))
+            LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(step_limit))
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
             )
@@ -5727,7 +5737,9 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
     name in (:abstol, :reltol) && (v = _flat_tol(v, _state_size(h), name))
     name in (:abstol, :reltol) &&
         _checked_everywhere(() -> _check_tol(v, length(h.u0), name), h.ctx.comm)
-    setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : name === :maxiters ? Int(v) : v)
+    setfield!(
+        o, name, name in (:dtmin, :dtmax) ? R(v) : name === :maxiters ? _step_limit(v) : v,
+    )
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib
     if name === :abstol || name === :reltol

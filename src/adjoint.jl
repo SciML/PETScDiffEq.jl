@@ -88,8 +88,10 @@ trajectory is kept in memory, every stage of every step; `-ts_trajectory_solutio
 keeps only the states and recomputes each step during the adjoint, and
 `-ts_trajectory_type basic` writes one file per step to the working directory instead. For
 an adaptive solve the memory trajectory reserves 8 bytes for each of `maxiters` steps before
-starting, 8 MB at the default and 8 GB at `maxiters = 10^9`, and PETSc's time span holds one
-more copy of the state for each cost time inside `tspan`. `TSImplicit` and `TSARKIMEX`
+starting, 8 MB at the default and 8 GB at `maxiters = 10^9`. Without a limit, at
+`maxiters = Inf` or `typemax(Int)`, it reserves them for 10000 steps and doubles that as
+they fill. PETSc's time span holds one more copy of the state for each cost time inside
+`tspan`. `TSImplicit` and `TSARKIMEX`
 solve transposed linear systems with the same Krylov solver and tolerances as their Newton
 steps, so with default options the gradient can be off by up to about their relative
 tolerance of 1e-5 while the forward states are far closer; pass
