@@ -2822,6 +2822,19 @@ function _flat_tol(tol, dims::Dims, name)
     return vec(tol)
 end
 
+# `save_idxs` as linear indices into the state, which a CartesianIndex names by its axes.
+_save_index(u0, i) = Int(i)
+function _save_index(u0, I::CartesianIndex)
+    checkbounds(Bool, u0, I) || throw(
+        ArgumentError(
+            "`save_idxs` has the index $(Tuple(I)), outside a state of size $(size(u0))",
+        ),
+    )
+    return LinearIndices(u0)[I]
+end
+_save_idxs(u0, idxs::Union{Integer, CartesianIndex}) = [_save_index(u0, idxs)]
+_save_idxs(u0, idxs) = Int[_save_index(u0, i) for i in idxs]
+
 function _buffer!(box, like)
     buf = box[]
     buf isa typeof(like) && axes(buf) == axes(like) && return buf
@@ -5029,7 +5042,7 @@ function _setup(
         nothing
     else
         _checked_everywhere(comm) do
-            v = save_idxs isa Integer ? [Int(save_idxs)] : Vector{Int}(collect(save_idxs))
+            v = _save_idxs(prob.u0, save_idxs)
             isempty(v) && throw(ArgumentError("`save_idxs` must name at least one component"))
             all(i -> 1 <= i <= n, v) || throw(
                 ArgumentError("`save_idxs` has an index outside 1:$n"),
@@ -6812,8 +6825,17 @@ end
 _retype(old, new) = eltype(old) <: Union{AbstractFloat, Complex} ? eltype(old).(new) : new
 
 # `f` keeps seeing the problem's shape, so a state of another shape is read in linear order.
-_in_shape(old, new) = !(new isa AbstractArray) || size(new) == size(old) ||
-    (old isa AbstractVector && new isa AbstractVector) ? new : reshape(new, size(old))
+function _in_shape(old, new)
+    new isa AbstractArray && size(new) != size(old) || return new
+    old isa AbstractVector && new isa AbstractVector && return new
+    length(new) == length(old) || throw(
+        DimensionMismatch(
+            "`reinit!` was given a state of size $(size(new)), but the problem's `u0` has " *
+                "size $(size(old)); give one with its $(length(old)) entries",
+        ),
+    )
+    return reshape(new, size(old))
+end
 
 SciMLBase.reinit!(integ::PETScIntegrator, u0 = integ.prob.u0; kwargs...) =
     _locked(() -> _reinit_unlocked(integ, u0; kwargs...))
