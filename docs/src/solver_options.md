@@ -2,14 +2,14 @@
 
 The options available in `solve` are documented
 [at the common solver options page](https://docs.sciml.ai/DiffEqDocs/stable/basics/common_solver_opts/).
-This package supports `dt`, `adaptive`, `dtmin`, `force_dtmin`, `dtmax`, `reltol` and
-`abstol` (either may be a vector of per-component tolerances), `saveat`, `save_everystep`,
+This package supports `dt`, `adaptive`, `dtmin`, `force_dtmin`, `dtmax`, `maxiters`, `reltol`
+and `abstol` (either may be a vector of per-component tolerances), `saveat`, `save_everystep`,
 `save_start`, `save_end`, `save_on`, `save_idxs`, `save_discretes`, `dense`, `callback`,
-`tstops`, `d_discontinuities`, `unstable_check`, `isoutofdomain`, `timeseries_errors`,
-`dense_errors`, `verbose` and `initializealg`. The warning a solve that ends early gives is logged at the
-`instability` level of a `DEVerbosity`, so `verbose = DEVerbosity(SciMLLogging.None())`
-silences it, as do `SciMLLogging.None()` and `false`. Keywords it cannot honour emit a
-warning rather than being silently dropped.
+`tstops`, `d_discontinuities`, `unstable_check`, `isoutofdomain`, `calculate_error`,
+`timeseries_errors`, `dense_errors`, `verbose` and `initializealg`. The warning a solve that
+ends early gives is logged at the `instability` level of a `DEVerbosity`, so
+`verbose = DEVerbosity(SciMLLogging.None())` silences it, as do `SciMLLogging.None()` and
+`false`. Keywords it cannot honour emit a warning rather than being silently dropped.
 
 Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
 only when it names them or `save_start` or `save_end` asks, and `save_everystep = true`
@@ -72,9 +72,10 @@ where the package interpolates itself, and it raises with a mass matrix or a `DA
 OrdinaryDiffEq's integrator does.
 
 `ODEProblem`, `SplitODEProblem`, `DAEProblem`, `DynamicalODEProblem` and
-`SecondOrderODEProblem` are supported, in place or out of place, along with
-`ODEFunction`'s `jac`, `jac_prototype` and `mass_matrix`. Supply a `jac_prototype` for
-anything sparse: without one the Jacobian is dense and forces a dense factorization.
+`SecondOrderODEProblem` are supported, in place or out of place except for a `DAEProblem`,
+whose residual has to be in place, along with `ODEFunction`'s `jac`, `jac_prototype` and
+`mass_matrix`. Supply a `jac_prototype` for anything sparse: without one the Jacobian is
+dense and forces a dense factorization.
 
 `TSARKIMEX` integrates the `f1` of a `SplitODEProblem` implicitly and its `f2` explicitly.
 Every other algorithm solves it as the `ODEProblem` of `f1 + f2` and returns that problem's

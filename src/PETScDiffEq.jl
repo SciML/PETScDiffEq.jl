@@ -387,7 +387,7 @@ then read row by row, so nothing beyond the index list is asked of the caller.
 Passing a `medium` set as well splits the state three ways, which is what PETSc's
 `"2a23"` and `"2a33"` want. Whatever neither set names is the fast part.
 
-Explicit, so a mass matrix and an analytic Jacobian are both refused. Without a
+Explicit, so a mass matrix is refused and a `jac` is ignored. Without a
 `medium` set `subtype` is one of `"2a22"`, `"2a32"`, `"p2"` or `"p3"`; with one it
 is `"2a23"` or `"2a33"`.
 
