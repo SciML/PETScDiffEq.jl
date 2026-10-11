@@ -207,7 +207,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test all(o -> isapprox(o, 3; atol = 0.2), orders)
     end
 
-    Sys.WORD_SIZE == 64 && @testset "TSARKIMEX takes its first stage at the step's start" begin
+    @testset "TSARKIMEX takes its first stage at the step's start" begin
         exact(t) = 1 / (2 - sin(t))
         seen = Float64[]
         rhs!(du, u, p, t) = (push!(seen, t); du[1] = u[1]^2 * cos(t); nothing)
@@ -3071,7 +3071,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.prob.p ≈ [1.5] atol = 1.0e-8
         end
 
-        Sys.WORD_SIZE == 64 && @testset "the solve goes on from what it gives" begin
+        @testset "the solve goes on from what it gives" begin
             for (prob, alg, err) in (
                     (mass(with_p), rosw, 1.0e-9), (mass(with_p), bdf, 1.0e-6),
                     (dae(with_p), PETScDiffEq.TSDAE(), 1.0e-6),
@@ -3090,7 +3090,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.u[end] ≈ [a, root(a)] atol = 1.0e-9
         end
 
-        Sys.WORD_SIZE == 64 && @testset "initialize_dae!, reinit! and callbacks run it again" begin
+        @testset "initialize_dae!, reinit! and callbacks run it again" begin
             for (prob, alg) in ((mass(with_p), rosw), (dae(with_p), PETScDiffEq.TSDAE()))
                 integ = SciMLBase.init(prob, alg; tol...)
                 SciMLBase.step!(integ)
@@ -6263,7 +6263,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test PETScDiffEq.TSDAE().autodiff isa PETScDiffEq.AutoForwardDiff
         end
 
-        Sys.WORD_SIZE == 64 && @testset "on a communicator the whole pattern is coloured" begin
+        @testset "on a communicator the whole pattern is coloured" begin
             n = 30
             h2 = (n + 1)^2
             function cubic_heat!(du, u, p, t)
@@ -6911,7 +6911,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         PETScDiffEq.PETScCompat.destroy!(da)
     end
 
-    Sys.WORD_SIZE == 64 && @testset "a DMStag as the dm" begin
+    @testset "a DMStag as the dm" begin
         PETSc = PETScDiffEq.PETSc
         LibPETSc = PETScDiffEq.LibPETSc
         on_grid = PETScDiffEq.reshape_local_array
@@ -7140,6 +7140,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         PETScDiffEq.PETScCompat.destroy!(plane)
     end
 
+    # Its helpers hand `Ref(0)` and `Int` arrays to PETSc where it reads and writes Int64.
     Sys.WORD_SIZE == 64 && @testset "a DMPlex as the dm" begin
         PETSc = PETScDiffEq.PETSc
         LibPETSc = PETScDiffEq.LibPETSc
@@ -12226,7 +12227,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
-        Sys.WORD_SIZE == 64 && @testset "a communicator of one rank" begin
+        @testset "a communicator of one rank" begin
             world = MPI.COMM_WORLD
             function springs!(ddu, du, u, p, t)
                 n = length(u)
