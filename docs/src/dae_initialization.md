@@ -32,14 +32,15 @@ they take no `nlsolve`, and when SNES fails the solve returns at `t0` with
 On a communicator other than `MPI.COMM_SELF` they run wherever they run serially, and SNES
 solves the whole state on the communicator, each rank its own rows, with the distributed
 Jacobian of the solve: the problem's `jac` filling this rank's rows of the sparse
-`jac_prototype`, or PETSc's colouring of that prototype, and with a `dm` the DM's colouring,
-whether or not the problem has a `jac`. Its linear solves are GMRES with block Jacobi, one
-ILU(0) block on each rank, to a relative tolerance of the square root of the precision's
-spacing, and the solve's `petsc_options` do not reach them. A row `BrownFullBasicInit()` does
-not solve keeps its variable there, so it takes a mass matrix whose zero columns are its zero
-rows, as a `Diagonal` one's are, and refuses a sparse one where they differ. When SNES fails
-the solve returns at `t0` with `ReturnCode.InitialFailure` on every rank, and an `f` or `jac`
-that throws on some ranks makes every rank throw, as in a solve.
+`jac_prototype`, or PETSc's colouring of that prototype, and with a `dm` the problem's `jac`
+filling the DM's matrix, or the DM's colouring without one. Its linear solves are GMRES with
+block Jacobi, one ILU(0) block on each rank, to a relative tolerance of the square root of
+the precision's spacing, and the solve's `petsc_options` do not reach them. A row
+`BrownFullBasicInit()` does not solve keeps its variable there, so it takes a mass matrix
+whose zero columns are its zero rows, as a `Diagonal` one's are, and refuses a sparse one
+where they differ. When SNES fails the solve returns at `t0` with
+`ReturnCode.InitialFailure` on every rank, and an `f` or `jac` that throws on some ranks
+makes every rank throw, as in a solve.
 
 `OverrideInit()` goes through SciMLBase's `get_initial_values`, as OrdinaryDiffEq's does, and
 PETSc's SNES solves the initialization system with a finite-difference Jacobian, to the

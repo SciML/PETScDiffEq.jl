@@ -518,7 +518,7 @@ end
                 chain, TSRK("4"; comm), PETScAdjoint(); t = [1.0],
                 dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing), dt = 0.05, adaptive = false,
             ),
-            "MPI.COMM_SELF only",
+            "without a `jac`, PETScAdjoint",
         )
         da = PETSc.DMDA(
             pl, comm, (LibPETSc.DM_BOUNDARY_NONE,), (2N,), 1, 1;

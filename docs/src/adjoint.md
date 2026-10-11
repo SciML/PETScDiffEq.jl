@@ -42,9 +42,8 @@ It works with `TSRK` of any subtype, `TSImplicit("beuler")`, `TSImplicit("cn")`,
 `TSImplicit("theta")` with its `theta`, in its midpoint form or with `-ts_theta_endpoint`,
 and `TSARKIMEX`. PETSc has no adjoint for `TSRosW`, `TSIRK`, `TSMPRK`, BDF,
 `TSBasicSymplectic` or `TSAlpha2`. A `DynamicalODEProblem` or
-`SecondOrderODEProblem` is differentiated on its flat `[v; u]`, on `MPI.COMM_SELF` only, with
-the costs handed `ArrayPartition(v, u)` states as `solve` saves them and `du0` returned as
-one.
+`SecondOrderODEProblem` is differentiated on its flat `[v; u]`, with the costs handed
+`ArrayPartition(v, u)` states as `solve` saves them and `du0` returned as one.
 
 It runs in PETSc's double real build. A `Float32` problem is differentiated there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and the
@@ -83,11 +82,12 @@ taken on by the error of the two solves; at tolerances of 1e-5 the two sums of
 
 `TSARKIMEX` is the one stiff family `PETScAdjoint` takes that has an error estimate, so the
 one stiff method whose adaptive solve it differentiates. It takes a `SplitODEProblem` as
-well, on `MPI.COMM_SELF`: the implicit part's `jac` and `paramjac` are the problem's, which
-a `SplitODEProblem` takes from `f1`, and the explicit part's are those of `f2`'s own
-`ODEFunction`, each built by automatic differentiation when missing. Two things are
-refused, because PETSc's ARKIMEX adjoint cannot do them. It has no quadrature, so an
-integral cost stops with "No method adjointintegral". And with `-ts_arkimex_fully_implicit`
+well: the implicit part's `jac` and `paramjac` are the problem's, which a `SplitODEProblem`
+takes from `f1`, and the explicit part's are those of `f2`'s own `ODEFunction`, each built
+by automatic differentiation when missing. Over a communicator `f2` needs a sparse
+`jac_prototype` of its own, as the [MPI](@ref) section describes. Two things are refused,
+because PETSc's ARKIMEX adjoint cannot do them. It has no quadrature, so an integral cost
+stops with "No method adjointintegral". And with `-ts_arkimex_fully_implicit`
 on a `SplitODEProblem` the solve takes `f2` implicitly while the adjoint still takes it
 explicitly, which put the gradient 24% off in the test problem. With any other algorithm,
 which solves a `SplitODEProblem` as the sum of its parts, `PETScAdjoint` refuses the problem;

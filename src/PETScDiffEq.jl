@@ -4953,8 +4953,7 @@ function _setup(
         _check_tol(reltol, n, "reltol")
     end
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
-    # On a communicator the DM's colouring builds the initialization's Jacobian.
-    jac_init = dm_jac && comm !== nothing ? nothing : jac_fn
+    jac_init = jac_fn
     p, initialized = _initialize!(
         u0, prob, prob, initializealg, f1, jac_init, petsclib, comm,
         R(prob.tspan[1]), R(prob.tspan[2]), real.(something(abstol, 1.0e-6)),
@@ -5240,7 +5239,7 @@ function _setup(
                 ],
             )
             clone !== nothing && _uses_ifunction(alg) && !has_jac &&
-                !_everywhere(comm, _dm_colours(petsclib, clone.ptr)) &&
+                !_dm_coloured(petsclib, clone.ptr, h.fd_mat, n, comm, S) &&
                 append!(effective_options, ["-snes_fd_color_use_mat"])
             append!(effective_options, alg.petsc_options)
             append!(effective_options, extra_options)
