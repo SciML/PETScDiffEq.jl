@@ -10820,6 +10820,37 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test abs(dp[1] - expected_dp) / abs(expected_dp) < 2.0e-12
         end
 
+        @testset "a cost time goes to its own step when steps are closer than the tolerance" begin
+            function lag(tau::T, omega, tend) where {T}
+                f!(du, u, p, t) = (du[1] = (p[1] * sin(omega * t) - u[1]) / tau; nothing)
+                return SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(
+                        f!; jac = (J, u, p, t) -> (J[1, 1] = -1 / tau; nothing),
+                        paramjac = (pJ, u, p, t) -> (pJ[1, 1] = sin(omega * t) / tau; nothing),
+                    ),
+                    T[0], (T(0), T(tend)), T[1],
+                )
+            end
+            # A lag of 1 ps driven at 10 GHz for 1 ns in seconds, and a Float32 clock at 20000 steps.
+            for (prob, alg, t, kwargs) in (
+                    (
+                        lag(1.0e-12, 2pi * 1.0e10, 1.0e-9), TSRK("5dp"), 0.7e-9,
+                        (abstol = 1.0e-9, reltol = 1.0e-9),
+                    ),
+                    (lag(1.0f0, 0.6f0, 10.0f0), TSRK("4"), 7.0, (dt = 5.0f-4, adaptive = false)),
+                )
+                steps, given = Tuple{Float64, Float64}[], Float64[]
+                _, dp = PETScDiffEq._discrete_adjoint(
+                    prob, alg, PETScAdjoint();
+                    t = [t], dgdu_discrete = (out, u, p, t, i) -> (push!(given, u[1]); out .= u; nothing),
+                    unstable_check = (dt, u, p, t) -> (push!(steps, (t, u[1])); false), kwargs...,
+                )
+                k = argmin([abs(s - t) for (s, _) in steps])
+                @test given == [steps[k][2]]
+                @test dp[1] ≈ given[1]^2 rtol = 1.0e-6
+            end
+        end
+
         @testset "an empty state with a sparse jac_prototype" begin
             prob = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(
