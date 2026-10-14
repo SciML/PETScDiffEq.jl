@@ -1405,12 +1405,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             hits = Float64[]
             undone = Ref(false)
             change_p = SciMLBase.DiscreteCallback(
-                (u, t, integ) -> t == 0.5, integ -> (integ.p[1] = 20.0; nothing),
+                (u, t, integ) -> t == 0.5, integ -> (integ.p[1] = 21.0; nothing),
             )
             cross = SciMLBase.ContinuousCallback(
                 (u, t, integ) -> u[1] - 0.7, integ -> push!(hits, integ.t),
             )
-            first_after = (u, p, t) -> reject && p[1] == 20.0 && !undone[] && (undone[] = true)
+            first_after = (u, p, t) -> reject && p[1] == 21.0 && !undone[] && (undone[] = true)
             SciMLBase.solve(
                 SciMLBase.ODEProblem(rate!, [1.0], (0.0, 1.0), [0.0]), PETScDiffEq.TSRK("3bs");
                 dt = 0.1, abstol = 1.0e-8, reltol = 1.0e-8, tstops = [0.5],
@@ -1420,7 +1420,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
         @test events[2][2]
         @test abs(only(events[2][1]) - only(events[1][1])) < 1.0e-8
-        @test abs(only(events[2][1]) - (0.5 + log(1 / 0.7) / 20)) < 1.0e-8
+        @test abs(only(events[2][1]) - (0.5 + log(1 / 0.7) / 21)) < 1.0e-8
     end
 
     @testset "d_discontinuities and force_dtmin as OrdinaryDiffEq has them" begin
@@ -5404,6 +5404,37 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.t[i - 1] < 0.25
         end
 
+        @testset "an adaptive step resumes at the controller's size after a stop" begin
+            slow!(du, u, p, t) = (du .= -0.1 .* u; nothing)
+            for tspan in ((0.0, 100.0), (100.0, 0.0))
+                long = SciMLBase.ODEProblem(slow!, [1.0], tspan)
+                exact = exp(-0.1 * (tspan[2] - tspan[1]))
+                for alg in (
+                        PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
+                        PETScDiffEq.TSImplicit("bdf"),
+                    )
+                    plain = SciMLBase.solve(long, alg)
+                    sol = SciMLBase.solve(long, alg; tstops = 1.0:99.0)
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test all(in(sol.t), 1.0:99.0)
+                    @test sol.stats.naccept < 120
+                    @test abs(sol.u[end][1] - exact) < abs(plain.u[end][1] - exact)
+                end
+            end
+            long = SciMLBase.ODEProblem(slow!, [1.0], (0.0, 100.0))
+            for stops in ([50.0], [50.0, 50.001])
+                sol = SciMLBase.solve(long, PETScDiffEq.TSRK("5dp"); tstops = stops)
+                i = findfirst(==(stops[end]), sol.t)
+                @test sol.t[i + 1] - sol.t[i] > 5
+            end
+            integ = SciMLBase.init(long, PETScDiffEq.TSRK("5dp"))
+            for _ in 1:100
+                SciMLBase.step!(integ, 1.0, true)
+            end
+            @test integ.t == 100.0
+            @test integ.iter < 120
+        end
+
         @testset "stops closer together than dt" begin
             for kw in ((adaptive = false,), (reltol = 1.0e-8, abstol = 1.0e-10))
                 sol = SciMLBase.solve(
@@ -5486,7 +5517,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
 
             @testset "forward" begin
-                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
                 check_queue(integ, [1.0])
                 SciMLBase.add_tstop!(integ, 0.35)
                 check_queue(integ, [0.35, 1.0])
