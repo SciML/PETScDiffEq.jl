@@ -9655,6 +9655,65 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "An infinite time span runs until a callback ends it" begin
+        Terminated = SciMLBase.ReturnCode.Terminated
+        relax!(du, u, p, t) = (du .= 0.5 .- u; nothing)
+        exact(t) = 0.5 .+ [0.5, 1.5] .* exp(-t)
+        alg = PETScDiffEq.TSRK("5dp")
+        for (tf, past) in ((Inf, (u, t, integ) -> t > 5), (-Inf, (u, t, integ) -> t < -5))
+            prob = SciMLBase.ODEProblem(relax!, [1.0, 2.0], (0.0, tf))
+            stop = SciMLBase.DiscreteCallback(past, SciMLBase.terminate!)
+            reference = SciMLBase.solve(prob, Tsit5(); callback = stop)
+            sol = SciMLBase.solve(prob, alg; callback = stop)
+            @test reference.retcode == sol.retcode == Terminated
+            @test 5 < abs(sol.t[end]) < 7
+            @test isapprox(sol.u[end], exact(sol.t[end]); rtol = 1.0e-3)
+            @test isapprox(sol(sign(tf) * 3.0), reference(sign(tf) * 3.0); rtol = 2.0e-2)
+            long = SciMLBase.solve(
+                SciMLBase.remake(prob; tspan = (0.0, sign(tf) * 100)), alg; callback = stop,
+            )
+            @test sol.t == long.t
+            @test sol.u == long.u
+            integ = SciMLBase.init(prob, alg; callback = stop)
+            for _ in 1:1000
+                SciMLBase.step!(integ)
+                integ.sol.retcode == Terminated && break
+            end
+            @test integ.t == sol.t[end]
+            @test integ.sol.t == sol.t
+            saveat = sign(tf) .* [1.0, 2.0]
+            sol = SciMLBase.solve(prob, alg; callback = stop, saveat)
+            @test sol.t[1:2] == saveat
+            @test length(sol.t) == length(SciMLBase.solve(prob, Tsit5(); callback = stop, saveat).t)
+        end
+        prob = SciMLBase.ODEProblem(relax!, [1.0, 2.0], (0.0, Inf))
+        sol = SciMLBase.solve(prob, alg; maxiters = 50, verbose = false)
+        @test sol.retcode == SciMLBase.ReturnCode.MaxIters
+        @test isfinite(sol.t[end])
+        stop = SciMLBase.DiscreteCallback((u, t, integ) -> t > 5, SciMLBase.terminate!)
+        dae = SciMLBase.DAEProblem(
+            (r, du, u, p, t) -> (r[1] = du[1] - (0.5 - u[1]); r[2] = u[2] - 2 * u[1]; nothing),
+            [-0.5, 0.0], [1.0, 2.0], (0.0, Inf); differential_vars = [true, false],
+        )
+        sol = SciMLBase.solve(dae, PETScDiffEq.TSDAE(); callback = stop)
+        @test sol.retcode == Terminated
+        @test isapprox(sol.u[end], [1, 2] .* (0.5 + 0.5 * exp(-sol.t[end])); rtol = 1.0e-2)
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(
+                (du, u, p, t) -> (du[1] = 0.5 - u[1]; du[2] = u[2] - 2 * u[1]; nothing);
+                mass_matrix = Diagonal([1.0, 0.0]),
+            ),
+            [1.0, 3.0], (0.0, Inf),
+        )
+        sol = SciMLBase.solve(
+            mass, PETScDiffEq.TSRosW(); callback = stop,
+            initializealg = DiffEqBase.ShampineCollocationInit(),
+        )
+        @test sol.retcode == Terminated
+        # A collocation step on the whole span would land on the equilibrium.
+        @test abs(sol.u[1][1] - 1) < 1.0e-2
+    end
+
     Sys.WORD_SIZE == 64 && @testset "times PETSc reads as PETSC_DETERMINE, PETSC_CURRENT or PETSC_UNLIMITED" begin
         # Those are -1, -2 and -3 on PETSc's clock, which runs on -t for a reversed span.
         Success, MaxIters = SciMLBase.ReturnCode.Success, SciMLBase.ReturnCode.MaxIters

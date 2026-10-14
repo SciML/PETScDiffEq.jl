@@ -1988,8 +1988,9 @@ end
 _floor(R, dtmin, force_dtmin, adaptive) =
     force_dtmin || !adaptive || dtmin === nothing ? zero(R) : abs(R(dtmin))
 
-_near(t::Float64) = 100 * eps(max(1.0, abs(t)))
-_near(t::Float32) = 4 * eps(abs(t))
+# Finite at an infinite end, so `tf - _near(tf)` stays infinite rather than NaN.
+_near(t::Float64) = 100 * eps(clamp(abs(t), 1.0, floatmax(t)))
+_near(t::Float32) = 4 * eps(min(abs(t), floatmax(t)))
 
 # PETSc divides by zero on a step of a few ulps. Float64 already has a one-ulp floor.
 _min_step(t::Float64) = zero(t)
@@ -3843,6 +3844,10 @@ end
 
 # TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
 _maxsteps(maxiters) = LibPETSc.PetscInt(clamp(maxiters, 0, typemax(LibPETSc.PetscInt)))
+# PETSc refuses an infinite max time.
+_max_time(s) = min(s, floatmax(s))
+# A first step that scales with the span takes an infinite one as one.
+_span(t0, tf) = isinf(tf) ? one(tf) : abs(tf - t0)
 
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothing)
     rows, cols, _ = findnz(jac_prototype)
@@ -4981,7 +4986,8 @@ function _setup(
     saveat_times = saveat isa Number ?
         collect(R, t0:abs(R(saveat)):tf) :
         sort!(tdir .* Vector{R}(collect(saveat)))
-    filter!(t -> t0 - eps(tf) <= t <= tf + eps(tf), saveat_times)
+    slack = eps(isinf(tf) ? t0 : tf)
+    filter!(t -> t0 - slack <= t <= tf + slack, saveat_times)
     at_start(t) = abs(t - t0) <= _near(t0)
     at_end(t) = abs(t - tf) <= _near(tf)
     no_saveat = !(saveat isa Number) && isempty(saveat)
@@ -5210,7 +5216,7 @@ function _setup(
             LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
             dt_given && _set_first_step!(h, dt, dtmin, force_dtmin)
-            LibPETSc.TSSetMaxTime(petsclib, ts, tf)
+            LibPETSc.TSSetMaxTime(petsclib, ts, _max_time(tf))
             LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(maxiters))
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
@@ -5355,7 +5361,7 @@ function _setup(
                 user_t0 = R(prob.tspan[1])
                 est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
                 dt = if is_dae
-                    max(R(1.0e-6) * abs(tf - t0), _min_step(user_t0))
+                    max(R(1.0e-6) * _span(t0, tf), _min_step(user_t0))
                 elseif has_mass
                     max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
                 else
@@ -7009,7 +7015,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
     target = stop === nothing ? h.tf : stop
     # TSSetMaxTime reads -1 as PETSC_DETERMINE; the step is cut to the target below.
-    LibPETSc.TSSetMaxTime(pl, h.ts, target == -1 ? nextfloat(target) : target)
+    LibPETSc.TSSetMaxTime(pl, h.ts, target == -1 ? nextfloat(target) : _max_time(target))
     if h.matches
         _match_step!(integ, target - integ.tdir * integ.t)
     elseif LibPETSc.TSGetTimeStep(pl, h.ts) > target - integ.tdir * integ.t
@@ -7140,7 +7146,7 @@ end
 function _estimate_dt(h::TSHandles{<:Any, <:Any, R}, opts, u, s, stops) where {R}
     ctx = h.ctx
     dtmin = abs(getfield(opts, :dtmin))
-    ctx.dae && return max(R(1.0e-6) * abs(h.tf - h.t0), _min_step(s))
+    ctx.dae && return max(R(1.0e-6) * _span(h.t0, h.tf), _min_step(s))
     ctx.M === nothing ||
         return max(nextfloat(max(dtmin, eps(s))), R(1.0e-6), _min_step(s))
     i = findfirst(>(s), stops)
