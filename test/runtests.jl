@@ -4684,6 +4684,34 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
             end
         end
+
+        @testset "symbols name the saved states" begin
+            sys = SciMLBase.SymbolCache([:x, :y], Symbol[], :t)
+            named = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(pair!; sys), [1.0, 1.0], (0.0, 1.0),
+            )
+            kw = (dt = 0.1, saveat = 0.25, tols...)
+            full = SciMLBase.solve(named, alg; kw...)
+            for idxs in ([2, 1], [:y, :x])
+                sol = SciMLBase.solve(named, alg; kw..., save_idxs = idxs)
+                @test sol.u == [u[[2, 1]] for u in full.u]
+                @test sol[:x] == full[:x]
+                @test sol[:y] == full[:y]
+            end
+            for idxs in (2, [2], :y, [:y])
+                sol = SciMLBase.solve(named, alg; kw..., save_idxs = idxs)
+                @test sol.u == [u[[2]] for u in full.u]
+                @test sol[:y] == full[:y]
+            end
+            @test_throws ArgumentError SciMLBase.solve(named, alg; kw..., save_idxs = [:z])
+        end
+
+        @testset "a matrix of indices into an array state" begin
+            grid = SciMLBase.ODEProblem(decay!, [1.0 2.0; 3.0 4.0], (0.0, 1.0))
+            full = SciMLBase.solve(grid, alg; dt = 0.1, saveat = 0.5, tols...)
+            sol = SciMLBase.solve(grid, alg; dt = 0.1, saveat = 0.5, save_idxs = [1 2; 3 4], tols...)
+            @test sol.u == [vec(u)[[1, 3, 2, 4]] for u in full.u]
+        end
     end
 
     @testset "out-of-place problems" begin

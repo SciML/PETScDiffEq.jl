@@ -2822,6 +2822,33 @@ function _flat_tol(tol, dims::Dims, name)
     return vec(tol)
 end
 
+# `save_idxs` as linear indices into the state, with a symbol resolved through the problem's system.
+function _save_idxs(prob, idxs)
+    idxs isa AbstractArray && SciMLBase.symbolic_type(idxs) == SciMLBase.NotSymbolic() ||
+        return _state_indices!(Int[], prob, idxs)
+    v = Int[]
+    for i in idxs
+        _state_indices!(v, prob, i)
+    end
+    return v
+end
+
+_state_indices!(v, prob, i::Integer) = push!(v, Int(i))
+function _state_indices!(v, prob, sym)
+    i = SciMLBase.variable_index(prob, sym)
+    i === nothing && throw(
+        ArgumentError(
+            "`save_idxs` names $sym, which is not a state of the problem's system; " *
+                "only states can be saved",
+        ),
+    )
+    return append!(v, i)
+end
+
+# The integer `save_idxs` method keeps the order the states are saved in.
+_saved_subsystem(prob, ctx) =
+    last(SciMLBase.get_save_idxs_and_saved_subsystem(prob, ctx.save_idxs))
+
 function _buffer!(box, like)
     buf = box[]
     buf isa typeof(like) && axes(buf) == axes(like) && return buf
@@ -5029,7 +5056,7 @@ function _setup(
         nothing
     else
         _checked_everywhere(comm) do
-            v = save_idxs isa Integer ? [Int(save_idxs)] : Vector{Int}(collect(save_idxs))
+            v = _save_idxs(prob, save_idxs)
             isempty(v) && throw(ArgumentError("`save_idxs` must name at least one component"))
             all(i -> 1 <= i <= n, v) || throw(
                 ArgumentError("`save_idxs` has an index outside 1:$n"),
@@ -5494,6 +5521,7 @@ function _assemble(
     return SciMLBase.build_solution(
         prob, alg, ts, ctx.us; retcode = retcode, stats = stats,
         dense = ctx.dense, interp = _interp(ctx, ts, dus),
+        saved_subsystem = _saved_subsystem(prob, ctx),
         calculate_error = get(kwargs, :calculate_error, true),
         timeseries_errors = get(kwargs, :timeseries_errors, true),
         dense_errors = get(kwargs, :dense_errors, false),
@@ -6000,6 +6028,7 @@ function _adopt_p!(integ::PETScIntegrator, p)
     rebuilt = SciMLBase.build_solution(
         integ.prob, integ.alg, sol.t, sol.u; retcode = sol.retcode, stats = sol.stats,
         dense = sol.dense, interp = sol.interp,
+        saved_subsystem = _saved_subsystem(integ.prob, integ.h.ctx),
         calculate_error = get(integ.kwargs, :calculate_error, true),
         timeseries_errors = get(integ.kwargs, :timeseries_errors, true),
         dense_errors = get(integ.kwargs, :dense_errors, false),
@@ -6696,6 +6725,7 @@ function _initial_solution(prob, alg, h::TSHandles, kwargs)
     return SciMLBase.build_solution(
         prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
         dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = stats,
+        saved_subsystem = _saved_subsystem(prob, h.ctx),
         calculate_error = get(kwargs, :calculate_error, true),
     )
 end
