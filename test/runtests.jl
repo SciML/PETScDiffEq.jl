@@ -11601,6 +11601,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         () -> grad(adj_prob(copy(u0), copy(p0), (1.0, 0.0)), TSRK("4"); t = [-0.1]),
                     ),
                     (
+                        "PETScAdjoint needs a finite tspan; got (0.0, Inf)",
+                        () -> grad(
+                            adj_prob(copy(u0), copy(p0), (0.0, Inf)), TSRK("4"); maxiters = 5,
+                        ),
+                    ),
+                    (
                         "cost time t[1] = 0.105 is not a time the solve stepped to",
                         () -> grad(prob, TSRK("4"); t = [0.105]),
                     ),

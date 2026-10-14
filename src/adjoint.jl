@@ -793,6 +793,8 @@ function _check_adjoint_problem(
     end
     discrete = !_unset(t) && dgdu_discrete !== nothing
     integral = g !== nothing || dgdu_continuous !== nothing
+    all(isfinite, prob.tspan) ||
+        throw(ArgumentError("PETScAdjoint needs a finite tspan; got $(prob.tspan)"))
     discrete || integral || throw(
         ArgumentError(
             "PETScAdjoint needs cost times `t` with `dgdu_discrete(out, u, p, t, i)`, an " *
