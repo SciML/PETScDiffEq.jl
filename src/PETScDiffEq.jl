@@ -2781,9 +2781,31 @@ end
 
 _stored(A::SparseMatrixCSC, i, j) = any(==(i), @view A.rowval[A.colptr[j]:(A.colptr[j + 1] - 1)])
 
-_as_inplace(f, iip::Bool) = iip ? f : (du, u, p, t) -> (du .= f(u, p, t); nothing)
+# The broadcast below would spread a number, or a one-entry array, over the whole state.
+function _checked_rhs(r, n)
+    r isa AbstractArray && length(r) == n && return r
+    throw(
+        ArgumentError(
+            "an out-of-place right-hand side returned $(summary(r)), where an array of " *
+                "length $n is expected",
+        ),
+    )
+end
+
+function _checked_jac(A, J)
+    A isa AbstractMatrix && size(A) == size(J) && return A
+    throw(
+        ArgumentError(
+            "an out-of-place `jac` returned $(summary(A)), where a " *
+                "$(join(size(J), " x ")) matrix is expected",
+        ),
+    )
+end
+
+_as_inplace(f, iip::Bool) = iip ? f :
+    (du, u, p, t) -> (du .= _checked_rhs(f(u, p, t), length(du)); nothing)
 _as_inplace_jac(j, iip::Bool) = iip ? j :
-    (J, u, p, t) -> (_copy_jac!(J, j(u, p, t)); nothing)
+    (J, u, p, t) -> (_copy_jac!(J, _checked_jac(j(u, p, t), J)); nothing)
 
 # An array-shaped state is stepped as PETSc's flat vector, which `f` and `jac` get reshaped.
 _shaped(f, ::Nothing) = f
@@ -2943,7 +2965,8 @@ function _flat_columns(nv, n, comm)
     )
 end
 
-_as_inplace_part(f, iip::Bool) = iip ? f : (d, v, u, p, t) -> (d .= f(v, u, p, t); nothing)
+_as_inplace_part(f, iip::Bool) = iip ? f :
+    (d, v, u, p, t) -> (d .= _checked_rhs(f(v, u, p, t), length(d)); nothing)
 
 _partitioned(f, iip, nv) = Partitioned(
     _as_inplace_part(SciMLBase.unwrapped_f(f.f1.f), iip),
@@ -3013,7 +3036,10 @@ _partition(template, x) = copyto!(similar(template, eltype(x)), x)
 
 function _partitioned_jac(jac, template, iip)
     iip && return (J, x, p, t) -> jac(J, _partition(template, x), p, t)
-    return (J, x, p, t) -> (_copy_jac!(J, jac(_partition(template, x), p, t)); nothing)
+    return function (J, x, p, t)
+        _copy_jac!(J, _checked_jac(jac(_partition(template, x), p, t), J))
+        return nothing
+    end
 end
 
 # `+ zero(s)` turns -0.0 into 0.0, which `isless` would otherwise put before 0.0.

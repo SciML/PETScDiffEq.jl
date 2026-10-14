@@ -4706,6 +4706,38 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "a result that is not an array of the state's length is refused" begin
+            span = (0.0, 1.0)
+            first_entry(u, p, t) = -u[1]
+            first_only(u, p, t) = [-u[1]]
+            nothing_more(u, p, t) = 0.0
+            force(v, u, p, t) = -u[1]
+            second = SciMLBase.SecondOrderODEProblem(force, [0.0, 0.0], [1.0, 2.0], span)
+            for (pr, alg) in (
+                    (SciMLBase.ODEProblem(first_entry, [1.0, 2.0], span), PETScDiffEq.TSRK("5dp")),
+                    (SciMLBase.ODEProblem(first_entry, [1.0], span), PETScDiffEq.TSImplicit("bdf")),
+                    (SciMLBase.ODEProblem(first_only, [1.0, 2.0], span), PETScDiffEq.TSRK("5dp")),
+                    (
+                        SciMLBase.SplitODEProblem(oop, nothing_more, [1.0, 2.0], span),
+                        PETScDiffEq.TSARKIMEX("3"),
+                    ),
+                    (second, PETScDiffEq.TSBasicSymplectic()),
+                    (second, PETScDiffEq.TSAlpha2()),
+                )
+                @test_throws "an out-of-place right-hand side returned" SciMLBase.solve(
+                    pr, alg; dt = 0.01,
+                )
+            end
+            for j in ((u, p, t) -> -1.0, (u, p, t) -> [-1.0 0.0 0.0 -1.0])
+                pr = SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(oop; jac = j), [1.0, 2.0], span,
+                )
+                @test_throws "an out-of-place `jac` returned" SciMLBase.solve(
+                    pr, PETScDiffEq.TSRosW("ra34pw2"),
+                )
+            end
+        end
+
         @testset "an out-of-place jac is used" begin
             ojac(u, p, t) = fill(-1.0, 1, 1)
             owrong(u, p, t) = fill(100.0, 1, 1)
