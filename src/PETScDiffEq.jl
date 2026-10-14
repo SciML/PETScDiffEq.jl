@@ -5872,9 +5872,11 @@ function _set_p_unlocked(integ::PETScIntegrator, v)
     return v
 end
 
-Base.setproperty!(integ::PETScIntegrator, name::Symbol, v) = name === :p ?
-    _locked(() -> _set_p_unlocked(integ, v)) :
-    setfield!(integ, name, convert(fieldtype(typeof(integ), name), v))
+function Base.setproperty!(integ::PETScIntegrator, name::Symbol, v)
+    name === :p && return _locked(() -> _set_p_unlocked(integ, v))
+    name === :u && _check_length(getfield(integ, :u), v)
+    return setfield!(integ, name, convert(fieldtype(typeof(integ), name), v))
+end
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
 function _proposed_dt_unlocked(integ::PETScIntegrator)
@@ -5968,6 +5970,7 @@ DiffEqBase.get_tstops_array(integ::PETScIntegrator) = integ.tstops
 DiffEqBase.get_tstops_max(integ::PETScIntegrator) = last(integ.tstops)
 
 function _set_u_unlocked(integ::PETScIntegrator, u)
+    _check_length(integ.u, u, integ.h.ctx.comm)
     copyto!(integ.u, u)
     integ.finished && return nothing
     _write_state!(integ.h, integ.u)
@@ -6722,6 +6725,8 @@ function _reinit_unlocked(
     )
     _check_real(tstops, :tstops)
     _check_real(d_discontinuities, :d_discontinuities)
+    # `_in_shape` refuses another length for a state of another shape.
+    integ.prob.u0 isa AbstractVector && _check_length(integ.prob.u0, u0, integ.h.ctx.comm)
     R = typeof(integ.t)
     tstops, d_discontinuities = _times(R, tstops), _times(R, d_discontinuities)
     if integ.prob.f isa SciMLBase.DynamicalODEFunction && !hasproperty(u0, :x)
@@ -7188,6 +7193,15 @@ _no_resize() = throw(
             "length needs a new integrator",
     ),
 )
+_check_length(u, v, comm = nothing) = _checked_everywhere(comm) do
+    length(v) == length(u) || throw(
+        ArgumentError(
+            "PETScDiffEq cannot change the length of the state: it has $(length(u)) " *
+                "entries and was given $(length(v)), and a state of another length needs a " *
+                "new integrator",
+        ),
+    )
+end
 Base.resize!(::PETScIntegrator, ::Int) = _no_resize()
 Base.deleteat!(::PETScIntegrator, idxs) = _no_resize()
 SciMLBase.addat!(::PETScIntegrator, idxs, val = nothing) = _no_resize()

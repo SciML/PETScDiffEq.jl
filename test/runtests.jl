@@ -4170,21 +4170,28 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.terminate!(integ)
         end
 
-        @testset "reinit! onto a different size resizes the interpolation cache" begin
+        @testset "reinit!, set_u! and integ.u refuse a state of another length" begin
             wide = SciMLBase.ODEProblem(
-                (du, u, p, t) -> (du .= -u; nothing), ones(4), (0.0, 2.0),
+                (du, u, p, t) -> (du .= -u; nothing), [1.0, 2.0, 3.0, 4.0], (0.0, 1.0),
             )
-            integ = SciMLBase.init(
-                wide, PETScDiffEq.TSRK("5dp"); dt = 0.2,
-                callback = SciMLBase.ContinuousCallback(
-                    (u, t, i) -> sum(u) - 1.0, i -> nothing,
-                ),
-            )
-            SciMLBase.reinit!(integ, ones(2))
-            @test length(integ.ucache) == 2
+            integ = SciMLBase.init(wide, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            SciMLBase.step!(integ)
+            u = copy(integ.u)
+            for wrong in (fill(9.0, 3), fill(9.0, 5))
+                msg = "cannot change the length of the state: it has 4 entries and was " *
+                    "given $(length(wrong))"
+                @test_throws msg SciMLBase.reinit!(integ, wrong)
+                @test_throws msg SciMLBase.set_u!(integ, wrong)
+                @test_throws msg SciMLBase.set_ut!(integ, wrong, 0.5)
+                @test_throws msg integ.u = wrong
+                @test integ.u == u
+            end
+            SciMLBase.set_u!(integ, fill(9.0, 4))
+            @test integ.u == fill(9.0, 4)
+            SciMLBase.reinit!(integ, fill(2.0, 4))
             sol = SciMLBase.solve!(integ)
-            @test length(sol.u[end]) == 2
-            @test all(isfinite, sol.u[end])
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.u[end] ≈ fill(2exp(-1.0), 4) rtol = 1.0e-3
         end
 
         @testset "dtmax = Inf means no cap" begin
