@@ -20,6 +20,8 @@ const SERIAL_GAP = 1.0e-15
 # Measured at 1 to 3 ranks: a dm adjoint is within 1.3e-16 of the comm-mode one in 1-D and
 # 1.1e-15 of a DMDA on MPI.COMM_SELF in 2-D.
 const DM_GAP = 5.0e-15
+# Measured at 1 and 2 ranks: with `jac` and `paramjac` built on the DMDA it is within 8.8e-16.
+const DM_AD_GAP = 1.0e-13
 # Measured at 1 and 2 ranks: a split problem is within 7.0e-16 of its serial adjoint.
 const SPLIT_GAP = 5.0e-15
 # Measured at 1 and 2 ranks: with `jac` and `paramjac` built it is within 8.8e-16 of serial.
@@ -351,13 +353,13 @@ dm_problem(;
     tspan = first(FORWARD), p = copy(P), f = dm_heat!, jac = dm_jac!, paramjac = dm_paramjac!,
 ) = ODEProblem(ODEFunction(f; jac, paramjac), heat0(rows), tspan, p)
 
-with_dm(name) = Dict(
+with_dm(name; kw...) = Dict(
     "TSRK" => TSRK("4"; dm = da),
-    "backward Euler" => TSImplicit("beuler", exact(comm); dm = da),
-    "Crank-Nicolson" => TSImplicit("cn", exact(comm); dm = da),
-    "theta 0.7" => TSImplicit("theta", 0.7, exact(comm); dm = da),
-    "ARKIMEX l2" => TSARKIMEX("l2", exact(comm); dm = da),
-    "ARKIMEX 3" => TSARKIMEX("3", exact(comm); dm = da),
+    "backward Euler" => TSImplicit("beuler", exact(comm); dm = da, kw...),
+    "Crank-Nicolson" => TSImplicit("cn", exact(comm); dm = da, kw...),
+    "theta 0.7" => TSImplicit("theta", 0.7, exact(comm); dm = da, kw...),
+    "ARKIMEX l2" => TSARKIMEX("l2", exact(comm); dm = da, kw...),
+    "ARKIMEX 3" => TSARKIMEX("3", exact(comm); dm = da, kw...),
 )[name]
 
 const NX, NY = 5, 4
@@ -418,10 +420,10 @@ function on_plane(value, g)
     return u
 end
 
-function plane_gradient(g, alg)
+function plane_gradient(g, alg; jac = two_fields_jac(g), paramjac = two_fields_paramjac(g))
     w = on_plane((c, i, j) -> c * i * hx * (1 + j * hy), g)
     u0 = on_plane((c, i, j) -> sinpi(c * i * hx) * sinpi(j * hy), g)
-    fn = ODEFunction(two_fields(g); jac = two_fields_jac(g), paramjac = two_fields_paramjac(g))
+    fn = ODEFunction(two_fields(g); jac, paramjac)
     return PETScDiffEq._discrete_adjoint(
         ODEProblem(fn, u0, (0.0, 0.02), copy(P2)), alg, PETScAdjoint();
         t = collect(0.0:0.005:0.02), dgdu_discrete = (out, u, p, t, i) -> (out .= u .+ p[2] .* w),
@@ -504,24 +506,38 @@ end
         mine = vcat(gathered(du0, counts), vec(dp))
         theirs = vcat(gathered(ref[1], counts), vec(ref[2]))
         rank == 0 && @test relerr(mine, theirs) <= DM_GAP
+        dual = with_dm(name; autodiff = AutoForwardDiff())
+        for built in ((:jac, :paramjac), (:jac,), (:paramjac,))
+            bare = dm_problem(; tspan, p, (key => nothing for key in built)...)
+            du0, dp = gradient(bare, dual, times, rows)
+            @test same_everywhere(dp)
+            auto = vcat(gathered(du0, counts), vec(dp))
+            rank == 0 && @test relerr(auto, theirs) <= DM_AD_GAP
+        end
     end
 
     @testset "a 2-D DMDA with two fields matches one on MPI.COMM_SELF: $name, $processors" for (
                 name, make,
             ) in (
-                ("TSRK", (c, g) -> TSRK("4"; dm = g)),
-                ("Crank-Nicolson", (c, g) -> TSImplicit("cn", exact(c); dm = g)),
-                ("ARKIMEX l2", (c, g) -> TSARKIMEX("l2", exact(c); dm = g)),
+                ("TSRK", (c, g; kw...) -> TSRK("4"; dm = g)),
+                ("Crank-Nicolson", (c, g; kw...) -> TSImplicit("cn", exact(c); dm = g, kw...)),
+                ("ARKIMEX l2", (c, g; kw...) -> TSARKIMEX("l2", exact(c); dm = g, kw...)),
             ), processors in ((1, nranks), (nranks, 1))
         g = plane(comm, processors)
         du0, dp = plane_gradient(g, make(comm, g))
         @test same_everywhere(dp)
         mine = vcat(natural(du0, g, comm), vec(dp))
+        dual = make(comm, g; autodiff = AutoForwardDiff())
+        du0, dp = plane_gradient(g, dual; jac = nothing, paramjac = nothing)
+        @test same_everywhere(dp)
+        auto = vcat(natural(du0, g, comm), vec(dp))
         PETScCompat.destroy!(g)
         if rank == 0
             solo = plane(MPI.COMM_SELF)
             sdu0, sdp = plane_gradient(solo, make(MPI.COMM_SELF, solo))
-            @test relerr(mine, vcat(natural(sdu0, solo, MPI.COMM_SELF), vec(sdp))) <= DM_GAP
+            reference = vcat(natural(sdu0, solo, MPI.COMM_SELF), vec(sdp))
+            @test relerr(mine, reference) <= DM_GAP
+            @test relerr(auto, reference) <= DM_AD_GAP
             PETScCompat.destroy!(solo)
         end
     end
@@ -641,6 +657,11 @@ end
             ("paramjac", "TSRK with a dm", TSRK("4"; dm = da), :adjoint),
             ("paramjac", "Crank-Nicolson with a dm", with_dm("Crank-Nicolson"), :adjoint),
             ("f", "TSRK with a dm", TSRK("4", ["-ts_trajectory_solution_only", "1"]; dm = da), :adjoint),
+            ("f", "TSRK with a dm building both", TSRK("4"; dm = da), :adjoint),
+            (
+                "f", "Crank-Nicolson with a dm building both",
+                with_dm("Crank-Nicolson"; autodiff = AutoForwardDiff()), :adjoint,
+            ),
             ("dgdu", "TSRK with a dm", TSRK("4"; dm = da), :adjoint),
             ("dgdp", "TSRK with a dm", TSRK("4"; dm = da), :after),
         )
@@ -659,8 +680,8 @@ end
             )
         else
             dm_problem(;
-                f = pick("f", dm_heat!), jac = pick("jac", dm_jac!),
-                paramjac = pick("paramjac", dm_paramjac!),
+                f = pick("f", dm_heat!), jac = built ? nothing : pick("jac", dm_jac!),
+                paramjac = built ? nothing : pick("paramjac", dm_paramjac!),
             )
         end
         e = caught() do
@@ -814,15 +835,26 @@ end
             (foreach(k -> J[k, rows[k]] = rank == thrower ? 2u[k] : -1.0, eachindex(rows)); nothing)
         diagonal = sparse(1:length(rows), rows, 1.0, length(rows), N)
         rk_dm = TSRK("4"; dm = da)
+        cn_dm = with_dm("Crank-Nicolson")
         for (prob, what) in (
                 (dm_problem(jac = nothing), "the ODEFunction's `jac` with a `dm`"),
                 (dm_problem(paramjac = nothing), "the ODEFunction's `paramjac` with a `dm`"),
             )
-            @test refused(() -> gradient(prob, rk_dm, times, rows), "PETScAdjoint needs $what")
+            @test refused(
+                () -> gradient(prob, cn_dm, times, rows),
+                "PETScAdjoint needs $what under `autodiff = AutoFiniteDiff()`",
+            )
+            @test refused(
+                () -> gradient(prob, with_dm("Crank-Nicolson"; autodiff = zygote.autodiff), times, rows),
+                "AutoZygote()` with a `dm`",
+            )
         end
         some = dm_problem(paramjac = rank == thrower ? nothing : dm_paramjac!)
-        e = caught(() -> gradient(some, rk_dm, times, rows))
+        e = caught(() -> gradient(some, cn_dm, times, rows))
         @test rank == thrower ? e isa ArgumentError && occursin("`paramjac`", e.msg) : remote(e)
+        nranks > 1 && @test refused(
+            () -> gradient(some, rk_dm, times, rows), "`jac` and `paramjac` on every rank",
+        )
         nranks > 1 && @test refused(
             () -> gradient(dm_problem(), rk_dm, times, rows; g = (u, p, t) -> sum(abs2, u)),
             "integral cost on MPI.COMM_SELF only",
