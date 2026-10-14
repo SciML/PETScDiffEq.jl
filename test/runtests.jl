@@ -7,6 +7,7 @@ using SparseArrays
 using DiffEqCallbacks
 using DiffEqCallbacks: PresetTimeCallback
 using MPI
+using OrdinaryDiffEqCore: OrdinaryDiffEqCore
 using OrdinaryDiffEqTsit5: Tsit5
 using RecipesBase: RecipesBase
 using Test
@@ -4084,7 +4085,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             ours = SciMLBase.solve(prob(), rk4; callback = callback(), fixed..., kw...)
             theirs = SciMLBase.solve(prob(), Tsit5(); callback = callback(), fixed..., kw...)
-            @test same(ours, theirs)
+            # OrdinaryDiffEqCore gates the initial and final saves on `save_discretes` from 4.19.
+            gated = pkgversion(OrdinaryDiffEqCore) >= v"4.19"
+            (gated || get(kw, :save_discretes, true) !== false) && @test same(ours, theirs)
             if get(kw, :save_discretes, true) === false
                 @test all(d -> isempty(d.t), ours.discretes)
             end
