@@ -1135,7 +1135,7 @@ end
             # The DM's three colours fit one call on dual numbers.
             @test dual.stats.nf == got.stats.nf + dual.stats.njacs
             coloured = solve(dm_heat(), make(; dm = da, comm); saveat = 0.01, TOL...)
-            @test coloured.stats.njacs == 0
+            @test coloured.stats.njacs > 0
             @test got.stats.nf < coloured.stats.nf
             us, cs = natural(got, da, N), natural(coloured, da, N)
             if rank == 0
@@ -1441,7 +1441,7 @@ end
             coloured = solve(dm_wave(), make(; dm = stag); saveat = 0.02, TOL...)
             @test got.retcode == coloured.retcode == ReturnCode.Success
             @test got.stats.njacs > 0
-            @test coloured.stats.njacs == 0
+            @test coloured.stats.njacs > 0
             @test got.stats.nf < coloured.stats.nf
             @test same_everywhere(got.stats.nf)
             us, cs = wave_natural.(got.u, Ref(stag)), wave_natural.(coloured.u, Ref(stag))
@@ -1659,7 +1659,7 @@ end
                 coloured = solve(dm_rd(), make(; dm = q.dm); saveat = 0.02, TOL...)
                 @test got.retcode == coloured.retcode == ReturnCode.Success
                 @test got.stats.njacs > 0
-                @test coloured.stats.njacs == 0
+                @test coloured.stats.njacs > 0
                 @test got.stats.nf < coloured.stats.nf
                 @test same_everywhere(got.stats.nf)
                 us, cs = plex_natural.(got.u, Ref(q)), plex_natural.(coloured.u, Ref(q))

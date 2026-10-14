@@ -2286,8 +2286,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 SciMLBase.DAEProblem(withjac, du0, u0, tspan), PETScDiffEq.TSDAE();
                 dt = 1.0e-3, adaptive = false,
             )
-            @test plain.stats.njacs == 0
-            @test given.stats.njacs > 0
+            @test plain.stats.njacs == given.stats.njacs > 0
             @test SciMLBase.solve(
                 SciMLBase.DAEProblem(
                     SciMLBase.DAEFunction(resid!; jac = wrong_dae_jac!), du0, u0, tspan,
@@ -3368,6 +3367,36 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test minimum(asked[2:3]) > sol.stats.naccept
         @test sol.stats.ncondition == sum(asked)
         @test sol.stats.nsolve == sol.stats.naccept
+    end
+
+    @testset "njacs counts the Jacobians PETSc differences" begin
+        f!(du, u, p, t) = (du[1] = -u[1] + u[2]^2; du[2] = -2u[2]; nothing)
+        proto = sparse([1, 1, 2], [1, 2, 2], ones(3), 2, 2)
+        dense = SciMLBase.ODEProblem(f!, [1.0, 0.5], (0.0, 1.0))
+        coloured = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(f!; jac_prototype = proto), [1.0, 0.5], (0.0, 1.0),
+        )
+        cases = Any[
+            (dense, PETScDiffEq.TSRosW, (;)), (coloured, PETScDiffEq.TSRosW, (;)),
+            (dense, PETScDiffEq.TSImplicit, (;)), (coloured, PETScDiffEq.TSImplicit, (;)),
+        ]
+        Sys.WORD_SIZE == 64 &&
+            push!(cases, (coloured, PETScDiffEq.TSImplicit, (; comm = MPI.COMM_WORLD)))
+        fixed = (dt = 0.05, adaptive = false)
+        for (prob, T, kw) in cases
+            subtype = T === PETScDiffEq.TSRosW ? "ra34pw2" : "bdf"
+            solve_with(ad) = SciMLBase.solve(prob, T(subtype; autodiff = ad, kw...); fixed...)
+            fd = solve_with(PETScDiffEq.AutoFiniteDiff())
+            ad = solve_with(PETScDiffEq.AutoForwardDiff())
+            @test fd.retcode == ad.retcode == SciMLBase.ReturnCode.Success
+            @test fd.stats.njacs == ad.stats.njacs > 0
+        end
+        bdf = PETScDiffEq.TSImplicit("bdf"; autodiff = PETScDiffEq.AutoFiniteDiff())
+        integ = SciMLBase.init(dense, bdf; fixed...)
+        SciMLBase.step!(integ)
+        SciMLBase.step!(integ)
+        stepped = integ.sol.stats.njacs
+        @test 0 < stepped < SciMLBase.solve!(integ).stats.njacs
     end
 
     @testset "a solver failure is a retcode, a misuse is an error" begin
@@ -5716,8 +5745,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             ),
             alg; dt = 1.0e-3,
         )
-        @test plain.stats.njacs == 0
-        @test withjac.stats.njacs > 0
+        @test plain.stats.njacs == withjac.stats.njacs > 0
         @test withjac.stats.nf < plain.stats.nf
         @test withjac.retcode == SciMLBase.ReturnCode.Success
         @test abs(withjac.u[end][1] - cos(0.1)) < 1.0e-6
@@ -6617,7 +6645,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             coloured = SciMLBase.solve(
                 SciMLBase.ODEProblem(heat_dm!, u0, (0.0, 0.1), da), with_dm; kw...,
             )
-            @test coloured.stats.njacs == 0
+            @test coloured.stats.njacs > 0
             @test got.stats.nf < coloured.stats.nf
             # Measured 1.2e-14 for bdf, 4.4e-16 for rosw, 1.0e-11 for alpha, 4.0e-11 for dirk.
             @test maximum(abs, got.u[end] - coloured.u[end]) <= gap
@@ -7077,7 +7105,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             @test got.retcode == coloured.retcode == SciMLBase.ReturnCode.Success
             @test got.stats.njacs == njac[] > 0
-            @test coloured.stats.njacs == 0
+            @test coloured.stats.njacs > 0
             @test got.stats.nf < coloured.stats.nf
             # Measured 5.1e-26 for bdf and 1.4e-15 for rosw against the serial solve, and 1.0e-14
             # and 1.1e-15 against colouring.
@@ -7368,7 +7396,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 ref = SciMLBase.solve(plain(; jac = jac!), make(); saveat = 0.02, tol...)
                 @test got.retcode == coloured.retcode == SciMLBase.ReturnCode.Success
                 @test got.stats.njacs > 0
-                @test coloured.stats.njacs == 0
+                @test coloured.stats.njacs > 0
                 @test got.stats.nf < coloured.stats.nf
                 # Measured 0.0 against the serial solve for both and up to 1.5e-14 against
                 # colouring.
@@ -11732,7 +11760,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             user = solve_at(jprob, PETScDiffEq.TSAlpha2(; radius = 0.5))
             fd = solve_at(prob, PETScDiffEq.TSAlpha2(; radius = 0.5, autodiff = PETScDiffEq.AutoFiniteDiff()))
             @test collect(user.u[end]) ≈ collect(ad.u[end]) rtol = 1.0e-10
-            @test ad.stats.njacs > 0 && user.stats.njacs == ad.stats.njacs && fd.stats.njacs == 0
+            @test ad.stats.njacs > 0 && user.stats.njacs == ad.stats.njacs && fd.stats.njacs > 0
             for sol in (ad, user, fd)
                 @test sol.retcode == SciMLBase.ReturnCode.Success
                 @test final_err(sol, exact) < 7.0e-3
@@ -11793,7 +11821,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test collect(sol.u[end]) ≈ collect(dense.u[end]) rtol = 1.0e-10
                 @test sol.stats.njacs == dense.stats.njacs > 0
             end
-            @test coloured.stats.njacs == 0
+            @test coloured.stats.njacs > 0
             if second(; jac_prototype = proto).f.jac_prototype isa SparseMatrixCSC
                 @test ad.stats.nf > user.stats.nf == dense.stats.nf
                 @test_throws "of the first-order system `[v; u]' = [f(v, u, p, t); v]`, 4 x 4" solve_at(
@@ -12051,7 +12079,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test collect(sol.u[end]) ≈ collect(dense.u[end]) rtol = exact_jac ? 1.0e-10 : 1.0e-6
                 # A linear system takes one Newton iteration a solve only with the right Jacobian.
                 @test sol.stats.nnonliniter == forward.stats.nnonliniter
-                @test (sol.stats.njacs > 0) == exact_jac
+                @test sol.stats.njacs == dense.stats.njacs > 0
             end
 
             prob = back(osc!, osc_exact(2.0), 2.0)

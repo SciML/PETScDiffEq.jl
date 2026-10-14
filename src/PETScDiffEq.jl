@@ -2497,7 +2497,34 @@ function _dm_colours(read, pl, dm)
     return true
 end
 
-function _colour_jacobian!(pl, ts, mat)
+const COLOUR_JACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+const DENSE_JACOBIAN_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
+function _counted_jacobian(routine, snes, x, A, B, ctx_ptr)
+    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
+    # PETSc reads a non-null context as its MatFDColoring.
+    code = ccall(
+        _symbol(ctx.petsclib, routine), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, LibPETSc.CVec, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}),
+        snes, x, A, B, C_NULL,
+    )
+    code == 0 && (ctx.njacs += 1)
+    return code
+end
+
+_colour_jacobian_cb(
+    snes::LibPETSc.CSNES, x::LibPETSc.CVec, A::LibPETSc.CMat, B::LibPETSc.CMat,
+    ctx_ptr::Ptr{Cvoid},
+)::LibPETSc.PetscErrorCode =
+    _counted_jacobian(:SNESComputeJacobianDefaultColor, snes, x, A, B, ctx_ptr)
+
+_dense_jacobian_cb(
+    snes::LibPETSc.CSNES, x::LibPETSc.CVec, A::LibPETSc.CMat, B::LibPETSc.CMat,
+    ctx_ptr::Ptr{Cvoid},
+)::LibPETSc.PetscErrorCode = _counted_jacobian(:SNESComputeJacobianDefault, snes, x, A, B, ctx_ptr)
+
+# Without a matrix PETSc makes a dense one for the SNES, which it differences column by column.
+function _difference_jacobian!(pl, ts, mat, ctxptr)
     lib = Libdl.dlopen(pl.petsc_library)
     snes = Ref{LibPETSc.CSNES}(C_NULL)
     ccall(
@@ -2507,7 +2534,8 @@ function _colour_jacobian!(pl, ts, mat)
     code = ccall(
         Libdl.dlsym(lib, :SNESSetJacobian), LibPETSc.PetscErrorCode,
         (LibPETSc.CSNES, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
-        snes[], mat, mat, Libdl.dlsym(lib, :SNESComputeJacobianDefaultColor), C_NULL,
+        snes[], something(mat, C_NULL), something(mat, C_NULL),
+        mat === nothing ? DENSE_JACOBIAN_PTR[] : COLOUR_JACOBIAN_PTR[], ctxptr,
     )
     code == 0 || throw(LibPETSc.PetscError(code))
     return nothing
@@ -3794,6 +3822,14 @@ end
 # `@cfunction` pointers do not survive precompilation.
 function __init__()
     POST_STEP_PTR[] = @cfunction(_post_step!, LibPETSc.PetscErrorCode, (LibPETSc.CTS,))
+    COLOUR_JACOBIAN_PTR[] = @cfunction(
+        _colour_jacobian_cb, LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, LibPETSc.CVec, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid})
+    )
+    DENSE_JACOBIAN_PTR[] = @cfunction(
+        _dense_jacobian_cb, LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, LibPETSc.CVec, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid})
+    )
     PRE_SOLVE_PTR[] = @cfunction(
         _pre_solve!, LibPETSc.PetscErrorCode,
         (LibPETSc.CKSP, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
@@ -4704,7 +4740,7 @@ function _distributed_second_order!(
     if !has_jac
         LibPETSc.MatSetValuesCOO(pl, mat, zeros(S, length(rows)), LibPETSc.INSERT_VALUES)
         PETSc.assemble!(mat)
-        return _colour_jacobian!(pl, h.ts, mat)
+        return _difference_jacobian!(pl, h.ts, mat, ctxptr)
     end
     ctx.row_cols0, ctx.row_src, ctx.row_src2, ctx.row_buf = cols0, src_v, src_u, buf
     ctx.coo = COOJacobian(Int[], S[], zeros(S, length(rows)))
@@ -5158,7 +5194,9 @@ function _setup(
                     h.fd_mat = PETScCompat.PetscMat(
                         petsclib, MPI.COMM_SELF, _rows_pattern(cols0, nv); with_arrays = true,
                     )
-                    _colour_jacobian!(petsclib, ts, h.fd_mat)
+                    _difference_jacobian!(petsclib, ts, h.fd_mat, ctxptr)
+                else
+                    _difference_jacobian!(petsclib, ts, nothing, ctxptr)
                 end
             elseif clone !== nothing && _uses_ifunction(alg)
                 mat = LibPETSc.DMCreateMatrix(petsclib, clone)
@@ -5167,7 +5205,7 @@ function _setup(
                     LibPETSc.TSSetIJacobian(petsclib, ts, mat, mat, ptrs.dm_ijacobian, ctxptr)
                 else
                     h.fd_mat = mat
-                    _colour_jacobian!(petsclib, ts, mat)
+                    _difference_jacobian!(petsclib, ts, mat, ctxptr)
                 end
             elseif comm !== nothing && _uses_ifunction(alg)
                 rstart = first(LibPETSc.VecGetOwnershipRange(petsclib, u))
@@ -5185,7 +5223,7 @@ function _setup(
                 else
                     LibPETSc.MatSetValuesCOO(petsclib, mat, coo.vals, LibPETSc.INSERT_VALUES)
                     PETSc.assemble!(mat)
-                    _colour_jacobian!(petsclib, ts, mat)
+                    _difference_jacobian!(petsclib, ts, mat, ctxptr)
                 end
             elseif has_jac && uses_sparse_jac
                 pattern = _jacobian_pattern(J0, n, M)
@@ -5205,7 +5243,9 @@ function _setup(
                     petsclib, MPI.COMM_SELF, _fd_pattern(prob.f.jac_prototype, M, n);
                     with_arrays = true,
                 )
-                _colour_jacobian!(petsclib, ts, h.fd_mat)
+                _difference_jacobian!(petsclib, ts, h.fd_mat, ctxptr)
+            elseif _uses_ifunction(alg)
+                _difference_jacobian!(petsclib, ts, nothing, ctxptr)
             end
             LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
