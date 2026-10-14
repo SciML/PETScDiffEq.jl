@@ -6,6 +6,10 @@ on:
     tags: ['*']
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref != 'refs/heads/main' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -28,4 +32,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
-        run: julia --project=docs docs/make.jl
+        # Deploys from several pull requests push to gh-pages at once, and all but one are rejected.
+        run: |
+          for attempt in 1 2 3; do
+            julia --project=docs docs/make.jl && exit 0
+            sleep $((20 * attempt))
+          done
+          exit 1
