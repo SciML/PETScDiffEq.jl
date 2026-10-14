@@ -87,8 +87,10 @@ trajectory is kept in memory, every stage of every step; `-ts_trajectory_solutio
 keeps only the states and recomputes each step during the adjoint, and
 `-ts_trajectory_type basic` writes one file per step to the working directory instead. For
 an adaptive solve the memory trajectory reserves 8 bytes for each of `maxiters` steps before
-starting, 8 MB at the default and 8 GB at `maxiters = 10^9`, and PETSc's time span holds one
-more copy of the state for each cost time inside `tspan`. `TSImplicit` and `TSARKIMEX`
+starting, 8 MB at the default and 8 GB at `maxiters = 10^9`. Without a limit, at
+`maxiters = Inf` or `typemax(Int)`, it reserves them for 10000 steps and doubles that as
+they fill. PETSc's time span holds one more copy of the state for each cost time inside
+`tspan`. `TSImplicit` and `TSARKIMEX`
 solve transposed linear systems with the same Krylov solver and tolerances as their Newton
 steps, so with default options the gradient can be off by up to about their relative
 tolerance of 1e-5 while the forward states are far closer; pass
@@ -719,12 +721,15 @@ function _check_adjoint_problem(
     differences = _petsc_differences(alg)
     parts = (("the ODEFunction's", prob.f), (is_split ? (("`f2`'s", prob.f.f2),) : ())...)
     dm === nothing || _check_adjoint_dm(prob, dm, parts)
+    # An implicit method is under `AutoFiniteDiff()` on a communicator unless told otherwise.
+    forward = "pass `autodiff = AutoForwardDiff()` to the algorithm to have it built" *
+        (comm === nothing ? "" : ", since `AutoFiniteDiff()` is its default $_NOT_SELF")
     for (whose, fun) in parts
         differences && fun.jac === nothing && throw(
             ArgumentError(
                 "PETScAdjoint needs $whose `jac` under `autodiff = AutoFiniteDiff()`: " *
                     "PETSc's adjoint step multiplies by the Jacobian it is given and has no " *
-                    "other source for it",
+                    "other source for it; give the problem a `jac`, or $forward",
             ),
         )
     end
@@ -769,7 +774,8 @@ function _check_adjoint_problem(
             ArgumentError(
                 "PETScAdjoint needs $whose `paramjac` under " *
                     "`autodiff = AutoFiniteDiff()` when the problem has parameters: PETSc " *
-                    "builds the parameter gradient from it",
+                    "builds the parameter gradient from it; give the problem a `paramjac`, " *
+                    "or $forward",
             ),
         )
     end
