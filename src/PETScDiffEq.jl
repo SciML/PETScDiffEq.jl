@@ -59,7 +59,10 @@ TSRK(
     subtype::AbstractString = "5dp",
     petsc_options::AbstractVector{<:AbstractString} = String[];
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
-) = TSRK(String(subtype), String[String(o) for o in petsc_options], _alg_comm(comm, dm), dm)
+) = TSRK(
+    _check_subtype("TSRK", subtype, _RK_ORDER), String[String(o) for o in petsc_options],
+    _alg_comm(comm, dm), dm,
+)
 
 """
     TSRosW(subtype = "ra34pw2", petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
@@ -117,7 +120,8 @@ TSRosW(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSRosW(
-    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _check_subtype("TSRosW", subtype, _ROSW_ORDER), String[String(o) for o in petsc_options],
+    _check_autodiff(autodiff),
     _alg_comm(comm, dm), dm,
 )
 
@@ -253,7 +257,9 @@ TSIRK(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSIRK(
-    Int(nstages), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    nstages >= 1 ? Int(nstages) :
+        throw(ArgumentError("`nstages` must be at least 1, got $nstages")),
+    String[String(o) for o in petsc_options], _check_autodiff(autodiff),
     _alg_comm(comm, dm), dm,
 )
 
@@ -348,7 +354,8 @@ TSARKIMEX(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSARKIMEX(
-    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _check_subtype("TSARKIMEX", subtype, _ARKIMEX_ORDER, _ARKIMEX_DIRK),
+    String[String(o) for o in petsc_options], _check_autodiff(autodiff),
     _alg_comm(comm, dm), dm,
 )
 
@@ -356,6 +363,7 @@ const _MPRK_TWO_WAY = ("2a22", "2a32", "p2", "p3")
 const _MPRK_THREE_WAY = ("2a23", "2a33")
 
 function _check_mprk(slow, medium, subtype, distributed)
+    _check_subtype("TSMPRK", subtype, _MPRK_ORDER)
     for (name, v) in (("slow", slow), ("medium", medium))
         all(i -> i >= 1, v) || throw(ArgumentError("`$name` indices start at 1"))
         length(unique(v)) == length(v) || throw(ArgumentError("`$name` repeats an index"))
@@ -683,6 +691,23 @@ const _ARKIMEX_ORDER = Dict(
 const _MPRK_ORDER = Dict(
     "2a22" => 2, "2a23" => 2, "2a32" => 2, "2a33" => 2, "p2" => 2, "p3" => 3,
 )
+
+# TSARKIMEXSetType also takes PETSc's TSDIRK tableaux.
+const _ARKIMEX_DIRK = (
+    "s212", "es122sal", "es213sal", "es324sal", "es325sal", "657a", "es648sa", "658a",
+    "s659a", "7510sal", "es7510sa", "759a", "s7511sal", "8614a", "8616sal", "es8516sal",
+)
+
+function _check_subtype(family, subtype, table, extra = ())
+    t = String(subtype)
+    haskey(table, t) || t in extra || throw(
+        ArgumentError(
+            "$family has no subtype \"$t\"; PETSc's are " *
+                join(map(n -> "\"$n\"", [sort!(collect(keys(table))); extra...]), ", "),
+        ),
+    )
+    return t
+end
 
 function _order(table, family, subtype)
     haskey(table, subtype) ||
@@ -3987,6 +4012,35 @@ function _refuse_method(name, has_mass, has_jac, is_split, is_dae)
     return nothing
 end
 
+# PETSc registers some TS types only when it is built with the package behind them.
+function _check_ts_type(pl, t)
+    list = unsafe_load(Ptr{Ptr{Cvoid}}(_symbol(pl, :TSList)))
+    names, n = Ref{Ptr{Cstring}}(C_NULL), Ref{Cint}(0)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscFunctionListGet), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Ptr{Cstring}}, Ptr{Cint}), list, names, n,
+        ),
+        "PetscFunctionListGet",
+    )
+    types = [unsafe_string(unsafe_load(names[], i)) for i in 1:n[]]
+    free = unsafe_load(Ptr{Ptr{Cvoid}}(_symbol(pl, :PetscTrFree)))
+    _check_code(
+        ccall(
+            free, LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Cint, Cstring, Cstring),
+            names[], 0, "_check_ts_type", "PETScDiffEq.jl",
+        ),
+        "PetscFree",
+    )
+    t in types || throw(
+        ArgumentError(
+            "PETSc has no TS type \"$t\"; its types are " *
+                join(map(n -> "\"$n\"", sort!(types)), ", "),
+        ),
+    )
+    return nothing
+end
+
 _set_subtype!(petsclib, ts, alg::TSRK) =
     PETScCompat.TSRKSetType(petsclib, ts, alg.subtype)
 _set_subtype!(petsclib, ts, alg::TSRosW) =
@@ -4802,6 +4856,11 @@ function _setup(
         )
         _check_real(value, name)
     end
+    for (name, value) in ((:dt, dt), (:dtmin, dtmin), (:dtmax, dtmax))
+        value !== nothing && isnan(value) && throw(ArgumentError("`$name` is NaN"))
+    end
+    dt === nothing || isfinite(dt) || throw(ArgumentError("`dt` is infinite"))
+    dtmax === nothing || !iszero(dtmax) || throw(ArgumentError("`dtmax` is zero"))
     dt_given = dt !== nothing
     is_split = prob.f isa SciMLBase.SplitFunction
     is_dae = prob isa SciMLBase.AbstractDAEProblem
@@ -5103,6 +5162,7 @@ function _setup(
         ts = h.ts
         clone === nothing || LibPETSc.TSSetDM(petsclib, ts, clone)
         LibPETSc.TSSetProblemType(petsclib, ts, LibPETSc.TS_NONLINEAR)
+        _check_ts_type(petsclib, _ts_type(alg))
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
         _set_subtype!(petsclib, ts, alg)
 

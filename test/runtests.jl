@@ -2052,6 +2052,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "a subtype PETSc does not register is refused" begin
+        for mk in (
+                () -> PETScDiffEq.TSRK("nonsense"),
+                () -> PETScDiffEq.TSRosW("nonsense"),
+                () -> PETScDiffEq.TSARKIMEX("nonsense"),
+                () -> PETScDiffEq.TSMPRK([1], "nonsense"),
+            )
+            @test_throws "has no subtype \"nonsense\"; PETSc's are" mk()
+        end
+        @test_throws "\"5dp\", \"5f\"" PETScDiffEq.TSRK("nonsense")
+        @test_throws "`nstages` must be at least 1" PETScDiffEq.TSIRK(0)
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for alg in (PETScDiffEq.TSImplicit("nonsense"), PETScDiffEq.TSGeneric("nonsense"))
+            @test_throws "PETSc has no TS type \"nonsense\"; its types are" SciMLBase.solve(
+                prob, alg; dt = 0.1,
+            )
+            @test_throws "\"beuler\"" SciMLBase.init(prob, alg; dt = 0.1)
+        end
+        for s in PETScDiffEq._ARKIMEX_DIRK
+            sol = SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX(s); dt = 0.1, adaptive = false)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+        end
+    end
+
     @testset "PETSc types this package cannot drive are refused" begin
         for t in ("alpha2", "basicsymplectic", "discgrad", "eimex", "mimex", "mprk", "pseudo")
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
@@ -8260,6 +8284,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test fixed.stats.naccept == 20
         @test abs(fixed.u[end][1] - exp(-1.0)) < 1.0e-8
         @test SciMLBase.solve(prob, alg; dt = 0.05).stats.naccept < 20
+    end
+
+    @testset "a NaN step size, an infinite dt and a zero dtmax are refused" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        alg = PETScDiffEq.TSRK("5dp")
+        for (kw, msg) in (
+                ((; dt = NaN), "`dt` is NaN"),
+                ((; dt = NaN, adaptive = false), "`dt` is NaN"),
+                ((; dtmin = NaN), "`dtmin` is NaN"),
+                ((; dtmax = NaN), "`dtmax` is NaN"),
+                ((; dt = Inf), "`dt` is infinite"),
+                ((; dtmax = 0.0), "`dtmax` is zero"),
+            )
+            @test_throws msg SciMLBase.solve(prob, alg; kw...)
+            @test_throws msg SciMLBase.init(prob, alg; kw...)
+        end
     end
 
     @testset "dtmin and dtmax reach the controller" begin

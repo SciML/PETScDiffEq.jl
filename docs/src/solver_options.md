@@ -17,7 +17,9 @@ saves every step alongside it. `dtmin` is a floor the solve keeps: once PETSc pr
 smaller step, the solve ends there with `ReturnCode.DtLessThanMin`. A step shortened to
 land on a stop or the final time does not count, and a fixed-step solve has no floor, as in
 OrdinaryDiffEq. With `force_dtmin = true` the solve goes on at `dtmin` instead, and the floor
-wins over a smaller `dtmax`. `d_discontinuities` are stepped onto, and, as SciML defines them,
+wins over a smaller `dtmax`. A NaN `dt`, `dtmin` or `dtmax`, an infinite `dt` and a zero
+`dtmax` throw an `ArgumentError`, where OrdinaryDiffEq ends the solve with `DtNaN` or
+`Unstable`, or takes an infinite `dt` as the whole span. `d_discontinuities` are stepped onto, and, as SciML defines them,
 the step after each starts one ULP past it, so the right-hand side there sees the new regime
 when written as `if t > t_d`. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
 step that leaves the domain is taken again at a fifth of its size, as OrdinaryDiffEq takes it;
