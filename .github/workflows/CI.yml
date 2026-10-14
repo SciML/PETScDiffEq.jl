@@ -8,14 +8,15 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A push to main gets its own group, so one merged after another is not cancelled while it waits.
+  group: ${{ github.workflow }}-${{ github.ref != 'refs/heads/main' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
     # Explicit arch axis so include:x86 adds a new cell instead of merging into
     # Julia 1 / ubuntu-latest (which would silently replace the x64 lane).
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ matrix.group }}${{ matrix.group == 'MPI' && format(' -n {0}', matrix.ranks) || '' }}${{ matrix.part && format(' {0}', matrix.part) || '' }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ matrix.group }}${{ matrix.group == 'MPI' && format(' -n {0}', matrix.ranks) || '' }}${{ matrix.group != 'MPI' && matrix.part && format(' {0}', matrix.part) || '' }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -30,11 +31,15 @@ jobs:
         group: [Core, MPI]
         # One MPI job per rank count. Core does not read ranks, so it keeps one of its three.
         ranks: [1, 2, 3]
+        # Core runs as two processes, each about half of the file. MPI does not read part.
+        part: ['1/2', '2/2']
         exclude:
           - group: Core
             ranks: 2
           - group: Core
             ranks: 3
+          - group: MPI
+            part: '2/2'
         # PETSc_jll 3.25 has no 32-bit builds, and Julia 1.10 cannot resolve 3.25, so the
         # 32-bit lane runs where it gets 3.22.
         # One 32-bit process runs out of address space compiling the whole suite, so it runs in parts.
@@ -54,6 +59,15 @@ jobs:
             arch: x86
             group: All
             part: 3/3
+          # Apple silicon, where PETSc_jll and MPI come from other builds than on Linux.
+          - version: '1.10'
+            os: macos-latest
+            arch: aarch64
+            group: Core
+          - version: '1'
+            os: macos-latest
+            arch: aarch64
+            group: Core
     steps:
       - uses: actions/checkout@v7
       - name: Install 32-bit runtime libraries (i386)
@@ -73,7 +87,7 @@ jobs:
         env:
           GROUP: ${{ matrix.group }}
           MPI_RANKS: ${{ matrix.group == 'MPI' && matrix.ranks || '' }}
-          TEST_PART: ${{ matrix.part }}
+          TEST_PART: ${{ matrix.group != 'MPI' && matrix.part || '' }}
         # PETSc.jl 0.5 needs Julia 1.12, so 1.10 cannot take the latest compatible versions.
         with:
           force_latest_compatible_version: ${{ matrix.version == '1.10' && 'false' || 'auto' }}
