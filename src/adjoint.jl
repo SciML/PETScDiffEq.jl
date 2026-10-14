@@ -378,7 +378,7 @@ function _adjoint_record_body!(adj, step, s, x_ptr)
         while adj.next <= length(order) && cost_s[order[adj.next]] <= s
             k = order[adj.next]
             c = cost_s[k]
-            if adj.held_step >= 0 && c <= adj.held_until && c - adj.s_prev < s - c
+            if adj.held_step >= 0 && c <= adj.held_until && (c - adj.s_prev < s - c || s - c > tol)
                 _record_cost!(adj, k, adj.held_step, () -> copy(adj.held_u))
             elseif s - c <= tol
                 _record_cost!(adj, k, step, () -> _readvec!(similar(adj.u), pl, x))
