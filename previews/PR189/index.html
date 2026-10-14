@@ -12,7 +12,7 @@ end
 u0 = [1.0; 0.0; 0.0]
 tspan = (0.0, 100.0)
 prob = SciMLBase.ODEProblem(lorenz, u0, tspan)
-sol = SciMLBase.solve(prob, TSRK(&quot;5dp&quot;); dt = 0.01, abstol = 1e-8, reltol = 1e-8)</code></pre><p><code>dt</code> sets the first step. An adaptive solve can leave it out, and the first step is then Hairer and Wanner&#39;s estimate as OrdinaryDiffEq uses it, taken with the <code>abstol</code> and <code>reltol</code> keywords (SciML&#39;s defaults, <code>abstol = 1e-6</code> and <code>reltol = 1e-3</code>, when not given). DAE and mass-matrix problems start from a small step instead. A solve PETSc steps at a fixed size needs <code>dt</code>: <code>adaptive = false</code>, <code>-ts_adapt_type none</code>, the fixed-step families (<code>TSImplicit</code> and <code>TSDAE</code> other than <code>bdf</code>, <code>TSIRK</code>, <code>TSMPRK</code>), and subtypes registered without an embedded error estimate. What counts is the type PETSc runs after <code>petsc_options</code>: <code>TSImplicit(&quot;beuler&quot;, [&quot;-ts_type&quot;, &quot;bdf&quot;])</code> runs without <code>dt</code> and <code>TSImplicit(&quot;bdf&quot;, [&quot;-ts_type&quot;, &quot;beuler&quot;])</code> needs it. A <code>TSGeneric</code> naming a type no other constructor covers needs it too, since whether that type adapts is not known here.</p><p><code>u0</code> is a vector or an array of any shape, of real or complex numbers. An array-shaped state, such as the matrix of a 2-D grid, is stepped as PETSc&#39;s flat vector <code>vec(u0)</code> and reshaped where it meets your code, without a copy: <code>f</code>, <code>jac</code>, <code>isoutofdomain</code>, <code>unstable_check</code> and callbacks get arrays of <code>u0</code>&#39;s size, and <code>sol.u</code>, <code>sol(t)</code>, <code>integrator.u</code>, <code>integrator.uprev</code>, <code>get_du</code>, <code>set_u!</code> and <code>reinit!</code> take and return them. The Jacobian a <code>jac</code> fills, a <code>jac_prototype</code> and a mass matrix act on <code>vec(u)</code>, so each is <code>length(u0)</code> square, <code>save_idxs</code> and <code>TSMPRK</code>&#39;s components are linear indices into the state, and a tolerance for each component is an array of <code>u0</code>&#39;s size or a vector of its length. <code>set_u!</code> and <code>reinit!</code> also take a state of another shape with as many entries and read it in linear order. An array type other than <code>Array</code>, such as a <code>Transpose</code>, is stepped and given back as an <code>Array</code> of its size. The solve is the one of the same problem written on <code>vec(u0)</code>, step for step. This covers an <code>ODEProblem</code> and a <code>SplitODEProblem</code> on <code>MPI.COMM_SELF</code>; <a href="limitations/#Limitations">Limitations</a> lists what still needs <code>vec(u0)</code>.</p><h2 id="Reproducibility"><a class="docs-heading-anchor" href="#Reproducibility">Reproducibility</a><a id="Reproducibility-1"></a><a class="docs-heading-anchor-permalink" href="#Reproducibility" title="Permalink"></a></h2><details><summary>The documentation of this SciML package was built using these direct dependencies,</summary><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Status `~/_work/PETScDiffEq.jl/PETScDiffEq.jl/docs/Project.toml`
+sol = SciMLBase.solve(prob, TSRK(&quot;5dp&quot;); dt = 0.01, abstol = 1e-8, reltol = 1e-8)</code></pre><p><code>dt</code> sets the first step. An adaptive solve can leave it out, and the first step is then Hairer and Wanner&#39;s estimate as OrdinaryDiffEq uses it, taken with the <code>abstol</code> and <code>reltol</code> keywords (SciML&#39;s defaults, <code>abstol = 1e-6</code> and <code>reltol = 1e-3</code>, when not given). DAE and mass-matrix problems start from a small step instead. A solve PETSc steps at a fixed size needs <code>dt</code>: <code>adaptive = false</code>, <code>-ts_adapt_type none</code>, the fixed-step families (<code>TSImplicit</code> and <code>TSDAE</code> other than <code>bdf</code>, <code>TSIRK</code>, <code>TSMPRK</code>), and subtypes registered without an embedded error estimate. What counts is the type PETSc runs after <code>petsc_options</code>: <code>TSImplicit(&quot;beuler&quot;, [&quot;-ts_type&quot;, &quot;bdf&quot;])</code> runs without <code>dt</code> and <code>TSImplicit(&quot;bdf&quot;, [&quot;-ts_type&quot;, &quot;beuler&quot;])</code> needs it. A <code>TSGeneric</code> naming a type no other constructor covers needs it too, since whether that type adapts is not known here.</p><p><code>u0</code> is a vector or an array of any shape, of real or complex numbers. An array-shaped state, such as the matrix of a 2-D grid, is stepped as PETSc&#39;s flat vector <code>vec(u0)</code> and reshaped where it meets your code, without a copy: <code>f</code>, <code>jac</code>, <code>isoutofdomain</code>, <code>unstable_check</code> and callbacks get arrays of <code>u0</code>&#39;s size, and <code>sol.u</code>, <code>sol(t)</code>, <code>integrator.u</code>, <code>integrator.uprev</code>, <code>get_du</code>, <code>set_u!</code> and <code>reinit!</code> take and return them. The Jacobian a <code>jac</code> fills, a <code>jac_prototype</code> and a mass matrix act on <code>vec(u)</code>, so each is <code>length(u0)</code> square, <code>save_idxs</code> and <code>TSMPRK</code>&#39;s components are linear indices into the state, <code>save_idxs</code> taking <code>CartesianIndex</code>es as well, and a tolerance for each component is an array of <code>u0</code>&#39;s size or a vector of its length. <code>set_u!</code> and <code>reinit!</code> also take a state of another shape with as many entries and read it in linear order. An array type other than <code>Array</code>, such as a <code>Transpose</code>, is stepped and given back as an <code>Array</code> of its size. The solve is the one of the same problem written on <code>vec(u0)</code>, step for step. This covers an <code>ODEProblem</code> and a <code>SplitODEProblem</code> on <code>MPI.COMM_SELF</code>; <a href="limitations/#Limitations">Limitations</a> lists what still needs <code>vec(u0)</code>.</p><h2 id="Reproducibility"><a class="docs-heading-anchor" href="#Reproducibility">Reproducibility</a><a id="Reproducibility-1"></a><a class="docs-heading-anchor-permalink" href="#Reproducibility" title="Permalink"></a></h2><details><summary>The documentation of this SciML package was built using these direct dependencies,</summary><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Status `~/_work/PETScDiffEq.jl/PETScDiffEq.jl/docs/Project.toml`
   [e30172f5] Documenter v1.19.0
   [0a65194f] PETScDiffEq v0.9.46 `~/_work/PETScDiffEq.jl/PETScDiffEq.jl`</code></pre></details><details><summary>and using this machine and Julia version.</summary><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Julia Version 1.13.1
 Commit 96ca370cf0e (2026-09-25 19:34 UTC)
@@ -20,9 +20,9 @@ Build Info:
   Official https://julialang.org release
 Platform Info:
   OS: Linux (x86_64-linux-gnu)
-  CPU: 192 × AMD EPYC 9455 48-Core Processor
+  CPU: 112 × AMD EPYC 7663 56-Core Processor
   WORD_SIZE: 64
-  LLVM: libLLVM-20.1.8 (ORCJIT, znver5)
+  LLVM: libLLVM-20.1.8 (ORCJIT, znver3)
   GC: Built with stock GC
 Threads: 1 default, 1 interactive, 1 GC (on 4 virtual cores)
 Environment:
@@ -45,11 +45,11 @@ Environment:
   [a8cc5b0e] Crayons v4.2.0
   [9a962f9c] DataAPI v1.16.0
   [e2d170a0] DataValueInterfaces v1.0.0
-  [2b5f629d] DiffEqBase v7.21.3
+  [2b5f629d] DiffEqBase v7.21.4
   [163ba53b] DiffResults v1.1.0
   [b552c78f] DiffRules v1.16.0
   [a0c0ee7d] DifferentiationInterface v0.7.21
-  [ffbed154] DocStringExtensions v0.9.5
+⌅ [ffbed154] DocStringExtensions v0.9.5
   [e30172f5] Documenter v1.19.0
   [4e289a0a] EnumX v1.0.7
   [f151be2c] EnzymeCore v0.8.23
@@ -57,7 +57,7 @@ Environment:
   [7034ab61] FastBroadcast v1.4.0
   [9aa1b823] FastClosures v0.3.2
   [a4df4552] FastPower v1.5.0
-  [64ca27bc] FindFirstFunctions v3.4.0
+  [64ca27bc] FindFirstFunctions v3.4.1
   [f6369f11] ForwardDiff v1.4.6
   [069b7b12] FunctionWrappers v1.1.3
   [77dc65aa] FunctionWrappersWrappers v1.13.0
@@ -73,16 +73,16 @@ Environment:
   [0e77f7df] LazilyInitializedFields v1.3.0
   [2ab3a3ac] LogExpFunctions v1.0.2
   [e6f89c97] LoggingExtras v1.2.0
-  [da04e1cc] MPI v0.20.27
+  [da04e1cc] MPI v0.20.28
   [3da0fdf6] MPIPreferences v0.1.12
   [1914dd2f] MacroTools v0.5.16
   [d0879d2d] MarkdownAST v0.1.3
   [bb5d69b7] MaybeInplace v0.1.8
   [46d2c3a1] MuladdMacro v0.2.7
   [77ba4419] NaNMath v1.1.4
-  [be0214bd] NonlinearSolveBase v2.54.1
+  [be0214bd] NonlinearSolveBase v2.55.0
   [6fe1bfb0] OffsetArrays v1.17.0
-  [bac558e1] OrderedCollections v2.0.2
+  [bac558e1] OrderedCollections v2.0.3
   [ace2c81b] PETSc v0.5.2
   [0a65194f] PETScDiffEq v0.9.46 `~/_work/PETScDiffEq.jl/PETScDiffEq.jl`
   [69de0a69] Parsers v3.0.0
@@ -92,17 +92,17 @@ Environment:
   [21216c6a] Preferences v1.6.0
   [08abe8d2] PrettyTables v3.5.0
   [3cdcf5f2] RecipesBase v1.4.0
-  [731186ca] RecursiveArrayTools v4.5.3
+  [731186ca] RecursiveArrayTools v4.5.4
   [189a3867] Reexport v1.2.2
   [2792f1a3] RegistryInstances v0.1.0
   [9fe22ead] RespecializeParams v1.3.0
   [7e49a35a] RuntimeGeneratedFunctions v0.5.27
-  [0bca4576] SciMLBase v3.57.0
-  [19f34311] SciMLJacobianOperators v0.1.19
+  [0bca4576] SciMLBase v3.58.0
+  [19f34311] SciMLJacobianOperators v0.1.20
   [a6db7da4] SciMLLogging v2.1.0
-  [c0aeaf25] SciMLOperators v1.30.2
+  [c0aeaf25] SciMLOperators v1.30.3
   [431bcebd] SciMLPublic v1.3.0
-  [53ae85a6] SciMLStructures v1.10.5
+  [53ae85a6] SciMLStructures v1.10.6
   [efcf1570] Setfield v1.1.2
   [0a514795] SparseMatrixColorings v0.4.28
   [276daf66] SpecialFunctions v2.9.0
@@ -128,7 +128,7 @@ Environment:
   [94ce4f54] Libiconv_jll v1.18.0+0
   [d00139f3] METIS_jll v5.1.4+0
   [b5ada748] MPIABI_jll v1.0.1+0
-  [7cb0a576] MPICH_jll v5.0.2+0
+  [7cb0a576] MPICH_jll v5.0.2+1
   [f1f71cc9] MPItrampoline_jll v5.5.6+0
   [ca64183c] MUMPS_jll v5.9.4+0
   [9237b28f] MicrosoftMPI_jll v10.1.4+3
@@ -206,4 +206,4 @@ Environment:
   [8e850b90] libblastrampoline_jll v5.15.0+0
   [8e850ede] nghttp2_jll v1.67.1+0
   [3f19e933] p7zip_jll v17.8.2+0
-Info Packages marked with ⌅ have new versions available but compatibility constraints restrict them from upgrading. To see why use `status --outdated -m`</code></pre></details></article><nav class="docs-footer"><a class="docs-footer-nextpage" href="solver_options/">Solver Options »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Sunday 11 October 2026 07:27">Sunday 11 October 2026</span>. Using Julia version 1.13.1.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
+Info Packages marked with ⌅ have new versions available but compatibility constraints restrict them from upgrading. To see why use `status --outdated -m`</code></pre></details></article><nav class="docs-footer"><a class="docs-footer-nextpage" href="solver_options/">Solver Options »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Wednesday 14 October 2026 19:10">Wednesday 14 October 2026</span>. Using Julia version 1.13.1.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
