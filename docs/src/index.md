@@ -74,12 +74,13 @@ reshaped where it meets your code, without a copy: `f`, `jac`, `isoutofdomain`,
 `integrator.u`, `integrator.uprev`, `get_du`, `set_u!` and `reinit!` take and return them.
 The Jacobian a `jac` fills, a `jac_prototype` and a mass matrix act on `vec(u)`, so each is
 `length(u0)` square, `save_idxs` and `TSMPRK`'s components are linear indices into the
-state, and a tolerance for each component is an array of `u0`'s size or a vector of its
-length. `set_u!` and `reinit!` also take a state of another shape with as many entries and
-read it in linear order. An array type other than `Array`, such as a `Transpose`, is stepped
-and given back as an `Array` of its size. The solve is the one of the same problem written
-on `vec(u0)`, step for step. This covers an `ODEProblem` and a `SplitODEProblem` on
-`MPI.COMM_SELF`; [Limitations](@ref) lists what still needs `vec(u0)`.
+state, `save_idxs` taking `CartesianIndex`es as well, and a tolerance for each component is
+an array of `u0`'s size or a vector of its length. `set_u!` and `reinit!` also take a state
+of another shape with as many entries and read it in linear order. An array type other than
+`Array`, such as a `Transpose`, is stepped and given back as an `Array` of its size. The
+solve is the one of the same problem written on `vec(u0)`, step for step. This covers an
+`ODEProblem` and a `SplitODEProblem` on `MPI.COMM_SELF`; [Limitations](@ref) lists what
+still needs `vec(u0)`.
 
 ## Reproducibility
 
