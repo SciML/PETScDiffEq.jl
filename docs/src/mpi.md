@@ -217,7 +217,7 @@ six methods, and on one rank that of central differences of the same fixed-step 
 hand-written ones on the same ranks.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
-which every algorithm that takes `comm` takes as well. The solve then runs on the DM's
+which all algorithms but `TSBasicSymplectic` and `TSAlpha2` take. The solve then runs on the DM's
 communicator, which `comm` may name too but not contradict, and `u0` is the block of the grid
 this rank owns, in the DM's order. `f(du, u, p, t)` gets `u` ghosted: before every call to `f`,
 including the package's own calls for the first step size, dense output, callbacks, `get_du`
