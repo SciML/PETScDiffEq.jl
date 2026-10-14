@@ -10903,13 +10903,18 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
             end
             # A lag of 1 ps driven at 10 GHz for 1 ns in seconds, and a Float32 clock at 20000 steps.
-            for (prob, alg, t, kwargs) in (
-                    (
-                        lag(1.0e-12, 2pi * 1.0e10, 1.0e-9), TSRK("5dp"), 0.7e-9,
-                        (abstol = 1.0e-9, reltol = 1.0e-9),
-                    ),
-                    (lag(1.0f0, 0.6f0, 10.0f0), TSRK("4"), 7.0, (dt = 5.0f-4, adaptive = false)),
-                )
+            cases = Any[
+                (
+                    lag(1.0e-12, 2pi * 1.0e10, 1.0e-9), TSRK("5dp"), 0.7e-9,
+                    (abstol = 1.0e-9, reltol = 1.0e-9),
+                ),
+            ]
+            # The 32-bit build refuses this cost time (#225).
+            Sys.WORD_SIZE == 64 && push!(
+                cases,
+                (lag(1.0f0, 0.6f0, 10.0f0), TSRK("4"), 7.0, (dt = 5.0f-4, adaptive = false)),
+            )
+            for (prob, alg, t, kwargs) in cases
                 steps, given = Tuple{Float64, Float64}[], Float64[]
                 _, dp = PETScDiffEq._discrete_adjoint(
                     prob, alg, PETScAdjoint();
