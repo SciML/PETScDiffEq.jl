@@ -251,8 +251,8 @@ const EXACT = 1.0e-4
                 @test isempty(sol.u[end]) == (rank != holder)
                 rank == holder || continue
                 ref = solve(decay(1:N), TSImplicit("bdf"; autodiff = alg.autodiff); tol...)
-                @test sol.t == ref.t
-                @test maximum(abs, sol.u[end] - ref.u[end]) <= bound.implicit
+                @test sol.t[end] == ref.t[end]
+                @test maximum(abs, sol.u[end] - ref.u[end]) <= bound.adaptive
             end
         end
     end
