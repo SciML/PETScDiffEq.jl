@@ -1289,12 +1289,15 @@ function _discrete_adjoint_unlocked(
                 ),
             )
             reason = LibPETSc.TSGetConvergedReason(pl, ts)
-            reason == LibPETSc.TS_CONVERGED_TIME || throw(
+            s_end = LibPETSc.TSGetSolveTime(pl, ts)
+            # PETSc reports TS_CONVERGED_ITS when the last step maxiters allows lands on tf.
+            reached = reason == LibPETSc.TS_CONVERGED_TIME ||
+                reason == LibPETSc.TS_CONVERGED_ITS && s_end >= h.tf - _near(h.tf)
+            reached || throw(
                 ArgumentError(
-                    "the forward solve stopped with $reason at t = " *
-                        "$(_user_t(h.tdir, LibPETSc.TSGetSolveTime(pl, ts))), short of " *
-                        "tspan's end; raise `maxiters`, in `solve` as well as here, or " *
-                        "find out why the steps failed",
+                    "the forward solve stopped with $reason at t = $(_user_t(h.tdir, s_end)), " *
+                        "short of tspan's end; raise `maxiters`, in `solve` as well as here, " *
+                        "or find out why the steps failed",
                 ),
             )
             # PETSc reports TS_CONVERGED_TIME even when the state overflowed.
