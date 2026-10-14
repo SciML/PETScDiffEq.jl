@@ -8253,6 +8253,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         )
     end
 
+    @testset "a discrete problem is refused" begin
+        halve!(du, u, p, t) = (du .= u ./ 2; nothing)
+        for prob in (
+                SciMLBase.DiscreteProblem((u, p, t) -> u ./ 2, [1.0], (0.0, 5.0)),
+                SciMLBase.DiscreteProblem(halve!, [1.0], (0.0, 5.0)),
+                SciMLBase.ImplicitDiscreteProblem(
+                    (r, u, uprev, p, t) -> (r .= u .- uprev ./ 2; nothing), [1.0], (0.0, 5.0),
+                ),
+            )
+            msg = "PETScDiffEq does not support $(nameof(typeof(prob)))"
+            @test_throws msg SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"))
+            @test_throws msg SciMLBase.init(prob, PETScDiffEq.TSImplicit("bdf"))
+        end
+    end
+
     @testset "adaptive = false gives fixed steps" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         alg = PETScDiffEq.TSRK("5dp")
