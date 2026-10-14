@@ -150,8 +150,7 @@ function PETScDiffEq._solve_and_pullback(
     sol = SciMLBase.solve(prob, alg; save_idxs, kwargs...)
     ts = copy(sol.t)
     n = length(prob.u0)
-    kept = save_idxs === nothing ? nothing :
-        save_idxs isa Integer ? [Int(save_idxs)] : Vector{Int}(collect(save_idxs))
+    kept = save_idxs === nothing ? nothing : PETScDiffEq._save_idxs(prob, save_idxs)
     has_p = !(p === nothing || p isa SciMLBase.NullParameters)
 
     function petsc_adjoint_pullback(Δ)

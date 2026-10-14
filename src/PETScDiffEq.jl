@@ -388,7 +388,7 @@ then read row by row, so nothing beyond the index list is asked of the caller.
 Passing a `medium` set as well splits the state three ways, which is what PETSc's
 `"2a23"` and `"2a33"` want. Whatever neither set names is the fast part.
 
-Explicit, so a mass matrix and an analytic Jacobian are both refused. Without a
+Explicit, so a mass matrix is refused and a `jac` is ignored. Without a
 `medium` set `subtype` is one of `"2a22"`, `"2a32"`, `"p2"` or `"p3"`; with one it
 is `"2a23"` or `"2a33"`.
 
@@ -2823,7 +2823,18 @@ function _flat_tol(tol, dims::Dims, name)
     return vec(tol)
 end
 
-# `save_idxs` as linear indices into the state, with a symbol resolved through the problem's system.
+# `save_idxs` as linear indices into the state: a CartesianIndex by its axes, a symbol through
+# the problem's system.
+_save_index(u0, i) = Int(i)
+function _save_index(u0, I::CartesianIndex)
+    checkbounds(Bool, u0, I) || throw(
+        ArgumentError(
+            "`save_idxs` has the index $(Tuple(I)), outside a state of size $(size(u0))",
+        ),
+    )
+    return LinearIndices(u0)[I]
+end
+
 function _save_idxs(prob, idxs)
     idxs isa AbstractArray && SII.symbolic_type(idxs) == SII.NotSymbolic() ||
         return _state_indices!(Int[], prob, idxs)
@@ -2834,7 +2845,7 @@ function _save_idxs(prob, idxs)
     return v
 end
 
-_state_indices!(v, prob, i::Integer) = push!(v, Int(i))
+_state_indices!(v, prob, i::Union{Integer, CartesianIndex}) = push!(v, _save_index(prob.u0, i))
 function _state_indices!(v, prob, sym)
     i = SII.variable_index(prob, sym)
     i === nothing && throw(
@@ -3870,7 +3881,18 @@ function _check_inttype(petsclib)
 end
 
 # TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
-_maxsteps(maxiters) = LibPETSc.PetscInt(clamp(maxiters, 0, typemax(LibPETSc.PetscInt)))
+# No limit has to be PETSc's own largest count, which is wider than `Int` on 32-bit.
+_maxsteps(maxiters) = maxiters == typemax(Int) ? typemax(LibPETSc.PetscInt) :
+    LibPETSc.PetscInt(clamp(maxiters, 0, typemax(LibPETSc.PetscInt)))
+
+# OrdinaryDiffEq stops once `iter > maxiters`, so a fraction counts as its floor and `Inf`
+# never stops, as `typemax(Int)` never does here.
+function _step_limit(maxiters::Real)
+    isnan(maxiters) && throw(ArgumentError("`maxiters` is NaN; pass `Inf` for no limit"))
+    maxiters >= typemax(Int) && return typemax(Int)
+    maxiters <= typemin(Int) && return typemin(Int)
+    return floor(Int, maxiters)
+end
 
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothing)
     rows, cols, _ = findnz(jac_prototype)
@@ -4819,6 +4841,7 @@ function _setup(
     for (key, value) in pairs(kwargs)
         _drops(key, value) && @warn "PETScDiffEq does not support `$key` and is ignoring it"
     end
+    step_limit = _step_limit(maxiters)
     prob.u0 isa AbstractArray{<:Union{Real, Complex}} || throw(
         ArgumentError("PETScDiffEq requires an AbstractArray u0 of real or complex numbers"),
     )
@@ -5110,7 +5133,7 @@ function _setup(
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
-        false, false, Int(maxiters), false, nothing, nothing, 0, 0, false, shape,
+        false, false, step_limit, false, nothing, nothing, 0, 0, false, shape,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -5239,7 +5262,7 @@ function _setup(
             LibPETSc.TSSetTime(petsclib, ts, t0)
             dt_given && _set_first_step!(h, dt, dtmin, force_dtmin)
             LibPETSc.TSSetMaxTime(petsclib, ts, tf)
-            LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(maxiters))
+            LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(step_limit))
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
             )
@@ -5756,7 +5779,9 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
     name in (:abstol, :reltol) && (v = _flat_tol(v, _state_size(h), name))
     name in (:abstol, :reltol) &&
         _checked_everywhere(() -> _check_tol(v, length(h.u0), name), h.ctx.comm)
-    setfield!(o, name, name in (:dtmin, :dtmax) ? R(v) : name === :maxiters ? Int(v) : v)
+    setfield!(
+        o, name, name in (:dtmin, :dtmax) ? R(v) : name === :maxiters ? _step_limit(v) : v,
+    )
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib
     if name === :abstol || name === :reltol
@@ -6527,7 +6552,7 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     integ.derivative_discontinuity = false
     _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, before)
     integ.finished && return nothing
-    initialize_save && _discretes(integ.sol) !== nothing &&
+    initialize_save && integ.opts.save_discretes && _discretes(integ.sol) !== nothing &&
         SciMLBase.save_discretes_if_enabled!(integ, integ.opts.callback; skip_duplicates = true)
     _everywhere(h.ctx.comm, integ.u == before) && return nothing
     copyto!(integ.uprev, integ.u)
@@ -6843,8 +6868,17 @@ end
 _retype(old, new) = eltype(old) <: Union{AbstractFloat, Complex} ? eltype(old).(new) : new
 
 # `f` keeps seeing the problem's shape, so a state of another shape is read in linear order.
-_in_shape(old, new) = !(new isa AbstractArray) || size(new) == size(old) ||
-    (old isa AbstractVector && new isa AbstractVector) ? new : reshape(new, size(old))
+function _in_shape(old, new)
+    new isa AbstractArray && size(new) != size(old) || return new
+    old isa AbstractVector && new isa AbstractVector && return new
+    length(new) == length(old) || throw(
+        DimensionMismatch(
+            "`reinit!` was given a state of size $(size(new)), but the problem's `u0` has " *
+                "size $(size(old)); give one with its $(length(old)) entries",
+        ),
+    )
+    return reshape(new, size(old))
+end
 
 SciMLBase.reinit!(integ::PETScIntegrator, u0 = integ.prob.u0; kwargs...) =
     _locked(() -> _reinit_unlocked(integ, u0; kwargs...))
@@ -6872,7 +6906,8 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
     sol = _with_discretes(sol, _discretes(integ.sol))
     integ.sol = retcode === nothing ? sol : SciMLBase.solution_new_retcode(sol, retcode)
     # As in OrdinaryDiffEq, a finalizer's discretes are saved with an end point added here.
-    unsaved && _last_recorded(h.ctx, s) && _discretes(sol) !== nothing &&
+    unsaved && integ.opts.save_discretes && _last_recorded(h.ctx, s) &&
+        _discretes(sol) !== nothing &&
         SciMLBase.save_final_discretes!(integ, integ.opts.callback)
     integ.finished = true
     _destroy!(h)
