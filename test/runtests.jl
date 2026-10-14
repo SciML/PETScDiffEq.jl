@@ -3316,6 +3316,29 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test plain.stats.nf2 == 0
     end
 
+    @testset "nf and nf2 count the calls that estimate the first step" begin
+        calls = [0, 0]
+        f1!(du, u, p, t) = (calls[1] += 1; du .= -u; nothing)
+        f2!(du, u, p, t) = (calls[2] += 1; du .= 0.1 .* u; nothing)
+        prob = SciMLBase.ODEProblem(f1!, [1.0, 2.0], (0.0, 1.0))
+        split = SciMLBase.SplitODEProblem(f1!, f2!, [1.0, 2.0], (0.0, 1.0))
+        algs = Any[
+            (prob, PETScDiffEq.TSRK("5dp")), (prob, PETScDiffEq.TSRosW("ra34pw2")),
+            (prob, PETScDiffEq.TSImplicit("bdf")), (split, PETScDiffEq.TSARKIMEX("2e")),
+        ]
+        Sys.WORD_SIZE == 64 && push!(algs, (prob, PETScDiffEq.TSRK("5dp"; comm = MPI.COMM_WORLD)))
+        for (pr, alg) in algs, kw in ((;), (; dt = 0.1))
+            fill!(calls, 0)
+            sol = SciMLBase.solve(pr, alg; kw...)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test [sol.stats.nf, sol.stats.nf2] == calls
+        end
+        fill!(calls, 0)
+        integ = SciMLBase.init(split, PETScDiffEq.TSARKIMEX("2e"))
+        SciMLBase.solve!(integ)
+        @test [integ.sol.stats.nf, integ.sol.stats.nf2] == calls
+    end
+
     @testset "stats count the linear solves and the callback condition calls" begin
         chain_prob = SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(chain!; jac = chain_jac!, jac_prototype = CHAIN_PROTOTYPE),

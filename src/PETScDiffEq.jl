@@ -5366,14 +5366,17 @@ function _setup(
                         (abs(R(s) - user_t0) for s in tstops if tdir * (R(s) - user_t0) > 0);
                         init = R(Inf),
                     )
-                    threw = Ref{Any}(nothing)
+                    threw, calls = Ref{Any}(nothing), [0, 0]
                     estimate = _initial_dt(
-                        _guard_f(user_f1, comm, threw),
-                        user_f2 === nothing ? nothing : _guard_f(user_f2, comm, threw), u0,
+                        _counted(_guard_f(user_f1, comm, threw), calls, 1),
+                        user_f2 === nothing ? nothing :
+                            _counted(_guard_f(user_f2, comm, threw), calls, 2), u0,
                         p, user_t0, tdir, _running_order(petsclib, ts, running),
                         est_abstol, est_reltol, est_dtmin,
                         min(user_dtmax, first_stop, abs(tf - t0)), comm,
                     )
+                    ctx.nf += calls[1]
+                    ctx.nf2 += calls[2]
                     _throw_anywhere(comm, threw[])
                     estimate
                 end
