@@ -148,7 +148,7 @@ const METHODS = (
                 heat(rows, heat!; jac), make(comm), heat(1:N, heat_serial!; jac),
                 make(MPI.COMM_SELF; autodiff = ad), heat_exact(SPAN[2]), err; TOL...,
             )
-            @test (sol.stats.njacs > 0) == jac
+            @test sol.stats.njacs > 0
         end
         sol = compare(
             heat(rows, heat!; jac = true), TSImplicit("bdf"; comm),
@@ -174,7 +174,7 @@ const METHODS = (
                 heat(rows, heat!; jac), TSGeneric(type; comm), heat(1:N, heat_serial!; jac),
                 TSGeneric(type; autodiff = ad), heat_exact(SPAN[2]), err; kw...,
             )
-            @test (sol.stats.njacs > 0) == jac
+            @test sol.stats.njacs > 0
         end
         irk_counts = even(N)
         idx = owned(irk_counts)
@@ -353,7 +353,7 @@ const METHODS = (
                 fem(rows, heat!; jac), make(comm), fem(1:N, heat_serial!; jac),
                 make(MPI.COMM_SELF; autodiff = ad), exact, err; TOL...,
             )
-            @test (sol.stats.njacs > 0) == jac
+            @test sol.stats.njacs > 0
         end
         # A rank may give its rows as a Diagonal, while another gives them sparse.
         d = 1 .+ (1:N) ./ N

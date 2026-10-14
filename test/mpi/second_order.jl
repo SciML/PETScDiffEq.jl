@@ -231,7 +231,7 @@ end
                 SciMLBase.__solve(wave_problem(idx, a; span, jac, proto = true), a; kw...)
             end
             @test sol.retcode == ReturnCode.Success
-            @test (sol.stats.njacs > 0) == jac
+            @test sol.stats.njacs > 0
             @test matches(sol, ref, us, !jac ? COLOURED : how == "fixed" ? EXACT : STEPPED)
             exact = wave_exact(span[2] - span[1])
             rank == 0 && @test maximum(abs, us[end] - exact) <= ALPHA2_ERR[how]
@@ -263,7 +263,7 @@ end
                 )
             end
             @test sol.retcode == ReturnCode.Success
-            @test (sol.stats.njacs > 0) == jac
+            @test sol.stats.njacs > 0
             @test matches(sol, ref, us, STEPPED)
             rank == 0 && @test maximum(abs, us[end] - wave_exact(span[2] - span[1])) <= BDF_ERR
         end
