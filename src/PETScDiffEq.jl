@@ -16,6 +16,7 @@ using SciMLOperators: SciMLOperators
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
     sparse
 using SparseMatrixColorings: SparseMatrixColorings
+using SymbolicIndexingInterface: SymbolicIndexingInterface as SII
 
 include("petsc_compat.jl")
 
@@ -2824,7 +2825,7 @@ end
 
 # `save_idxs` as linear indices into the state, with a symbol resolved through the problem's system.
 function _save_idxs(prob, idxs)
-    idxs isa AbstractArray && SciMLBase.symbolic_type(idxs) == SciMLBase.NotSymbolic() ||
+    idxs isa AbstractArray && SII.symbolic_type(idxs) == SII.NotSymbolic() ||
         return _state_indices!(Int[], prob, idxs)
     v = Int[]
     for i in idxs
@@ -2835,7 +2836,7 @@ end
 
 _state_indices!(v, prob, i::Integer) = push!(v, Int(i))
 function _state_indices!(v, prob, sym)
-    i = SciMLBase.variable_index(prob, sym)
+    i = SII.variable_index(prob, sym)
     i === nothing && throw(
         ArgumentError(
             "`save_idxs` names $sym, which is not a state of the problem's system; " *
