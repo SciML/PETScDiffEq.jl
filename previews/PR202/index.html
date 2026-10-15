@@ -14,8 +14,8 @@ tspan = (0.0, 100.0)
 prob = SciMLBase.ODEProblem(lorenz, u0, tspan)
 sol = SciMLBase.solve(prob, TSRK(&quot;5dp&quot;); dt = 0.01, abstol = 1e-8, reltol = 1e-8)</code></pre><p><code>dt</code> sets the first step. An adaptive solve can leave it out, and the first step is then Hairer and Wanner&#39;s estimate as OrdinaryDiffEq uses it, taken with the <code>abstol</code> and <code>reltol</code> keywords (SciML&#39;s defaults, <code>abstol = 1e-6</code> and <code>reltol = 1e-3</code>, when not given). DAE and mass-matrix problems start from a small step instead. A solve PETSc steps at a fixed size needs <code>dt</code>: <code>adaptive = false</code>, <code>-ts_adapt_type none</code>, the fixed-step families (<code>TSImplicit</code> and <code>TSDAE</code> other than <code>bdf</code>, <code>TSIRK</code>, <code>TSMPRK</code>), and subtypes registered without an embedded error estimate. What counts is the type PETSc runs after <code>petsc_options</code>: <code>TSImplicit(&quot;beuler&quot;, [&quot;-ts_type&quot;, &quot;bdf&quot;])</code> runs without <code>dt</code> and <code>TSImplicit(&quot;bdf&quot;, [&quot;-ts_type&quot;, &quot;beuler&quot;])</code> needs it. A <code>TSGeneric</code> naming a type no other constructor covers needs it too, since whether that type adapts is not known here.</p><p><code>u0</code> is a vector or an array of any shape, of real or complex numbers. An array-shaped state, such as the matrix of a 2-D grid, is stepped as PETSc&#39;s flat vector <code>vec(u0)</code> and reshaped where it meets your code, without a copy: <code>f</code>, <code>jac</code>, <code>isoutofdomain</code>, <code>unstable_check</code> and callbacks get arrays of <code>u0</code>&#39;s size, and <code>sol.u</code>, <code>sol(t)</code>, <code>integrator.u</code>, <code>integrator.uprev</code>, <code>get_du</code>, <code>set_u!</code> and <code>reinit!</code> take and return them. The Jacobian a <code>jac</code> fills, a <code>jac_prototype</code> and a mass matrix act on <code>vec(u)</code>, so each is <code>length(u0)</code> square, <code>save_idxs</code> and <code>TSMPRK</code>&#39;s components are linear indices into the state, <code>save_idxs</code> taking <code>CartesianIndex</code>es as well, and a tolerance for each component is an array of <code>u0</code>&#39;s size or a vector of its length. <code>set_u!</code> and <code>reinit!</code> also take a state of another shape with as many entries and read it in linear order. An array type other than <code>Array</code>, such as a <code>Transpose</code>, is stepped and given back as an <code>Array</code> of its size. The solve is the one of the same problem written on <code>vec(u0)</code>, step for step. This covers an <code>ODEProblem</code> and a <code>SplitODEProblem</code> on <code>MPI.COMM_SELF</code>; <a href="limitations/#Limitations">Limitations</a> lists what still needs <code>vec(u0)</code>.</p><h2 id="Reproducibility"><a class="docs-heading-anchor" href="#Reproducibility">Reproducibility</a><a id="Reproducibility-1"></a><a class="docs-heading-anchor-permalink" href="#Reproducibility" title="Permalink"></a></h2><details><summary>The documentation of this SciML package was built using these direct dependencies,</summary><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Status `~/_work/PETScDiffEq.jl/PETScDiffEq.jl/docs/Project.toml`
   [e30172f5] Documenter v1.19.0
-  [0a65194f] PETScDiffEq v0.9.48 `~/_work/PETScDiffEq.jl/PETScDiffEq.jl`</code></pre></details><details><summary>and using this machine and Julia version.</summary><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Julia Version 1.13.1
-Commit 96ca370cf0e (2026-09-25 19:34 UTC)
+  [0a65194f] PETScDiffEq v0.9.48 `~/_work/PETScDiffEq.jl/PETScDiffEq.jl`</code></pre></details><details><summary>and using this machine and Julia version.</summary><pre class="documenter-example-output"><code class="nohighlight hljs ansi">Julia Version 1.13.2
+Commit 45b6d15e34b (2026-10-14 20:33 UTC)
 Build Info:
   Official https://julialang.org release
 Platform Info:
@@ -104,7 +104,7 @@ Environment:
   [431bcebd] SciMLPublic v1.3.0
   [53ae85a6] SciMLStructures v1.10.6
   [efcf1570] Setfield v1.1.2
-  [0a514795] SparseMatrixColorings v0.4.28
+  [0a514795] SparseMatrixColorings v0.4.29
   [276daf66] SpecialFunctions v2.9.0
   [1e83bf80] StaticArraysCore v1.4.4
   [10745b16] Statistics v1.11.5
@@ -128,12 +128,12 @@ Environment:
   [94ce4f54] Libiconv_jll v1.18.0+0
   [d00139f3] METIS_jll v5.1.4+0
   [b5ada748] MPIABI_jll v1.0.1+0
-  [7cb0a576] MPICH_jll v5.0.2+1
-  [f1f71cc9] MPItrampoline_jll v5.5.6+0
+  [7cb0a576] MPICH_jll v5.0.3+0
+  [f1f71cc9] MPItrampoline_jll v5.5.7+0
   [ca64183c] MUMPS_jll v5.9.4+0
   [9237b28f] MicrosoftMPI_jll v10.1.4+3
   [656ef2d0] OpenBLAS32_jll v0.3.34+0
-  [fe0851c0] OpenMPI_jll v5.0.13+0
+  [fe0851c0] OpenMPI_jll v5.0.14+0
   [9bd350c2] OpenSSH_jll v10.6.1+0
   [efe28fd5] OpenSpecFun_jll v0.5.6+0
   [b247a4be] PARMETIS_jll v4.0.9+0
@@ -192,18 +192,18 @@ Environment:
   [cf7118a7] UUIDs v1.11.0
   [4ec0a83e] Unicode v1.11.0
   [e66e0078] CompilerSupportLibraries_jll v1.5.5+2
-  [deac9b47] LibCURL_jll v8.18.0+1
-  [e37daf67] LibGit2_jll v1.9.1+0
+  [deac9b47] LibCURL_jll v8.22.0+0
+  [e37daf67] LibGit2_jll v1.9.7+0
   [29816b5a] LibSSH2_jll v1.11.104+0
   [14a3606d] MozillaCACerts_jll v2026.8.13
   [4536629a] OpenBLAS_jll v0.3.30+0
   [05823500] OpenLibm_jll v0.8.7+0
-  [458c3c95] OpenSSL_jll v3.5.6+0
+  [458c3c95] OpenSSL_jll v3.5.8+0
   [efcefdf7] PCRE2_jll v10.46.0+0
   [bea87d4a] SuiteSparse_jll v7.10.1+0
-  [83775a58] Zlib_jll v1.3.1+2
+  [83775a58] Zlib_jll v1.3.2+0
   [3161d3a3] Zstd_jll v1.5.7+1
   [8e850b90] libblastrampoline_jll v5.15.0+0
-  [8e850ede] nghttp2_jll v1.67.1+0
-  [3f19e933] p7zip_jll v17.8.2+0
-Info Packages marked with ⌅ have new versions available but compatibility constraints restrict them from upgrading. To see why use `status --outdated -m`</code></pre></details></article><nav class="docs-footer"><a class="docs-footer-nextpage" href="solver_options/">Solver Options »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Wednesday 14 October 2026 19:36">Wednesday 14 October 2026</span>. Using Julia version 1.13.1.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
+  [8e850ede] nghttp2_jll v1.70.0+0
+  [3f19e933] p7zip_jll v17.8.3+0
+Info Packages marked with ⌅ have new versions available but compatibility constraints restrict them from upgrading. To see why use `status --outdated -m`</code></pre></details></article><nav class="docs-footer"><a class="docs-footer-nextpage" href="solver_options/">Solver Options »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Thursday 15 October 2026 19:50">Thursday 15 October 2026</span>. Using Julia version 1.13.2.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
