@@ -296,16 +296,14 @@ function _ad_dae_jacobian(
     return ADComplexDAEJacobian(h!, b, prep, x, y, out, Jr, similar(u0), advice)
 end
 
-_direction(R, n) = [one(R) + R(k) / n for k in 1:n]
+_direction(R, n) = R[one(R) + R(k) / n for k in 1:n]
 _off(u0) = (R = real(eltype(u0)); u0 .+ complex(R(0.01), R(0.02)) .* (1 .+ abs.(u0)) .* _direction(R, length(u0)))
 
 _norms(::Nothing, xs...) = map(LinearAlgebra.norm, xs)
 _norms(comm::MPI.Comm, xs...) = Tuple(sqrt.(MPI.Allreduce([sum(abs2, x) for x in xs], +, comm)))
 
-function _check_holomorphic(h, v, backend, advice, comm = nothing)
-    n = length(v)
-    comm === nothing && n == 0 && return nothing
-    R = real(eltype(v))
+function _directional(h, v, backend)
+    n, R = length(v), real(eltype(v))
     w = _direction(R, n)
     function along(d)
         g = DI.derivative(ADTypes.dense_ad(backend), zero(R)) do e
@@ -315,7 +313,13 @@ function _check_holomorphic(h, v, backend, advice, comm = nothing)
         return complex.(g[1:n], g[(n + 1):(2n)])
     end
     along_real, along_imag = along(w), along(im .* w)
-    gap, re, ims = _norms(comm, along_imag .- im .* along_real, along_real, along_imag)
+    return along_imag .- im .* along_real, along_real, along_imag
+end
+
+function _check_holomorphic(h, v, backend, advice, comm = nothing)
+    comm === nothing && isempty(v) && return nothing
+    R = real(eltype(v))
+    gap, re, ims = _norms(comm, _checked_everywhere(() -> _directional(h, v, backend), comm)...)
     scale = re + ims
     (isfinite(gap) && isfinite(scale)) || return nothing
     gap <= sqrt(eps(R)) * scale && return nothing
@@ -479,7 +483,7 @@ function _ad_comm_jacobian(
         v = _off(u0)
         h = dae ? (z -> (r = similar(z); g!(r, z .- v, z, p, t); r)) :
             (z -> (dz = similar(z); g!(dz, z, p, t); dz))
-        _checked_everywhere(() -> _check_holomorphic(h, v, dense, advice, comm), comm)
+        _check_holomorphic(h, v, dense, advice, comm)
         _checked_everywhere(comm) do
             e, err[] = err[], nothing
             e === nothing || throw(_dual_failure(e) ? _dual_error(e, dense, advice) : e)
