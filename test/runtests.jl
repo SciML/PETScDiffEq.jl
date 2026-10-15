@@ -1405,12 +1405,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             hits = Float64[]
             undone = Ref(false)
             change_p = SciMLBase.DiscreteCallback(
-                (u, t, integ) -> t == 0.5, integ -> (integ.p[1] = 20.0; nothing),
+                (u, t, integ) -> t == 0.5, integ -> (integ.p[1] = 21.0; nothing),
             )
             cross = SciMLBase.ContinuousCallback(
                 (u, t, integ) -> u[1] - 0.7, integ -> push!(hits, integ.t),
             )
-            first_after = (u, p, t) -> reject && p[1] == 20.0 && !undone[] && (undone[] = true)
+            first_after = (u, p, t) -> reject && p[1] == 21.0 && !undone[] && (undone[] = true)
             SciMLBase.solve(
                 SciMLBase.ODEProblem(rate!, [1.0], (0.0, 1.0), [0.0]), PETScDiffEq.TSRK("3bs");
                 dt = 0.1, abstol = 1.0e-8, reltol = 1.0e-8, tstops = [0.5],
@@ -1420,7 +1420,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
         @test events[2][2]
         @test abs(only(events[2][1]) - only(events[1][1])) < 1.0e-8
-        @test abs(only(events[2][1]) - (0.5 + log(1 / 0.7) / 20)) < 1.0e-8
+        @test abs(only(events[2][1]) - (0.5 + log(1 / 0.7) / 21)) < 1.0e-8
     end
 
     @testset "d_discontinuities and force_dtmin as OrdinaryDiffEq has them" begin
@@ -4084,7 +4084,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             ours = SciMLBase.solve(prob(), rk4; callback = callback(), fixed..., kw...)
             theirs = SciMLBase.solve(prob(), Tsit5(); callback = callback(), fixed..., kw...)
-            @test same(ours, theirs)
+            # OrdinaryDiffEqCore gates the initial and final saves on `save_discretes` from 4.19.
+            core = Base.PkgId(Base.UUID("bbf590c4-e513-4bbe-9b18-05decba2e5d8"), "OrdinaryDiffEqCore")
+            gated = pkgversion(Base.loaded_modules[core]) >= v"4.19"
+            (gated || get(kw, :save_discretes, true) !== false) && @test same(ours, theirs)
             if get(kw, :save_discretes, true) === false
                 @test all(d -> isempty(d.t), ours.discretes)
             end
@@ -5474,6 +5477,37 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.t[i - 1] < 0.25
         end
 
+        @testset "an adaptive step resumes at the controller's size after a stop" begin
+            slow!(du, u, p, t) = (du .= -0.1 .* u; nothing)
+            for tspan in ((0.0, 100.0), (100.0, 0.0))
+                long = SciMLBase.ODEProblem(slow!, [1.0], tspan)
+                exact = exp(-0.1 * (tspan[2] - tspan[1]))
+                for alg in (
+                        PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
+                        PETScDiffEq.TSImplicit("bdf"),
+                    )
+                    plain = SciMLBase.solve(long, alg)
+                    sol = SciMLBase.solve(long, alg; tstops = 1.0:99.0)
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test all(in(sol.t), 1.0:99.0)
+                    @test sol.stats.naccept < 120
+                    @test abs(sol.u[end][1] - exact) < abs(plain.u[end][1] - exact)
+                end
+            end
+            long = SciMLBase.ODEProblem(slow!, [1.0], (0.0, 100.0))
+            for stops in ([50.0], [50.0, 50.001])
+                sol = SciMLBase.solve(long, PETScDiffEq.TSRK("5dp"); tstops = stops)
+                i = findfirst(==(stops[end]), sol.t)
+                @test sol.t[i + 1] - sol.t[i] > 5
+            end
+            integ = SciMLBase.init(long, PETScDiffEq.TSRK("5dp"))
+            for _ in 1:100
+                SciMLBase.step!(integ, 1.0, true)
+            end
+            @test integ.t == 100.0
+            @test integ.iter < 120
+        end
+
         @testset "stops closer together than dt" begin
             for kw in ((adaptive = false,), (reltol = 1.0e-8, abstol = 1.0e-10))
                 sol = SciMLBase.solve(
@@ -5556,7 +5590,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
 
             @testset "forward" begin
-                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
                 check_queue(integ, [1.0])
                 SciMLBase.add_tstop!(integ, 0.35)
                 check_queue(integ, [0.35, 1.0])
@@ -11400,6 +11434,77 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     SciMLBase.solve(on_dm(; jac = nothing), TSRK("4"; dm = da); fixed...).u
             end
 
+            forward = PETScDiffEq.AutoForwardDiff
+            # Measured: within 7.6e-16 of the hand-written `jac` and `paramjac`.
+            @testset "ForwardDiff builds a missing jac and paramjac on a DMDA: $name" for (
+                    name, make,
+                ) in methods
+                dual = name == "RK4" ? (;) : (; autodiff = forward())
+                for (tspan, t, p, built) in (
+                        ((0.0, 0.1), times, q0, (:jac, :paramjac)),
+                        ((0.1, 0.0), reverse(times), [-q0[1], q0[2], -q0[3]], (:jac, :paramjac)),
+                        ((0.0, 0.1), times, q0, (:jac,)), ((0.0, 0.1), times, q0, (:paramjac,)),
+                    )
+                    bare = on_dm(tspan; p, (key => nothing for key in built)...)
+                    got = dm_grad(bare, make(; dm = da, dual...); t, dgdp_discrete = cost_dp!)
+                    ref = dm_grad(on_dm(tspan; p), make(; dm = da); t, dgdp_discrete = cost_dp!)
+                    @test relerr(got, ref) < 1.0e-13
+                end
+            end
+
+            @testset "it builds them for an integral cost, a split problem, a periodic grid" begin
+                bare = on_dm(; jac = nothing, paramjac = nothing)
+                cost_kw = (; t = nothing, dgdu_discrete = nothing, g = (u, p, t) -> cost(u, p))
+                got = dm_grad(bare, TSRK("4"; dm = da); cost_kw...)
+                @test relerr(got, dm_grad(on_dm(), TSRK("4"; dm = da); cost_kw...)) < 1.0e-13
+                halves = SciMLBase.SplitODEProblem(
+                    (du, u, p, t) -> rd_dm!(du, u, [p[1], 0, 0], t),
+                    (du, u, p, t) -> rd_dm!(du, u, [0, p[2], p[3]], t), v0, (0.0, 0.1), q0,
+                )
+                summed = SciMLBase.SplitODEProblem(
+                    (du, u, p, t) -> rd!(du, u, [p[1], 0, 0], t),
+                    (du, u, p, t) -> rd!(du, u, [0, p[2], p[3]], t), v0, (0.0, 0.1), q0,
+                )
+                imex = TSARKIMEX("3", exact; dm = da, autodiff = forward())
+                got = dm_grad(halves, imex; dgdp_discrete = cost_dp!)
+                ref = dm_grad(summed, TSARKIMEX("3", exact); dgdp_discrete = cost_dp!)
+                @test relerr(got, ref) < 1.0e-13
+                # PETSc has no colouring for a periodic grid of 16 points, so the pattern's is used.
+                M = 16
+                ring = PETSc.DMDA(pl, MPI.COMM_SELF, (LibPETSc.DM_BOUNDARY_PERIODIC,), (M,), 2, 1)
+                function ring_dm!(du, u, p, t)
+                    U, D = grid(u, ring), grid(du, ring)
+                    for i in 1:M
+                        D[1, i] = p[1] * (U[1, i - 1] - 2U[1, i] + U[1, i + 1]) - p[2] * U[1, i]^3 +
+                            U[2, i]
+                        D[2, i] = p[3] * (U[2, i - 1] - 2U[2, i] + U[2, i + 1]) +
+                            U[1, i] * U[2, i + 1]
+                    end
+                    return nothing
+                end
+                function ring!(du, u, p, t)
+                    U(c, i) = u[2 * mod1(i, M) - 2 + c]
+                    for i in 1:M
+                        du[2i - 1] = p[1] * (U(1, i - 1) - 2U(1, i) + U(1, i + 1)) -
+                            p[2] * U(1, i)^3 + U(2, i)
+                        du[2i] = p[3] * (U(2, i - 1) - 2U(2, i) + U(2, i + 1)) +
+                            U(1, i) * U(2, i + 1)
+                    end
+                    return nothing
+                end
+                w0 = [0.4 + 0.3 * sin(1.7k) for k in 1:(2M)]
+                around(f) = SciMLBase.ODEProblem(f, w0, (0.0, 0.1), [30.0, 0.5, 20.0])
+                norm_du!(out, u, p, t, i) = (out .= u; nothing)
+                for make in (methods[1][2], cn, methods[5][2])
+                    dual = make === methods[1][2] ? (;) : (; autodiff = forward())
+                    alg = make(; dm = ring, dual...)
+                    got = dm_grad(around(ring_dm!), alg; dgdu_discrete = norm_du!)
+                    ref = dm_grad(around(ring!), make(); dgdu_discrete = norm_du!)
+                    @test relerr(got, ref) < 1.0e-13
+                end
+                PETScDiffEq.PETScCompat.destroy!(ring)
+            end
+
             @testset "what it refuses with a dm" begin
                 pl32 = PETSc.getlib(; PetscScalar = Float32)
                 PETScDiffEq.PETScCompat.isinitialized(pl32) || PETSc.initialize(pl32)
@@ -11408,18 +11513,38 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     (dv, v, u, p, t) -> (dv .= -u; nothing), (du, v, u, p, t) -> (du .= v; nothing),
                     v0, v0, (0.0, 0.1),
                 )
+                zygote = PETScDiffEq.ADTypes.AutoZygote()
+                differenced = "under `autodiff = AutoFiniteDiff()`, the default there"
                 for (message, call) in (
                         (
-                            "PETScAdjoint needs the ODEFunction's `jac` with a `dm`",
-                            () -> dm_grad(on_dm(; jac = nothing), TSRK("4"; dm = da)),
-                        ),
-                        (
-                            "PETScAdjoint needs the ODEFunction's `jac` with a `dm`",
+                            "PETScAdjoint needs the ODEFunction's `jac` with a `dm` $differenced",
                             () -> dm_grad(on_dm(; jac = nothing), TSImplicit("cn"; dm = da)),
                         ),
                         (
-                            "PETScAdjoint needs the ODEFunction's `paramjac` with a `dm`",
+                            "PETScAdjoint needs the ODEFunction's `paramjac` with a `dm` $differenced",
                             () -> dm_grad(on_dm(; paramjac = nothing), cn(; dm = da)),
+                        ),
+                        (
+                            "PETScAdjoint needs `f2`'s `jac` with a `dm` $differenced",
+                            () -> dm_grad(
+                                SciMLBase.SplitODEProblem(
+                                    SciMLBase.ODEFunction(rd_dm!; jac = rd_jac_dm!), rd_dm!, v0,
+                                    (0.0, 0.1), q0,
+                                ),
+                                TSARKIMEX("3"; dm = da),
+                            ),
+                        ),
+                        (
+                            "PETScAdjoint cannot build the ODEFunction's `jac` with " *
+                                "`$zygote` with a `dm`",
+                            () -> dm_grad(on_dm(; jac = nothing), cn(; dm = da, autodiff = zygote)),
+                        ),
+                        (
+                            "PETScAdjoint cannot build the ODEFunction's `paramjac` with " *
+                                "`$zygote` with a `dm`",
+                            () -> dm_grad(
+                                on_dm(; paramjac = nothing), cn(; dm = da, autodiff = zygote),
+                            ),
                         ),
                         (
                             "PETScAdjoint runs in PETSc's double real build, so its `dm` has to " *
@@ -11432,6 +11557,20 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         ),
                     )
                     @test_throws "ArgumentError: $message" call()
+                end
+                @test_throws "or pass `autodiff = AutoForwardDiff()` to the algorithm" dm_grad(
+                    on_dm(; jac = nothing), cn(; dm = da),
+                )
+                if Sys.WORD_SIZE == 64
+                    stag = PETSc.DMStag(
+                        pl, MPI.COMM_SELF, (LibPETSc.DM_BOUNDARY_GHOSTED,), (7,), (1, 1), 1,
+                    )
+                    for built in (:jac, :paramjac)
+                        @test_throws "`$built` with a `dm` of type `stag`" dm_grad(
+                            on_dm(; built => nothing), TSRK("4"; dm = stag),
+                        )
+                    end
+                    PETScDiffEq.PETScCompat.destroy!(stag)
                 end
                 PETScDiffEq.PETScCompat.destroy!(da32)
             end
