@@ -1366,10 +1366,18 @@ end
         @test refused(
             () -> PETScDiffEq._discrete_adjoint(
                 ODEProblem((du, u, p, t) -> heat_dm!(du, u, da, t), heat0(rows), SPAN),
-                TSRK("4"; dm = da), PETScAdjoint(); t = [0.1],
+                TSImplicit("cn"; dm = da), PETScAdjoint(); t = [0.1],
                 dgdu_discrete = (out, u, p, t, i) -> (out .= u), dt = 0.01, adaptive = false,
             ),
             "PETScAdjoint needs the ODEFunction's `jac` with a `dm`",
+        )
+        @test refused(
+            () -> PETScDiffEq._discrete_adjoint(
+                ODEProblem(wave_dm!, on_wave(wave0, stag), SPAN, [0.7, 1.3]),
+                TSRK("4"; dm = stag), PETScAdjoint(); t = [0.1],
+                dgdu_discrete = (out, u, p, t, i) -> (out .= u), dt = 0.01, adaptive = false,
+            ),
+            "`jac` with a `dm` of type `stag`",
         )
         shell = LibPETSc.DMShellCreate(pl, comm)
         @test refused(

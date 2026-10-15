@@ -245,6 +245,36 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
         )
     end
 
+    @testset "maxiters that the solve reaches tspan's end within" begin
+        last_state = (t = [1.0], dgdu_discrete = dg!)
+        adjoint(alg, costs; kwargs...) = adjoint_sensitivities(
+            solve(prob, alg; kwargs...), alg; sensealg = PETScAdjoint(), costs..., kwargs...,
+        )
+        summed(alg; kwargs...) =
+            p -> sum(solve(prob, alg; p, sensealg = PETScAdjoint(), kwargs...).u[end])
+        fixed = (dt = 0.1, adaptive = false)
+        for costs in (last_state, (; g))
+            @test adjoint(TSRK("4"), costs; maxiters = 10, fixed...) ==
+                adjoint(TSRK("4"), costs; maxiters = 11, fixed...)
+            @test_throws "the forward solve stopped with TS_CONVERGED_ITS" adjoint(
+                TSRK("4"), costs; maxiters = 9, fixed...,
+            )
+        end
+        @test Zygote.gradient(summed(TSRK("4"); maxiters = 10, fixed...), P0) ==
+            Zygote.gradient(summed(TSRK("4"); maxiters = 11, fixed...), P0)
+        tol = (abstol = 1.0e-8, reltol = 1.0e-8)
+        stats = solve(prob, TSRK("5dp"); tol...).stats
+        n = stats.naccept + stats.nreject
+        @test n > 2
+        @test adjoint(TSRK("5dp"), last_state; maxiters = n, tol...) ==
+            adjoint(TSRK("5dp"), last_state; maxiters = n + 1, tol...)
+        @test Zygote.gradient(summed(TSRK("5dp"); maxiters = n, tol...), P0) ==
+            Zygote.gradient(summed(TSRK("5dp"); maxiters = n + 1, tol...), P0)
+        @test_throws "short of tspan's end" adjoint(
+            TSRK("5dp"), last_state; maxiters = n - 1, tol...,
+        )
+    end
+
     # Measured for the fit and the last state: 1.1e-8 and 7.2e-9 for 5dp, 1.5e-7 and 7.6e-8
     # for ARKIMEX 3, 1.6e-7 and 8.6e-8 on the split problem; with fixed steps 2.1e-10.
     @testset "Zygote differentiates solve" begin
