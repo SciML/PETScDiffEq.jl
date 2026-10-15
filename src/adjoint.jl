@@ -188,6 +188,9 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     order::Vector{Int}
     next::Int
     s_prev::Float64
+    held_step::Int
+    held_until::Float64
+    held_u::Vector{Float64}
     clock::DataType
     cost_at_step::Dict{Int, Vector{Int}}
     u_at_step::Dict{Int, Vector{Float64}}
@@ -368,6 +371,7 @@ function _adjoint_record!(
     return _adjoint_record_body!(adj, Int(step), Float64(s), x_ptr)
 end
 
+# Each cost time goes to the nearest step within the tolerance, so a step is held until the next.
 function _adjoint_record_body!(adj, step, s, x_ptr)
     pl = adj.petsclib
     try
@@ -376,24 +380,45 @@ function _adjoint_record_body!(adj, step, s, x_ptr)
             sqrt(Float64(eps(R))) * (s - adj.s_prev),
             (step + 100) * Float64(eps(R(max(1.0, abs(s))))),
         )
-        adj.s_prev = s
+        x = PETSc.VecPtr(pl, x_ptr, false)
         order, cost_s = adj.order, adj.cost_s
-        while adj.next <= length(order) && cost_s[order[adj.next]] <= s + tol
+        while adj.next <= length(order) && cost_s[order[adj.next]] <= s
             k = order[adj.next]
-            if abs(cost_s[k] - s) <= tol
-                push!(get!(Vector{Int}, adj.cost_at_step, step), k)
-                haskey(adj.u_at_step, step) || (
-                    adj.u_at_step[step] =
-                        _readvec!(similar(adj.u), pl, PETSc.VecPtr(pl, x_ptr, false))
-                )
+            c = cost_s[k]
+            if adj.held_step >= 0 && c <= adj.held_until && (c - adj.s_prev < s - c || s - c > tol)
+                _record_cost!(adj, k, adj.held_step, () -> copy(adj.held_u))
+            elseif s - c <= tol
+                _record_cost!(adj, k, step, () -> _readvec!(similar(adj.u), pl, x))
             end
             adj.next += 1
+        end
+        adj.s_prev = s
+        adj.held_step = -1
+        if adj.next <= length(order) && cost_s[order[adj.next]] <= s + tol
+            adj.held_step, adj.held_until = step, s + tol
+            _readvec!(adj.held_u, pl, x)
         end
     catch e
         adj.err = e
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
+end
+
+function _record_cost!(adj, k, step, state)
+    push!(get!(Vector{Int}, adj.cost_at_step, step), k)
+    haskey(adj.u_at_step, step) || (adj.u_at_step[step] = state())
+    return nothing
+end
+
+# Cost times past the last step, within its tolerance, go to that step.
+function _record_last_costs!(adj)
+    while adj.next <= length(adj.order) && adj.held_step >= 0 &&
+            adj.cost_s[adj.order[adj.next]] <= adj.held_until
+        _record_cost!(adj, adj.order[adj.next], adj.held_step, () -> copy(adj.held_u))
+        adj.next += 1
+    end
+    return nothing
 end
 
 const ADJ_RECORD_PTR = Ref{Ptr{Cvoid}}(C_NULL)
@@ -799,6 +824,8 @@ function _check_adjoint_problem(
     end
     discrete = !_unset(t) && dgdu_discrete !== nothing
     integral = g !== nothing || dgdu_continuous !== nothing
+    all(isfinite, prob.tspan) ||
+        throw(ArgumentError("PETScAdjoint needs a finite tspan; got $(prob.tspan)"))
     discrete || integral || throw(
         ArgumentError(
             "PETScAdjoint needs cost times `t` with `dgdu_discrete(out, u, p, t, i)`, an " *
@@ -1239,7 +1266,8 @@ function _discrete_adjoint_unlocked(
             )
         context(jac, J, rows, paramjac, pscale, coo) = AdjointContext(
             pl, h.tdir, p, jac, J, rows..., paramjac, zeros(n, np), pscale, dgdu_discrete,
-            skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),
+            skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, -1, h.t0, zeros(n),
+            first(_eltypes(prob)),
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
@@ -1329,12 +1357,15 @@ function _discrete_adjoint_unlocked(
                 ),
             )
             reason = LibPETSc.TSGetConvergedReason(pl, ts)
-            reason == LibPETSc.TS_CONVERGED_TIME || throw(
+            s_end = LibPETSc.TSGetSolveTime(pl, ts)
+            # PETSc reports TS_CONVERGED_ITS when the last step maxiters allows lands on tf.
+            reached = reason == LibPETSc.TS_CONVERGED_TIME ||
+                reason == LibPETSc.TS_CONVERGED_ITS && s_end >= h.tf - _near(h.tf)
+            reached || throw(
                 ArgumentError(
-                    "the forward solve stopped with $reason at t = " *
-                        "$(_user_t(h.tdir, LibPETSc.TSGetSolveTime(pl, ts))), short of " *
-                        "tspan's end; raise `maxiters`, in `solve` as well as here, or " *
-                        "find out why the steps failed",
+                    "the forward solve stopped with $reason at t = $(_user_t(h.tdir, s_end)), " *
+                        "short of tspan's end; raise `maxiters`, in `solve` as well as here, " *
+                        "or find out why the steps failed",
                 ),
             )
             # PETSc reports TS_CONVERGED_TIME even when the state overflowed.
@@ -1345,6 +1376,7 @@ function _discrete_adjoint_unlocked(
                         "shorten tspan or take smaller steps",
                 ),
             )
+            _record_last_costs!(adj)
             matched = falses(length(cost_t))
             for ks in values(adj.cost_at_step), k in ks
                 matched[k] = true

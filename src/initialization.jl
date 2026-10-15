@@ -207,7 +207,7 @@ function _consistent!(
 end
 
 function _collocation_step(init, is_dae, t0, tf, dt, dtmax)
-    span = abs(tf - t0)
+    span = _span(t0, tf)
     top = dtmax === nothing || isinf(dtmax) ? span : abs(dtmax)
     step = if init.initdt !== nothing
         init.initdt
@@ -216,7 +216,7 @@ function _collocation_step(init, is_dae, t0, tf, dt, dtmax)
     elseif dt !== nothing
         sign(tf - t0) * min(abs(dt) / 5, top)
     else
-        (tf - t0) / 1000
+        sign(tf - t0) * span / 1000
     end
     return oftype(t0, step)
 end
