@@ -1989,8 +1989,9 @@ end
 _floor(R, dtmin, force_dtmin, adaptive) =
     force_dtmin || !adaptive || dtmin === nothing ? zero(R) : abs(R(dtmin))
 
-_near(t::Float64) = 100 * eps(max(1.0, abs(t)))
-_near(t::Float32) = 4 * eps(abs(t))
+# Finite at an infinite end, so `tf - _near(tf)` stays infinite rather than NaN.
+_near(t::Float64) = 100 * eps(clamp(abs(t), 1.0, floatmax(t)))
+_near(t::Float32) = 4 * eps(min(abs(t), floatmax(t)))
 
 # PETSc divides by zero on a step of a few ulps. Float64 already has a one-ulp floor.
 _min_step(t::Float64) = zero(t)
@@ -3894,6 +3895,11 @@ function _step_limit(maxiters::Real)
     return floor(Int, maxiters)
 end
 
+# PETSc refuses an infinite max time.
+_max_time(s) = min(s, floatmax(s))
+# A first step that scales with the span takes an infinite one as one.
+_span(t0, tf) = isinf(tf) ? one(tf) : abs(tf - t0)
+
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothing)
     rows, cols, _ = findnz(jac_prototype)
     all_rows = vcat(rows, 1:n)
@@ -5032,7 +5038,8 @@ function _setup(
     saveat_times = saveat isa Number ?
         collect(R, t0:abs(R(saveat)):tf) :
         sort!(tdir .* Vector{R}(collect(saveat)))
-    filter!(t -> t0 - eps(tf) <= t <= tf + eps(tf), saveat_times)
+    slack = eps(isinf(tf) ? t0 : tf)
+    filter!(t -> t0 - slack <= t <= tf + slack, saveat_times)
     at_start(t) = abs(t - t0) <= _near(t0)
     at_end(t) = abs(t - tf) <= _near(tf)
     no_saveat = !(saveat isa Number) && isempty(saveat)
@@ -5261,7 +5268,7 @@ function _setup(
             LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
             dt_given && _set_first_step!(h, dt, dtmin, force_dtmin)
-            LibPETSc.TSSetMaxTime(petsclib, ts, tf)
+            LibPETSc.TSSetMaxTime(petsclib, ts, _max_time(tf))
             LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(step_limit))
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
@@ -5406,7 +5413,7 @@ function _setup(
                 user_t0 = R(prob.tspan[1])
                 est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
                 dt = if is_dae
-                    max(R(1.0e-6) * abs(tf - t0), _min_step(user_t0))
+                    max(R(1.0e-6) * _span(t0, tf), _min_step(user_t0))
                 elseif has_mass
                     max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
                 else
@@ -5926,9 +5933,11 @@ function _set_p_unlocked(integ::PETScIntegrator, v)
     return v
 end
 
-Base.setproperty!(integ::PETScIntegrator, name::Symbol, v) = name === :p ?
-    _locked(() -> _set_p_unlocked(integ, v)) :
-    setfield!(integ, name, convert(fieldtype(typeof(integ), name), v))
+function Base.setproperty!(integ::PETScIntegrator, name::Symbol, v)
+    name === :p && return _locked(() -> _set_p_unlocked(integ, v))
+    name === :u && _check_length(getfield(integ, :u), v)
+    return setfield!(integ, name, convert(fieldtype(typeof(integ), name), v))
+end
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
 function _proposed_dt_unlocked(integ::PETScIntegrator)
@@ -6022,6 +6031,7 @@ DiffEqBase.get_tstops_array(integ::PETScIntegrator) = integ.tstops
 DiffEqBase.get_tstops_max(integ::PETScIntegrator) = last(integ.tstops)
 
 function _set_u_unlocked(integ::PETScIntegrator, u)
+    _check_length(integ.u, u, integ.h.ctx.comm)
     copyto!(integ.u, u)
     integ.finished && return nothing
     _write_state!(integ.h, integ.u)
@@ -6778,6 +6788,8 @@ function _reinit_unlocked(
     )
     _check_real(tstops, :tstops)
     _check_real(d_discontinuities, :d_discontinuities)
+    # `_in_shape` refuses another length for a state of another shape.
+    integ.prob.u0 isa AbstractVector && _check_length(integ.prob.u0, u0, integ.h.ctx.comm)
     R = typeof(integ.t)
     tstops, d_discontinuities = _times(R, tstops), _times(R, d_discontinuities)
     if integ.prob.f isa SciMLBase.DynamicalODEFunction && !hasproperty(u0, :x)
@@ -7038,8 +7050,20 @@ function _match_step!(integ::PETScIntegrator, remaining)
     return nothing
 end
 
-_resumed_step(integ::PETScIntegrator, stop) = integ.h.matches && !integ.h.fixed ?
-    max(integ.tdir * integ.dtcache, _min_step(stop)) : integ.tdir * integ.dtcache
+function _resumed_step(integ::PETScIntegrator, stop)
+    h = integ.h
+    h.matches && return h.fixed ? integ.tdir * integ.dtcache :
+        max(integ.tdir * integ.dtcache, _min_step(stop))
+    _fixed_step(h) && return integ.tdir * integ.dtcache
+    pl = h.petsclib
+    # PETSc cuts its proposal only while its clock is short of its max time.
+    LibPETSc.TSGetTime(pl, h.ts) < LibPETSc.TSGetMaxTime(pl, h.ts) &&
+        return integ.tdir * integ.dtcache
+    return max(integ.tdir * integ.dtcache, LibPETSc.TSGetTimeStep(pl, h.ts))
+end
+
+_fixed_step(h::TSHandles) =
+    LibPETSc.TSAdaptGetType(h.petsclib, LibPETSc.TSGetAdapt(h.petsclib, h.ts)) == "none"
 
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     integ.sol.retcode == SciMLBase.ReturnCode.InitialFailure && return nothing
@@ -7074,13 +7098,14 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     # PETSc keeps the step shortened onto its max time, so `dtcache` holds the uncut one.
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
     target = stop === nothing ? h.tf : stop
-    # TSSetMaxTime reads -1 as PETSC_DETERMINE; the step is cut to the target below.
-    LibPETSc.TSSetMaxTime(pl, h.ts, target == -1 ? nextfloat(target) : target)
+    # TSSetMaxTime reads -1 as PETSC_DETERMINE.
+    smax = target == -1 ? nextfloat(target) : _max_time(target)
+    LibPETSc.TSSetMaxTime(pl, h.ts, smax)
     if h.matches
         _match_step!(integ, target - integ.tdir * integ.t)
-    elseif LibPETSc.TSGetTimeStep(pl, h.ts) > target - integ.tdir * integ.t
+    elseif LibPETSc.TSGetTimeStep(pl, h.ts) > smax - integ.tdir * integ.t
         # TSAdaptChoose rejects a step past the max time, so it is shortened here.
-        LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
+        LibPETSc.TSSetTimeStep(pl, h.ts, smax - integ.tdir * integ.t)
     end
     h.stopped = 0
     (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
@@ -7118,9 +7143,13 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
             LibPETSc.TSSetTime(pl, h.ts, h.tf)
         end
     elseif integ.tdir * integ.t >= stop - _near(stop)
+        resumed = _resumed_step(integ, stop)
         integ.t = _user_t(integ.tdir, stop)
         LibPETSc.TSSetTime(pl, h.ts, stop)
-        LibPETSc.TSSetTimeStep(pl, h.ts, _resumed_step(integ, stop))
+        LibPETSc.TSSetTimeStep(pl, h.ts, resumed)
+    elseif !h.matches && !_fixed_step(h)
+        # PETSc has cut this proposal to the stop, so it is a lower bound of the uncut one.
+        integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     end
     integ.dt = integ.t - integ.tprev
     _read_state!(integ.u, ctx, h.u)
@@ -7206,7 +7235,7 @@ end
 function _estimate_dt(h::TSHandles{<:Any, <:Any, R}, opts, u, s, stops) where {R}
     ctx = h.ctx
     dtmin = abs(getfield(opts, :dtmin))
-    ctx.dae && return max(R(1.0e-6) * abs(h.tf - h.t0), _min_step(s))
+    ctx.dae && return max(R(1.0e-6) * _span(h.t0, h.tf), _min_step(s))
     ctx.M === nothing ||
         return max(nextfloat(max(dtmin, eps(s))), R(1.0e-6), _min_step(s))
     i = findfirst(>(s), stops)
@@ -7254,6 +7283,15 @@ _no_resize() = throw(
             "length needs a new integrator",
     ),
 )
+_check_length(u, v, comm = nothing) = _checked_everywhere(comm) do
+    length(v) == length(u) || throw(
+        ArgumentError(
+            "PETScDiffEq cannot change the length of the state: it has $(length(u)) " *
+                "entries and was given $(length(v)), and a state of another length needs a " *
+                "new integrator",
+        ),
+    )
+end
 Base.resize!(::PETScIntegrator, ::Int) = _no_resize()
 Base.deleteat!(::PETScIntegrator, idxs) = _no_resize()
 SciMLBase.addat!(::PETScIntegrator, idxs, val = nothing) = _no_resize()
