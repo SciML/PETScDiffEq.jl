@@ -235,6 +235,26 @@ const EXACT = 1.0e-4
                 @test raised(caught(() -> solve(prob, alg)), "f threw")
             end
         end
+
+        @testset "a rank with no rows" begin
+            holder = nranks - 1
+            decay!(du, u, p, t) = (du .= .-u .^ 2; nothing)
+            function decay(idx)
+                n = length(idx)
+                fn = ODEFunction(decay!; jac_prototype = sparse(1:n, idx, ones(S, n), n, N))
+                return ODEProblem(fn, S.(scale(S) .* (1 .+ idx ./ N)), (zero(R), one(R)))
+            end
+            for alg in (TSImplicit("bdf"; comm), TSImplicit("bdf"; comm, autodiff = ad))
+                sol = solve(decay(rank == holder ? (1:N) : (1:0)), alg; tol...)
+                @test sol.retcode == ReturnCode.Success
+                @test same_everywhere(sol.t)
+                @test isempty(sol.u[end]) == (rank != holder)
+                rank == holder || continue
+                ref = solve(decay(1:N), TSImplicit("bdf"; autodiff = alg.autodiff); tol...)
+                @test sol.t[end] == ref.t[end]
+                @test maximum(abs, sol.u[end] - ref.u[end]) <= bound.adaptive
+            end
+        end
     end
 
     @testset "every handle is freed" begin

@@ -16,6 +16,7 @@ using SciMLOperators: SciMLOperators
 using SparseArrays: SparseArrays, SparseMatrixCSC, findnz, nonzeros, nzrange, rowvals,
     sparse
 using SparseMatrixColorings: SparseMatrixColorings
+using SymbolicIndexingInterface: SymbolicIndexingInterface as SII
 
 include("petsc_compat.jl")
 
@@ -59,7 +60,10 @@ TSRK(
     subtype::AbstractString = "5dp",
     petsc_options::AbstractVector{<:AbstractString} = String[];
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
-) = TSRK(String(subtype), String[String(o) for o in petsc_options], _alg_comm(comm, dm), dm)
+) = TSRK(
+    _check_subtype("TSRK", subtype, _RK_ORDER), String[String(o) for o in petsc_options],
+    _alg_comm(comm, dm), dm,
+)
 
 """
     TSRosW(subtype = "ra34pw2", petsc_options = String[]; autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
@@ -117,7 +121,8 @@ TSRosW(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSRosW(
-    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _check_subtype("TSRosW", subtype, _ROSW_ORDER), String[String(o) for o in petsc_options],
+    _check_autodiff(autodiff),
     _alg_comm(comm, dm), dm,
 )
 
@@ -253,7 +258,9 @@ TSIRK(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSIRK(
-    Int(nstages), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    nstages >= 1 ? Int(nstages) :
+        throw(ArgumentError("`nstages` must be at least 1, got $nstages")),
+    String[String(o) for o in petsc_options], _check_autodiff(autodiff),
     _alg_comm(comm, dm), dm,
 )
 
@@ -348,7 +355,8 @@ TSARKIMEX(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSARKIMEX(
-    String(subtype), String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+    _check_subtype("TSARKIMEX", subtype, _ARKIMEX_ORDER, _ARKIMEX_DIRK),
+    String[String(o) for o in petsc_options], _check_autodiff(autodiff),
     _alg_comm(comm, dm), dm,
 )
 
@@ -356,6 +364,7 @@ const _MPRK_TWO_WAY = ("2a22", "2a32", "p2", "p3")
 const _MPRK_THREE_WAY = ("2a23", "2a33")
 
 function _check_mprk(slow, medium, subtype, distributed)
+    _check_subtype("TSMPRK", subtype, _MPRK_ORDER)
     for (name, v) in (("slow", slow), ("medium", medium))
         all(i -> i >= 1, v) || throw(ArgumentError("`$name` indices start at 1"))
         length(unique(v)) == length(v) || throw(ArgumentError("`$name` repeats an index"))
@@ -683,6 +692,23 @@ const _ARKIMEX_ORDER = Dict(
 const _MPRK_ORDER = Dict(
     "2a22" => 2, "2a23" => 2, "2a32" => 2, "2a33" => 2, "p2" => 2, "p3" => 3,
 )
+
+# TSARKIMEXSetType also takes PETSc's TSDIRK tableaux.
+const _ARKIMEX_DIRK = (
+    "s212", "es122sal", "es213sal", "es324sal", "es325sal", "657a", "es648sa", "658a",
+    "s659a", "7510sal", "es7510sa", "759a", "s7511sal", "8614a", "8616sal", "es8516sal",
+)
+
+function _check_subtype(family, subtype, table, extra = ())
+    t = String(subtype)
+    haskey(table, t) || t in extra || throw(
+        ArgumentError(
+            "$family has no subtype \"$t\"; PETSc's are " *
+                join(map(n -> "\"$n\"", [sort!(collect(keys(table))); extra...]), ", "),
+        ),
+    )
+    return t
+end
 
 function _order(table, family, subtype)
     haskey(table, subtype) ||
@@ -1988,8 +2014,9 @@ end
 _floor(R, dtmin, force_dtmin, adaptive) =
     force_dtmin || !adaptive || dtmin === nothing ? zero(R) : abs(R(dtmin))
 
-_near(t::Float64) = 100 * eps(max(1.0, abs(t)))
-_near(t::Float32) = 4 * eps(abs(t))
+# Finite at an infinite end, so `tf - _near(tf)` stays infinite rather than NaN.
+_near(t::Float64) = 100 * eps(clamp(abs(t), 1.0, floatmax(t)))
+_near(t::Float32) = 4 * eps(min(abs(t), floatmax(t)))
 
 # PETSc divides by zero on a step of a few ulps. Float64 already has a one-ulp floor.
 _min_step(t::Float64) = zero(t)
@@ -2822,7 +2849,8 @@ function _flat_tol(tol, dims::Dims, name)
     return vec(tol)
 end
 
-# `save_idxs` as linear indices into the state, which a CartesianIndex names by its axes.
+# `save_idxs` as linear indices into the state: a CartesianIndex by its axes, a symbol through
+# the problem's system.
 _save_index(u0, i) = Int(i)
 function _save_index(u0, I::CartesianIndex)
     checkbounds(Bool, u0, I) || throw(
@@ -2832,8 +2860,32 @@ function _save_index(u0, I::CartesianIndex)
     )
     return LinearIndices(u0)[I]
 end
-_save_idxs(u0, idxs::Union{Integer, CartesianIndex}) = [_save_index(u0, idxs)]
-_save_idxs(u0, idxs) = Int[_save_index(u0, i) for i in idxs]
+
+function _save_idxs(prob, idxs)
+    idxs isa AbstractArray && SII.symbolic_type(idxs) == SII.NotSymbolic() ||
+        return _state_indices!(Int[], prob, idxs)
+    v = Int[]
+    for i in idxs
+        _state_indices!(v, prob, i)
+    end
+    return v
+end
+
+_state_indices!(v, prob, i::Union{Integer, CartesianIndex}) = push!(v, _save_index(prob.u0, i))
+function _state_indices!(v, prob, sym)
+    i = SII.variable_index(prob, sym)
+    i === nothing && throw(
+        ArgumentError(
+            "`save_idxs` names $sym, which is not a state of the problem's system; " *
+                "only states can be saved",
+        ),
+    )
+    return append!(v, i)
+end
+
+# The integer `save_idxs` method keeps the order the states are saved in.
+_saved_subsystem(prob, ctx) =
+    last(SciMLBase.get_save_idxs_and_saved_subsystem(prob, ctx.save_idxs))
 
 function _buffer!(box, like)
     buf = box[]
@@ -3868,6 +3920,11 @@ function _step_limit(maxiters::Real)
     return floor(Int, maxiters)
 end
 
+# PETSc refuses an infinite max time.
+_max_time(s) = min(s, floatmax(s))
+# A first step that scales with the span takes an infinite one as one.
+_span(t0, tf) = isinf(tf) ? one(tf) : abs(tf - t0)
+
 function _jacobian_pattern(jac_prototype::SparseMatrixCSC, n::Integer, M = nothing)
     rows, cols, _ = findnz(jac_prototype)
     all_rows = vcat(rows, 1:n)
@@ -4008,6 +4065,35 @@ function _refuse_method(name, has_mass, has_jac, is_split, is_dae)
             ),
         )
     end
+    return nothing
+end
+
+# PETSc registers some TS types only when it is built with the package behind them.
+function _check_ts_type(pl, t)
+    list = unsafe_load(Ptr{Ptr{Cvoid}}(_symbol(pl, :TSList)))
+    names, n = Ref{Ptr{Cstring}}(C_NULL), Ref{Cint}(0)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscFunctionListGet), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Ptr{Cstring}}, Ptr{Cint}), list, names, n,
+        ),
+        "PetscFunctionListGet",
+    )
+    types = [unsafe_string(unsafe_load(names[], i)) for i in 1:n[]]
+    free = unsafe_load(Ptr{Ptr{Cvoid}}(_symbol(pl, :PetscTrFree)))
+    _check_code(
+        ccall(
+            free, LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Cint, Cstring, Cstring),
+            names[], 0, "_check_ts_type", "PETScDiffEq.jl",
+        ),
+        "PetscFree",
+    )
+    t in types || throw(
+        ArgumentError(
+            "PETSc has no TS type \"$t\"; its types are " *
+                join(map(n -> "\"$n\"", sort!(types)), ", "),
+        ),
+    )
     return nothing
 end
 
@@ -4827,6 +4913,11 @@ function _setup(
         )
         _check_real(value, name)
     end
+    for (name, value) in ((:dt, dt), (:dtmin, dtmin), (:dtmax, dtmax))
+        value !== nothing && isnan(value) && throw(ArgumentError("`$name` is NaN"))
+    end
+    dt === nothing || isfinite(dt) || throw(ArgumentError("`dt` is infinite"))
+    dtmax === nothing || !iszero(dtmax) || throw(ArgumentError("`dtmax` is zero"))
     dt_given = dt !== nothing
     is_split = prob.f isa SciMLBase.SplitFunction
     is_dae = prob isa SciMLBase.AbstractDAEProblem
@@ -5006,7 +5097,8 @@ function _setup(
     saveat_times = saveat isa Number ?
         collect(R, t0:abs(R(saveat)):tf) :
         sort!(tdir .* Vector{R}(collect(saveat)))
-    filter!(t -> t0 - eps(tf) <= t <= tf + eps(tf), saveat_times)
+    slack = eps(isinf(tf) ? t0 : tf)
+    filter!(t -> t0 - slack <= t <= tf + slack, saveat_times)
     at_start(t) = abs(t - t0) <= _near(t0)
     at_end(t) = abs(t - tf) <= _near(tf)
     no_saveat = !(saveat isa Number) && isempty(saveat)
@@ -5054,7 +5146,7 @@ function _setup(
         nothing
     else
         _checked_everywhere(comm) do
-            v = _save_idxs(prob.u0, save_idxs)
+            v = _save_idxs(prob, save_idxs)
             isempty(v) && throw(ArgumentError("`save_idxs` must name at least one component"))
             all(i -> 1 <= i <= n, v) || throw(
                 ArgumentError("`save_idxs` has an index outside 1:$n"),
@@ -5128,6 +5220,7 @@ function _setup(
         ts = h.ts
         clone === nothing || LibPETSc.TSSetDM(petsclib, ts, clone)
         LibPETSc.TSSetProblemType(petsclib, ts, LibPETSc.TS_NONLINEAR)
+        _check_ts_type(petsclib, _ts_type(alg))
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
         _set_subtype!(petsclib, ts, alg)
 
@@ -5235,7 +5328,7 @@ function _setup(
             LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
             dt_given && _set_first_step!(h, dt, dtmin, force_dtmin)
-            LibPETSc.TSSetMaxTime(petsclib, ts, tf)
+            LibPETSc.TSSetMaxTime(petsclib, ts, _max_time(tf))
             LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(step_limit))
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
@@ -5380,7 +5473,7 @@ function _setup(
                 user_t0 = R(prob.tspan[1])
                 est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
                 dt = if is_dae
-                    max(R(1.0e-6) * abs(tf - t0), _min_step(user_t0))
+                    max(R(1.0e-6) * _span(t0, tf), _min_step(user_t0))
                 elseif has_mass
                     max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
                 else
@@ -5519,6 +5612,7 @@ function _assemble(
     return SciMLBase.build_solution(
         prob, alg, ts, ctx.us; retcode = retcode, stats = stats,
         dense = ctx.dense, interp = _interp(ctx, ts, dus),
+        saved_subsystem = _saved_subsystem(prob, ctx),
         calculate_error = get(kwargs, :calculate_error, true),
         timeseries_errors = get(kwargs, :timeseries_errors, true),
         dense_errors = get(kwargs, :dense_errors, false),
@@ -5908,9 +6002,11 @@ function _set_p_unlocked(integ::PETScIntegrator, v)
     return v
 end
 
-Base.setproperty!(integ::PETScIntegrator, name::Symbol, v) = name === :p ?
-    _locked(() -> _set_p_unlocked(integ, v)) :
-    setfield!(integ, name, convert(fieldtype(typeof(integ), name), v))
+function Base.setproperty!(integ::PETScIntegrator, name::Symbol, v)
+    name === :p && return _locked(() -> _set_p_unlocked(integ, v))
+    name === :u && _check_length(getfield(integ, :u), v)
+    return setfield!(integ, name, convert(fieldtype(typeof(integ), name), v))
+end
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
 function _proposed_dt_unlocked(integ::PETScIntegrator)
@@ -6004,6 +6100,7 @@ DiffEqBase.get_tstops_array(integ::PETScIntegrator) = integ.tstops
 DiffEqBase.get_tstops_max(integ::PETScIntegrator) = last(integ.tstops)
 
 function _set_u_unlocked(integ::PETScIntegrator, u)
+    _check_length(integ.u, u, integ.h.ctx.comm)
     copyto!(integ.u, u)
     integ.finished && return nothing
     _write_state!(integ.h, integ.u)
@@ -6036,6 +6133,7 @@ function _adopt_p!(integ::PETScIntegrator, p)
     rebuilt = SciMLBase.build_solution(
         integ.prob, integ.alg, sol.t, sol.u; retcode = sol.retcode, stats = sol.stats,
         dense = sol.dense, interp = sol.interp,
+        saved_subsystem = _saved_subsystem(integ.prob, integ.h.ctx),
         calculate_error = get(integ.kwargs, :calculate_error, true),
         timeseries_errors = get(integ.kwargs, :timeseries_errors, true),
         dense_errors = get(integ.kwargs, :dense_errors, false),
@@ -6734,6 +6832,7 @@ function _initial_solution(prob, alg, h::TSHandles, kwargs)
     return SciMLBase.build_solution(
         prob, alg, ts, h.ctx.us; retcode = SciMLBase.ReturnCode.Default,
         dense = h.ctx.dense, interp = _interp(h.ctx, ts, dus), stats = stats,
+        saved_subsystem = _saved_subsystem(prob, h.ctx),
         calculate_error = get(kwargs, :calculate_error, true),
     )
 end
@@ -6760,6 +6859,8 @@ function _reinit_unlocked(
     )
     _check_real(tstops, :tstops)
     _check_real(d_discontinuities, :d_discontinuities)
+    # `_in_shape` refuses another length for a state of another shape.
+    integ.prob.u0 isa AbstractVector && _check_length(integ.prob.u0, u0, integ.h.ctx.comm)
     R = typeof(integ.t)
     tstops, d_discontinuities = _times(R, tstops), _times(R, d_discontinuities)
     if integ.prob.f isa SciMLBase.DynamicalODEFunction && !hasproperty(u0, :x)
@@ -7020,8 +7121,20 @@ function _match_step!(integ::PETScIntegrator, remaining)
     return nothing
 end
 
-_resumed_step(integ::PETScIntegrator, stop) = integ.h.matches && !integ.h.fixed ?
-    max(integ.tdir * integ.dtcache, _min_step(stop)) : integ.tdir * integ.dtcache
+function _resumed_step(integ::PETScIntegrator, stop)
+    h = integ.h
+    h.matches && return h.fixed ? integ.tdir * integ.dtcache :
+        max(integ.tdir * integ.dtcache, _min_step(stop))
+    _fixed_step(h) && return integ.tdir * integ.dtcache
+    pl = h.petsclib
+    # PETSc cuts its proposal only while its clock is short of its max time.
+    LibPETSc.TSGetTime(pl, h.ts) < LibPETSc.TSGetMaxTime(pl, h.ts) &&
+        return integ.tdir * integ.dtcache
+    return max(integ.tdir * integ.dtcache, LibPETSc.TSGetTimeStep(pl, h.ts))
+end
+
+_fixed_step(h::TSHandles) =
+    LibPETSc.TSAdaptGetType(h.petsclib, LibPETSc.TSGetAdapt(h.petsclib, h.ts)) == "none"
 
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     integ.sol.retcode == SciMLBase.ReturnCode.InitialFailure && return nothing
@@ -7056,13 +7169,14 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     # PETSc keeps the step shortened onto its max time, so `dtcache` holds the uncut one.
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
     target = stop === nothing ? h.tf : stop
-    # TSSetMaxTime reads -1 as PETSC_DETERMINE; the step is cut to the target below.
-    LibPETSc.TSSetMaxTime(pl, h.ts, target == -1 ? nextfloat(target) : target)
+    # TSSetMaxTime reads -1 as PETSC_DETERMINE.
+    smax = target == -1 ? nextfloat(target) : _max_time(target)
+    LibPETSc.TSSetMaxTime(pl, h.ts, smax)
     if h.matches
         _match_step!(integ, target - integ.tdir * integ.t)
-    elseif LibPETSc.TSGetTimeStep(pl, h.ts) > target - integ.tdir * integ.t
+    elseif LibPETSc.TSGetTimeStep(pl, h.ts) > smax - integ.tdir * integ.t
         # TSAdaptChoose rejects a step past the max time, so it is shortened here.
-        LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
+        LibPETSc.TSSetTimeStep(pl, h.ts, smax - integ.tdir * integ.t)
     end
     h.stopped = 0
     (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
@@ -7100,9 +7214,13 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
             LibPETSc.TSSetTime(pl, h.ts, h.tf)
         end
     elseif integ.tdir * integ.t >= stop - _near(stop)
+        resumed = _resumed_step(integ, stop)
         integ.t = _user_t(integ.tdir, stop)
         LibPETSc.TSSetTime(pl, h.ts, stop)
-        LibPETSc.TSSetTimeStep(pl, h.ts, _resumed_step(integ, stop))
+        LibPETSc.TSSetTimeStep(pl, h.ts, resumed)
+    elseif !h.matches && !_fixed_step(h)
+        # PETSc has cut this proposal to the stop, so it is a lower bound of the uncut one.
+        integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     end
     integ.dt = integ.t - integ.tprev
     _read_state!(integ.u, ctx, h.u)
@@ -7188,7 +7306,7 @@ end
 function _estimate_dt(h::TSHandles{<:Any, <:Any, R}, opts, u, s, stops) where {R}
     ctx = h.ctx
     dtmin = abs(getfield(opts, :dtmin))
-    ctx.dae && return max(R(1.0e-6) * abs(h.tf - h.t0), _min_step(s))
+    ctx.dae && return max(R(1.0e-6) * _span(h.t0, h.tf), _min_step(s))
     ctx.M === nothing ||
         return max(nextfloat(max(dtmin, eps(s))), R(1.0e-6), _min_step(s))
     i = findfirst(>(s), stops)
@@ -7236,6 +7354,15 @@ _no_resize() = throw(
             "length needs a new integrator",
     ),
 )
+_check_length(u, v, comm = nothing) = _checked_everywhere(comm) do
+    length(v) == length(u) || throw(
+        ArgumentError(
+            "PETScDiffEq cannot change the length of the state: it has $(length(u)) " *
+                "entries and was given $(length(v)), and a state of another length needs a " *
+                "new integrator",
+        ),
+    )
+end
 Base.resize!(::PETScIntegrator, ::Int) = _no_resize()
 Base.deleteat!(::PETScIntegrator, idxs) = _no_resize()
 SciMLBase.addat!(::PETScIntegrator, idxs, val = nothing) = _no_resize()
