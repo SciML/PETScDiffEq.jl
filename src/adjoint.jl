@@ -122,14 +122,19 @@ this rank's `ArrayPartition(v, u)`.
 
 With a `dm`, the adjoint runs on the DM as the solve does, for the same methods and discrete
 costs, and on a DM of a single rank for integral costs and a `SplitODEProblem` with
-`TSARKIMEX` too. The `ODEFunction` then needs `jac(J, u, p, t)`, filling the DM's matrix
-from the ghosted `u` as in an implicit solve, an explicit method included, whose own solve
-ignores it, and `paramjac(pJ, u, p, t)` when there are parameters, which gets `u` ghosted
-too and fills this rank's rows of `pJ` in the DM's order, a column per entry of `p`;
+`TSARKIMEX` too. The `ODEFunction`'s `jac(J, u, p, t)` then fills the DM's matrix from the
+ghosted `u` as in an implicit solve, an explicit method included, whose own solve ignores
+it, and its `paramjac(pJ, u, p, t)` gets `u` ghosted too and fills this rank's rows of `pJ`
+in the DM's order, a column per entry of `p`;
 `PETScDiffEq.reshape_local_array(view(pJ, :, k), dm)` indexes column `k` by grid point. A
-`SplitODEProblem` needs `f2`'s as well. Neither is built when missing, since automatic
-differentiation would not see the ghosted array and colouring only approximates the
-Jacobian. The costs, `du0` and `dp` follow the distributed convention, with the DM's block
+`SplitODEProblem` takes `f2`'s as well. On a DMDA a missing one is built with ForwardDiff
+and no other backend: `jac` as the solve builds it under `autodiff = AutoForwardDiff()`,
+by the DM's colours on the ghosted array of dual numbers, and `paramjac` by seeding `p`
+while `u` is the ghosted array of plain numbers, every rank calling `f` once per chunk of
+parameters. An implicit method's `autodiff` defaults to `AutoFiniteDiff()` with a `dm`,
+whose colouring only approximates the Jacobian, so pass `autodiff = AutoForwardDiff()` to
+have either built; `TSRK` builds them as it is. On a DMStag or a DMPlex both have to be
+given. The costs, `du0` and `dp` follow the distributed convention, with the DM's block
 of the state as this rank's rows: the cost functions get that block as `solve` saves it,
 not the ghosted array. The `dm` has to belong to PETSc's double real build.
 
@@ -183,6 +188,9 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     order::Vector{Int}
     next::Int
     s_prev::Float64
+    held_step::Int
+    held_until::Float64
+    held_u::Vector{Float64}
     clock::DataType
     cost_at_step::Dict{Int, Vector{Int}}
     u_at_step::Dict{Int, Vector{Float64}}
@@ -363,6 +371,7 @@ function _adjoint_record!(
     return _adjoint_record_body!(adj, Int(step), Float64(s), x_ptr)
 end
 
+# Each cost time goes to the nearest step within the tolerance, so a step is held until the next.
 function _adjoint_record_body!(adj, step, s, x_ptr)
     pl = adj.petsclib
     try
@@ -371,24 +380,45 @@ function _adjoint_record_body!(adj, step, s, x_ptr)
             sqrt(Float64(eps(R))) * (s - adj.s_prev),
             (step + 100) * Float64(eps(R(max(1.0, abs(s))))),
         )
-        adj.s_prev = s
+        x = PETSc.VecPtr(pl, x_ptr, false)
         order, cost_s = adj.order, adj.cost_s
-        while adj.next <= length(order) && cost_s[order[adj.next]] <= s + tol
+        while adj.next <= length(order) && cost_s[order[adj.next]] <= s
             k = order[adj.next]
-            if abs(cost_s[k] - s) <= tol
-                push!(get!(Vector{Int}, adj.cost_at_step, step), k)
-                haskey(adj.u_at_step, step) || (
-                    adj.u_at_step[step] =
-                        _readvec!(similar(adj.u), pl, PETSc.VecPtr(pl, x_ptr, false))
-                )
+            c = cost_s[k]
+            if adj.held_step >= 0 && c <= adj.held_until && (c - adj.s_prev < s - c || s - c > tol)
+                _record_cost!(adj, k, adj.held_step, () -> copy(adj.held_u))
+            elseif s - c <= tol
+                _record_cost!(adj, k, step, () -> _readvec!(similar(adj.u), pl, x))
             end
             adj.next += 1
+        end
+        adj.s_prev = s
+        adj.held_step = -1
+        if adj.next <= length(order) && cost_s[order[adj.next]] <= s + tol
+            adj.held_step, adj.held_until = step, s + tol
+            _readvec!(adj.held_u, pl, x)
         end
     catch e
         adj.err = e
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
+end
+
+function _record_cost!(adj, k, step, state)
+    push!(get!(Vector{Int}, adj.cost_at_step, step), k)
+    haskey(adj.u_at_step, step) || (adj.u_at_step[step] = state())
+    return nothing
+end
+
+# Cost times past the last step, within its tolerance, go to that step.
+function _record_last_costs!(adj)
+    while adj.next <= length(adj.order) && adj.held_step >= 0 &&
+            adj.cost_s[adj.order[adj.next]] <= adj.held_until
+        _record_cost!(adj, adj.order[adj.next], adj.held_step, () -> copy(adj.held_u))
+        adj.next += 1
+    end
+    return nothing
 end
 
 const ADJ_RECORD_PTR = Ref{Ptr{Cvoid}}(C_NULL)
@@ -720,7 +750,7 @@ function _check_adjoint_problem(
     )
     differences = _petsc_differences(alg)
     parts = (("the ODEFunction's", prob.f), (is_split ? (("`f2`'s", prob.f.f2),) : ())...)
-    dm === nothing || _check_adjoint_dm(prob, dm, parts)
+    dm === nothing || _check_adjoint_dm(prob, alg, dm, parts)
     # An implicit method is under `AutoFiniteDiff()` on a communicator unless told otherwise.
     forward = "pass `autodiff = AutoForwardDiff()` to the algorithm to have it built" *
         (comm === nothing ? "" : ", since `AutoFiniteDiff()` is its default $_NOT_SELF")
@@ -745,7 +775,7 @@ function _check_adjoint_problem(
             ),
         )
     end
-    if comm !== nothing && prob.f.jac === nothing
+    if comm !== nothing && dm === nothing && prob.f.jac === nothing
         prob.f.jac_prototype isa SparseMatrixCSC || throw(
             ArgumentError(
                 "without a `jac`, PETScAdjoint $_NOT_SELF needs a sparse `jac_prototype` " *
@@ -763,13 +793,8 @@ function _check_adjoint_problem(
         ),
     )
     for (whose, fun) in parts
-        has_p && !isempty(p) && dm !== nothing && fun.paramjac === nothing && throw(
-            ArgumentError(
-                "PETScAdjoint needs $whose `paramjac` $_WITH_DM when the problem has " *
-                    "parameters, filling this rank's rows from the ghosted `u` as `jac` " *
-                    "does: automatic differentiation would not see the ghosted array `f` takes",
-            ),
-        )
+        has_p && !isempty(p) && dm !== nothing && fun.paramjac === nothing &&
+            _check_adjoint_dm_build(alg, dm, whose, "paramjac")
         has_p && !isempty(p) && differences && fun.paramjac === nothing && throw(
             ArgumentError(
                 "PETScAdjoint needs $whose `paramjac` under " *
@@ -799,6 +824,8 @@ function _check_adjoint_problem(
     end
     discrete = !_unset(t) && dgdu_discrete !== nothing
     integral = g !== nothing || dgdu_continuous !== nothing
+    all(isfinite, prob.tspan) ||
+        throw(ArgumentError("PETScAdjoint needs a finite tspan; got $(prob.tspan)"))
     discrete || integral || throw(
         ArgumentError(
             "PETScAdjoint needs cost times `t` with `dgdu_discrete(out, u, p, t, i)`, an " *
@@ -846,7 +873,7 @@ function _check_adjoint_problem(
     return has_p
 end
 
-function _check_adjoint_dm(prob, dm, parts)
+function _check_adjoint_dm(prob, alg, dm, parts)
     S = PETSc.scalartype(_dm_lib(dm))
     S === Float64 || throw(
         ArgumentError(
@@ -862,15 +889,38 @@ function _check_adjoint_dm(prob, dm, parts)
         ),
     )
     for (whose, fun) in parts
-        fun.jac === nothing && throw(
-            ArgumentError(
-                "PETScAdjoint needs $whose `jac` $_WITH_DM, filling the DM's matrix as in " *
-                    "an implicit solve: automatic differentiation would not see the ghosted " *
-                    "array `f` takes, PETSc's colouring only approximates the Jacobian, and " *
-                    "its TSARKIMEX adjoint cannot use one coloured at all",
-            ),
-        )
+        fun.jac === nothing && _check_adjoint_dm_build(alg, dm, whose, "jac")
     end
+    return nothing
+end
+
+# A missing `jac` or `paramjac` is built on a DMDA by ForwardDiff, as the solve builds a `jac`.
+function _check_adjoint_dm_build(alg, dm, whose, name)
+    type = _dm_type(_dm_lib(dm), dm)
+    type == "da" || throw(
+        ArgumentError(
+            "PETScAdjoint needs $whose `$name` $_WITH_DM of type `$type`, filled from the " *
+                "ghosted `u`: a missing one is built on a DMDA only so far",
+        ),
+    )
+    backend = something(_autodiff(alg), AutoForwardDiff())
+    dense = ADTypes.dense_ad(backend)
+    dense isa AutoFiniteDiff && throw(
+        ArgumentError(
+            "PETScAdjoint needs $whose `$name` $_WITH_DM under " *
+                "`autodiff = AutoFiniteDiff()`, the default there: PETSc's colouring only " *
+                "approximates the Jacobian and its differences never reach its adjoint; give " *
+                "it, filled from the ghosted `u`, or pass `autodiff = AutoForwardDiff()` to " *
+                "the algorithm to have it built",
+        ),
+    )
+    dense isa AutoForwardDiff || throw(
+        ArgumentError(
+            "PETScAdjoint cannot build $whose `$name` with `$backend` $_WITH_DM, where `f` " *
+                "takes the ghosted array PETSc fills and only `AutoForwardDiff()` is carried " *
+                "through it; give the problem a `$name`, or use `AutoForwardDiff()`",
+        ),
+    )
     return nothing
 end
 
@@ -1167,7 +1217,14 @@ function _discrete_adjoint_unlocked(
             _flat_columns(length(prob.u0.x[1]), n, comm) : nothing
         jac, J = nothing, zeros(0, 0)
         if dm !== nothing
-            (!implicit || is_split) && (jac = Ghosted(rhs.jac, pl, dm.ptr))
+            # An explicit solve builds no Jacobian, so the adjoint builds the DM's own.
+            (!implicit || is_split) && (
+                jac = rhs.jac !== nothing ? Ghosted(rhs.jac, pl, dm.ptr) :
+                    _ad_dm_jacobian(
+                        backend, f_rhs, pl, dm.ptr, h.u0, p, user_t0, Ref(0),
+                        _ADJOINT_JAC_ADVICE, comm, N,
+                    )
+            )
         elseif !implicit || is_split
             jac = if rhs.jac !== nothing
                 user_jac(rhs.jac)
@@ -1196,7 +1253,11 @@ function _discrete_adjoint_unlocked(
             _coo_structure(J, first(LibPETSc.VecGetOwnershipRange(pl, h.u)), nothing, colmap)
         end
         paramjac(fun, f) = np == 0 ? nothing :
-            dm !== nothing ? Ghosted(fun.paramjac, pl, dm.ptr) :
+            dm !== nothing && fun.paramjac !== nothing ? Ghosted(fun.paramjac, pl, dm.ptr) :
+            dm !== nothing ? _ad_comm_paramjacobian(
+                backend, Ghosted(f, pl, dm.ptr), h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE,
+                comm,
+            ) :
             fun.paramjac !== nothing ? user_jac(fun.paramjac) :
             comm === nothing ?
             _ad_paramjacobian(backend, f, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE) :
@@ -1205,7 +1266,8 @@ function _discrete_adjoint_unlocked(
             )
         context(jac, J, rows, paramjac, pscale, coo) = AdjointContext(
             pl, h.tdir, p, jac, J, rows..., paramjac, zeros(n, np), pscale, dgdu_discrete,
-            skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, first(_eltypes(prob)),
+            skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, -1, h.t0, zeros(n),
+            first(_eltypes(prob)),
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
@@ -1295,12 +1357,15 @@ function _discrete_adjoint_unlocked(
                 ),
             )
             reason = LibPETSc.TSGetConvergedReason(pl, ts)
-            reason == LibPETSc.TS_CONVERGED_TIME || throw(
+            s_end = LibPETSc.TSGetSolveTime(pl, ts)
+            # PETSc reports TS_CONVERGED_ITS when the last step maxiters allows lands on tf.
+            reached = reason == LibPETSc.TS_CONVERGED_TIME ||
+                reason == LibPETSc.TS_CONVERGED_ITS && s_end >= h.tf - _near(h.tf)
+            reached || throw(
                 ArgumentError(
-                    "the forward solve stopped with $reason at t = " *
-                        "$(_user_t(h.tdir, LibPETSc.TSGetSolveTime(pl, ts))), short of " *
-                        "tspan's end; raise `maxiters`, in `solve` as well as here, or " *
-                        "find out why the steps failed",
+                    "the forward solve stopped with $reason at t = $(_user_t(h.tdir, s_end)), " *
+                        "short of tspan's end; raise `maxiters`, in `solve` as well as here, " *
+                        "or find out why the steps failed",
                 ),
             )
             # PETSc reports TS_CONVERGED_TIME even when the state overflowed.
@@ -1311,6 +1376,7 @@ function _discrete_adjoint_unlocked(
                         "shorten tspan or take smaller steps",
                 ),
             )
+            _record_last_costs!(adj)
             matched = falses(length(cost_t))
             for ks in values(adj.cost_at_step), k in ks
                 matched[k] = true
