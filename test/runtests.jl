@@ -4131,10 +4131,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             ours = SciMLBase.solve(prob(), rk4; callback = callback(), fixed..., kw...)
             theirs = SciMLBase.solve(prob(), Tsit5(); callback = callback(), fixed..., kw...)
-            # OrdinaryDiffEqCore gates the initial and final saves on `save_discretes` from 4.19.
-            core = Base.PkgId(Base.UUID("bbf590c4-e513-4bbe-9b18-05decba2e5d8"), "OrdinaryDiffEqCore")
-            gated = pkgversion(Base.loaded_modules[core]) >= v"4.19"
-            (gated || get(kw, :save_discretes, true) !== false) && @test same(ours, theirs)
+            @test same(ours, theirs)
             if get(kw, :save_discretes, true) === false
                 @test all(d -> isempty(d.t), ours.discretes)
             end
