@@ -7009,8 +7009,20 @@ function _match_step!(integ::PETScIntegrator, remaining)
     return nothing
 end
 
-_resumed_step(integ::PETScIntegrator, stop) = integ.h.matches && !integ.h.fixed ?
-    max(integ.tdir * integ.dtcache, _min_step(stop)) : integ.tdir * integ.dtcache
+function _resumed_step(integ::PETScIntegrator, stop)
+    h = integ.h
+    h.matches && return h.fixed ? integ.tdir * integ.dtcache :
+        max(integ.tdir * integ.dtcache, _min_step(stop))
+    _fixed_step(h) && return integ.tdir * integ.dtcache
+    pl = h.petsclib
+    # PETSc cuts its proposal only while its clock is short of its max time.
+    LibPETSc.TSGetTime(pl, h.ts) < LibPETSc.TSGetMaxTime(pl, h.ts) &&
+        return integ.tdir * integ.dtcache
+    return max(integ.tdir * integ.dtcache, LibPETSc.TSGetTimeStep(pl, h.ts))
+end
+
+_fixed_step(h::TSHandles) =
+    LibPETSc.TSAdaptGetType(h.petsclib, LibPETSc.TSGetAdapt(h.petsclib, h.ts)) == "none"
 
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     integ.sol.retcode == SciMLBase.ReturnCode.InitialFailure && return nothing
@@ -7045,13 +7057,14 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     # PETSc keeps the step shortened onto its max time, so `dtcache` holds the uncut one.
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
     target = stop === nothing ? h.tf : stop
-    # TSSetMaxTime reads -1 as PETSC_DETERMINE; the step is cut to the target below.
-    LibPETSc.TSSetMaxTime(pl, h.ts, target == -1 ? nextfloat(target) : target)
+    # TSSetMaxTime reads -1 as PETSC_DETERMINE.
+    smax = target == -1 ? nextfloat(target) : target
+    LibPETSc.TSSetMaxTime(pl, h.ts, smax)
     if h.matches
         _match_step!(integ, target - integ.tdir * integ.t)
-    elseif LibPETSc.TSGetTimeStep(pl, h.ts) > target - integ.tdir * integ.t
+    elseif LibPETSc.TSGetTimeStep(pl, h.ts) > smax - integ.tdir * integ.t
         # TSAdaptChoose rejects a step past the max time, so it is shortened here.
-        LibPETSc.TSSetTimeStep(pl, h.ts, target - integ.tdir * integ.t)
+        LibPETSc.TSSetTimeStep(pl, h.ts, smax - integ.tdir * integ.t)
     end
     h.stopped = 0
     (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
@@ -7089,9 +7102,13 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
             LibPETSc.TSSetTime(pl, h.ts, h.tf)
         end
     elseif integ.tdir * integ.t >= stop - _near(stop)
+        resumed = _resumed_step(integ, stop)
         integ.t = _user_t(integ.tdir, stop)
         LibPETSc.TSSetTime(pl, h.ts, stop)
-        LibPETSc.TSSetTimeStep(pl, h.ts, _resumed_step(integ, stop))
+        LibPETSc.TSSetTimeStep(pl, h.ts, resumed)
+    elseif !h.matches && !_fixed_step(h)
+        # PETSc has cut this proposal to the stop, so it is a lower bound of the uncut one.
+        integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     end
     integ.dt = integ.t - integ.tprev
     _read_state!(integ.u, ctx, h.u)
