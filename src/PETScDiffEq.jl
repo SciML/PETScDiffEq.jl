@@ -835,6 +835,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     shape::Union{Nothing, Dims}
     restep::Union{Nothing, Restep{R}}
     inner::Any
+    mass_slope::Bool
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -2171,6 +2172,17 @@ _no_du() = ArgumentError(
     "a DAEProblem gives no derivative to evaluate, so `get_du` has only the one its " *
         "initialization or PETSc's last step paired with the state, which has changed " *
         "since; take a step first",
+)
+
+_no_mass_du(ctx) = ArgumentError(
+    "`get_du` cannot solve M du = f(u) with a mass matrix that has a zero row, or a sparse " *
+        "one split over a communicator, so it has only " * (
+        ctx.alg_name in ("bdf", "beuler") ?
+            "the slope PETSc's last step solved for at its end, which the state has left " *
+            "since; take a step first" :
+            "a slope PETSc solves for at a step's end, which `$(ctx.alg_name)` has none " *
+            "of; use TSImplicit(\"bdf\") or TSImplicit(\"beuler\")"
+    ),
 )
 
 _no_slope(ctx) = ArgumentError(
@@ -5408,6 +5420,8 @@ function _setup(
         # `ctx.M === nothing` steers collectives, so an identity block still gets a Diagonal.
         LinearAlgebra.Diagonal(own_mass ? Vector{S}(mass_matrix.diag) : ones(S, n))
     end
+    # A rank holds only its own rows of a sparse M split over a communicator.
+    mass_slope = M !== nothing && (sparse_mass || _anywhere(comm, any(_zero_rows(M))))
     missing_diag = uses_sparse_jac ?
         [i for i in 1:n if !_stored(J0, i, i)] : Int[]
     m = alg isa TSAlpha2 ? nv : n
@@ -5482,7 +5496,7 @@ function _setup(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
-        nothing,
+        nothing, mass_slope,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -6375,14 +6389,29 @@ end
 
 function _checked_du(integ::PETScIntegrator)
     ctx = integ.h.ctx
-    if ctx.dae
-        _everywhere(ctx.comm, _at_step_end(integ)) || throw(_no_du())
+    if ctx.dae || ctx.mass_slope
+        _everywhere(ctx.comm, _at_step_end(integ)) ||
+            throw(ctx.dae ? _no_du() : _no_mass_du(ctx))
         du = integ.tdir .* ctx.fend
     else
-        du = integ.tdir .* _derivative(ctx, integ.tdir * integ.t, integ.u)
+        du = _derivative(ctx, integ.tdir * integ.t, integ.u)
         _raise_threw!(integ)
+        ctx.M === nothing || _mass_solve!(du, ctx.M)
+        du .*= integ.tdir
     end
     return _integ_state(ctx, du, identity)
+end
+
+_mass_solve!(du, M::LinearAlgebra.Diagonal) = (du ./= M.diag)
+function _mass_solve!(du, M)
+    F = LinearAlgebra.lu(M; check = false)
+    LinearAlgebra.issuccess(F) || throw(
+        ArgumentError(
+            "`get_du` solves M du = f(u), and the mass matrix is singular without a zero " *
+                "row to mark an algebraic equation, so it has no derivative to give",
+        ),
+    )
+    return du .= F \ du
 end
 
 _at_step_end(integ::PETScIntegrator) = integ.h.ctx.fend !== nothing &&
@@ -6706,18 +6735,22 @@ function _end_step_here!(integ::PETScIntegrator)
     return nothing
 end
 
-# BDF solves for the slope at its step's end; the theta methods step along the chord.
+# BDF solves for the slope at its step's end; the theta methods step along the chord, which
+# is that slope for backward Euler only.
 function _keep_dae_slope!(integ::PETScIntegrator)
     ctx = integ.h.ctx
-    ctx.fend = ctx.alg_name == "bdf" ? copy(ctx.mudot) :
-        (integ.u .- integ.uprev) ./ (integ.tdir * integ.dt)
+    if ctx.alg_name == "bdf"
+        ctx.fend = copy(ctx.mudot)
+    elseif ctx.dae || ctx.alg_name == "beuler"
+        ctx.fend = (integ.u .- integ.uprev) ./ (integ.tdir * integ.dt)
+    end
     return nothing
 end
 
 # ksponly never evaluates the residual at its solution, where BDF's slope is formed.
 function _linear_bdf_slope!(h)
     ctx, pl = h.ctx, h.petsclib
-    ctx.dae && ctx.linear && ctx.alg_name == "bdf" || return nothing
+    (ctx.dae || ctx.mass_slope) && ctx.linear && ctx.alg_name == "bdf" || return nothing
     Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) < 0 && return nothing
     _check_code(
         ccall(
@@ -7576,7 +7609,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         return _reject_step!(integ, before, abs(integ.t - integ.tprev))
     end
     _end_step_here!(integ)
-    ctx.dae && _keep_dae_slope!(integ)
+    (ctx.dae || ctx.mass_slope) && _keep_dae_slope!(integ)
     _live_stats!(integ)
     fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing

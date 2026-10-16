@@ -8805,6 +8805,56 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test isapprox(sol.u[end][2], exp(-1.0); atol = 1.0e-6)
         end
 
+        @testset "get_du solves M du = f, and takes the step's slope where M is singular" begin
+            for mass in (M, Diagonal(M), sparse([2.0 0.5; 0.0 1.0]))
+                f = SciMLBase.ODEFunction(scaled!; mass_matrix = mass)
+                integ = SciMLBase.init(
+                    SciMLBase.ODEProblem(f, [1.0, 1.0], (0.0, 1.0)), PETScDiffEq.TSRosW(),
+                )
+                @test SciMLBase.get_du(integ) ≈ -(Matrix(mass) \ integ.u)
+                foreach(_ -> SciMLBase.step!(integ), 1:3)
+                SciMLBase.set_u!(integ, 2 .* integ.u)
+                @test SciMLBase.get_du(integ) ≈ -(Matrix(mass) \ integ.u)
+            end
+            line!(du, u, p, t) = (du[1] = -u[1]; du[2] = u[2] - 2u[1]; nothing)
+            square!(du, u, p, t) = (du[1] = -u[1]; du[2] = u[2] - u[1]^2; nothing)
+            line = (line!, [1.0, 2.0], u -> [-u[1], -2u[1]])
+            square = (square!, [1.0, 1.0], u -> [-u[1], -2u[1]^2])
+            bdf, ksponly = PETScDiffEq.TSImplicit("bdf"), ["-snes_type", "ksponly"]
+            for mass in ([1.0 0.0; 0.0 0.0], Diagonal([1.0, 0.0]))
+                for ((g, u0, slope), alg, rtol) in (
+                        (line, bdf, 1.0e-10), (line, PETScDiffEq.TSImplicit("bdf", ksponly), 1.0e-10),
+                        (square, bdf, 1.0e-5), (square, PETScDiffEq.TSImplicit("beuler"), 1.0e-3),
+                    )
+                    integ = SciMLBase.init(
+                        SciMLBase.ODEProblem(
+                            SciMLBase.ODEFunction(g; mass_matrix = mass), u0, (0.0, 1.0),
+                        ), alg; dt = 1.0e-3, reltol = 1.0e-8, abstol = 1.0e-10,
+                    )
+                    @test_throws "take a step first" SciMLBase.get_du(integ)
+                    foreach(_ -> SciMLBase.step!(integ), 1:10)
+                    du = SciMLBase.get_du(integ)
+                    @test isapprox(du, slope(integ.u); rtol)
+                    out = zeros(2)
+                    @test SciMLBase.get_du!(out, integ) === out
+                    @test out == du
+                    SciMLBase.set_u!(integ, 2 .* integ.u)
+                    @test_throws "take a step first" SciMLBase.get_du(integ)
+                end
+                prob = SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(square!; mass_matrix = mass), [1.0, 1.0], (0.0, 1.0),
+                )
+                for alg in (PETScDiffEq.TSImplicit("cn"), PETScDiffEq.TSRosW())
+                    integ = SciMLBase.init(prob, alg; dt = 1.0e-3)
+                    SciMLBase.step!(integ)
+                    @test_throws "TSImplicit(\"bdf\")" SciMLBase.get_du(integ)
+                end
+            end
+            f = SciMLBase.ODEFunction(scaled!; mass_matrix = [1.0 1.0; 1.0 1.0])
+            integ = SciMLBase.init(SciMLBase.ODEProblem(f, [1.0, 1.0], (0.0, 1.0)), bdf)
+            @test_throws "singular without a zero row" SciMLBase.get_du(integ)
+        end
+
         @testset "rejected where it cannot be applied" begin
             @test_throws ArgumentError SciMLBase.solve(
                 prob, PETScDiffEq.TSRK("5dp"); dt = 0.01,

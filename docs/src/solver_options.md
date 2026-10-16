@@ -83,7 +83,11 @@ its own, and it raises there with a mass matrix, a `DAEProblem` or a finished in
 `change_t_via_interpolation!` stays inside the step.
 On a `DAEProblem`, `get_du` is the derivative its initialization or its last step paired with
 the state, the slope at the step's end for `TSDAE("bdf")` and the step's chord for the other
-subtypes, and it raises an `ArgumentError` once the state has changed since.
+subtypes, and it raises an `ArgumentError` once the state has changed since. With a mass
+matrix `get_du` solves `M du = f(u)` at the state. Where `M` has a zero row, or is a sparse
+one split over a communicator, it is instead the slope `TSImplicit("bdf")` or `"beuler"`
+solved for at its last step's end, and it raises an `ArgumentError` with any other type or
+once the state has changed since.
 `integrator(t; idxs)`, a vector of times and `integrator(out, t)` take the forms
 OrdinaryDiffEq's integrator does.
 
