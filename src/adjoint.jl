@@ -1267,7 +1267,8 @@ function _discrete_adjoint_unlocked(
         context(jac, J, rows, paramjac, pscale, coo) = AdjointContext(
             pl, h.tdir, p, jac, J, rows..., paramjac, zeros(n, np), pscale, dgdu_discrete,
             skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, -1, h.t0, zeros(n),
-            first(_eltypes(prob)),
+            # At the problem's precision, also on i686, which leaves the single build out.
+            first(_eltypes(prob, Type[Float32, ComplexF32])),
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
