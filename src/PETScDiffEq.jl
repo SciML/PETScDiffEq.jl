@@ -243,7 +243,11 @@ There it needs a `jac` or `autodiff = AutoForwardDiff()`, with a sparse `jac_pro
 this rank's rows with global columns. Any split of the state works: PETSc lays out its stage
 vector by its own even split, so on any other the solve runs on that one and moves the state to
 and from each rank's block around every call to `f` and `jac`; see the MPI section of the
-documentation. A `dm` is refused.
+documentation. A `dm` runs it as well, with `autodiff` defaulting to `AutoForwardDiff()`, which
+needs a DMDA; on a DMStag or a DMPlex give it a `jac`. PETSc also strides the stage vector by
+the state's block size, which only a block size of 1 gets right, so the solve runs on a plain
+vector, on PETSc's split when the DM's is another, with the DM's matrix copied to that split at
+every Jacobian.
 """
 struct TSIRK <: PETScTSAlgorithm
     nstages::Int
@@ -256,7 +260,7 @@ end
 TSIRK(
     nstages::Integer = 3, petsc_options::AbstractVector{<:AbstractString} = String[];
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
-    autodiff = _default_autodiff(comm, dm),
+    autodiff = dm === nothing ? _default_autodiff(comm, dm) : AutoForwardDiff(),
 ) = TSIRK(
     nstages >= 1 ? Int(nstages) :
         throw(ArgumentError("`nstages` must be at least 1, got $nstages")),
@@ -579,8 +583,7 @@ implicit `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`, `"arkimex"`, `"irk"`,
 implicit types are refused there: `"glle"`'s step control follows the round-off of the
 distributed linear solve, so it takes other steps than a serial solve and ends with another
 error, larger or smaller. A `dm` runs an explicit type as it runs [`TSRK`](@ref) and the same
-implicit types as it runs [`TSImplicit`](@ref), except `"irk"`, which it refuses as it does
-[`TSIRK`](@ref).
+implicit types, `"irk"` as [`TSIRK`](@ref) runs and the others as [`TSImplicit`](@ref) runs.
 """
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
@@ -3638,17 +3641,20 @@ function _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     pl = ctx.petsclib
     A = LibPETSc.PetscMat(A_ptr, pl)
     B = LibPETSc.PetscMat(B_ptr, pl)
+    # Off the DM's split the DM's own matrix is filled, then copied to PETSc's split.
+    moved = ctx.relayout === nothing ? nothing : ctx.relayout.mat
+    J = something(moved, B)
     try
         t = _stage_time(ctx, ts, t)
-        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        _mat_zero!(pl, B)
+        _readvec!(ctx.u, pl, _own_block(ctx, PETSc.VecPtr(pl, x_ptr, false)))
+        _mat_zero!(pl, J)
         err = nothing
         try
             if ctx.dae
                 _readvec!(ctx.mudot, pl, PETSc.VecPtr(pl, xdot_ptr, false))
-                ctx.jac!(B, ctx.mudot, ctx.u, ctx.p, shift, t)
+                ctx.jac!(J, ctx.mudot, ctx.u, ctx.p, shift, t)
             else
-                ctx.jac!(B, ctx.u, ctx.p, t)
+                ctx.jac!(J, ctx.u, ctx.p, t)
             end
         catch e
             ctx.comm === nothing && rethrow()
@@ -3660,13 +3666,21 @@ function _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
             return LibPETSc.PetscErrorCode(CALLBACK_THREW)
         end
         ctx.njacs += 1
-        PETSc.assemble!(B)
+        PETSc.assemble!(J)
         if !ctx.dae
             S = PETSc.scalartype(pl)
-            ctx.tdir > 0 && _mat_op!(pl, :MatScale, B, -one(S))
-            ctx.M === nothing ? _mat_op!(pl, :MatShift, B, S(shift)) :
-                _mat_add_diagonal!(pl, B, S(shift) .* ctx.M.diag)
+            ctx.tdir > 0 && _mat_op!(pl, :MatScale, J, -one(S))
+            ctx.M === nothing ? _mat_op!(pl, :MatShift, J, S(shift)) :
+                _mat_add_diagonal!(pl, J, S(shift) .* ctx.M.diag)
         end
+        moved === nothing || _check_code(
+            ccall(
+                _symbol(pl, :MatCreateSubMatrix), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Cint, Ptr{Ptr{Cvoid}}),
+                J.ptr, ctx.relayout.rows, ctx.relayout.rows, Cint(LibPETSc.MAT_REUSE_MATRIX),
+                Ref(B.ptr),
+            ),
+        )
         B.ptr == A.ptr || PETSc.assemble!(A)
     catch e
         ctx.err = e
@@ -4307,14 +4321,18 @@ function _destroy!(h::TSHandles)
     end
     h.ctx.work.ptr == C_NULL || PETScCompat.destroy!(h.ctx.work)
     h.u === nothing || PETScCompat.destroy!(h.u)
-    if h.ctx.relayout !== nothing
-        PETScCompat.destroy!(h.ctx.relayout.vec)
-        _check_code(
-            ccall(
-                _symbol(h.petsclib, :VecScatterDestroy), LibPETSc.PetscErrorCode,
-                (Ptr{Ptr{Cvoid}},), Ref(h.ctx.relayout.scatter),
-            ),
-        )
+    relayout = h.ctx.relayout
+    if relayout !== nothing
+        PETScCompat.destroy!(relayout.vec)
+        relayout.mat === nothing || PETScCompat.destroy!(relayout.mat)
+        for (name, obj) in ((:VecScatterDestroy, relayout.scatter), (:ISDestroy, relayout.rows))
+            _check_code(
+                ccall(
+                    _symbol(h.petsclib, name), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+                    Ref(obj),
+                ),
+            )
+        end
     end
     h.ts === nothing || _return_work_vec!(h.ctx, h.ts)
     _release_work_vec!(h.ctx)
@@ -4490,20 +4508,15 @@ const _NOT_SELF = "on a communicator other than MPI.COMM_SELF"
 
 _in_threads_loop() = Threads.threadpoolsize() > 1 && current_task() !== Base.roottask
 
-# TSSetUp_IRK splits its stage vector evenly whatever the state's split, so irk runs on that one.
-function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
+_petsc_split(pl, comm, N) = _plain_mdot(pl) do
+    LibPETSc.VecCreateMPI(
+        pl, comm, LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), LibPETSc.PetscInt(N),
+    )
+end
+
+function _move_state!(h, x)
     pl, ctx = h.petsclib, h.ctx
-    comm, n = ctx.comm, length(h.u0)
-    x = _plain_mdot(pl) do
-        LibPETSc.VecCreateMPI(
-            pl, comm, LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), LibPETSc.PetscInt(N),
-        )
-    end
-    lo, hi = LibPETSc.VecGetOwnershipRange(pl, x)
-    if _everywhere(comm, hi - lo == n)
-        PETScCompat.destroy!(x)
-        return nothing
-    end
+    n = length(h.u0)
     rstart = first(LibPETSc.VecGetOwnershipRange(pl, h.u))
     is, scatter = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
     _check_code(
@@ -4523,13 +4536,71 @@ function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
     )
     _check_code(ccall(_symbol(pl, :ISDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},), is))
     _check_code(code)
-    ctx.relayout = (; vec = h.u, scatter = scatter[])
+    ctx.relayout = (; vec = h.u, scatter = scatter[], mat = nothing, rows = C_NULL)
     h.u = x
     _relayout!(ctx, ctx.relayout.vec, x, LibPETSc.SCATTER_FORWARD)
     LibPETSc.TSSetSolution(pl, h.ts, x)
+    return nothing
+end
+
+# TSSetUp_IRK splits its stage vector evenly whatever the state's split, so irk runs on that one.
+function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
+    pl, comm = h.petsclib, h.ctx.comm
+    x = _petsc_split(pl, comm, N)
+    lo, hi = LibPETSc.VecGetOwnershipRange(pl, x)
+    if _everywhere(comm, hi - lo == length(h.u0))
+        PETScCompat.destroy!(x)
+        return nothing
+    end
+    _move_state!(h, x)
     PETScCompat.destroy!(h.jac_mat)
     h.jac_mat = LibPETSc.MatCreate(pl, comm)
     _coo_matrix!(h.jac_mat, pl, hi - lo, N, rows, cols)
+    LibPETSc.TSSetIJacobian(pl, h.ts, h.jac_mat, h.jac_mat, ijacobian, ctxptr)
+    return nothing
+end
+
+# TSStep_IRK also strides its stage vector by the state's block size, which only 1 gets right, so
+# with a DM irk runs on a plain vector, and off PETSc's split on a copy of the DM's matrix.
+function _irk_on_dm!(h, N, ijacobian, ctxptr)
+    pl, ctx = h.petsclib, h.ctx
+    comm, n = ctx.comm, length(h.u0)
+    x = comm === nothing ? _state_vec(pl, nothing, n) : _petsc_split(pl, comm, N)
+    lo, hi = LibPETSc.VecGetOwnershipRange(pl, x)
+    if _everywhere(comm, hi - lo == n)
+        _check_code(
+            ccall(
+                _symbol(pl, :VecCopy), LibPETSc.PetscErrorCode,
+                (LibPETSc.CVec, LibPETSc.CVec), h.u, x,
+            ),
+        )
+        PETScCompat.destroy!(h.u)
+        h.u = x
+        LibPETSc.TSSetSolution(pl, h.ts, x)
+        return nothing
+    end
+    _move_state!(h, x)
+    rows, sub = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :ISCreateStride), LibPETSc.PetscErrorCode,
+            (
+                MPI.API.MPI_Comm, LibPETSc.PetscInt, LibPETSc.PetscInt, LibPETSc.PetscInt,
+                Ptr{Ptr{Cvoid}},
+            ),
+            comm, hi - lo, lo, 1, rows,
+        ),
+    )
+    ctx.relayout = (; ctx.relayout..., rows = rows[])
+    _check_code(
+        ccall(
+            _symbol(pl, :MatCreateSubMatrix), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Cint, Ptr{Ptr{Cvoid}}),
+            h.jac_mat.ptr, rows[], rows[], Cint(LibPETSc.MAT_INITIAL_MATRIX), sub,
+        ),
+    )
+    ctx.relayout = (; ctx.relayout..., mat = h.jac_mat)
+    h.jac_mat = LibPETSc.PetscMat(sub[], pl)
     LibPETSc.TSSetIJacobian(pl, h.ts, h.jac_mat, h.jac_mat, ijacobian, ctxptr)
     return nothing
 end
@@ -4581,8 +4652,6 @@ end
 
 const _DISTRIBUTED_IMPLICIT =
     ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "irk", "alpha", "dirk")
-# PETSc's IRK takes an AIJ matrix made here, which would replace the DM's.
-const _DM_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "alpha", "dirk")
 const _WITH_DM = "with a `dm`"
 
 function _check_diagonal_mass(prob, is_dae, where, or = "")
@@ -4622,7 +4691,8 @@ end
 
 function _refuse_dm_autodiff(prob, alg, is_dae)
     ad, dm = _autodiff(alg), _alg_dm(alg)
-    other = "give the problem a `jac`, or leave `autodiff` at its default there, " *
+    other = _ts_type(alg) == "irk" ? "give the problem a `jac`" :
+        "give the problem a `jac`, or leave `autodiff` at its default there, " *
         "`AutoFiniteDiff()`, for the DM's colouring"
     ADTypes.dense_ad(ad) isa AutoForwardDiff || throw(
         ArgumentError(
@@ -4648,16 +4718,16 @@ function _refuse_dm_autodiff(prob, alg, is_dae)
 end
 
 function _refuse_dm(prob, alg, is_dae)
-    alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX, TSGeneric} || throw(
+    alg isa Union{TSRK, TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX, TSGeneric} || throw(
         ArgumentError(
             "PETScDiffEq cannot run $(nameof(typeof(alg))) $_WITH_DM; TSRK, TSRosW, " *
-                "TSImplicit, TSDAE, TSARKIMEX and TSGeneric can",
+                "TSImplicit, TSIRK, TSDAE, TSARKIMEX and TSGeneric can",
         ),
     )
-    alg isa TSGeneric && !alg.explicit && !(alg.ts_type in _DM_IMPLICIT) && throw(
+    alg isa TSGeneric && !alg.explicit && !(alg.ts_type in _DISTRIBUTED_IMPLICIT) && throw(
         ArgumentError(
             "TSGeneric(\"$(alg.ts_type)\") cannot run $_WITH_DM; only " *
-                "$(join(_DM_IMPLICIT, ", ")) can",
+                "$(join(_DISTRIBUTED_IMPLICIT, ", ")) can",
         ),
     )
     has_jac = prob.f.jac !== nothing
@@ -4671,6 +4741,13 @@ function _refuse_dm(prob, alg, is_dae)
         ArgumentError("the `dm` gives the Jacobian's pattern, so leave out `jac_prototype`"),
     )
     _uses_ifunction(alg) || return nothing
+    has_jac || !_petsc_differences(alg) || _ts_type(alg) != "irk" || throw(
+        ArgumentError(
+            "TSIRK needs a `jac` or `autodiff = AutoForwardDiff()` $_WITH_DM, since PETSc " *
+                "builds its coupled-stage matrix from one and has no finite-difference " *
+                "fallback for it",
+        ),
+    )
     has_jac || _petsc_differences(alg) || _refuse_dm_autodiff(prob, alg, is_dae)
     _check_diagonal_mass(prob, is_dae, _WITH_DM)
     return nothing
@@ -5466,7 +5543,7 @@ function _setup(
                 ),
             )
             distributable = alg isa Union{TSBasicSymplectic, TSAlpha2} ? (_ts_type(alg),) :
-                _uses_ifunction(alg) ? (dm === nothing ? _DISTRIBUTED_IMPLICIT : _DM_IMPLICIT) :
+                _uses_ifunction(alg) ? _DISTRIBUTED_IMPLICIT :
                 alg isa TSMPRK ? ("mprk", _EXPLICIT_ONLY...) : _EXPLICIT_ONLY
             comm === nothing && dm === nothing || chosen in distributable || throw(
                 ArgumentError(
@@ -5477,10 +5554,13 @@ function _setup(
             )
             running = _running_name(petsclib, ts)
             _refuse_method(running, has_mass, has_jac, is_split, is_dae)
-            comm === nothing || chosen != "irk" ||
+            if chosen == "irk" && dm !== nothing
+                _irk_on_dm!(h, N, ptrs.dm_ijacobian, ctxptr)
+            elseif chosen == "irk" && comm !== nothing
                 _irk_on_petsc_split!(h, N, rows, cols, ptrs.sparse_ijacobian, ctxptr)
+            end
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
-            if chosen == "irk" && has_jac && !uses_sparse_jac
+            if chosen == "irk" && has_jac && !uses_sparse_jac && !dm_jac
                 PETScCompat.destroy!(h.jac_mat)
                 h.jac_mat = PETScCompat.PetscMat(petsclib, n, n, n)
                 LibPETSc.TSSetIJacobian(

@@ -6868,11 +6868,26 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         picked = PETScDiffEq.TSImplicit("bdf", ["-ts_type", "dirk"]; dm = da)
         @test SciMLBase.solve(dm_prob((0.0, 0.1)), picked; dt = 1.0e-4, tol...).u ==
             SciMLBase.solve(dm_prob((0.0, 0.1)), generic("dirk"; dm = da); dt = 1.0e-4, tol...).u
-        for type in ("irk", "glle")
-            @test_throws "TSGeneric(\"$type\") cannot run with a `dm`" SciMLBase.solve(
-                dm_prob((0.0, 0.1)), generic(type; dm = da); dt = 1.0e-3,
-            )
+        @test_throws "TSGeneric(\"glle\") cannot run with a `dm`" SciMLBase.solve(
+            dm_prob((0.0, 0.1)), generic("glle"; dm = da); dt = 1.0e-3,
+        )
+        empty!(seen)
+        fixed = (; dt = 1.0e-3, adaptive = false)
+        irk = SciMLBase.solve(dm_prob((0.0, 0.1)), PETScDiffEq.TSIRK(; dm = da); fixed...)
+        ref = SciMLBase.solve(ref_prob((0.0, 0.1)), PETScDiffEq.TSIRK(); fixed...)
+        @test irk.retcode == SciMLBase.ReturnCode.Success
+        @test irk.t == ref.t
+        @test irk.u == ref.u
+        @test irk.stats.njacs == ref.stats.njacs == length(seen) > 0
+        picked = PETScDiffEq.TSImplicit("bdf", ["-ts_type", "irk"]; dm = da)
+        for alg in (generic("irk"; dm = da), picked)
+            @test SciMLBase.solve(dm_prob((0.0, 0.1)), alg; fixed...).u == irk.u
         end
+        plain_heat = SciMLBase.ODEProblem(heat_dm!, u0, (0.0, 0.1), da)
+        @test SciMLBase.solve(plain_heat, PETScDiffEq.TSIRK(; dm = da); fixed...).u == irk.u
+        @test_throws "TSIRK needs a `jac` or `autodiff = AutoForwardDiff()` with a `dm`" SciMLBase.solve(
+            plain_heat, generic("irk"; dm = da); fixed...,
+        )
         back = SciMLBase.solve(dm_prob((0.1, 0.0)), PETScDiffEq.TSImplicit("bdf"; dm = da); tol...)
         ref = SciMLBase.solve(ref_prob((0.1, 0.0)), PETScDiffEq.TSImplicit("bdf"); tol...)
         @test back.retcode == SciMLBase.ReturnCode.Success
@@ -7022,6 +7037,31 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test got.u == hand.u
             @test got.stats.njacs == hand.stats.njacs > 0
             @test got.stats.nf == hand.stats.nf + got.stats.njacs
+            PETScDiffEq.PETScCompat.destroy!(da)
+        end
+        # TSIRK's stages are strided by the state's block size, here the two degrees of freedom.
+        function line_plain!(du, u, edge, t)
+            U, D = reshape(u, 2, :), reshape(du, 2, :)
+            N = size(U, 2)
+            at(c, i) = edge == periodic ? U[c, mod1(i, N)] : 1 <= i <= N ? U[c, i] : 0.0
+            for i in 1:N
+                x, y = U[1, i], U[2, i]
+                D[1, i] = 1 + x^2 * y - 4x + N^2 * (at(1, i - 1) - 2x + at(1, i + 1))
+                D[2, i] = 3x - x^2 * y + N^2 * (at(2, i - 1) - 2y + at(2, i + 1))
+            end
+            return nothing
+        end
+        irk(; kw...) = PETScDiffEq.TSIRK(2; kw...)
+        for edge in (periodic, ghosted)
+            da = PETSc.DMDA(pl, MPI.COMM_SELF, (edge,), (15,), 2, 1)
+            hand = SciMLBase.solve(line(da; jac = line_jac!), irk(; dm = da); dt = 1.0e-3)
+            got = SciMLBase.solve(line(da), irk(; dm = da); dt = 1.0e-3)
+            plain = SciMLBase.solve(
+                SciMLBase.ODEProblem(line_plain!, start(30), (0.0, 0.1), edge), irk(); dt = 1.0e-3,
+            )
+            @test got.retcode == SciMLBase.ReturnCode.Success
+            @test got.t == hand.t == plain.t
+            @test got.u == hand.u == plain.u
             PETScDiffEq.PETScCompat.destroy!(da)
         end
         da = PETSc.DMDA(pl, MPI.COMM_SELF, (periodic,), (15,), 2, 1)

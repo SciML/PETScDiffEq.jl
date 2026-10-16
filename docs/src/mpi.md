@@ -257,9 +257,10 @@ sol_bdf = solve(prob, TSImplicit("bdf"; dm = da))
 
 With a `dm` the implicit algorithms need no `jac_prototype`. Their Jacobian is the DM's own
 matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil. Without a `jac` PETSc
-fills it by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()`;
-the stencil has to cover every point `f` reads. Colouring calls `f` once per colour at every
-Jacobian, and the colours grow with the stencil width and the degrees of freedom at a point.
+fills it by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()`,
+except in `TSIRK`, below; the stencil has to cover every point `f` reads. Colouring calls `f`
+once per colour at every Jacobian, and the colours grow with the stencil width and the degrees
+of freedom at a point.
 The colours are the DM's own where they fit its matrix. PETSc's DMDA colouring repeats along
 an axis with period `2s + 1` for stencil width `s`, or 5 for the 2-D star of width 1, so on a
 periodic axis whose number of points is not a multiple of the period PETSc refuses to colour
@@ -443,7 +444,7 @@ matched with a mass matrix exactly, as a `SplitODEProblem` in `TSARKIMEX` to 5.4
 `DAEProblem` in `TSDAE` to 1.1e-14, and `PETScAdjoint` with a `jac` and a `paramjac` matched the
 adjoint without a DM exactly.
 
-The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
+The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSIRK`, `TSDAE`,
 `TSARKIMEX` and `TSGeneric`, explicit or implicit, `saveat`, dense output, callbacks and
 the integrator interface, a `Diagonal` mass matrix, a `SplitODEProblem`, whose `f2` gets `u`
 ghosted as `f` does, and a `DAEProblem`, whose residual `f(r, du, u, p, t)` gets `u` ghosted
@@ -452,6 +453,20 @@ and `du` owned. Everything else the package calls, such as a callback, `unstable
 DM itself stays free for further solves. A DM on `MPI.COMM_SELF`, or on a single rank, gives a
 serial solve. Only a DMDA, a DMStag or a DMPlex is taken so far, and any other DM, such as a
 DMShell, is refused with an `ArgumentError`.
+
+`TSIRK` builds its coupled-stage matrix from the DM's, so it needs a `jac` or ForwardDiff, its
+default `autodiff` with a `dm`: `AutoFiniteDiff()` is refused, and so is ForwardDiff on a
+DMStag or a DMPlex without a `jac`. PETSc lays the stage vector out by its own even split, as
+on a `comm`, and strides it by the state's block size, which only a block size of 1 gets right,
+while a DM's vectors have one per degree of freedom at a point. So the solve runs on a plain
+vector: on the DM's split where that is PETSc's, and otherwise on PETSc's, moving the state to
+and from each rank's block around every call to `f` and `jac`, and copying the DM's matrix, as
+`jac` or ForwardDiff fills it, to PETSc's split with `MatCreateSubMatrix` at every Jacobian. On
+1 to 3 ranks a heat equation on an uneven DMDA took the steps and states of the same solve on a
+`comm` bit for bit, through a callback that changes `u`, and gave the same states from a `jac`
+as from ForwardDiff. Under `-ksp_rtol 1e-14` it, a DMDA with two degrees of freedom, the DMStag
+wave and both DMPlex problems above matched the serial solves without a DM to 3.7e-15, and on
+one rank exactly.
 
 `PETScAdjoint` runs with a `dm` too, for the methods and discrete costs it takes on a `comm`,
 and on a DM of a single rank for integral costs and a `SplitODEProblem` with `TSARKIMEX` as
@@ -481,9 +496,9 @@ on 1-D and 2-D grids with one and two degrees of freedom and ghosted and periodi
 2.9e-16 of the gradient from a hand-written `jac` and `paramjac`, for `TSRK`, `TSImplicit` and
 `TSARKIMEX` in both time directions.
 
-A solve with a `dm` refuses `TSIRK`, `TSMPRK` and an implicit `TSGeneric` of type `"irk"`,
-or of a type refused on a `comm`, with an `ArgumentError`. A distributed solve, with a `dm`
-or without, is refused off the root task
+A solve with a `dm` refuses `TSMPRK` and an implicit `TSGeneric` of a type refused on a `comm`
+with an `ArgumentError`. A distributed solve, with a `dm` or without, is refused off the root
+task
 when Julia has more than one thread, whether inside `Threads.@threads` (as `EnsembleThreads`
 runs its trajectories) or from a `Threads.@spawn` task: nothing there keeps the ranks' solves
 in the same order, and ranks taking them in different orders run different solves as one and

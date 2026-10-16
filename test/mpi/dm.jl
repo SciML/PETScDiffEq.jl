@@ -38,6 +38,8 @@ const STAG_ADJOINT_GAP = 1.0e-14
 const PLEX_SERIAL_TOL = 1.0e-13
 const PLEX_COLOUR_TOL = 5.0e-13
 const PLEX_STEP_TOL = 1.0e-15
+# Measured at 1 to 3 ranks: TSIRK under `-ksp_rtol 1e-14` is within 3.7e-15 of the serial solve.
+const IRK_SERIAL_TOL = 2.0e-14
 
 function uneven(n)
     counts = floor.(Int, n .* (1:nranks) ./ sum(1:nranks))
@@ -776,6 +778,77 @@ end
         PETScCompat.destroy!(along)
     end
 
+    @testset "TSIRK on PETSc's own split" begin
+        irk(; kw...) = TSIRK(2, ["-ksp_rtol", "1e-14"]; kw...)
+        function heat_jac_dm!(J, u, da, t)
+            for i in rows
+                set_stencil_values!(J, (1, i), ((1, i - 1), (1, i), (1, i + 1)), (1, -2, 1) ./ dx^2)
+            end
+            return nothing
+        end
+        function heat_jac_rows!(J, u, p, t)
+            for (k, i) in enumerate(rows), j in neighbours(i)
+                J[k, j] = (i == j ? -2 : 1) / dx^2
+            end
+            return nothing
+        end
+        halve = DiscreteCallback((u, t, i) -> t == 0.05, i -> (i.u .*= 0.5))
+        events = (; saveat = 0.02, callback = halve, tstops = [0.05], FIXED...)
+        got = solve(dm_heat(), irk(; dm = da); events...)
+        ref = solve(comm_heat(; jac = heat_jac_rows!), irk(; comm); events...)
+        @test got.retcode == ReturnCode.Success
+        @test got.t == ref.t
+        @test everywhere(got.u == ref.u)
+        @test got.stats.njacs == ref.stats.njacs > 0
+        by_stencil = solve(dm_heat(; jac = heat_jac_dm!), irk(; dm = da); events...)
+        @test everywhere(by_stencil.u == got.u)
+        us = natural(got, da, N)
+        if rank == 0
+            serial = solve(serial_heat(), irk(); events...)
+            @test got.t == serial.t
+            @test maxdiff(us, serial.u) <= IRK_SERIAL_TOL
+        end
+
+        # Two degrees of freedom give the DM's vectors a block size of two.
+        pair = PETSc.DMDA(
+            pl, comm, (GHOSTED,), (N,), 2, 1; points_per_proc = (LibPETSc.PetscInt.(counts),),
+        )
+        function pair_dm!(du, u, da, t)
+            U, D = reshape_local_array(u, da), reshape_local_array(du, da)
+            for i in axes(D, 2), c in 1:2
+                D[c, i] = c * (U[c, i - 1] - 2U[c, i] + U[c, i + 1]) / dx^2 - U[3 - c, i]
+            end
+            return nothing
+        end
+        function pair_serial!(du, u, p, t)
+            U, D = reshape(u, 2, N), reshape(du, 2, N)
+            at(c, i) = 1 <= i <= N ? U[c, i] : 0.0
+            for i in 1:N, c in 1:2
+                D[c, i] = c * (at(c, i - 1) - 2U[c, i] + at(c, i + 1)) / dx^2 - U[3 - c, i]
+            end
+            return nothing
+        end
+        function pair_natural(u)
+            full = zeros(2, N)
+            a = reshape_local_array(u, pair)
+            for i in axes(a, 2)
+                full[:, i] = a[:, i]
+            end
+            return MPI.Reduce(vec(full), +, comm; root = 0)
+        end
+        pair0(idx) = vec([c * x for c in 1:2, x in heat0(idx)])
+        got = solve(ODEProblem(pair_dm!, pair0(rows), SPAN, pair), irk(; dm = pair); FIXED...)
+        @test got.retcode == ReturnCode.Success
+        us = pair_natural.(got.u)
+        if rank == 0
+            serial = solve(ODEProblem(pair_serial!, pair0(1:N), SPAN), irk(); FIXED...)
+            @test got.t == serial.t
+            @test maxdiff(us, serial.u) <= IRK_SERIAL_TOL
+        end
+        PETScCompat.destroy!(pair)
+        @test everywhere(refs(da.ptr) == 1)
+    end
+
     @testset "a DMDA on MPI.COMM_SELF, one to each rank" begin
         solo = line_da(MPI.COMM_SELF)
         for make in (explicit, implicit)
@@ -1324,9 +1397,20 @@ end
 
     @testset "refusals" begin
         prob = dm_heat()
-        for alg in (TSIRK(2; dm = da), TSMPRK([1]; dm = da), TSGeneric("irk"; dm = da))
+        for alg in (TSMPRK([1]; dm = da), TSGeneric("glle"; dm = da))
             @test refused(() -> solve(prob, alg; dt = 1.0e-3), "cannot run")
         end
+        @test refused(
+            () -> solve(prob, TSIRK(2; dm = da, autodiff = AutoFiniteDiff()); dt = 1.0e-3),
+            "TSIRK needs a `jac` or `autodiff = AutoForwardDiff()` with a `dm`",
+        )
+        @test refused(
+            () -> solve(
+                ODEProblem(wave_dm!, on_wave(wave0, stag), SPAN, [1.0, 1.0]), TSIRK(2; dm = stag);
+                dt = 1.0e-3,
+            ),
+            "not on a DM of type `stag`; give the problem a `jac`",
+        )
         @test refused(
             () -> solve(
                 ODEProblem(
@@ -1360,8 +1444,8 @@ end
             "only a `Diagonal` mass matrix",
         )
         @test refused(
-            () -> solve(prob, TSImplicit("bdf", ["-ts_type", "irk"]; dm = da)),
-            "`irk` cannot run with a `dm`",
+            () -> solve(prob, TSImplicit("bdf", ["-ts_type", "glle"]; dm = da)),
+            "`glle` cannot run with a `dm`",
         )
         @test refused(
             () -> PETScDiffEq._discrete_adjoint(
@@ -1458,6 +1542,16 @@ end
                 @test maxdiff(us, ref.u) <= STAG_SERIAL_TOL
                 @test maxdiff(cs, us) <= COLOUR_TOL
             end
+        end
+
+        irk(; kw...) = TSIRK(2, ["-ksp_rtol", "1e-14"]; kw...)
+        got = solve(dm_wave(; jac = wave_jac_dm!), irk(; dm = stag); saveat = 0.02, FIXED...)
+        @test got.retcode == ReturnCode.Success
+        us = wave_natural.(got.u, Ref(stag))
+        if rank == 0
+            ref = solve(serial_wave(; jac = wave_jac!), irk(); saveat = 0.02, FIXED...)
+            @test got.t == ref.t
+            @test maxdiff(us, ref.u) <= IRK_SERIAL_TOL
         end
 
         weights = 1 .+ (1:NW) ./ NW
@@ -1644,6 +1738,7 @@ end
         direct = ["-ksp_type", "preonly", "-pc_type", "redundant"]
         bdf(; kw...) = TSImplicit("bdf", direct; kw...)
         rosw(; kw...) = TSRosW("ra34pw2", direct; kw...)
+        irk(; kw...) = TSIRK(2, ["-ksp_rtol", "1e-14"]; kw...)
         for (simplex, cells) in ((true, false), (false, true))
             q = plex_problem(simplex, cells)
             back = plex_natural(q.u0, q)
@@ -1659,6 +1754,14 @@ end
                 ref = solve(serial_rd(), explicit(); saveat = 0.02, FIXED...)
                 @test got.t == ref.t
                 @test us == ref.u
+            end
+            got = solve(dm_rd(; jac = plex_rd_jac_dm!), irk(; dm = q.dm); saveat = 0.02, FIXED...)
+            @test got.retcode == ReturnCode.Success
+            us = plex_natural.(got.u, Ref(q))
+            if rank == 0
+                ref = solve(serial_rd(; jac = plex_rd_jac!), irk(); saveat = 0.02, FIXED...)
+                @test got.t == ref.t
+                @test maxdiff(us, ref.u) <= IRK_SERIAL_TOL
             end
             for make in (bdf, rosw)
                 got = solve(
