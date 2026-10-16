@@ -327,6 +327,7 @@ const METHODS = (
         @test maximum(abs, SciMLBase.get_du(integ) - slope) <= 1.0e-8 * maximum(abs, slope)
         SciMLBase.set_u!(integ, 2 .* integ.u)
         @test refused(() -> SciMLBase.get_du(integ), "has changed since")
+        SciMLBase.terminate!(integ)
     end
 
     @testset "a Diagonal mass matrix" begin
