@@ -3392,8 +3392,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         algs = Any[
             (prob, PETScDiffEq.TSRK("5dp")), (prob, PETScDiffEq.TSRosW("ra34pw2")),
             (prob, PETScDiffEq.TSImplicit("bdf")), (split, PETScDiffEq.TSARKIMEX("2e")),
+            (prob, PETScDiffEq.TSRK("5dp"; comm = MPI.COMM_WORLD)),
         ]
-        Sys.WORD_SIZE == 64 && push!(algs, (prob, PETScDiffEq.TSRK("5dp"; comm = MPI.COMM_WORLD)))
         for (pr, alg) in algs, kw in ((;), (; dt = 0.1))
             fill!(calls, 0)
             sol = SciMLBase.solve(pr, alg; kw...)
@@ -3424,10 +3424,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         newton = SciMLBase.solve(chain_prob, beuler(String[]); fixed...)
         @test newton.stats.nsolve == newton.stats.nnonliniter >= 20
         @test SciMLBase.solve(chain_prob, beuler(["-snes_ksp_ew"]); fixed...).stats.nsolve == -1
-        if Sys.WORD_SIZE == 64
-            on_world = beuler(; comm = MPI.COMM_WORLD)
-            @test counts(SciMLBase.solve(chain_prob, on_world; fixed...)) == (20, 20, -1, 0)
-        end
+        on_world = beuler(; comm = MPI.COMM_WORLD)
+        @test counts(SciMLBase.solve(chain_prob, on_world; fixed...)) == (20, 20, -1, 0)
 
         integ = SciMLBase.init(chain_prob, beuler(); fixed...)
         @test counts(integ.sol) == (0, 0, -1, 0)
@@ -3470,9 +3468,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         cases = Any[
             (dense, PETScDiffEq.TSRosW, (;)), (coloured, PETScDiffEq.TSRosW, (;)),
             (dense, PETScDiffEq.TSImplicit, (;)), (coloured, PETScDiffEq.TSImplicit, (;)),
+            (coloured, PETScDiffEq.TSImplicit, (; comm = MPI.COMM_WORLD)),
         ]
-        Sys.WORD_SIZE == 64 &&
-            push!(cases, (coloured, PETScDiffEq.TSImplicit, (; comm = MPI.COMM_WORLD)))
         fixed = (dt = 0.05, adaptive = false)
         for (prob, T, kw) in cases
             subtype = T === PETScDiffEq.TSRosW ? "ra34pw2" : "bdf"
@@ -4167,10 +4164,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
         back = SciMLBase.ODEProblem(f, [1.0], (1.0, 0.0), [0.0, 10.0, 1.0])
         @test SciMLBase.solve(back, rk4; callback = bump(), fixed...).discretes[1].t ≈ 1:-0.1:0
-        if Sys.WORD_SIZE == 64
-            on_world = PETScDiffEq.TSRK("4"; comm = MPI.COMM_WORLD)
-            @test same(SciMLBase.solve(prob(), on_world; callback = bump(), fixed...), sol)
-        end
+        on_world = PETScDiffEq.TSRK("4"; comm = MPI.COMM_WORLD)
+        @test same(SciMLBase.solve(prob(), on_world; callback = bump(), fixed...), sol)
 
         integ = SciMLBase.init(prob(), rk4; callback = bump(), fixed...)
         @test integ.sol.ps[:d] == [0.0]
@@ -6081,11 +6076,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
         @test stepped(sparse_both) == stepped(sparse_whole)
         @test SciMLBase.solve(split, TSARKIMEX("3"); tol...).stats.nf2 > 0
-        if Sys.WORD_SIZE == 64
-            world = MPI.COMM_WORLD
-            same(split, plain, TSRK("5dp"; comm = world); tol...)
-            same(sparse_both, sparse_whole, TSImplicit("bdf"; comm = world); tol...)
-        end
+        world = MPI.COMM_WORLD
+        same(split, plain, TSRK("5dp"; comm = world); tol...)
+        same(sparse_both, sparse_whole, TSImplicit("bdf"; comm = world); tol...)
         zero!(du, u, p, t) = (du .= 0.0; nothing)
         @test_throws "operator-valued" SciMLBase.solve(
             SciMLBase.SplitODEProblem(
@@ -7143,14 +7136,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test_throws "only `AutoForwardDiff()` is carried through it" SciMLBase.solve(
             line(da), bdf(da; autodiff = zygote),
         )
-        if Sys.WORD_SIZE == 64
-            stag = PETSc.DMStag(pl, MPI.COMM_SELF, (ghosted,), (4,), (1, 1), 1)
-            @test_throws "only on a DMDA so far, not on a DM of type `stag`" SciMLBase.solve(
-                SciMLBase.ODEProblem(line!, zeros(9), (0.0, 0.1), stag),
-                PETScDiffEq.TSImplicit("bdf"; dm = stag, autodiff = forward()),
-            )
-            PETScDiffEq.PETScCompat.destroy!(stag)
-        end
+        stag = PETSc.DMStag(pl, MPI.COMM_SELF, (ghosted,), (4,), (1, 1), 1)
+        @test_throws "only on a DMDA so far, not on a DM of type `stag`" SciMLBase.solve(
+            SciMLBase.ODEProblem(line!, zeros(9), (0.0, 0.1), stag),
+            PETScDiffEq.TSImplicit("bdf"; dm = stag, autodiff = forward()),
+        )
+        PETScDiffEq.PETScCompat.destroy!(stag)
         PETScDiffEq.PETScCompat.destroy!(da)
     end
 
@@ -9989,6 +9980,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test abs(sol.u[1][1] - 1) < 1.0e-2
     end
 
+    # On i686 a Float32 problem steps on PETSc's double build, so its times come back Float64.
     Sys.WORD_SIZE == 64 && @testset "times PETSc reads as PETSC_DETERMINE, PETSC_CURRENT or PETSC_UNLIMITED" begin
         # Those are -1, -2 and -3 on PETSc's clock, which runs on -t for a reversed span.
         Success, MaxIters = SciMLBase.ReturnCode.Success, SciMLBase.ReturnCode.MaxIters
@@ -11021,7 +11013,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(du0, central_differences(loss, u0)) < 1.0e-8
         end
 
-        Sys.WORD_SIZE == 64 && @testset "TSARKIMEX on a split problem on a communicator of one rank" begin
+        @testset "TSARKIMEX on a split problem on a communicator of one rank" begin
             world = MPI.COMM_WORLD
             on_world = TSARKIMEX("3", exact; comm = world)
             for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t))
@@ -11228,7 +11220,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test chunked[2] ≈ grad(eight, TSImplicit("beuler", exact))[2] rtol = 1.0e-12
         end
 
-        Sys.WORD_SIZE == 64 && @testset "a communicator of one rank differentiates both too" begin
+        @testset "a communicator of one rank differentiates both too" begin
             world = MPI.COMM_WORLD
             direct = [exact[1:6]; "-pc_type"; "redundant"]
             ad = PETScDiffEq.AutoForwardDiff()
@@ -11461,7 +11453,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 kick!, drift!; jac = joined_jac!, paramjac = joined_paramjac!,
                 jac_prototype = sparse([1, 1, 1, 1, 2, 2, 3, 4, 4], [1, 2, 3, 4, 3, 4, 1, 2, 3], 1.0, 4, 4),
             )
-            if Sys.WORD_SIZE == 64 && fn.jac_prototype isa SparseMatrixCSC
+            if fn.jac_prototype isa SparseMatrixCSC
                 bare = SciMLBase.DynamicalODEFunction{true}(kick!, drift!; fn.jac_prototype)
                 dual = on(; comm = MPI.COMM_WORLD, autodiff = PETScDiffEq.AutoForwardDiff())
                 for (tspan, t) in (((0.0, 1.0), forward_t), ((1.0, 0.0), backward_t))
@@ -11767,17 +11759,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test_throws "or pass `autodiff = AutoForwardDiff()` to the algorithm" dm_grad(
                     on_dm(; jac = nothing), cn(; dm = da),
                 )
-                if Sys.WORD_SIZE == 64
-                    stag = PETSc.DMStag(
-                        pl, MPI.COMM_SELF, (LibPETSc.DM_BOUNDARY_GHOSTED,), (7,), (1, 1), 1,
+                stag = PETSc.DMStag(
+                    pl, MPI.COMM_SELF, (LibPETSc.DM_BOUNDARY_GHOSTED,), (7,), (1, 1), 1,
+                )
+                for built in (:jac, :paramjac)
+                    @test_throws "`$built` with a `dm` of type `stag`" dm_grad(
+                        on_dm(; built => nothing), TSRK("4"; dm = stag),
                     )
-                    for built in (:jac, :paramjac)
-                        @test_throws "`$built` with a `dm` of type `stag`" dm_grad(
-                            on_dm(; built => nothing), TSRK("4"; dm = stag),
-                        )
-                    end
-                    PETScDiffEq.PETScCompat.destroy!(stag)
                 end
+                PETScDiffEq.PETScCompat.destroy!(stag)
                 PETScDiffEq.PETScCompat.destroy!(da32)
             end
             PETScDiffEq.PETScCompat.destroy!(da)
@@ -12804,7 +12794,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             PETScDiffEq.PETScCompat.destroy!(line)
         end
 
-        Sys.WORD_SIZE == 64 && @testset "ForwardDiff on a communicator of one rank" begin
+        @testset "ForwardDiff on a communicator of one rank" begin
             world, ad = MPI.COMM_WORLD, PETScDiffEq.AutoForwardDiff()
             near(i) = max(1, i - 1):min(5, i + 1)
             function damped!(ddu, du, u, p, t)
@@ -12943,6 +12933,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         rank_counts = isempty(listed) ? [1, 2, 3] : tryparse.(Int, split(listed, ','))
         allunique(rank_counts) && rank_counts ⊆ 1:3 ||
             error("MPI_RANKS is a comma-separated list of distinct rank counts from 1, 2 and 3, not $listed")
+        # On i686 mpi/ fails on Float32 (no single build), DMPlex's Int32 refs and bit-exact adjoint states.
         if Sys.WORD_SIZE == 64 && !Sys.iswindows()
             dir = joinpath(@__DIR__, "mpi")
             julia = Base.julia_cmd()
