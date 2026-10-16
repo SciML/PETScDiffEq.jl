@@ -192,6 +192,7 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     held_until::Float64
     held_u::Vector{Float64}
     clock::DataType
+    adaptive::Bool
     cost_at_step::Dict{Int, Vector{Int}}
     u_at_step::Dict{Int, Vector{Float64}}
     u::Vector{Float64}
@@ -361,25 +362,25 @@ const ADJ_RHSJACOBIANP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 const ADJ_IJACOBIANP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _adjoint_record!(
-        ::LibPETSc.CTS,
+        ts_ptr::LibPETSc.CTS,
         step::LibPETSc.PetscInt,
         s::Float64,
         x_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     adj = unsafe_pointer_to_objref(ctx_ptr)::AdjointContext
-    return _adjoint_record_body!(adj, Int(step), Float64(s), x_ptr)
+    return _adjoint_record_body!(adj, Int(step), Float64(s), x_ptr, ts_ptr)
 end
 
+_cost_tol(R, step, s, h) =
+    max(sqrt(Float64(eps(R))) * h, (step + 100) * Float64(eps(R(max(1.0, abs(s))))))
+
 # Each cost time goes to the nearest step within the tolerance, so a step is held until the next.
-function _adjoint_record_body!(adj, step, s, x_ptr)
+function _adjoint_record_body!(adj, step, s, x_ptr, ts_ptr)
     pl = adj.petsclib
     try
         R = adj.clock
-        tol = max(
-            sqrt(Float64(eps(R))) * (s - adj.s_prev),
-            (step + 100) * Float64(eps(R(max(1.0, abs(s))))),
-        )
+        tol = _cost_tol(R, step, s, s - adj.s_prev)
         x = PETSc.VecPtr(pl, x_ptr, false)
         order, cost_s = adj.order, adj.cost_s
         while adj.next <= length(order) && cost_s[order[adj.next]] <= s
@@ -397,12 +398,22 @@ function _adjoint_record_body!(adj, step, s, x_ptr)
         if adj.next <= length(order) && cost_s[order[adj.next]] <= s + tol
             adj.held_step, adj.held_until = step, s + tol
             _readvec!(adj.held_u, pl, x)
+        elseif adj.adaptive && adj.next <= length(order)
+            _land_on!(adj, LibPETSc.TS(ts_ptr, pl), step, s, cost_s[order[adj.next]])
         end
     catch e
         adj.err = e
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
+end
+
+# PETSc takes a span time within 1e-6 * dt * |t| of a step as reached, and steps over it.
+function _land_on!(adj, ts, step, s, c)
+    pl = adj.petsclib
+    h = LibPETSc.TSGetTimeStep(pl, ts)
+    s + h - c > _cost_tol(adj.clock, step + 1, s + h, h) && LibPETSc.TSSetTimeStep(pl, ts, c - s)
+    return nothing
 end
 
 function _record_cost!(adj, k, step, state)
@@ -1267,7 +1278,7 @@ function _discrete_adjoint_unlocked(
         context(jac, J, rows, paramjac, pscale, coo) = AdjointContext(
             pl, h.tdir, p, jac, J, rows..., paramjac, zeros(n, np), pscale, dgdu_discrete,
             skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, -1, h.t0, zeros(n),
-            first(_eltypes(prob)),
+            first(_eltypes(prob)), adaptive,
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,

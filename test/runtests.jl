@@ -10684,6 +10684,41 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-9
         end
 
+        # PETSc takes a span time within 1e-6 * dt * |t| of a step as reached (#215).
+        @testset "an adaptive solve ends a step on each cost time on a long clock: $name" for (
+                name, alg, tspan, ts,
+            ) in (
+                ("5dp", TSRK("5dp"), (0.0, 2.0e6), [5.0e5, 1.0e6, 5.0e5 + 1, 1.5e6]),
+                ("5dp backward in time", TSRK("5dp"), (2.0e6, 0.0), [1.5e6, 1.0e6, 5.0e5]),
+                ("5dp away from 0", TSRK("5dp"), (1.0e6, 1.0e6 + 2), 1.0e6 .+ [0.5, 1.0, 1.5]),
+                ("ARKIMEX 3", TSARKIMEX("3", exact), (0.0, 2.0e6), [5.0e5, 1.0e6, 1.5e6]),
+            )
+            scale = abs(tspan[2] - tspan[1])
+            decay!(du, u, p, t) = (du[1] = -p[1] / scale * u[1]; nothing)
+            prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    decay!; jac = (J, u, p, t) -> (J[1, 1] = -p[1] / scale; nothing),
+                    paramjac = (pJ, u, p, t) -> (pJ[1, 1] = -u[1] / scale; nothing),
+                ),
+                [1.0], tspan, [1.0],
+            )
+            steps = [tspan[1]]
+            du0, dp = PETScDiffEq._discrete_adjoint(
+                prob, alg, PETScAdjoint(); t = ts, dgdu_discrete = half_norm_du!,
+                unstable_check = (dt, u, p, t) -> (push!(steps, t); false),
+            )
+            push!(steps, tspan[2])
+            stepped(θ) = SciMLBase.solve(
+                SciMLBase.remake(prob; u0 = θ[1:1], p = θ[2:2]), alg;
+                dt = scale, adaptive = false, tstops = steps[2:(end - 1)],
+            )
+            at = [findfirst(==(t), steps) for t in ts]
+            @test !any(isnothing, at)
+            @test stepped([1.0, 1.0]).t == steps
+            loss(θ) = (sol = stepped(θ); sum(half_norm(sol.u[i], nothing, 0.0) for i in at))
+            @test relerr([du0; vec(dp)], central_differences(loss, [1.0, 1.0])) < 5.0e-9
+        end
+
         function quadrature(θ, alg, tspan, cost; dt = 0.01, kwargs...)
             aug!(dz, z, p, t) = (
                 adj_f!(view(dz, 1:2), view(z, 1:2), p, t); dz[3] = cost(view(z, 1:2), p, t); nothing
