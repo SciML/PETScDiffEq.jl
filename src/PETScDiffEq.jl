@@ -456,7 +456,7 @@ const _SYMPLECTIC_TYPES = Dict(
 )
 
 """
-    TSBasicSymplectic(subtype = "velverlet", petsc_options = String[]; comm = MPI.COMM_SELF)
+    TSBasicSymplectic(subtype = "velverlet", petsc_options = String[]; comm = MPI.COMM_SELF, dm = nothing)
 
 PETSc's basic symplectic integrators, `TSBASICSYMPLECTIC`, for a `DynamicalODEProblem`
 or a `SecondOrderODEProblem`. `subtype` is `"sieuler"` (or `"1"`), semi-implicit Euler of
@@ -476,18 +476,21 @@ if you pass a tolerance. Being explicit they ignore a `jac` and refuse a mass ma
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it: the initial `v` and
 `u` hold this rank's blocks of the velocity and the position, and `f1` and `f2` see only those
 blocks and are collective, as `f` is for [`TSRK`](@ref); see the MPI section of the
-documentation.
+documentation. A `dm` runs it on a PETSc DM: `v` and `u` are each the block of the grid this rank
+owns, and `f1`, and a `DynamicalODEProblem`'s `f2`, get both of them ghosted through the DM, as
+`f` gets `u` for `TSRK`.
 """
 struct TSBasicSymplectic <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 function TSBasicSymplectic(
         subtype::AbstractString = "velverlet",
         petsc_options::AbstractVector{<:AbstractString} = String[];
-        comm::MPI.Comm = MPI.COMM_SELF,
+        comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     )
     name = get(_SYMPLECTIC_TYPES, String(subtype), nothing)
     name === nothing && throw(
@@ -496,11 +499,13 @@ function TSBasicSymplectic(
                 "\"velverlet\", \"3\" or \"4\"",
         ),
     )
-    return TSBasicSymplectic(name, String[String(o) for o in petsc_options], comm)
+    return TSBasicSymplectic(
+        name, String[String(o) for o in petsc_options], _alg_comm(comm, dm), dm,
+    )
 end
 
 """
-    TSAlpha2(petsc_options = String[]; radius = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSAlpha2(petsc_options = String[]; radius = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 PETSc's generalized-alpha method for second-order systems, `TSALPHA2`, for a
 `SecondOrderODEProblem` `u'' = f(u', u, p, t)`. Implicit and of order 2. `radius` is the
@@ -531,24 +536,30 @@ A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for
 [`TSBasicSymplectic`](@ref), with this rank's velocity and position of the same length. There
 `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` or `AutoForwardDiff()` fills this rank's
 rows of a sparse `jac_prototype` of the first-order system, whose columns number the whole
-`[v; u]`; see the MPI section of the documentation.
+`[v; u]`; see the MPI section of the documentation. A `dm` runs it on a PETSc DM, which lays out
+the position, the velocity and the acceleration alike: `f` gets `u'` and `u` ghosted, and PETSc
+colours the DM's matrix for the matrix it factors, so `autodiff` stays at its default there,
+`AutoFiniteDiff()`, and a `jac` is refused.
 """
 struct TSAlpha2 <: PETScTSAlgorithm
     radius::Union{Nothing, Float64}
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 function TSAlpha2(
         petsc_options::AbstractVector{<:AbstractString} = String[];
-        radius = nothing, comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm, nothing),
+        radius = nothing, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+        autodiff = _default_autodiff(comm, dm),
     )
     radius === nothing || 0 <= radius <= 1 ||
         throw(ArgumentError("`radius` must be between 0 and 1, got $radius"))
     return TSAlpha2(
         radius === nothing ? nothing : Float64(radius),
-        String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+        String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+        _alg_comm(comm, dm), dm,
     )
 end
 
@@ -1033,7 +1044,14 @@ struct Ghosted{F, L}
     dm::Ptr{Cvoid}
 end
 
-function _ghosted(call, g::Ghosted, u)
+# A part of a DynamicalODEProblem, which gets the velocity and the position both ghosted.
+struct GhostedPart{F, L}
+    f::F
+    petsclib::L
+    dm::Ptr{Cvoid}
+end
+
+function _ghosted(call, g::Union{Ghosted, GhostedPart}, u)
     pl, dm = g.petsclib, g.dm
     loc = _dm_vec!(pl, :DMGetLocalVector, dm)
     try
@@ -1054,6 +1072,9 @@ end
 (g::Ghosted)(du, u, p, t) = _ghosted(a -> g.f(du, a, p, t), g, u)
 (g::Ghosted)(r, du, u, p, t) = _ghosted(a -> g.f(r, du, a, p, t), g, u)
 (g::Ghosted)(J, du, u, p, gamma, t) = _ghosted(a -> g.f(J, du, a, p, gamma, t), g, u)
+
+(g::GhostedPart)(d, v, u, p, t) =
+    _ghosted(a -> _ghosted(b -> g.f(d, a, b, p, t), g, u), g, v)
 
 """
     PETScDiffEq.reshape_local_array(x, dm)
@@ -4535,12 +4556,6 @@ function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
 end
 
 function _check_dynamical(prob, alg, has_mass, comm, dm)
-    dm === nothing || throw(
-        ArgumentError(
-            "PETScDiffEq cannot run a DynamicalODEProblem or SecondOrderODEProblem " *
-                "$_WITH_DM yet; pass its communicator as `comm` instead",
-        ),
-    )
     parts = prob.u0 isa AbstractVector && hasproperty(prob.u0, :x) ? prob.u0.x : ()
     length(parts) == 2 && all(x -> x isa AbstractVector, parts) || throw(
         ArgumentError(
@@ -4554,6 +4569,7 @@ function _check_dynamical(prob, alg, has_mass, comm, dm)
                 "SecondOrderODEProblem",
         ),
     )
+    dm === nothing || _check_dynamical_dm(prob, alg)
     alg isa TSAlpha2 || return nothing
     prob.problem_type isa SciMLBase.SecondOrderODEProblem || throw(
         ArgumentError(
@@ -4574,6 +4590,48 @@ function _check_dynamical(prob, alg, has_mass, comm, dm)
         ArgumentError(
             "TSAlpha2 takes a `jac_prototype` of the first-order system `[v; u]' = " *
                 "[f(v, u, p, t); v]`, $n x $n, but this one is $(join(size(proto), " x "))",
+        ),
+    )
+    return nothing
+end
+
+# Each block of the first-order form's Jacobian gets the DM's pattern, its rows running as the
+# state does, this rank's velocity and then its position.
+function _pair_matrix(pl, dm, m, comm)
+    rstart, cols, _, _ = _checked_everywhere(() -> _dm_pattern(pl, dm, m), comm)
+    starts = comm === nothing ? [rstart] : MPI.Allgather(rstart, comm)
+    sizes = comm === nothing ? [m] : MPI.Allgather(m, comm)
+    owner(c) = findlast(q -> sizes[q] > 0 && starts[q] <= c, eachindex(starts))
+    at(c, half) = (q = owner(c); 2 * starts[q] + half * sizes[q] + c - starts[q])
+    rows, pair_cols = LibPETSc.PetscInt[], LibPETSc.PetscInt[]
+    for half in 0:1, r in 1:m, c in cols[r], other in 0:1
+        push!(rows, 2 * rstart + half * m + r - 1)
+        push!(pair_cols, at(c, other))
+    end
+    mat = LibPETSc.MatCreate(pl, something(comm, MPI.COMM_SELF))
+    _coo_matrix!(mat, pl, 2m, 2 * sum(sizes), rows, pair_cols)
+    LibPETSc.MatSetValuesCOO(
+        pl, mat, zeros(PETSc.scalartype(pl), length(rows)), LibPETSc.INSERT_VALUES,
+    )
+    PETSc.assemble!(mat)
+    return mat
+end
+
+# The DM's matrix covers one half of the state, so the Jacobian is PETSc's colouring of it.
+function _check_dynamical_dm(prob, alg)
+    _uses_ifunction(alg) || return nothing
+    prob.f.jac === nothing || throw(
+        ArgumentError(
+            "PETScDiffEq cannot take a `jac` for a DynamicalODEProblem or " *
+                "SecondOrderODEProblem $_WITH_DM, whose matrix holds one half of the state; " *
+                "leave it out for PETSc's colouring",
+        ),
+    )
+    _petsc_differences(alg) || throw(
+        ArgumentError(
+            "PETScDiffEq cannot use `$(_autodiff(alg))` for a DynamicalODEProblem or " *
+                "SecondOrderODEProblem $_WITH_DM; leave `autodiff` at its default there, " *
+                "`AutoFiniteDiff()`, for PETSc's colouring",
         ),
     )
     return nothing
@@ -4648,10 +4706,12 @@ function _refuse_dm_autodiff(prob, alg, is_dae)
 end
 
 function _refuse_dm(prob, alg, is_dae)
-    alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX, TSGeneric} || throw(
+    alg isa Union{
+        TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX, TSGeneric, TSBasicSymplectic, TSAlpha2,
+    } || throw(
         ArgumentError(
             "PETScDiffEq cannot run $(nameof(typeof(alg))) $_WITH_DM; TSRK, TSRosW, " *
-                "TSImplicit, TSDAE, TSARKIMEX and TSGeneric can",
+                "TSImplicit, TSDAE, TSARKIMEX, TSGeneric, TSBasicSymplectic and TSAlpha2 can",
         ),
     )
     alg isa TSGeneric && !alg.explicit && !(alg.ts_type in _DM_IMPLICIT) && throw(
@@ -5057,12 +5117,22 @@ function _setup(
         )
         _checked_everywhere(comm) do
             m = _dm_local_size(petsclib, dm)
-            m == n || throw(
-                ArgumentError(
-                    "`u0` has $n entries on this rank, but the `dm` gives it $m, its own " *
-                        "grid points times the degrees of freedom at each",
-                ),
-            )
+            if dyn
+                nv == n - nv == m || throw(
+                    ArgumentError(
+                        "the initial velocity and position have $nv and $(n - nv) entries " *
+                            "on this rank, but the `dm` gives each $m, its own grid points " *
+                            "times the degrees of freedom at each",
+                    ),
+                )
+            else
+                m == n || throw(
+                    ArgumentError(
+                        "`u0` has $n entries on this rank, but the `dm` gives it $m, its " *
+                            "own grid points times the degrees of freedom at each",
+                    ),
+                )
+            end
         end
     end
 
@@ -5080,7 +5150,14 @@ function _setup(
     f1 = is_dae || dyn ? f1 : _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
     f1, f2 = _shaped(f1, shape), _shaped(f2, shape)
-    if dm !== nothing
+    if dm !== nothing && dyn
+        # A SecondOrderODEProblem's f2 is SciMLBase's `du .= v`, on the owned blocks.
+        owned = prob.problem_type isa SciMLBase.SecondOrderODEProblem
+        f1 = Partitioned(
+            GhostedPart(f1.f1, petsclib, dm.ptr),
+            owned ? f1.f2 : GhostedPart(f1.f2, petsclib, dm.ptr), nv,
+        )
+    elseif dm !== nothing
         f1 = Ghosted(f1, petsclib, dm.ptr)
         f2 = f2 === nothing ? nothing : Ghosted(f2, petsclib, dm.ptr)
     end
@@ -5235,7 +5312,9 @@ function _setup(
         )
     end
     clone = dm === nothing ? nothing : _clone_dm(petsclib, dm)
-    uvec = clone === nothing ? _state_vec(petsclib, comm, n) :
+    # The state of a DynamicalODEProblem is the DM's vector twice over, [v; u] on each rank.
+    pair = dyn && clone !== nothing
+    uvec = clone === nothing || pair ? _state_vec(petsclib, comm, n) :
         _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib)
     A = kept !== nothing ? Vector{U} : dyn ? typeof(similar(prob.u0, U)) :
         Array{U, ndims(prob.u0)}
@@ -5248,7 +5327,7 @@ function _setup(
         row_cols0, row_src, row_src2, row_buf, J0,
         R[], A[], A[], nothing, nothing,
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
-        clone === nothing ? _work_vec(petsclib, comm, uvec, n) :
+        clone === nothing || pair ? _work_vec(petsclib, comm, uvec, n) :
             _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
         R(NaN), similar(u0), t0, copy(u0), nothing, nothing, false,
@@ -5280,7 +5359,8 @@ function _setup(
     try
         h.ts = LibPETSc.TSCreate(petsclib, something(comm, MPI.COMM_SELF))
         ts = h.ts
-        clone === nothing || LibPETSc.TSSetDM(petsclib, ts, clone)
+        # TSAlpha2 steps the position alone, which the DM lays out and colours.
+        clone === nothing || pair && !(alg isa TSAlpha2) || LibPETSc.TSSetDM(petsclib, ts, clone)
         LibPETSc.TSSetProblemType(petsclib, ts, LibPETSc.TS_NONLINEAR)
         _check_ts_type(petsclib, _ts_type(alg))
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
@@ -5328,7 +5408,10 @@ function _setup(
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, ptrs.split_rhs, ctxptr)
             end
             if alg isa TSAlpha2
-                if comm !== nothing
+                if clone !== nothing
+                    h.fd_mat = LibPETSc.DMCreateMatrix(petsclib, clone)
+                    _difference_jacobian!(petsclib, ts, h.fd_mat, ctxptr)
+                elseif comm !== nothing
                     P = has_jac ? J0 : SparseMatrixCSC(prob.f.jac_prototype)
                     _distributed_second_order!(h, nv, P, has_jac, ptrs, ctxptr)
                 elseif has_jac
@@ -5342,6 +5425,9 @@ function _setup(
                 else
                     _difference_jacobian!(petsclib, ts, nothing, ctxptr)
                 end
+            elseif pair && _uses_ifunction(alg)
+                h.fd_mat = _pair_matrix(petsclib, dm.ptr, nv, comm)
+                _difference_jacobian!(petsclib, ts, h.fd_mat, ctxptr)
             elseif clone !== nothing && _uses_ifunction(alg)
                 mat = LibPETSc.DMCreateMatrix(petsclib, clone)
                 if has_jac
@@ -5423,7 +5509,8 @@ function _setup(
                 ],
             )
             clone !== nothing && _uses_ifunction(alg) && !has_jac &&
-                !_dm_coloured(petsclib, clone.ptr, h.fd_mat, n, comm, S) &&
+                (!pair || alg isa TSAlpha2) &&
+                !_dm_coloured(petsclib, clone.ptr, h.fd_mat, pair ? nv : n, comm, S) &&
                 append!(effective_options, ["-snes_fd_color_use_mat"])
             append!(effective_options, alg.petsc_options)
             append!(effective_options, extra_options)

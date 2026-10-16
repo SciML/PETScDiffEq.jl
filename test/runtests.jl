@@ -12798,7 +12798,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 PETScDiffEq.PETSc.getlib(; PetscScalar = Float64), MPI.COMM_SELF,
                 (PETScDiffEq.LibPETSc.DM_BOUNDARY_NONE,), (10,), 1, 1,
             )
-            @test_throws "SecondOrderODEProblem with a `dm` yet" SciMLBase.solve(
+            @test_throws "have 5 and 5 entries on this rank, but the `dm` gives each 10" SciMLBase.solve(
                 springs(), PETScDiffEq.TSRK("5dp"; dm = line),
             )
             PETScDiffEq.PETScCompat.destroy!(line)

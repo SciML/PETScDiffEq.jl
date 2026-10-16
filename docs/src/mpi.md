@@ -160,9 +160,9 @@ Jacobian from the prototype instead, for `TSAlpha2` and for the implicit algorit
 first-order form, as it does for an `ODEProblem`: the columns are coloured in the prototype's
 order, and each rank seeds the entries of its own `[v; u]` that those columns stand for, so
 `f1` and `f2` have to exchange dual numbers as `f` does there. It needs the sparse prototype,
-and other backends are refused. A `dm` is refused for these problems. Split over 1 to 3 ranks,
-unevenly on more than one, a 1-D wave equation and a
-chain of particles gave the serial solve's states to 3e-15 with `TSBasicSymplectic` and fixed
+and other backends are refused. A `dm` runs them as well, as described below. Split over 1 to 3
+ranks, unevenly on more than one, a 1-D wave equation and a chain of particles gave the serial
+solve's states to 3e-15 with `TSBasicSymplectic` and fixed
 steps of `TSRK`, the energy error included, and to 1.2e-9 with adaptive steps of `TSRK("5dp")`.
 `TSAlpha2` and `TSImplicit("bdf")` with a `jac` agreed to 2e-10 with `["-ksp_type", "preonly",
 "-pc_type", "redundant"]` in `petsc_options` and to 8e-8 with the default linear solver, and
@@ -217,7 +217,7 @@ six methods, and on one rank that of central differences of the same fixed-step 
 hand-written ones on the same ranks.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
-which all algorithms but `TSBasicSymplectic` and `TSAlpha2` take. The solve then runs on the DM's
+which every algorithm takes. The solve then runs on the DM's
 communicator, which `comm` may name too but not contradict, and `u0` is the block of the grid
 this rank owns, in the DM's order. `f(du, u, p, t)` gets `u` ghosted: before every call to `f`,
 including the package's own calls for the first step size, dense output, callbacks, `get_du`
@@ -452,6 +452,48 @@ and `du` owned. Everything else the package calls, such as a callback, `unstable
 DM itself stays free for further solves. A DM on `MPI.COMM_SELF`, or on a single rank, gives a
 serial solve. Only a DMDA, a DMStag or a DMPlex is taken so far, and any other DM, such as a
 DMShell, is refused with an `ArgumentError`.
+
+A `SecondOrderODEProblem` or `DynamicalODEProblem` runs on a DM as well, with
+`TSBasicSymplectic`, `TSAlpha2` or any algorithm on its first-order form. The velocity and the
+position are each a vector of the DM: the initial `v` and `u` are the blocks of the grid this
+rank owns, and the state PETSc steps holds this rank's velocity and then its position, as on a
+`comm`. `f1(dv, v, u, p, t)` gets both `v` and `u` ghosted, so `reshape_local_array` views
+either by grid point and a damping term can read the neighbouring velocities, and `dv` is the
+owned block. A `DynamicalODEProblem`'s `f2` gets them ghosted too, while a
+`SecondOrderODEProblem`'s, SciMLBase's `du = v`, gets the owned blocks. `TSAlpha2` steps the
+position alone, which the DM lays out, and PETSc colours the DM's matrix for the matrix it
+factors. An implicit algorithm on the first-order form gets a matrix whose four blocks, the
+velocity's and the position's rows and columns, each have the DM's pattern, and PETSc colours
+that. Both build their Jacobian only so: the DM's matrix holds one half of the state, so a
+`jac` and `autodiff` backends other than the default, `AutoFiniteDiff()`, are refused, and so
+is `PETScAdjoint`. The wave equation on the DMDA above:
+
+```julia
+function wave!(ddu, du, u, da, t)
+    U = PETScDiffEq.reshape_local_array(u, da)
+    D = PETScDiffEq.reshape_local_array(ddu, da)
+    for i in axes(D, 2)
+        D[1, i] = (U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2
+    end
+end
+
+u0 = sinpi.((xs .+ (1:xm)) .* dx)
+prob = SecondOrderODEProblem(wave!, zero(u0), u0, (0.0, 1.0), da)
+sol_rk = solve(prob, TSRK("4"; dm = da); dt = 1e-3)
+sol_verlet = solve(prob, TSBasicSymplectic("velverlet"; dm = da); dt = 1e-3)
+sol_alpha = solve(prob, TSAlpha2(; dm = da); dt = 1e-3)
+```
+
+On `MPI.COMM_SELF` and on 1 to 3 ranks, unevenly split, a wave with damping that reads the
+neighbouring velocities took the steps and states of the same solve on a `comm` bit for bit
+with `TSRK`, adaptive or not, and `TSBasicSymplectic`, through a callback that changes `u`, and
+those of the serial solve without a DM exactly. A DMDA with two coupled degrees of freedom, a
+`DynamicalODEProblem` whose `f2` reads the neighbouring momenta, the DMStag wave and the DMPlex
+reaction-diffusion above as accelerations, and reversed spans did the same with these
+algorithms. Under `["-snes_rtol", "1e-14", "-snes_atol", "1e-12", "-ksp_rtol", "1e-14"]`,
+`TSAlpha2` and `TSImplicit`'s `"cn"` and `"bdf"` at fixed steps matched the serial solves to
+2.2e-13, and `TSAlpha2` and `"bdf"` at adaptive ones took the same number of steps, with times
+within 1.9e-9 and states within 2.3e-8.
 
 `PETScAdjoint` runs with a `dm` too, for the methods and discrete costs it takes on a `comm`,
 and on a DM of a single rank for integral costs and a `SplitODEProblem` with `TSARKIMEX` as
