@@ -6444,19 +6444,26 @@ function _adopt_p!(integ::PETScIntegrator, p)
     return nothing
 end
 
-function _initialize_state!(integ::PETScIntegrator, init)
+# `slope` is the DAE's derivative in PETSc's time, as `ctx.fend` holds it.
+function _initialize_state!(integ::PETScIntegrator, init, slope = integ.h.ctx.fend)
     h = integ.h
+    ctx = h.ctx
     prob = _with_p(_summed(integ.prob, integ.alg), integ.p)
     u = integ.u isa Array ? vec(integ.u) : Vector(integ.u)
+    du = ctx.dae && slope !== nothing ? integ.tdir .* slope : _start_du(prob, u)
     before = h.ad_calls === nothing ? 0 : h.ad_calls[]
     p, ok = _initialize!(
-        u, prob, integ, init, h.f_init, h.jac_init, h.petsclib, h.ctx.comm, integ.t,
+        u, prob, integ, init, h.f_init, h.jac_init, h.petsclib, ctx.comm, integ.t,
         _user_t(integ.tdir, h.tf), real.(integ.opts.abstol), real.(integ.opts.reltol),
-        iszero(integ.dt) ? nothing : integ.dt, integ.opts.dtmax,
+        iszero(integ.dt) ? nothing : integ.dt, integ.opts.dtmax, du,
     )
     h.ad_calls === nothing || (h.ad_calls[] = before)
     u === integ.u || copyto!(integ.u, u)
     _overrides(init, prob.f) && _adopt_p!(integ, p)
+    if ok && ctx.dae && _resolve_init(init, prob.f) isa _INIT_ALGS
+        _end_step_here!(integ)
+        ctx.fend = integ.tdir .* du
+    end
     return ok
 end
 
@@ -6467,14 +6474,14 @@ function _initial_failure!(integ::PETScIntegrator)
     return nothing
 end
 
-function _reinitialize!(integ::PETScIntegrator, init, before)
+function _reinitialize!(integ::PETScIntegrator, init, before, slope = integ.h.ctx.fend)
     ctx = integ.h.ctx
     ctx.dae || ctx.M !== nothing || return nothing
     init = _resolve_init(something(init, _initializealg(integ)), integ.prob.f)
     # PETSc keeps a DAEProblem's derivative to itself, so a state left alone passes the check.
     ctx.dae && init isa SciMLBase.CheckInit && _everywhere(ctx.comm, integ.u == before) &&
         return nothing
-    _initialize_state!(integ, init) || _initial_failure!(integ)
+    _initialize_state!(integ, init, slope) || _initial_failure!(integ)
     return nothing
 end
 
@@ -6900,6 +6907,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     end
     best === nothing && return false
     saved = _save_step!(integ, best, false; slack = zero(best))
+    slope = ctx.fend
     _rollback!(integ, best, dt, true)
     residual = integ.event_residual[best_k]
     best_cb.rootfind === SciMLBase.NoRootFind ? fill!(residual, 0.0) :
@@ -6917,7 +6925,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     modified = _anywhere(ctx.comm, integ.derivative_discontinuity)
     stop === nothing ||
         (_stop!(integ, best_cb, stop, pre, best_crossing, modified); return true)
-    modified && _reinitialize!(integ, best_cb.initializealg, before)
+    modified && _reinitialize!(integ, best_cb.initializealg, before, slope)
     integ.finished && return true
     _rollback!(integ, integ.t, dt, false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)

@@ -3145,6 +3145,44 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.terminate!(integ)
         end
 
+        @testset "a DAE is initialized again from the derivative it holds, not du0" begin
+            ramp!(r, du, u, p, t) = (r[1] = du[1] - t; r[2] = u[2] - 2u[1]; nothing)
+            ramp = SciMLBase.DAEProblem(
+                ramp!, [0.0, 0.0], [0.0, 0.0], (0.0, 1.0); differential_vars = [true, false],
+            )
+            at_half = (u, t, integ) -> t == 0.5
+            for (shift, init) in (([1.0, 2.0], SciMLBase.CheckInit()), ([1.0, 0.0], brown))
+                integ = SciMLBase.init(
+                    ramp, PETScDiffEq.TSDAE(); initializealg = init, tstops = [0.5], tol...,
+                    callback = SciMLBase.DiscreteCallback(at_half, i -> (i.u .+= shift; nothing)),
+                )
+                while integ.t < 0.5
+                    SciMLBase.step!(integ)
+                end
+                @test SciMLBase.get_du(integ) ≈ [0.5, 1.0]
+                sol = SciMLBase.solve!(integ)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test isapprox(sol.u[end], [1.5, 3.0]; rtol = 1.0e-7)
+            end
+            integ = SciMLBase.init(ramp, PETScDiffEq.TSDAE(); tol...)
+            foreach(_ -> SciMLBase.step!(integ), 1:5)
+            SciMLBase.set_u!(integ, integ.u .+ [1.0, 2.0])
+            SciMLBase.initialize_dae!(integ)
+            @test SciMLBase.get_du(integ) ≈ [integ.t, 2integ.t]
+            unit!(r, du, u, p, t) = (r[1] = du[1] - 1; r[2] = u[2] - 2u[1]; nothing)
+            sol = SciMLBase.solve(
+                SciMLBase.DAEProblem(
+                    unit!, [0.0, 0.0], [0.0, 0.0], (0.0, 1.0); differential_vars = [true, false],
+                ), PETScDiffEq.TSDAE(); initializealg = brown, tol...,
+                callback = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> u[1] - 0.5, integ -> (integ.u .+= [1.0, 2.0]; nothing);
+                    initializealg = SciMLBase.CheckInit(),
+                ),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.u[end] ≈ [2.0, 4.0]
+        end
+
         @testset "a callback's change of p is initialized against, and a failure ends there" begin
             rooted!(du, u, p, t) = (du[1] = -u[1]; du[2] = u[2]^2 - p[1]; nothing)
             prob = SciMLBase.ODEProblem(
