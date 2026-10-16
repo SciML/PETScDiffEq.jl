@@ -81,8 +81,7 @@ its stage, at `t + theta * dt`, or in its endpoint form of
 or the algorithm's `autodiff`; where it is given and `dgdp_continuous` is not, the direct
 derivative with respect to `p` is taken as zero, as SciMLSensitivity's adjoints take it.
 Under `AutoFiniteDiff()` the derivatives have to be given. Given together with discrete
-terms, the two gradients are added. An integral cost is refused on a communicator other
-than `MPI.COMM_SELF`.
+terms, the two gradients are added.
 
 `petsc_options` apply to this adjoint's own run and are parsed after the algorithm's. The
 trajectory is kept in memory, every stage of every step; `-ts_trajectory_solution_only 1`
@@ -114,16 +113,21 @@ An implicit method's `autodiff` defaults to `AutoFiniteDiff()` on such a `comm`,
 `f2`'s `ODEFunction`, whose sparse `jac_prototype` of this rank's rows is needed with or
 without a `jac`. `dgdu_discrete` gets this rank's rows of the state and writes their
 derivative, and `dgdp_discrete` gives this rank's share of the direct derivative, which the
-ranks add up. `du0` holds this rank's rows, and `dp` is the whole gradient on every rank.
-The cost times, `no_start`, the length of `p` and whether `dgdp_discrete`, `jac` and
+ranks add up. An integral cost is split the same way: `g` gets this rank's rows and gives
+its share of the integrand, `dgdu_continuous` writes the derivative of the whole integrand
+with respect to those rows, and `dgdp_continuous` gives this rank's share of its direct
+derivative. A missing one is taken of this rank's share of `g` with respect to its own rows
+and `p`, so a `g` whose share reads other ranks' rows needs `dgdu_continuous`. `du0` holds
+this rank's rows, and `dp` is the whole gradient on every rank. The cost times, `no_start`,
+the length of `p`, whether there is an integral cost and whether `dgdp_discrete`, `jac` and
 `paramjac` are given must agree across the ranks. A `DynamicalODEProblem` or
 `SecondOrderODEProblem` runs there too: its `jac_prototype` holds this rank's `v` rows and
 then its `u` rows, with the columns of the whole `[v; u]` as in its solve, `paramjac` fills
 the same rows, a missing `jac` or `paramjac` is built as above, and the costs and `du0` are
 this rank's `ArrayPartition(v, u)`.
 
-With a `dm`, the adjoint runs on the DM as the solve does, for the same methods and discrete
-costs, and on a DM of a single rank for integral costs and a `SplitODEProblem` with
+With a `dm`, the adjoint runs on the DM as the solve does, for the same methods and costs,
+and on a DM of a single rank for a `SplitODEProblem` with
 `TSARKIMEX` too. The `ODEFunction`'s `jac(J, u, p, t)` then fills the DM's matrix from the
 ghosted `u` as in an implicit solve, an explicit method included, whose own solve ignores
 it, and its `paramjac(pJ, u, p, t)` gets `u` ghosted too and fills this rank's rows of `pJ`
@@ -483,11 +487,12 @@ mutable struct IntegralContext{T, P, DGU, DGP}
     u::Vector{Float64}
     gu::Vector{Float64}
     gp::Vector{Float64}
-    gu_col::Matrix{Float64}
-    gp_col::Matrix{Float64}
+    gp_rows::Vector{Float64}
+    p_rows::UnitRange{Int}
     gu_mat::Any
     gp_mat::Any
     err::Any
+    comm::Union{Nothing, MPI.Comm}
 end
 
 # Only the integral's gradient is returned, so the integrand PETSc sums can be zero.
@@ -533,8 +538,14 @@ function _integral_body!(q, s, x_ptr, A_ptr, dg!, out)
     try
         _readvec!(q.u, pl, PETSc.VecPtr(pl, x_ptr, false))
         fill!(out, 0.0)
-        dg! === nothing || dg!(out, q.u, q.p, _user_t(q.tdir, s))
+        dg! === nothing ||
+            _adjoint_call!(() -> dg!(out, q.u, q.p, _user_t(q.tdir, s)), q, out)
         LinearAlgebra.rmul!(out, q.tdir)
+        # Each rank's dg/dp is its share, and mu holds the rows of p this rank owns.
+        if out === q.gp && q.comm !== nothing
+            MPI.Allreduce!(out, +, q.comm)
+            copyto!(q.gp_rows, view(out, q.p_rows))
+        end
         PETSc.assemble!(LibPETSc.PetscMat(A_ptr, pl))
     catch e
         q.err = e
@@ -857,12 +868,6 @@ function _check_adjoint_problem(
                 "cost needs its derivative with respect to the state, so give one of those",
         ),
     )
-    integral && comm !== nothing && throw(
-        ArgumentError(
-            "PETScAdjoint supports an integral cost on MPI.COMM_SELF only; $_NOT_SELF " *
-                "give discrete costs, `t` with `dgdu_discrete`",
-        ),
-    )
     integral && differences && dgdu_continuous === nothing && throw(
         ArgumentError(
             "PETScAdjoint needs `dgdu_continuous` under `autodiff = AutoFiniteDiff()`, " *
@@ -1038,7 +1043,8 @@ function _check_agreement(comm, args)
     throw(
         ArgumentError(
             "PETScAdjoint $_NOT_SELF needs the same cost times `t`, `no_start`, number of " *
-                "parameters and choice of `dgdp_discrete`, `jac` and `paramjac` on every rank",
+                "parameters, presence of an integral cost and choice of `dgdp_discrete`, " *
+                "`jac` and `paramjac` on every rank",
         ),
     )
 end
@@ -1077,8 +1083,15 @@ function _quadrature_ts(pl, ts)
     return quad[]
 end
 
-function _set_integral!(q::IntegralContext, ts, np)
-    pl = q.petsclib
+# A matrix of one column holding `data`, this rank's `n` of its `N` rows.
+_column(pl, ::Nothing, data, n, N) = PETScCompat.PetscMat(pl, reshape(data, n, 1))
+_column(pl, comm::MPI.Comm, data, n, N) = LibPETSc.MatCreateDense(
+    pl, comm, LibPETSc.PetscInt(n), LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE),
+    LibPETSc.PetscInt(N), LibPETSc.PetscInt(1), pointer(data),
+)
+
+function _set_integral!(q::IntegralContext, ts, N, mu)
+    pl, n, np = q.petsclib, length(q.u), length(q.gp)
     qptr = pointer_from_objref(q)
     quad = _quadrature_ts(pl, ts)
     code = ccall(
@@ -1087,7 +1100,7 @@ function _set_integral!(q::IntegralContext, ts, np)
         quad, C_NULL, INTEGRAL_RHS_PTR[], qptr,
     )
     _check_code(code, "TSSetRHSFunction")
-    q.gu_mat = PETScCompat.PetscMat(pl, q.gu_col)
+    q.gu_mat = _column(pl, q.comm, q.gu, n, N)
     code = ccall(
         _symbol(pl, :TSSetRHSJacobian), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
@@ -1095,8 +1108,13 @@ function _set_integral!(q::IntegralContext, ts, np)
     )
     _check_code(code, "TSSetRHSJacobian")
     np == 0 && return nothing
+    if q.comm !== nothing
+        lo, hi = LibPETSc.VecGetOwnershipRange(pl, mu)
+        q.p_rows = (lo + 1):hi
+        q.gp_rows = zeros(hi - lo)
+    end
     # PETSc's RK adjoint reads this matrix whenever mu is asked for, zero or not.
-    q.gp_mat = PETScCompat.PetscMat(pl, q.gp_col)
+    q.gp_mat = _column(pl, q.comm, q.gp_rows, length(q.gp_rows), np)
     code = ccall(
         _symbol(pl, :TSSetRHSJacobianP), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
@@ -1195,7 +1213,7 @@ function _discrete_adjoint_unlocked(
         (
             cost_t, skip_start, np, dgdp_discrete === nothing, prob.f.jac === nothing,
             prob.f.paramjac === nothing, is_split && prob.f.f2.jac === nothing,
-            is_split && prob.f.f2.paramjac === nothing,
+            is_split && prob.f.f2.paramjac === nothing, integral,
         ),
     )
 
@@ -1307,13 +1325,11 @@ function _discrete_adjoint_unlocked(
                     _ad_cost_gradient(backend, g, h.u0, p, user_t0, _g_of_u) : dgdu_continuous,
                 np > 0 && dgdu_continuous === nothing && dgdp_continuous === nothing ?
                     _ad_cost_gradient(backend, g, h.u0, p, user_t0, _g_of_p) : dgdp_continuous,
-                zeros(n), gu, gp, reshape(gu, n, 1), reshape(gp, np, 1), nothing, nothing,
-                nothing,
+                zeros(n), gu, gp, gp, 1:np, nothing, nothing, nothing, comm,
             )
         end
         adjptr = pointer_from_objref(adj)
         GC.@preserve ctx adj q ex begin
-            integral && _set_integral!(q, ts, np)
             implicit || (
                 dm === nothing ? _set_rhs_jacobian!(adj, ts, n, N, coo_rows, coo_cols) :
                     _set_dm_rhs_jacobian!(adj, ts)
@@ -1336,6 +1352,7 @@ function _discrete_adjoint_unlocked(
                 end
                 push!(adj.muarr, adj.mu.ptr)
             end
+            integral && _set_integral!(q, ts, N, adj.mu)
             adj.lam = comm === nothing ? PETScCompat.PetscVec(pl, adj.lam_buf) :
                 LibPETSc.VecCreateMPIWithArray(
                     pl, comm, LibPETSc.PetscInt(1), LibPETSc.PetscInt(n),

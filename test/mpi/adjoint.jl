@@ -32,6 +32,9 @@ const SPLIT_AD_GAP = 5.0e-14
 # within 3.3e-14 with `jac` and `paramjac` built.
 const WAVE_GAP = 2.0e-13
 const FD_GAP = 2.0e-9
+# Measured at 1 to 3 ranks: an adaptive solve with an integral cost is within 2.8e-13 of the
+# serial adjoint, whose steps differ by its error norms' rounding.
+const ADAPTIVE_GAP = 1.0e-12
 const thrower = nranks - 1
 
 function uneven(n)
@@ -180,6 +183,26 @@ function gradient(prob, alg, times, idx; kw...)
         dgdp_discrete = cost_dp(idx), dt = DT, adaptive = false, kw...,
     )
 end
+
+# Each rank's `g` is its share of the integrand, on its own rows.
+integrand(idx) = (u, p, t) -> cost(u, p, idx)
+integrand_du(idx) = (out, u, p, t) -> cost_du(idx)(out, u, p, t, 0)
+integrand_dp(idx) = (out, u, p, t) -> cost_dp(idx)(out, u, p, t, 0)
+const INTEGRALS = (
+    ("g", idx -> (; g = integrand(idx))),
+    ("dgdu_continuous", idx -> (; dgdu_continuous = integrand_du(idx))),
+    (
+        "both derivatives and discrete costs",
+        idx -> (;
+            dgdu_continuous = integrand_du(idx), dgdp_continuous = integrand_dp(idx),
+            t = FORWARD[2], dgdu_discrete = cost_du(idx),
+        ),
+    ),
+)
+
+integral(prob, alg, costs; kw...) = PETScDiffEq._discrete_adjoint(
+    prob, alg, PETScAdjoint(); costs..., dt = DT, adaptive = false, kw...,
+)
 
 function loss(alg, tspan, times, u0, p, problem)
     sol = solve(problem(rows, halo; tspan, u0, p), alg; dt = DT, adaptive = false, saveat = times)
@@ -575,6 +598,50 @@ end
         rank == 0 && @test relerr(mine, ref) <= SERIAL_GAP
     end
 
+    @testset "an integral cost matches the serial adjoint: $name, $dir, $what" for (name, make) in
+            METHODS[1:4], (dir, (tspan, times, p)) in (("forward", FORWARD), ("backward", BACKWARD)),
+            (what, costs) in INTEGRALS
+        built = (; autodiff = AutoForwardDiff())
+        du0, dp = integral(heat_problem(rows, halo; tspan, p), make(comm; built...), costs(rows))
+        @test same_everywhere(dp)
+        mine = vcat(gathered(du0, counts), vec(dp))
+        if rank == 0
+            serial = integral(
+                heat_problem(1:N, walls; tspan, p), make(MPI.COMM_SELF; built...), costs(1:N),
+            )
+            @test relerr(mine, vcat(serial[1], vec(serial[2]))) <= SERIAL_GAP
+        end
+    end
+
+    @testset "an integral cost in an adaptive solve matches the serial adjoint: $dir, $what" for (
+                dir, (tspan, times, p),
+            ) in (("forward", FORWARD), ("backward", BACKWARD)), (what, costs) in INTEGRALS[1:2]
+        tolerances = (adaptive = true, abstol = 1.0e-6, reltol = 1.0e-6)
+        du0, dp = integral(
+            heat_problem(rows, halo; tspan, p), TSRK("5dp"; comm), costs(rows); tolerances...,
+        )
+        @test same_everywhere(dp)
+        mine = vcat(gathered(du0, counts), vec(dp))
+        if rank == 0
+            serial = integral(
+                heat_problem(1:N, walls; tspan, p), TSRK("5dp"), costs(1:N); tolerances...,
+            )
+            @test relerr(mine, vcat(serial[1], vec(serial[2]))) <= ADAPTIVE_GAP
+        end
+    end
+
+    @testset "an integral cost on a dm matches the comm-mode adjoint: $name, $what" for (
+                name, make,
+            ) in METHODS[1:4], (what, costs) in INTEGRALS
+        built = (; autodiff = AutoForwardDiff())
+        du0, dp = integral(dm_problem(), with_dm(name; built...), costs(rows))
+        @test same_everywhere(dp)
+        ref = integral(heat_problem(rows, halo), make(comm; built...), costs(rows))
+        mine = vcat(gathered(du0, counts), vec(dp))
+        theirs = vcat(gathered(ref[1], counts), vec(ref[2]))
+        rank == 0 && @test relerr(mine, theirs) <= DM_GAP
+    end
+
     @testset "a partitioned problem matches the serial adjoint and finite differences: $name, $dir" for (
                 name, make,
             ) in METHODS, (dir, (tspan, times)) in (("forward", FORWARD[1:2]), ("backward", BACKWARD[1:2]))
@@ -693,6 +760,28 @@ end
         @test raised(e, "$what threw")
     end
 
+    @testset "an integral cost throwing on one rank raises on every rank: $what, $name" for (
+            what, name, alg,
+        ) in (
+            ("g", "TSRK", TSRK("4"; comm)),
+            ("dgdu_continuous", "Crank-Nicolson", TSImplicit("cn", exact(comm); comm)),
+            ("dgdp_continuous", "TSRK", TSRK("4"; comm)),
+            ("g", "TSRK with a dm", TSRK("4"; dm = da)),
+            ("dgdp_continuous", "Crank-Nicolson with a dm", with_dm("Crank-Nicolson")),
+        )
+        # The adjoint runs from tspan's end, so its first calls see t > 0.05.
+        late = (args...) -> args[end] > 0.05
+        pick(key, f) = key == what ? throwing(f, what, late) : f
+        g = function (u, p, t)
+            rank == thrower && late(t) && error("g threw on rank $rank")
+            return cost(u, p, rows)
+        end
+        du, dp = pick("dgdu_continuous", integrand_du(rows)), pick("dgdp_continuous", integrand_dp(rows))
+        costs = what == "g" ? (; g) : (; dgdu_continuous = du, dgdp_continuous = dp)
+        prob = alg.dm === nothing ? heat_problem(rows, halo) : dm_problem()
+        @test raised(caught(() -> integral(prob, alg, costs)), "$what threw")
+    end
+
     @testset "f2's $what throwing on one rank raises on every rank" for what in ("jac", "paramjac")
         pick(key, f) = key == what ? throwing(f, what, (args...) -> true) : f
         prob = split_problem(
@@ -752,9 +841,11 @@ end
             () -> gradient(heat_with(jac_prototype = nothing), rk, times, rows),
             "sparse `jac_prototype`",
         )
-        @test refused(
-            () -> gradient(heat_with(), rk, times, rows; g = (u, p, t) -> sum(abs2, u)),
-            "integral cost on MPI.COMM_SELF only",
+        nranks > 1 && @test refused(
+            () -> gradient(
+                heat_with(), rk, times, rows; (rank == thrower ? (; g = integrand(rows)) : (;))...,
+            ),
+            "presence of an integral cost",
         )
         imex = TSARKIMEX("l2"; comm, autodiff = AutoForwardDiff())
         imex_zygote = TSARKIMEX("l2"; comm, autodiff = PETScDiffEq.ADTypes.AutoZygote())
@@ -854,10 +945,6 @@ end
         @test rank == thrower ? e isa ArgumentError && occursin("`paramjac`", e.msg) : remote(e)
         nranks > 1 && @test refused(
             () -> gradient(some, rk_dm, times, rows), "`jac` and `paramjac` on every rank",
-        )
-        nranks > 1 && @test refused(
-            () -> gradient(dm_problem(), rk_dm, times, rows; g = (u, p, t) -> sum(abs2, u)),
-            "integral cost on MPI.COMM_SELF only",
         )
         for (alg, kw, what) in (
                 (colouring, (; jac = nothing), "`jac` under `autodiff = AutoFiniteDiff()`"),
