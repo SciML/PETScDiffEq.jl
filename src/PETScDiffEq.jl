@@ -2083,6 +2083,12 @@ _no_interpolant(ctx) = ArgumentError(
         "as BDF, or keep saveat times on step ends and pass `rootfind = NoRootFind`",
 )
 
+_no_du() = ArgumentError(
+    "a DAEProblem gives no derivative to evaluate, so `get_du` has only the one its " *
+        "initialization or PETSc's last step paired with the state, which has changed " *
+        "since; take a step first",
+)
+
 _no_slope(ctx) = ArgumentError(
     "a mass matrix or a DAEProblem gives no derivative to build a Hermite interpolant " *
         "from, so `$(ctx.alg_name)` has no slope for integrator(t, Val{1})",
@@ -5132,10 +5138,11 @@ function _setup(
     end
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
     jac_init = jac_fn
+    du0 = _start_du(prob, u0)
     p, initialized = _initialize!(
         u0, prob, prob, initializealg, f1, jac_init, petsclib, comm,
         R(prob.tspan[1]), R(prob.tspan[2]), real.(something(abstol, 1.0e-6)),
-        real.(something(reltol, 1.0e-3)), dt, dtmax,
+        real.(something(reltol, 1.0e-3)), dt, dtmax, du0,
     )
     ad_calls === nothing || (ad_calls[] = ad_before)
     user_f1, user_f2 = f1, f2
@@ -5251,7 +5258,8 @@ function _setup(
         clone === nothing ? _work_vec(petsclib, comm, uvec, n) :
             _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
-        R(NaN), similar(u0), t0, copy(u0), nothing, nothing, false,
+        R(NaN), similar(u0), t0, copy(u0), nothing, du0 === nothing ? nothing : tdir .* du0,
+        false,
         slow_idxs, medium_idxs, fast_idxs,
         R(NaN), similar(u0), false,
         zero(R), false,
@@ -6149,10 +6157,19 @@ function _raise_threw!(integ::PETScIntegrator)
 end
 
 function _checked_du(integ::PETScIntegrator)
-    du = integ.tdir .* _derivative(integ.h.ctx, integ.tdir * integ.t, integ.u)
-    _raise_threw!(integ)
+    ctx = integ.h.ctx
+    if ctx.dae
+        _everywhere(ctx.comm, _at_step_end(integ)) || throw(_no_du())
+        du = integ.tdir .* ctx.fend
+    else
+        du = integ.tdir .* _derivative(ctx, integ.tdir * integ.t, integ.u)
+        _raise_threw!(integ)
+    end
     return _integ_state(integ.prob, du, identity)
 end
+
+_at_step_end(integ::PETScIntegrator) = integ.h.ctx.fend !== nothing &&
+    integ.tdir * integ.t == integ.h.ctx.end_s && integ.u == integ.h.ctx.end_u
 
 _integ_state(prob, x, f = copy) =
     prob.f isa SciMLBase.DynamicalODEFunction ? _partition(prob.u0, x) :
@@ -6453,6 +6470,29 @@ function _end_step_here!(integ::PETScIntegrator)
     ctx.end_s = integ.tdir * integ.t
     copyto!(ctx.end_u, integ.u)
     ctx.fend = nothing
+    return nothing
+end
+
+# BDF solves for the slope at its step's end; the theta methods step along the chord.
+function _keep_dae_slope!(integ::PETScIntegrator)
+    ctx = integ.h.ctx
+    ctx.fend = ctx.alg_name == "bdf" ? copy(ctx.mudot) :
+        (integ.u .- integ.uprev) ./ (integ.tdir * integ.dt)
+    return nothing
+end
+
+# ksponly never evaluates the residual at its solution, where BDF's slope is formed.
+function _linear_bdf_slope!(h)
+    ctx, pl = h.ctx, h.petsclib
+    ctx.dae && ctx.linear && ctx.alg_name == "bdf" || return nothing
+    Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) < 0 && return nothing
+    _check_code(
+        ccall(
+            _symbol(pl, :SNESComputeFunction), LibPETSc.PetscErrorCode,
+            (LibPETSc.CSNES, LibPETSc.CVec, LibPETSc.CVec),
+            _snes(pl, h.ts.ptr), h.u.ptr, ctx.work.ptr,
+        ),
+    )
     return nothing
 end
 
@@ -7252,6 +7292,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         _hold_work_vec!(ctx, h.ts)
     failure = _run!(h) do
         LibPETSc.TSStep(pl, h.ts)
+        _linear_bdf_slope!(h)
     end
     if _threw!(ctx)
         err = ctx.err
@@ -7298,6 +7339,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         return _reject_step!(integ, before, abs(integ.t - integ.tprev))
     end
     _end_step_here!(integ)
+    ctx.dae && _keep_dae_slope!(integ)
     _live_stats!(integ)
     fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing

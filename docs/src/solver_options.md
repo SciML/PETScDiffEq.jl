@@ -70,6 +70,9 @@ With a mass matrix or a `DAEProblem` only PETSc's is available, and a type that 
 raises an `ArgumentError` when such a state is needed. `integrator(t, Val{1})` is the slope
 of the cubic Hermite interpolant through the step's ends, the interpolant's own derivative
 where the package interpolates itself, and it raises with a mass matrix or a `DAEProblem`.
+On a `DAEProblem`, `get_du` is the derivative its initialization or its last step paired with
+the state, the slope at the step's end for `TSDAE("bdf")` and the step's chord for the other
+subtypes, and it raises an `ArgumentError` once the state has changed since.
 `integrator(t; idxs)`, a vector of times and `integrator(out, t)` take the forms
 OrdinaryDiffEq's integrator does.
 

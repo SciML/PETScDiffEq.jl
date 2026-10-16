@@ -2471,6 +2471,69 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             sol = SciMLBase.solve!(integ)
             @test abs(sol.u[end][1] - exp(-1)) < 1.0e-6
         end
+
+        @testset "get_du is the slope paired with u by the start or the last step" begin
+            prob = SciMLBase.DAEProblem(withjac, du0, u0, tspan)
+            for opts in (String[], ["-snes_type", "ksponly"])
+                integ = SciMLBase.init(prob, PETScDiffEq.TSDAE("bdf", opts))
+                @test SciMLBase.get_du(integ) == du0
+                foreach(_ -> SciMLBase.step!(integ), 1:20)
+                du = SciMLBase.get_du(integ)
+                @test abs(du[1] + integ.u[1]) < 1.0e-12
+                @test du[2] ≈ du[1]
+                @test isapprox(du[1], -exp(-integ.t); rtol = 1.0e-2)
+                out = zeros(2)
+                @test SciMLBase.get_du!(out, integ) === out
+                @test out == du
+                SciMLBase.solve!(integ)
+                @test isapprox(SciMLBase.get_du(integ)[1], -exp(-1); rtol = 1.0e-2)
+            end
+            for subtype in ("beuler", "cn")
+                integ = SciMLBase.init(prob, PETScDiffEq.TSDAE(subtype); dt = 0.01)
+                foreach(_ -> SciMLBase.step!(integ), 1:3)
+                @test SciMLBase.get_du(integ) ≈
+                    (integ.u - integ.uprev) / (integ.t - integ.tprev)
+            end
+            back = SciMLBase.DAEProblem(withjac, exp(-1) .* du0, exp(-1) .* u0, (1.0, 0.0))
+            integ = SciMLBase.init(back, PETScDiffEq.TSDAE())
+            foreach(_ -> SciMLBase.step!(integ), 1:20)
+            @test abs(SciMLBase.get_du(integ)[1] + integ.u[1]) < 1.0e-12
+            dv = [true, false]
+            brown = DiffEqBase.BrownFullBasicInit()
+            integ = SciMLBase.init(
+                SciMLBase.DAEProblem(withjac, [0.0, -1.0], u0, tspan; differential_vars = dv),
+                PETScDiffEq.TSDAE(); initializealg = brown,
+            )
+            @test SciMLBase.get_du(integ) ≈ [-1.0, -1.0]
+            seen = []
+            function halve!(integ)
+                push!(seen, SciMLBase.get_du(integ) + integ.u)
+                integ.u .*= 0.5
+                push!(
+                    seen, try
+                        SciMLBase.get_du(integ)
+                    catch e
+                        e
+                    end,
+                )
+                return nothing
+            end
+            once = (u, t, integ) -> t > 0.1 && isempty(seen)
+            integ = SciMLBase.init(
+                SciMLBase.DAEProblem(withjac, du0, u0, tspan; differential_vars = dv),
+                PETScDiffEq.TSDAE(); initializealg = brown,
+                callback = SciMLBase.DiscreteCallback(once, halve!),
+            )
+            while isempty(seen)
+                SciMLBase.step!(integ)
+            end
+            @test maximum(abs, seen[1]) < 1.0e-12
+            @test seen[2] isa ArgumentError
+            SciMLBase.step!(integ)
+            @test abs(SciMLBase.get_du(integ)[1] + integ.u[1]) < 1.0e-12
+            SciMLBase.set_u!(integ, 2 .* integ.u)
+            @test_throws ArgumentError SciMLBase.get_du(integ)
+        end
     end
 
     @testset "DAE initialization" begin
