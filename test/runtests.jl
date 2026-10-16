@@ -65,6 +65,22 @@ function damped_oscillator_jac!(J, u, p, t)
 end
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
+# An array type of its own over a plain Vector, read by name as a ComponentArray is.
+struct Named{T} <: AbstractVector{T}
+    data::Vector{T}
+end
+Base.size(x::Named) = size(getfield(x, :data))
+Base.IndexStyle(::Type{<:Named}) = IndexLinear()
+Base.getindex(x::Named, i::Int) = getfield(x, :data)[i]
+Base.setindex!(x::Named, v, i::Int) = (getfield(x, :data)[i] = v; x)
+Base.similar(::Named, ::Type{T}, dims::Dims{1}) where {T} = Named(Vector{T}(undef, dims))
+Base.BroadcastStyle(::Type{<:Named}) = Broadcast.ArrayStyle{Named}()
+Base.similar(bc::Broadcast.Broadcasted{Broadcast.ArrayStyle{Named}}, ::Type{T}) where {T} =
+    Named(Vector{T}(undef, length(bc)))
+Base.getproperty(x::Named, s::Symbol) =
+    s === :a ? x[1] : s === :b ? view(x, 2:length(x)) : getfield(x, s)
+Base.setproperty!(x::Named, s::Symbol, v) = s === :a ? (x[1] = v) : setfield!(x, s, v)
+
 # GROUP=MPI2 is MPI on 2 ranks, for a workflow that passes only GROUP.
 const GROUP, GROUP_RANKS = let group = get(ENV, "GROUP", ""), ranks = match(r"^MPI([123])$", group)
     isempty(group) ? ("All", "") : ranks === nothing ? (group, "") : ("MPI", String(ranks[1]))
@@ -634,6 +650,36 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test after.u[k][1] ≈ 10.5
     end
 
+    @testset "stops and saved points 1e-14 apart on a 1 ns span" begin
+        fast!(du, u, p, t) = (du[1] = -1.0e9 * u[1]; nothing)
+        prob = SciMLBase.ODEProblem(fast!, [1.0], (0.0, 1.0e-9))
+        back = SciMLBase.ODEProblem(fast!, [exp(-1.0)], (1.0e-9, 0.0))
+        alg = PETScDiffEq.TSRK("5dp")
+        tol = (abstol = 1.0e-12, reltol = 1.0e-12)
+        inner = (save_start = false, save_end = false)
+        err(sol) = maximum(abs(sol.u[i][1] * exp(1.0e9 * sol.t[i]) - 1) for i in eachindex(sol.t))
+        idle = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+        for kw in ((;), (callback = idle,))
+            t10 = SciMLBase.solve(prob, alg; tol..., kw...).t[10]
+            near = [1.0e-14, t10 - 2.0e-14, t10 + 2.0e-14, 1.0e-9 - 1.0e-14]
+            sol = SciMLBase.solve(prob, alg; saveat = near, inner..., tol..., kw...)
+            @test sol.t == near
+            @test err(sol) < 1.0e-11
+            sol = SciMLBase.solve(back, alg; saveat = reverse(near), inner..., tol..., kw...)
+            @test sol.t == reverse(near)
+            @test err(sol) < 1.0e-11
+        end
+        stops = [3.0e-10, 3.0e-10 + 1.0e-14, 1.0e-9 - 1.0e-14]
+        hits = Float64[]
+        tick = SciMLBase.DiscreteCallback((u, t, integ) -> t in stops, integ -> push!(hits, integ.t))
+        SciMLBase.solve(prob, alg; tstops = stops, callback = tick, tol...)
+        @test hits == stops
+        quit = SciMLBase.DiscreteCallback((u, t, integ) -> t == stops[end], SciMLBase.terminate!)
+        sol = SciMLBase.solve(prob, alg; tstops = stops[end:end], callback = quit, tol...)
+        @test sol.retcode == SciMLBase.ReturnCode.Terminated
+        @test sol.t[end] == stops[end]
+    end
+
     @testset "an exception from the user's code leaves no PETSc traceback" begin
         throws!(du, u, p, t) = (t > 0.3 && error("boom"); du[1] = -u[1]; nothing)
         bad = SciMLBase.ODEProblem(throws!, [1.0], (0.0, 1.0))
@@ -660,6 +706,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test err isa ErrorException && err.msg == "boom"
             @test !occursin("PETSC ERROR", read(path, String))
         end
+    end
+
+    failing_petsc_call(::Ptr{Cvoid}, ::Ptr{Cvoid}) = PETScDiffEq.LibPETSc.PetscErrorCode(62)
+
+    @testset "an error code PETSc returns is raised, not ignored" begin
+        pl = PETScDiffEq.PETSc.getlib(; PetscScalar = Float64)
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        never = (dt, u, p, t) -> false
+        for name in (:TSSetPostStep, :TSGetSolution)
+            key = (pl.petsc_library, name)
+            original = PETScDiffEq._symbol(pl, name)
+            PETScDiffEq.PETSC_SYMBOLS[key] = @cfunction(
+                failing_petsc_call, PETScDiffEq.LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
+            )
+            try
+                @test_throws PETScDiffEq.LibPETSc.PetscError(62) SciMLBase.solve(
+                    prob, PETScDiffEq.TSRK("5dp"); unstable_check = never,
+                )
+            finally
+                PETScDiffEq.PETSC_SYMBOLS[key] = original
+            end
+        end
+        @test SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); unstable_check = never).retcode ==
+            SciMLBase.ReturnCode.Success
     end
 
     @testset "Float32" begin
@@ -2471,6 +2541,69 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             sol = SciMLBase.solve!(integ)
             @test abs(sol.u[end][1] - exp(-1)) < 1.0e-6
         end
+
+        @testset "get_du is the slope paired with u by the start or the last step" begin
+            prob = SciMLBase.DAEProblem(withjac, du0, u0, tspan)
+            for opts in (String[], ["-snes_type", "ksponly"])
+                integ = SciMLBase.init(prob, PETScDiffEq.TSDAE("bdf", opts))
+                @test SciMLBase.get_du(integ) == du0
+                foreach(_ -> SciMLBase.step!(integ), 1:20)
+                du = SciMLBase.get_du(integ)
+                @test abs(du[1] + integ.u[1]) < 1.0e-12
+                @test du[2] ≈ du[1]
+                @test isapprox(du[1], -exp(-integ.t); rtol = 1.0e-2)
+                out = zeros(2)
+                @test SciMLBase.get_du!(out, integ) === out
+                @test out == du
+                SciMLBase.solve!(integ)
+                @test isapprox(SciMLBase.get_du(integ)[1], -exp(-1); rtol = 1.0e-2)
+            end
+            for subtype in ("beuler", "cn")
+                integ = SciMLBase.init(prob, PETScDiffEq.TSDAE(subtype); dt = 0.01)
+                foreach(_ -> SciMLBase.step!(integ), 1:3)
+                @test SciMLBase.get_du(integ) ≈
+                    (integ.u - integ.uprev) / (integ.t - integ.tprev)
+            end
+            back = SciMLBase.DAEProblem(withjac, exp(-1) .* du0, exp(-1) .* u0, (1.0, 0.0))
+            integ = SciMLBase.init(back, PETScDiffEq.TSDAE())
+            foreach(_ -> SciMLBase.step!(integ), 1:20)
+            @test abs(SciMLBase.get_du(integ)[1] + integ.u[1]) < 1.0e-12
+            dv = [true, false]
+            brown = DiffEqBase.BrownFullBasicInit()
+            integ = SciMLBase.init(
+                SciMLBase.DAEProblem(withjac, [0.0, -1.0], u0, tspan; differential_vars = dv),
+                PETScDiffEq.TSDAE(); initializealg = brown,
+            )
+            @test SciMLBase.get_du(integ) ≈ [-1.0, -1.0]
+            seen = []
+            function halve!(integ)
+                push!(seen, SciMLBase.get_du(integ) + integ.u)
+                integ.u .*= 0.5
+                push!(
+                    seen, try
+                        SciMLBase.get_du(integ)
+                    catch e
+                        e
+                    end,
+                )
+                return nothing
+            end
+            once = (u, t, integ) -> t > 0.1 && isempty(seen)
+            integ = SciMLBase.init(
+                SciMLBase.DAEProblem(withjac, du0, u0, tspan; differential_vars = dv),
+                PETScDiffEq.TSDAE(); initializealg = brown,
+                callback = SciMLBase.DiscreteCallback(once, halve!),
+            )
+            while isempty(seen)
+                SciMLBase.step!(integ)
+            end
+            @test maximum(abs, seen[1]) < 1.0e-12
+            @test seen[2] isa ArgumentError
+            SciMLBase.step!(integ)
+            @test abs(SciMLBase.get_du(integ)[1] + integ.u[1]) < 1.0e-12
+            SciMLBase.set_u!(integ, 2 .* integ.u)
+            @test_throws ArgumentError SciMLBase.get_du(integ)
+        end
     end
 
     @testset "DAE initialization" begin
@@ -4044,7 +4177,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test SciMLBase.get_du(integ)[1] ≈ -integ.u[1]
             mid = (integ.tprev + integ.t) / 2
             @test abs(integ(mid)[1] - exp(-mid)) < 1.0e-6
-            @test_throws ArgumentError integ(integ.t + 1.0)
+            ahead = integ.t + integ.dt / 2
+            @test abs(integ(ahead)[1] - exp(-ahead)) < 5.0e-6
             SciMLBase.add_saveat!(integ, 0.55)
             SciMLBase.set_proposed_dt!(integ, 0.05)
             sol = SciMLBase.solve!(integ)
@@ -4070,6 +4204,63 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test worst[1] < 3.0e-6
                 @test worst[2] < 3.0e-5
             end
+        end
+
+        @testset "PositiveDomain and GeneralDomain extrapolate past the step" begin
+            fall!(du, u, p, t) = (du .= -50 .* u; nothing)
+            drop = SciMLBase.ODEProblem(fall!, [1.0, 2.0], (0.0, 1.0))
+            outside!(resid, u, p, t) = (resid .= max.(.-u, 0.0); nothing)
+            general() = DiffEqCallbacks.GeneralDomain(
+                outside!, [1.0, 2.0]; autodiff = PETScDiffEq.AutoForwardDiff(),
+                resid_prototype = zeros(2),
+            )
+            @test minimum(minimum, SciMLBase.solve(drop, PETScDiffEq.TSRK("3bs")).u) < 0
+            algs = (
+                PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRK("3bs"),
+                PETScDiffEq.TSRosW("ra34pw2"), PETScDiffEq.TSImplicit("bdf"; order = 3),
+            )
+            for alg in algs, domain in (DiffEqCallbacks.PositiveDomain, general)
+                integ = SciMLBase.init(drop, alg; callback = domain())
+                lowest = Inf
+                while !integ.finished
+                    SciMLBase.step!(integ)
+                    lowest = min(lowest, minimum(integ.u))
+                end
+                @test integ.sol.retcode == SciMLBase.ReturnCode.Success
+                @test lowest >= 0
+                sol = SciMLBase.solve(drop, alg; callback = domain())
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.u[end] == integ.u
+                @test all(<(1.0e-7), sol.u[end])
+            end
+
+            back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
+            for (pr, exact) in ((prob, t -> exp(-t)), (back, t -> exp(1 - t)))
+                integ = SciMLBase.init(pr, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+                @test_throws "no step has been taken yet" integ(integ.t + integ.tdir * 0.05)
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                ahead, h = integ.t + integ.dt / 2, 1.0e-6
+                @test abs(integ(ahead)[1] - exact(ahead)) < 6.0e-6
+                @test abs(integ(ahead, Val{1})[1] + exact(ahead)) < 3.0e-4
+                @test abs(
+                    integ(ahead, Val{1})[1] - (integ(ahead + h)[1] - integ(ahead - h)[1]) / 2h,
+                ) < 1.0e-8
+                @test_throws "or past its end" integ(integ.tprev - integ.dt / 2)
+                @test_throws "can only interpolate inside" SciMLBase.change_t_via_interpolation!(
+                    integ, ahead,
+                )
+                SciMLBase.solve!(integ)
+                @test_throws "the integrator has finished" integ(integ.t + integ.dt / 2)
+            end
+
+            massive = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0], (0.0, 1.0),
+            )
+            integ = SciMLBase.init(massive, PETScDiffEq.TSImplicit("bdf"); dt = 0.1)
+            SciMLBase.step!(integ)
+            @test_throws "no derivative to build a Hermite" integ(integ.t + integ.dt / 2)
+            SciMLBase.terminate!(integ)
         end
     end
 
@@ -5189,6 +5380,148 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.reinit!(integ, vec(2 .* u0))
             @test integ.u == 2 .* u0
             SciMLBase.terminate!(integ)
+        end
+    end
+
+    @testset "a u0 of another array type keeps it" begin
+        function osc!(du, u, p, t)
+            du.a = u.b[1]
+            du.b[1] = -u.a - p[1] * u.b[1]
+            du.b[2] = -u.b[2]^2
+            return nothing
+        end
+        osc(u, p, t) = (du = similar(u); osc!(du, u, p, t); du)
+        function osc_jac!(J, u, p, t)
+            fill!(J, 0)
+            J[1, 2], J[2, 1], J[2, 2], J[3, 3] = 1.0, -1.0, -p[1], -2 * u.b[2]
+            return nothing
+        end
+        damp!(du, u, p, t) = (du .= -p[1] .* u; nothing)
+        # The same problems written by hand on the plain vector, which `Named` wraps in place.
+        flat(f!) = (du, u, p, t) -> f!(Named(du), Named(u), p, t)
+        flat_oop(u, p, t) = collect(osc(Named(u), p, t))
+        flat_jac!(J, u, p, t) = osc_jac!(J, Named(u), p, t)
+        u0 = Named([1.0, -1.0, 2.0])
+        ode(f, u; kw...) =
+            SciMLBase.ODEProblem(SciMLBase.ODEFunction(f; kw...), u, (0.0, 1.0), [0.3])
+        same(a, b) = a.t == b.t && length(a.u) == length(b.u) &&
+            all(collect(x) == y for (x, y) in zip(a.u, b.u))
+        rk, bdf = PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf")
+
+        reference = SciMLBase.solve(ode(osc!, u0), Tsit5())
+        @testset "$(nameof(typeof(alg))) matches the problem on the plain vector" for alg in
+            (rk, PETScDiffEq.TSRosW("ra34pw2"), bdf)
+            sol = SciMLBase.solve(ode(osc!, u0), alg)
+            @test sol.u[end] isa Named{Float64} && typeof(sol.u[end]) == typeof(reference.u[end])
+            @test typeof(sol(0.5)) == typeof(reference(0.5)) == Named{Float64}
+            @test typeof(sol(0.5, Val{1})) == typeof(reference(0.5, Val{1}))
+            @test same(sol, SciMLBase.solve(ode(flat(osc!), collect(u0)), alg))
+            oop = SciMLBase.solve(ode(osc, u0), alg)
+            @test oop.u[end] isa Named{Float64}
+            @test same(oop, SciMLBase.solve(ode(flat_oop, collect(u0)), alg))
+        end
+        @test same(
+            SciMLBase.solve(ode(osc!, u0; jac = osc_jac!), bdf),
+            SciMLBase.solve(ode(flat(osc!), collect(u0); jac = flat_jac!), bdf),
+        )
+        mass = Diagonal([1.0, 2.0, 3.0])
+        @test same(
+            SciMLBase.solve(ode(osc!, u0; mass_matrix = mass), bdf),
+            SciMLBase.solve(ode(flat(osc!), collect(u0); mass_matrix = mass), bdf),
+        )
+        parts(f, u) = SciMLBase.SplitODEProblem(f(damp!), f(osc!), u, (0.0, 1.0), [0.3])
+        for alg in (PETScDiffEq.TSARKIMEX("3"), rk)
+            @test same(
+                SciMLBase.solve(parts(identity, u0), alg),
+                SciMLBase.solve(parts(flat, collect(u0)), alg),
+            )
+        end
+        for T in (ComplexF64, Float32)
+            sol = SciMLBase.solve(ode(osc!, Named(T.(collect(u0)))), rk)
+            @test sol.u[end] isa Named{T}
+            @test same(sol, SciMLBase.solve(ode(flat(osc!), T.(collect(u0))), rk))
+        end
+
+        @testset "saving and the functions that see the state" begin
+            kw = (saveat = 0.25, save_idxs = [3, 1])
+            picked = SciMLBase.solve(ode(osc!, u0), rk; kw...)
+            @test picked.u[end] isa Vector{Float64}
+            @test same(picked, SciMLBase.solve(ode(flat(osc!), collect(u0)), rk; kw...))
+            saved = SciMLBase.solve(ode(osc!, u0), rk; saveat = 0.25, dense = false)
+            @test all(u -> u isa Named{Float64}, saved.u) && saved(0.3) isa Named{Float64}
+            seen = Set{Type}()
+            SciMLBase.solve(
+                ode(osc!, u0), rk;
+                isoutofdomain = (u, p, t) -> (push!(seen, typeof(u)); u.a > 10),
+                unstable_check = (dt, u, p, t) -> (push!(seen, typeof(u)); u.a > 10),
+            )
+            @test seen == Set([Named{Float64}])
+        end
+
+        @testset "callbacks and the integrator" begin
+            # `a` reads and `set_a!` writes the first entry of each formulation's state.
+            function run(f, u, a, set_a!)
+                fired = [0, 0]
+                cross = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> a(u) - 0.5, integ -> (fired[1] += 1; set_a!(integ.u, 1.0)),
+                )
+                double = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t == 0.5,
+                    integ -> (fired[2] += 1; set_a!(integ.u, 2 * a(integ.u))),
+                )
+                integ = SciMLBase.init(
+                    ode(f, u), rk; callback = SciMLBase.CallbackSet(cross, double), tstops = [0.5],
+                )
+                SciMLBase.step!(integ)
+                seen = (
+                    copy(integ.u), copy(integ.uprev), SciMLBase.get_du(integ), integ(integ.t / 2),
+                    first(SciMLBase.get_tmp_cache(integ)),
+                )
+                SciMLBase.set_u!(integ, 2 .* collect(u))
+                SciMLBase.step!(integ)
+                stepped = copy(integ.u)
+                fill!(fired, 0)
+                SciMLBase.reinit!(integ, collect(u))
+                restarted = copy(integ.u)
+                return (; seen, stepped, restarted, sol = SciMLBase.solve!(integ), fired)
+            end
+            a = run(osc!, u0, u -> u.a, (u, v) -> (u.a = v))
+            b = run(flat(osc!), collect(u0), u -> u[1], (u, v) -> (u[1] = v))
+            @test all(x -> x isa Named{Float64}, (a.seen..., a.stepped, a.restarted))
+            @test all(collect(x) == y for (x, y) in zip(a.seen[1:4], b.seen[1:4]))
+            @test collect(a.stepped) == b.stepped && a.restarted == u0
+            @test same(a.sol, b.sol) && all(u -> u isa Named{Float64}, a.sol.u)
+            @test a.fired == b.fired && a.fired[1] > 0 && a.fired[2] == 1
+            integ = SciMLBase.init(ode(osc!, u0), rk)
+            SciMLBase.reinit!(integ, Named([2, 1, 4]))
+            @test integ.u isa Named{Float64} && integ.u == [2.0, 1.0, 4.0]
+            SciMLBase.terminate!(integ)
+        end
+
+        @testset "a step interpolated in calls f as often as on the plain vector" begin
+            calls = Ref(0)
+            counted!(du, u, p, t) = (calls[] += 1; du .= -u; nothing)
+            function count(u)
+                calls[] = 0
+                integ = SciMLBase.init(ode(counted!, u), PETScDiffEq.TSRK("4"); dt = 0.1)
+                for _ in 1:5
+                    SciMLBase.step!(integ)
+                    integ(integ.t - 0.05)
+                end
+                SciMLBase.terminate!(integ)
+                return calls[]
+            end
+            @test count(u0) == count(collect(u0)) == count(reshape(collect(u0), 1, 3))
+        end
+
+        @testset "PETScAdjoint gives du0 in u0's type" begin
+            run(f, u, of_u) = PETScDiffEq._discrete_adjoint(
+                ode(f, u), rk, PETScAdjoint(); t = [1.0],
+                dgdu_discrete = (out, u, p, t, i) -> (fill!(out, 0); of_u(out, u); nothing),
+            )
+            du0, dp = run(osc!, u0, (out, u) -> (out.a = 2 * u.a))
+            flat_du0, flat_dp = run(flat(osc!), collect(u0), (out, u) -> (out[1] = 2 * u[1]))
+            @test du0 isa Named{Float64} && collect(du0) ≈ flat_du0 && dp ≈ flat_dp
         end
     end
 
@@ -7870,12 +8203,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 PETScDiffEq.TSGeneric(st) for st in ("alpha", "theta", "beuler", "cn", "bdf", "arkimex", "rosw")
             )
             push!(
-                algs, PETScDiffEq.TSRK("5dp", ["-ts_rk_type", "8vr"]),
+                algs, PETScDiffEq.TSRK("5dp", ["-ts_rk_type", "3bs"]),
                 PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "rodas3"]),
             )
             # ark3 and the lassp pair are refused, and ars122 needs a split problem.
             families = (
-                (PETScDiffEq.TSRK, PETScDiffEq._RK_ORDER, ("5dp",)),
+                (PETScDiffEq.TSRK, PETScDiffEq._RK_ORDER, ("5dp", "5f", "5bs", "6vr", "7vr", "8vr")),
                 (
                     PETScDiffEq.TSRosW, PETScDiffEq._ROSW_ORDER,
                     ("ra34pw2", "lassp3p4s2c", "llssp3p4s2c", "ark3"),
@@ -7950,6 +8283,60 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
                 SciMLBase.solve(back, alg; fixed..., callback = cb)
                 @test abs(hit[] - dense_root(dense, level)) < 5.0e-15
+            end
+        end
+
+        @testset "TSRK of order 5 and up through points its own steps reach" begin
+            lv = SciMLBase.ODEProblem(
+                lotka_volterra!, [1.0, 1.0], (0.0, 2.0), [1.5, 1.0, 3.0, 1.0],
+            )
+            ref = SciMLBase.solve(lv, Tsit5(); abstol = 1.0e-13, reltol = 1.0e-13)
+            lv_back = SciMLBase.remake(lv; u0 = ref(2.0), tspan = (2.0, 0.0))
+            tol = (abstol = 1.0e-10, reltol = 1.0e-10)
+            want = collect(0.05:0.1:1.95)
+            err(sol) = maximum(norm(sol.u[i] - ref(sol.t[i])) for i in eachindex(sol.t))
+            slope(u, t) = (du = similar(u); lotka_volterra!(du, u, lv.p, t); du)
+            root = dense_root(ref, 2.5)
+            algs = [PETScDiffEq.TSRK(st) for st in ("5f", "5bs", "6vr", "7vr", "8vr")]
+            push!(algs, PETScDiffEq.TSRK("5dp", ["-ts_rk_type", "8vr"]))
+            for alg in algs
+                for (prob, at) in ((lv, want), (lv_back, reverse(want)))
+                    steps = SciMLBase.solve(prob, alg; tol...)
+                    saved = SciMLBase.solve(prob, alg; tol..., saveat = at)
+                    @test err(saved) < 5 * err(steps)
+                    @test saved.u ==
+                        SciMLBase.solve!(SciMLBase.init(prob, alg; tol..., saveat = at)).u
+                end
+                saved = SciMLBase.solve(lv, alg; tol..., saveat = want)
+                integ = SciMLBase.init(lv, alg; tol...)
+                while !SciMLBase.done(integ)
+                    SciMLBase.step!(integ)
+                    for (k, w) in enumerate(want)
+                        integ.tprev < w < integ.t || continue
+                        @test integ(w) == saved.u[k]
+                        @test norm(integ(w, Val{1}) - slope(integ(w), w)) < 1.0e-6
+                    end
+                end
+                hit = Ref(NaN)
+                cb = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> u[1] - 2.5,
+                    integ -> (hit[] = integ.t; SciMLBase.terminate!(integ)),
+                )
+                SciMLBase.solve(lv, alg; tol..., callback = cb)
+                @test abs(hit[] - root) < 5.0e-10
+            end
+            # The interior points cost their stages once for each step a state is taken in.
+            prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+            for (st, stages) in (("5f", 6), ("6vr", 9), ("8vr", 2 * 13))
+                alg = PETScDiffEq.TSRK(st)
+                nf(; kw...) = SciMLBase.solve(prob, alg; fixed..., kw...).stats.nf
+                nf_init(; kw...) =
+                    SciMLBase.solve!(SciMLBase.init(prob, alg; fixed..., kw...)).stats.nf
+                plain = nf(save_everystep = false)
+                for count in (nf, nf_init)
+                    @test count(saveat = [0.25]) == plain + 2 + stages
+                    @test count(saveat = [0.22, 0.25, 0.28]) == count(saveat = [0.25])
+                end
             end
         end
 
@@ -8791,7 +9178,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test integ(one, tm, Val{1}; idxs = 2) == [du[2]]
                 @test integ(out, ts) == fill(integ(integ.t), 3) && out == integ.u
                 @test_throws ArgumentError integ(tm, Val{2})
-                @test_throws ArgumentError integ(integ.t + 1.0, Val{1})
+                @test_throws ArgumentError integ(integ.tprev - 1.0, Val{1})
                 SciMLBase.solve!(integ)
                 tm = (integ.tprev + integ.t) / 2
                 u = integ(tm)
@@ -10723,6 +11110,41 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 return sum(coupled(sol.u[i], θ[3:6], t) for (i, t) in zip(at, ts))
             end
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-9
+        end
+
+        # PETSc takes a span time within 1e-6 * dt * |t| of a step as reached (#215).
+        @testset "an adaptive solve ends a step on each cost time on a long clock: $name" for (
+                name, alg, tspan, ts,
+            ) in (
+                ("5dp", TSRK("5dp"), (0.0, 2.0e6), [5.0e5, 1.0e6, 5.0e5 + 1, 1.5e6]),
+                ("5dp backward in time", TSRK("5dp"), (2.0e6, 0.0), [1.5e6, 1.0e6, 5.0e5]),
+                ("5dp away from 0", TSRK("5dp"), (1.0e6, 1.0e6 + 2), 1.0e6 .+ [0.5, 1.0, 1.5]),
+                ("ARKIMEX 3", TSARKIMEX("3", exact), (0.0, 2.0e6), [5.0e5, 1.0e6, 1.5e6]),
+            )
+            scale = abs(tspan[2] - tspan[1])
+            decay!(du, u, p, t) = (du[1] = -p[1] / scale * u[1]; nothing)
+            prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    decay!; jac = (J, u, p, t) -> (J[1, 1] = -p[1] / scale; nothing),
+                    paramjac = (pJ, u, p, t) -> (pJ[1, 1] = -u[1] / scale; nothing),
+                ),
+                [1.0], tspan, [1.0],
+            )
+            steps = [tspan[1]]
+            du0, dp = PETScDiffEq._discrete_adjoint(
+                prob, alg, PETScAdjoint(); t = ts, dgdu_discrete = half_norm_du!,
+                unstable_check = (dt, u, p, t) -> (push!(steps, t); false),
+            )
+            push!(steps, tspan[2])
+            stepped(θ) = SciMLBase.solve(
+                SciMLBase.remake(prob; u0 = θ[1:1], p = θ[2:2]), alg;
+                dt = scale, adaptive = false, tstops = steps[2:(end - 1)],
+            )
+            at = [findfirst(==(t), steps) for t in ts]
+            @test !any(isnothing, at)
+            @test stepped([1.0, 1.0]).t == steps
+            loss(θ) = (sol = stepped(θ); sum(half_norm(sol.u[i], nothing, 0.0) for i in at))
+            @test relerr([du0; vec(dp)], central_differences(loss, [1.0, 1.0])) < 5.0e-9
         end
 
         function quadrature(θ, alg, tspan, cost; dt = 0.01, kwargs...)
