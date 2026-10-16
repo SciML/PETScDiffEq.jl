@@ -634,6 +634,36 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test after.u[k][1] ≈ 10.5
     end
 
+    @testset "stops and saved points 1e-14 apart on a 1 ns span" begin
+        fast!(du, u, p, t) = (du[1] = -1.0e9 * u[1]; nothing)
+        prob = SciMLBase.ODEProblem(fast!, [1.0], (0.0, 1.0e-9))
+        back = SciMLBase.ODEProblem(fast!, [exp(-1.0)], (1.0e-9, 0.0))
+        alg = PETScDiffEq.TSRK("5dp")
+        tol = (abstol = 1.0e-12, reltol = 1.0e-12)
+        inner = (save_start = false, save_end = false)
+        err(sol) = maximum(abs(sol.u[i][1] * exp(1.0e9 * sol.t[i]) - 1) for i in eachindex(sol.t))
+        idle = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+        for kw in ((;), (callback = idle,))
+            t10 = SciMLBase.solve(prob, alg; tol..., kw...).t[10]
+            near = [1.0e-14, t10 - 2.0e-14, t10 + 2.0e-14, 1.0e-9 - 1.0e-14]
+            sol = SciMLBase.solve(prob, alg; saveat = near, inner..., tol..., kw...)
+            @test sol.t == near
+            @test err(sol) < 1.0e-11
+            sol = SciMLBase.solve(back, alg; saveat = reverse(near), inner..., tol..., kw...)
+            @test sol.t == reverse(near)
+            @test err(sol) < 1.0e-11
+        end
+        stops = [3.0e-10, 3.0e-10 + 1.0e-14, 1.0e-9 - 1.0e-14]
+        hits = Float64[]
+        tick = SciMLBase.DiscreteCallback((u, t, integ) -> t in stops, integ -> push!(hits, integ.t))
+        SciMLBase.solve(prob, alg; tstops = stops, callback = tick, tol...)
+        @test hits == stops
+        quit = SciMLBase.DiscreteCallback((u, t, integ) -> t == stops[end], SciMLBase.terminate!)
+        sol = SciMLBase.solve(prob, alg; tstops = stops[end:end], callback = quit, tol...)
+        @test sol.retcode == SciMLBase.ReturnCode.Terminated
+        @test sol.t[end] == stops[end]
+    end
+
     @testset "an exception from the user's code leaves no PETSc traceback" begin
         throws!(du, u, p, t) = (t > 0.3 && error("boom"); du[1] = -u[1]; nothing)
         bad = SciMLBase.ODEProblem(throws!, [1.0], (0.0, 1.0))

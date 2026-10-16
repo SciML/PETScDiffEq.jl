@@ -1914,12 +1914,13 @@ function _post_step_serial!(ctx, ts)
         ctx.own_matchstep && _matchstep!(pl, ts)
         s = LibPETSc.TSGetTime(pl, ts)
         smax = LibPETSc.TSGetMaxTime(pl, ts)
-        s >= smax - _near(smax) && return LibPETSc.PetscErrorCode(0)
+        s >= smax - _near(smax, ctx.tbound) && return LibPETSc.PetscErrorCode(0)
         hnext = LibPETSc.TSGetTimeStep(pl, ts)
         stop = false
         if ctx.halt_stalled && reason == 0 && s <= LibPETSc.TSGetPrevTime(pl, ts)
             ctx.stalled = stop = true
-        elseif ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
+        elseif ctx.dtmin > 0 && hnext < ctx.dtmin &&
+                s + hnext < smax - _near(smax, ctx.tbound)
             ctx.dt_too_small = stop = true
         end
         if !stop && (ctx.unstable !== nothing || ctx.halt_nonfinite)
@@ -1955,9 +1956,10 @@ function _post_step_collective!(ctx, ts_ptr)
         smax = LibPETSc.TSGetMaxTime(pl, ts)
         accepted = Int(LibPETSc.TSGetConvergedReason(pl, ts)) >= 0
         ctx.own_matchstep && accepted && _matchstep!(pl, ts)
-        if accepted && s < smax - _near(smax)
+        if accepted && s < smax - _near(smax, ctx.tbound)
             hnext = LibPETSc.TSGetTimeStep(pl, ts)
-            small = ctx.dtmin > 0 && hnext < ctx.dtmin && s + hnext < smax - _near(smax)
+            small = ctx.dtmin > 0 && hnext < ctx.dtmin &&
+                s + hnext < smax - _near(smax, ctx.tbound)
             if !small && (ctx.unstable !== nothing || ctx.halt_nonfinite)
                 x = Ref{LibPETSc.CVec}(C_NULL)
                 ccall(
@@ -2014,9 +2016,10 @@ end
 _floor(R, dtmin, force_dtmin, adaptive) =
     force_dtmin || !adaptive || dtmin === nothing ? zero(R) : abs(R(dtmin))
 
-# Finite at an infinite end, so `tf - _near(tf)` stays infinite rather than NaN.
-_near(t::Float64) = 100 * eps(clamp(abs(t), 1.0, floatmax(t)))
-_near(t::Float32) = 4 * eps(min(abs(t), floatmax(t)))
+# Floored at `bound`, the span's largest |t|, below 1, so a span near 0 keeps its own scale.
+# Finite at an infinite end, so `tf - _near(tf, bound)` stays infinite rather than NaN.
+_near(t::Float64, bound) = 100 * eps(clamp(abs(t), min(1.0, bound), floatmax(t)))
+_near(t::Float32, bound) = 4 * eps(min(abs(t), floatmax(t)))
 
 # PETSc divides by zero on a step of a few ulps. Float64 already has a one-ulp floor.
 _min_step(t::Float64) = zero(t)
@@ -3734,7 +3737,7 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
         (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
             _hold_work_vec!(ctx, ts_ptr)
         ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
-        tol = _near(t)
+        tol = _near(t, ctx.tbound)
         landed = false
         while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= t + tol
             want = ctx.saveat[ctx.saveat_idx]
@@ -5161,8 +5164,9 @@ function _setup(
         sort!(tdir .* Vector{R}(collect(saveat)))
     slack = eps(isinf(tf) ? t0 : tf)
     filter!(t -> t0 - slack <= t <= tf + slack, saveat_times)
-    at_start(t) = abs(t - t0) <= _near(t0)
-    at_end(t) = abs(t - tf) <= _near(tf)
+    bound = max(abs(t0), abs(tf))
+    at_start(t) = abs(t - t0) <= _near(t0, bound)
+    at_end(t) = abs(t - tf) <= _near(tf, bound)
     no_saveat = !(saveat isa Number) && isempty(saveat)
     save_everystep = save_on && something(save_everystep, no_saveat)
     save_start = something(
@@ -5260,7 +5264,7 @@ function _setup(
         false,
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
-        nothing, 0, 0, max(abs(t0), abs(tf)),
+        nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape,
     )
     h = TSHandles(
@@ -5614,7 +5618,7 @@ function _assemble(
         prob, alg, h::TSHandles, tend, uend, st, kwargs, verbose = get(kwargs, :verbose, true),
     )
     ctx = h.ctx
-    tf, t0, tol = h.tf, h.t0, _near(h.tf)
+    tf, t0, tol = h.tf, h.t0, _near(h.tf, ctx.tbound)
     # -ts_exact_final_time interpolate reports a point past tf mid-sequence.
     keep = findall(t -> t <= tf + tol, ctx.ts)
     if length(keep) != length(ctx.ts)
@@ -5641,7 +5645,7 @@ function _assemble(
         pop!(ctx.us)
         ctx.dense && pop!(ctx.dus)
     end
-    if !h.save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= _near(t0)
+    if !h.save_start && length(ctx.ts) > 1 && abs(ctx.ts[1] - t0) <= _near(t0, ctx.tbound)
         popfirst!(ctx.ts)
         popfirst!(ctx.us)
         ctx.dense && popfirst!(ctx.dus)
@@ -6379,9 +6383,9 @@ end
 function _state_at_unlocked(integ::PETScIntegrator, t, deriv::Type = Val{0})
     # Snap only from outside the step: Float32 root-finder probes can round onto an end.
     s, s0, s1 = integ.tdir * t, integ.tdir * integ.tprev, integ.tdir * integ.t
-    if s == s1 || s1 < s <= s1 + _near(integ.t)
+    if s == s1 || s1 < s <= s1 + _near(integ.t, integ.h.ctx.tbound)
         return deriv === Val{0} ? integ.u : _interpolate!(integ, s1, deriv)
-    elseif s == s0 || s0 - _near(integ.tprev) <= s < s0
+    elseif s == s0 || s0 - _near(integ.tprev, integ.h.ctx.tbound) <= s < s0
         return deriv === Val{0} ? integ.uprev : _interpolate!(integ, s0, deriv)
     end
     s0 <= s <= s1 || throw(
@@ -6875,7 +6879,7 @@ SciMLBase.pop_tstop!(integ::PETScIntegrator) = popfirst!(integ.tstops)
 
 function _initial_save!(h::TSHandles)
     ctx = h.ctx
-    tol = _near(h.t0)
+    tol = _near(h.t0, ctx.tbound)
     landed = false
     while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= h.t0 + tol
         _record_end!(ctx, ctx.saveat[ctx.saveat_idx], h.u0)
@@ -7106,10 +7110,13 @@ end
 SciMLBase.terminate!(integ::PETScIntegrator, retcode = SciMLBase.ReturnCode.Terminated) =
     _locked(() -> _terminate_unlocked(integ, retcode))
 
-function _save_step!(integ::PETScIntegrator, upto, endpoint::Bool; slack = _near(upto))
+function _save_step!(
+        integ::PETScIntegrator, upto, endpoint::Bool;
+        slack = _near(upto, integ.h.ctx.tbound),
+    )
     h = integ.h
     ctx = h.ctx
-    tol = _near(integ.t)
+    tol = _near(integ.t, ctx.tbound)
     n = length(ctx.ts)
     on = integ.opts.save_on
     landed = false
@@ -7231,8 +7238,9 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         _everywhere(ctx.comm, integ.u == ctx.end_u && !ctx.pdirty)
     ctx.fstart = reuse ? ctx.fend : nothing
     ctx.pdirty = false
-    tol = _near(h.tf)
-    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t)
+    tol = _near(h.tf, ctx.tbound)
+    while !isempty(integ.tstops) &&
+            integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t, ctx.tbound)
         popfirst!(integ.tstops)
     end
     # PETSc keeps the step shortened onto its max time, so `dtcache` holds the uncut one.
@@ -7282,7 +7290,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
             integ.t = _user_t(integ.tdir, h.tf)
             LibPETSc.TSSetTime(pl, h.ts, h.tf)
         end
-    elseif integ.tdir * integ.t >= stop - _near(stop)
+    elseif integ.tdir * integ.t >= stop - _near(stop, ctx.tbound)
         resumed = _resumed_step(integ, stop)
         integ.t = _user_t(integ.tdir, stop)
         LibPETSc.TSSetTime(pl, h.ts, stop)
@@ -7304,7 +7312,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     saved = !fired && _save_step!(integ, integ.t, true)
     # Discrete callbacks run with the stop they landed on still at the head of the queue.
     _apply_callbacks!(integ, saved)
-    while !isempty(integ.tstops) && integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t)
+    while !isempty(integ.tstops) &&
+            integ.tstops[1] <= integ.tdir * integ.t + _near(integ.t, ctx.tbound)
         popfirst!(integ.tstops)
     end
     integ.finished && return nothing

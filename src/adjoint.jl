@@ -1360,7 +1360,8 @@ function _discrete_adjoint_unlocked(
             s_end = LibPETSc.TSGetSolveTime(pl, ts)
             # PETSc reports TS_CONVERGED_ITS when the last step maxiters allows lands on tf.
             reached = reason == LibPETSc.TS_CONVERGED_TIME ||
-                reason == LibPETSc.TS_CONVERGED_ITS && s_end >= h.tf - _near(h.tf)
+                reason == LibPETSc.TS_CONVERGED_ITS &&
+                s_end >= h.tf - _near(h.tf, h.ctx.tbound)
             reached || throw(
                 ArgumentError(
                     "the forward solve stopped with $reason at t = $(_user_t(h.tdir, s_end)), " *
