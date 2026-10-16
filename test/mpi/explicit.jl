@@ -209,6 +209,12 @@ crossing_last_row(idx, level) =
         @test all(u -> length(u) == 1, sol.u)
         @test abs(sol.u[end][1] - ref.u[end][1]) <= DECAY_ERR
         @test abs(sol.u[end][1] - decay_exact(rows, 1.0)[end]) <= DECAY_ERR
+        one = solve(
+            decay_problem(rows), TSRK("5dp"; comm);
+            abstol = fill(1.0e-10, n), reltol = fill(1.0e-10, n),
+            save_idxs = rank == 0 ? n : [n],
+        )
+        @test one.u == (rank == 0 ? only.(sol.u) : sol.u)
     end
 
     @testset "a rank with no rows" begin
