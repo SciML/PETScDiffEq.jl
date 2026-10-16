@@ -193,9 +193,19 @@ those from a hand-written `jac` and `paramjac` and of the serial adjoint's, for 
 `TSARKIMEX`'s own solve reads; the prototype is needed with or without the `jac`.
 `dgdu_discrete` gets this rank's rows of the state and writes their gradient, and
 `dgdp_discrete` gives this rank's share of the cost's direct derivative with respect to `p`,
-which the ranks add up. `du0` comes back as this rank's rows and `dp` as the whole gradient,
-the same on every rank. The cost times, `no_start`, the length of `p` and whether
-`dgdp_discrete`, `jac` and `paramjac` are given have to agree across the ranks. A `jac`,
+which the ranks add up. An integral cost is split the same way. `g(u, p, t)` gets this
+rank's rows and returns its share of the integrand, the ranks' shares adding up to the
+whole; `dgdu_continuous` writes the integrand's derivative with respect to this rank's rows,
+and `dgdp_continuous` gives this rank's share of its direct derivative. Without them `g` is
+differentiated on each rank, with respect to its own rows and to `p`, so a share that reads
+other ranks' rows, through a halo exchange of its own, needs `dgdu_continuous`. On 1 to 3
+ranks an integral cost on a reaction-diffusion problem gave the serial adjoint's gradient to
+3.1e-16 with fixed steps, whether `g` was differentiated or its derivatives were given and
+with or without discrete costs, and to 2.8e-13 in an adaptive solve, whose steps move with
+the rounding of its error norms. `du0` comes back as this rank's rows and `dp` as the whole
+gradient, the same on every rank. The cost times, `no_start`, the length of `p`, whether
+there is an integral cost and whether `dgdp_discrete`, `jac` and `paramjac` are given have
+to agree across the ranks. A `jac`,
 `paramjac`, cost function or `f` that throws on some ranks makes every rank throw, as in a
 solve. The transposed linear solves of `TSImplicit` and `TSARKIMEX` use the solver above;
 `["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
@@ -453,8 +463,8 @@ DM itself stays free for further solves. A DM on `MPI.COMM_SELF`, or on a single
 serial solve. Only a DMDA, a DMStag or a DMPlex is taken so far, and any other DM, such as a
 DMShell, is refused with an `ArgumentError`.
 
-`PETScAdjoint` runs with a `dm` too, for the methods and discrete costs it takes on a `comm`,
-and on a DM of a single rank for integral costs and a `SplitODEProblem` with `TSARKIMEX` as
+`PETScAdjoint` runs with a `dm` too, for the methods and costs it takes on a `comm`, and on a
+DM of a single rank for a `SplitODEProblem` with `TSARKIMEX` as
 well. It takes the problem's `jac`, filling the DM's matrix as above, and when there are
 parameters a `paramjac(pJ, u, p, t)` that gets `u` ghosted and fills this rank's rows of `pJ`
 in the DM's order, a column per entry of `p`, which

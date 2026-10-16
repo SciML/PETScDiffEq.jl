@@ -11328,6 +11328,32 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        Sys.WORD_SIZE == 64 && @testset "an integral cost on a communicator of one rank" begin
+            world = MPI.COMM_WORLD
+            direct = [exact[1:6]; "-pc_type"; "redundant"]
+            ad = PETScDiffEq.AutoForwardDiff()
+            prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0); sparse_jac = true)
+            costs = (
+                (; g = coupled),
+                (; dgdu_continuous = integrand_du!),
+                (; dgdu_continuous = integrand_du!, dgdp_continuous = integrand_dp!),
+            )
+            algs = (
+                (TSRK("4"; comm = world), TSRK("4")),
+                (TSImplicit("cn", direct; comm = world, autodiff = ad), TSImplicit("cn", exact)),
+            )
+            for (on_world, alone) in algs, cost in costs
+                ref = integral(prob, alone; cost...)
+                du0, dp = integral(prob, on_world; cost...)
+                @test du0 ≈ ref[1] rtol = 1.0e-12
+                @test dp ≈ ref[2] rtol = 1.0e-12
+                both = grad(prob, on_world; cost...)
+                ref = grad(prob, alone; cost...)
+                @test both[1] ≈ ref[1] rtol = 1.0e-12
+                @test both[2] ≈ ref[2] rtol = 1.0e-12
+            end
+        end
+
         @testset "a user exception reaches the caller and leaves nothing behind" begin
             live() = count(h -> !h.destroyed, keys(PETScDiffEq.LIVE_HANDLES))
             before = live()
