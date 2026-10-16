@@ -4788,11 +4788,52 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
 
         @testset "a single index and saveat" begin
             one = SciMLBase.solve(prob, alg; dt = 0.1, save_idxs = 1, tols...)
-            @test length(one.u[1]) == 1
-            @test abs(one.u[end][1] - exp(-1)) < 1.0e-7
+            @test one.u isa Vector{Float64}
+            @test abs(one.u[end] - exp(-1)) < 1.0e-7
             at = SciMLBase.solve(prob, alg; dt = 0.1, saveat = 0.25, save_idxs = [2], tols...)
             @test at.t == [0.0, 0.25, 0.5, 0.75, 1.0]
             @test abs(at.u[3][1] - exp(-1.0)) < 1.0e-7
+        end
+
+        @testset "a single index saves numbers, as OrdinaryDiffEq does" begin
+            ref = SciMLBase.solve(prob, Tsit5(); save_idxs = 2, tols...)
+            sol = SciMLBase.solve(prob, alg; dt = 0.1, save_idxs = 2, tols...)
+            many = SciMLBase.solve(prob, alg; dt = 0.1, save_idxs = [2], tols...)
+            @test typeof(sol.u) == typeof(ref.u) == Vector{Float64}
+            @test sol.t == many.t
+            @test sol.u == only.(many.u)
+            @test sol.dense
+            @test sol.interp.du == only.(many.interp.du)
+            for deriv in (Val{0}, Val{1})
+                @test sol(0.55, deriv) isa Float64
+                @test sol(0.55, deriv) ≈ only(many(0.55, deriv))
+            end
+            for kw in (
+                    (; saveat = 0.25), (; saveat = 0.25, save_start = false, save_end = false),
+                    (; save_everystep = false), (; dense = false),
+                )
+                one = SciMLBase.solve(prob, alg; dt = 0.1, save_idxs = 2, kw..., tols...)
+                listed = SciMLBase.solve(prob, alg; dt = 0.1, save_idxs = [2], kw..., tols...)
+                @test one.t == listed.t
+                @test one.u == only.(listed.u)
+                @test one(0.3) ≈ only(listed(0.3))
+            end
+            integ = SciMLBase.init(prob, alg; dt = 0.1, save_idxs = 2, tols...)
+            @test integ.opts.save_idxs == SciMLBase.init(prob, Tsit5(); save_idxs = 2).opts.save_idxs
+            SciMLBase.step!(integ)
+            SciMLBase.savevalues!(integ)
+            @test integ.sol.u isa Vector{Float64}
+            @test SciMLBase.solve!(integ).u[end] == sol.u[end]
+            SciMLBase.reinit!(integ)
+            @test SciMLBase.solve!(integ).u == sol.u
+            dae = SciMLBase.DAEProblem(
+                (r, du, u, p, t) -> (r .= du .+ [1, 2] .* u; nothing), [-1.0, -2.0],
+                [1.0, 1.0], (0.0, 1.0),
+            )
+            one = SciMLBase.solve(dae, PETScDiffEq.TSDAE(); saveat = 0.5, save_idxs = 2)
+            @test one.u == only.(
+                SciMLBase.solve(dae, PETScDiffEq.TSDAE(); saveat = 0.5, save_idxs = [2]).u
+            )
         end
 
         @testset "a blow-up in an unsaved component is still Unstable" begin
@@ -4831,7 +4872,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             for idxs in (2, [2], :y, [:y])
                 sol = SciMLBase.solve(named, alg; kw..., save_idxs = idxs)
-                @test sol.u == [u[[2]] for u in full.u]
+                @test sol.u == [idxs isa Vector ? u[[2]] : u[2] for u in full.u]
                 @test sol[:y] == full[:y]
             end
             @test_throws ArgumentError SciMLBase.solve(named, alg; kw..., save_idxs = [:z])
@@ -5068,7 +5109,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test by_axes.t == whole.t
                 @test by_axes.u == [u[picked] for u in whole.u]
                 one = SciMLBase.solve(ode(grid!, u0), rk; saving..., save_idxs = picked[1])
-                @test one.u == [[u[picked[1]]] for u in whole.u]
+                @test one.u == [u[picked[1]] for u in whole.u]
             end
             @test_throws "`save_idxs` has the index (4, 1), outside a state of size (3, 2)" SciMLBase.solve(
                 ode(grid!, u0), rk; save_idxs = [CartesianIndex(4, 1)],
@@ -9419,7 +9460,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test o.tstops == [0.35, 0.5, 1.0]
             @test o.saveat == [0.25]
             @test o.d_discontinuities == [0.35]
-            @test o.save_idxs == [1]
+            @test o.save_idxs == 1
             @test !o.dense && !o.save_everystep
             @test collect(o.callback.discrete_callbacks) == [never]
             @test o.unstable_check === blow && o.isoutofdomain === neg

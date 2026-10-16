@@ -306,6 +306,10 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
         @test relerr(
             gradient(row, prob, TSRK("5dp"); save_idxs = [2], mine...), references[3],
         ) < 1.0e-7
+        second(problem, alg, u0, p; kwargs...) = sum(
+            abs2, solve(problem, alg; u0, p, saveat = TS, save_idxs = 2, kwargs...).u .- data[2, :],
+        )
+        @test relerr(gradient(second, prob, TSRK("5dp"); mine...), references[3]) < 1.0e-7
         only_p = Zygote.gradient(p -> fit(prob, TSRK("5dp"), U0, p; mine...), P0)[1]
         @test relerr(only_p, references[1][3:6]) < 1.0e-7
         @test Zygote.gradient(p -> 0 * fit(prob, TSRK("5dp"), U0, p; mine...), P0)[1] == zeros(4)

@@ -1876,7 +1876,8 @@ function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
     return du
 end
 
-_kept(ctx::TSContext{R, S, A}, x) where {R, S, A} = A <: Vector ? x :
+_kept(ctx::TSContext{R, S, A}, x) where {R, S, A} = A <: Number ? only(x) :
+    A <: Vector ? x :
     A <: Array ? reshape(x, ctx.shape) : A((x[1:ctx.f!.nv], x[(ctx.f!.nv + 1):end]))
 
 function _record_end!(ctx, t, x)
@@ -2042,7 +2043,11 @@ function _derivative(ctx::TSContext{R, S}, t, u) where {R, S}
 end
 
 _saved(ctx::TSContext{R, S, A}, u) where {R, S, A} = ctx.save_idxs === nothing ?
-    _as_u0(ctx, Vector{eltype(A)}(vec(u))) : eltype(A)[u[i] for i in ctx.save_idxs]
+    _as_u0(ctx, Vector{eltype(A)}(vec(u))) :
+    _kept(ctx, eltype(A)[u[i] for i in ctx.save_idxs])
+
+_given_idxs(ctx::TSContext{R, S, A}) where {R, S, A} =
+    A <: Number ? only(ctx.save_idxs) : ctx.save_idxs
 
 _interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, dus) :
     SciMLBase.LinearInterpolation(ts, ctx.us)
@@ -2911,9 +2916,10 @@ function _save_index(u0, I::CartesianIndex)
     return LinearIndices(u0)[I]
 end
 
+_listed(idxs) = idxs isa AbstractArray && SII.symbolic_type(idxs) == SII.NotSymbolic()
+
 function _save_idxs(prob, idxs)
-    idxs isa AbstractArray && SII.symbolic_type(idxs) == SII.NotSymbolic() ||
-        return _state_indices!(Int[], prob, idxs)
+    _listed(idxs) || return _state_indices!(Int[], prob, idxs)
     v = Int[]
     for i in idxs
         _state_indices!(v, prob, i)
@@ -5237,7 +5243,9 @@ function _setup(
     clone = dm === nothing ? nothing : _clone_dm(petsclib, dm)
     uvec = clone === nothing ? _state_vec(petsclib, comm, n) :
         _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib)
-    A = kept !== nothing ? Vector{U} : dyn ? typeof(similar(prob.u0, U)) :
+    # A single index saves numbers, as OrdinaryDiffEq does.
+    A = kept !== nothing ? (_listed(save_idxs) || length(kept) > 1 ? Vector{U} : U) :
+        dyn ? typeof(similar(prob.u0, U)) :
         Array{U, ndims(prob.u0)}
     # f scatters through the caller's DM, so the handle holds a reference to it.
     dms = clone === nothing ? Ptr{Cvoid}[] : [clone.ptr, _referenced(petsclib, dm.ptr)]
@@ -5901,7 +5909,7 @@ mutable struct PETScIntegratorOpts{H, R}
     save_end::Bool
     save_discretes::Bool
     dense::Bool
-    save_idxs::Union{Nothing, Vector{Int}}
+    save_idxs::Union{Nothing, Int, Vector{Int}}
     calck::Bool
     internalnorm::Any
     unstable_check::Any
@@ -6113,7 +6121,7 @@ function _make_opts(
         get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
         get(kwargs, :save_on, true) === true,
         ctx.maxiters, ctx.save_everystep, h.save_start, h.save_end,
-        get(kwargs, :save_discretes, true) === true, ctx.dense, ctx.save_idxs,
+        get(kwargs, :save_discretes, true) === true, ctx.dense, _given_idxs(ctx),
         ctx.hermite || ctx.interpolates === true, _internalnorm(ctx.comm),
         ctx.unstable, ctx.domain,
         callback isa SciMLBase.CallbackSet ? callback : SciMLBase.CallbackSet(callback),
