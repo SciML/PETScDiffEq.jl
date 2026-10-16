@@ -662,6 +662,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    failing_petsc_call(::Ptr{Cvoid}, ::Ptr{Cvoid}) = PETScDiffEq.LibPETSc.PetscErrorCode(62)
+
+    @testset "an error code PETSc returns is raised, not ignored" begin
+        pl = PETScDiffEq.PETSc.getlib(; PetscScalar = Float64)
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        never = (dt, u, p, t) -> false
+        for name in (:TSSetPostStep, :TSGetSolution)
+            key = (pl.petsc_library, name)
+            original = PETScDiffEq._symbol(pl, name)
+            PETScDiffEq.PETSC_SYMBOLS[key] = @cfunction(
+                failing_petsc_call, PETScDiffEq.LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
+            )
+            try
+                @test_throws PETScDiffEq.LibPETSc.PetscError(62) SciMLBase.solve(
+                    prob, PETScDiffEq.TSRK("5dp"); unstable_check = never,
+                )
+            finally
+                PETScDiffEq.PETSC_SYMBOLS[key] = original
+            end
+        end
+        @test SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); unstable_check = never).retcode ==
+            SciMLBase.ReturnCode.Success
+    end
+
     @testset "Float32" begin
         build(integ) = PETScDiffEq.PETSc.scalartype(integ.h.petsclib)
         none = ["-ts_adapt_type", "none"]
