@@ -9958,6 +9958,51 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test integ.u == SciMLBase.solve(prob, bdf; dt = 0.01, adaptive = false).u[end]
     end
 
+    @testset "a callback that clears the flag after changing u does not restart PETSc" begin
+        rotate!(du, u, p, t) = (du[1] = u[2]; du[2] = -u[1]; nothing)
+        prob = SciMLBase.ODEProblem(rotate!, [1.0, 1.0], (0.0, 2.0))
+        tol = (abstol = 1.0e-8, reltol = 1.0e-8)
+        project(u) = u .* sqrt(2 / (u[1]^2 + u[2]^2))
+        drift(sol) = maximum(u -> abs(u[1]^2 + u[2]^2 - 2), sol.u)
+        every(affect!) = SciMLBase.DiscreteCallback(
+            (u, t, integ) -> true, affect!; save_positions = (false, false),
+        )
+        cleared = every(
+            integ -> (
+                integ.u .= project(integ.u); SciMLBase.derivative_discontinuity!(integ, false)
+            ),
+        )
+        flagged = every(integ -> (integ.u .= project(integ.u); nothing))
+        set_u = every(
+            integ -> (
+                SciMLBase.set_u!(integ, project(integ.u));
+                SciMLBase.derivative_discontinuity!(integ, false)
+            ),
+        )
+        # Measured: 543 steps alone or cleared, 8795 restarted; drift 1.1e-7 alone, 1.9e-10 kept.
+        bdf = PETScDiffEq.TSImplicit("bdf")
+        alone = SciMLBase.solve(prob, bdf; tol...)
+        kept = SciMLBase.solve(prob, bdf; tol..., callback = cleared)
+        @test kept.stats.naccept < 2 * alone.stats.naccept
+        @test drift(kept) < drift(alone) / 100
+        for cb in (flagged, set_u)
+            @test SciMLBase.solve(prob, bdf; tol..., callback = cb).stats.naccept >
+                10 * alone.stats.naccept
+        end
+        integ = SciMLBase.init(prob, bdf; tol...)
+        while integ.t < 2.0
+            SciMLBase.step!(integ)
+            integ.u .= project(integ.u)
+        end
+        @test integ.sol.stats.naccept > 10 * alone.stats.naccept
+        # TSRK keeps its last stage's slope, as OrdinaryDiffEq's FSAL methods do.
+        rk = PETScDiffEq.TSRK("5dp")
+        alone = SciMLBase.solve(prob, rk; tol...)
+        nf, n = alone.stats.nf, alone.stats.naccept
+        @test SciMLBase.solve(prob, rk; tol..., callback = cleared).stats.nf < nf + n ÷ 2
+        @test SciMLBase.solve(prob, rk; tol..., callback = flagged).stats.nf >= nf + n
+    end
+
     @testset "Only methods with an error estimate adapt" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         steps(alg, rt) = SciMLBase.solve(

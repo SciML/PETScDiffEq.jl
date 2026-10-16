@@ -6949,6 +6949,9 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
             _write_state!(h, integ.u)
             LibPETSc.TSRestartStep(h.petsclib, h.ts)
             _dirty!(ctx)
+        else
+            # A cleared flag keeps BDF's past states and an FSAL slope, as OrdinaryDiffEq's do.
+            _take_written_state!(integ, false)
         end
         if cb.save_positions[2]
             _save_here!(integ)
@@ -7093,12 +7096,12 @@ function _take_written_tolerances!(integ::PETScIntegrator)
     return nothing
 end
 
-function _take_written_state!(integ::PETScIntegrator)
+function _take_written_state!(integ::PETScIntegrator, restart::Bool = true)
     h = integ.h
     _everywhere(h.ctx.comm, _read_state!(integ.ucache, h.ctx, h.u) == integ.u) &&
         return nothing
     _write_state!(h, integ.u)
-    LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    restart && LibPETSc.TSRestartStep(h.petsclib, h.ts)
     _dirty!(h.ctx)
     return nothing
 end
