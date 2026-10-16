@@ -11641,6 +11641,41 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "cost times 1e-14 from t0, tf or each other on a 1 ns span get their own steps" begin
+            p = 3.0e9
+            prob = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (du[1] = -p[1] * u[1]; nothing);
+                    jac = (J, u, p, t) -> (J[1, 1] = -p[1]; nothing),
+                    paramjac = (pJ, u, p, t) -> (pJ[1, 1] = -u[1]; nothing),
+                ),
+                [1.0], (0.0, 1.0e-9), [p],
+            )
+            function cost_at(ts)
+                steps, given = Tuple{Float64, Float64}[], Float64[]
+                _, dp = PETScDiffEq._discrete_adjoint(
+                    prob, TSRK("5dp"), PETScAdjoint();
+                    t = ts, abstol = 1.0e-12, reltol = 1.0e-12,
+                    dgdu_discrete = (out, u, p, t, i) -> (push!(given, u[1]); out .= 1; nothing),
+                    unstable_check = (dt, u, p, t) -> (push!(steps, (t, u[1])); false),
+                )
+                return steps, given, dp[1] / sum(-ts .* exp.(-p .* ts)) - 1
+            end
+            # Measured: dp to 4.4e-12, the error of the forward solve.
+            for ts in ([1.0e-14], [1.0e-9 - 1.0e-14], [5.0e-10, 5.0e-10 + 1.0e-14])
+                steps, given, err = cost_at(ts)
+                at = [findfirst(s -> first(s) == t, steps) for t in ts]
+                @test !any(isnothing, at)
+                @test sort(given) == sort([last(steps[k]) for k in filter(!isnothing, at)])
+                @test abs(err) < 1.0e-11
+            end
+            # Closer than PETSc 3.22 lets a step end before the next span time, they share one.
+            for ts in ([5.0e-10, 5.0e-10 + 1.0e-15], [1.0e-9 - 1.0e-15])
+                @test abs(last(cost_at(ts))) < 1.0e-5
+            end
+            @test_throws "lies outside tspan" cost_at([1.0e-9 + 1.0e-14])
+        end
+
         @testset "an empty state with a sparse jac_prototype" begin
             prob = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(
