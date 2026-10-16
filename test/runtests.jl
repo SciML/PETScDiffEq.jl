@@ -4044,7 +4044,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test SciMLBase.get_du(integ)[1] ≈ -integ.u[1]
             mid = (integ.tprev + integ.t) / 2
             @test abs(integ(mid)[1] - exp(-mid)) < 1.0e-6
-            @test_throws ArgumentError integ(integ.t + 1.0)
+            ahead = integ.t + integ.dt / 2
+            @test abs(integ(ahead)[1] - exp(-ahead)) < 5.0e-6
             SciMLBase.add_saveat!(integ, 0.55)
             SciMLBase.set_proposed_dt!(integ, 0.05)
             sol = SciMLBase.solve!(integ)
@@ -4070,6 +4071,63 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test worst[1] < 3.0e-6
                 @test worst[2] < 3.0e-5
             end
+        end
+
+        @testset "PositiveDomain and GeneralDomain extrapolate past the step" begin
+            fall!(du, u, p, t) = (du .= -50 .* u; nothing)
+            drop = SciMLBase.ODEProblem(fall!, [1.0, 2.0], (0.0, 1.0))
+            outside!(resid, u, p, t) = (resid .= max.(.-u, 0.0); nothing)
+            general() = DiffEqCallbacks.GeneralDomain(
+                outside!, [1.0, 2.0]; autodiff = PETScDiffEq.AutoForwardDiff(),
+                resid_prototype = zeros(2),
+            )
+            @test minimum(minimum, SciMLBase.solve(drop, PETScDiffEq.TSRK("3bs")).u) < 0
+            algs = (
+                PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRK("3bs"),
+                PETScDiffEq.TSRosW("ra34pw2"), PETScDiffEq.TSImplicit("bdf"; order = 3),
+            )
+            for alg in algs, domain in (DiffEqCallbacks.PositiveDomain, general)
+                integ = SciMLBase.init(drop, alg; callback = domain())
+                lowest = Inf
+                while !integ.finished
+                    SciMLBase.step!(integ)
+                    lowest = min(lowest, minimum(integ.u))
+                end
+                @test integ.sol.retcode == SciMLBase.ReturnCode.Success
+                @test lowest >= 0
+                sol = SciMLBase.solve(drop, alg; callback = domain())
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.u[end] == integ.u
+                @test all(<(1.0e-7), sol.u[end])
+            end
+
+            back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
+            for (pr, exact) in ((prob, t -> exp(-t)), (back, t -> exp(1 - t)))
+                integ = SciMLBase.init(pr, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
+                @test_throws "no step has been taken yet" integ(integ.t + integ.tdir * 0.05)
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                ahead, h = integ.t + integ.dt / 2, 1.0e-6
+                @test abs(integ(ahead)[1] - exact(ahead)) < 6.0e-6
+                @test abs(integ(ahead, Val{1})[1] + exact(ahead)) < 3.0e-4
+                @test abs(
+                    integ(ahead, Val{1})[1] - (integ(ahead + h)[1] - integ(ahead - h)[1]) / 2h,
+                ) < 1.0e-8
+                @test_throws "or past its end" integ(integ.tprev - integ.dt / 2)
+                @test_throws "can only interpolate inside" SciMLBase.change_t_via_interpolation!(
+                    integ, ahead,
+                )
+                SciMLBase.solve!(integ)
+                @test_throws "the integrator has finished" integ(integ.t + integ.dt / 2)
+            end
+
+            massive = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0], (0.0, 1.0),
+            )
+            integ = SciMLBase.init(massive, PETScDiffEq.TSImplicit("bdf"); dt = 0.1)
+            SciMLBase.step!(integ)
+            @test_throws "no derivative to build a Hermite" integ(integ.t + integ.dt / 2)
+            SciMLBase.terminate!(integ)
         end
     end
 
@@ -8750,7 +8808,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test integ(one, tm, Val{1}; idxs = 2) == [du[2]]
                 @test integ(out, ts) == fill(integ(integ.t), 3) && out == integ.u
                 @test_throws ArgumentError integ(tm, Val{2})
-                @test_throws ArgumentError integ(integ.t + 1.0, Val{1})
+                @test_throws ArgumentError integ(integ.tprev - 1.0, Val{1})
                 SciMLBase.solve!(integ)
                 tm = (integ.tprev + integ.t) / 2
                 u = integ(tm)

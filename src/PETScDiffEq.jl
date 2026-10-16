@@ -6376,7 +6376,25 @@ function SciMLBase.step!(integ::PETScIntegrator, dt, stop_at_tdt = false)
     return nothing
 end
 
-function _state_at_unlocked(integ::PETScIntegrator, t, deriv::Type = Val{0})
+_extrapolates(integ::PETScIntegrator) = integ.h.ctx.M === nothing && !integ.h.ctx.dae &&
+    !integ.finished && integ.tprev != integ.t
+
+function _outside_step(integ::PETScIntegrator, t, ahead::Bool)
+    step = "the step just taken, $(integ.tprev) to $(integ.t)"
+    ahead && integ.tdir * t > integ.tdir * integ.t || return ArgumentError(
+        "PETScDiffEq can only interpolate inside $step$(ahead ? ", or past its end" : ""), " *
+            "but $t was asked for",
+    )
+    why = integ.finished ? "the integrator has finished" :
+        integ.tprev == integ.t ? "no step has been taken yet" :
+        "a mass matrix or a DAEProblem gives no derivative to build a Hermite interpolant from"
+    return ArgumentError("PETScDiffEq cannot extrapolate to $t, past $step: $why")
+end
+
+# PETSc's TSInterpolate refuses times past its clock, so `ahead` extrapolates the Hermite cubic.
+function _state_at_unlocked(
+        integ::PETScIntegrator, t, deriv::Type = Val{0}, ahead::Bool = false,
+    )
     # Snap only from outside the step: Float32 root-finder probes can round onto an end.
     s, s0, s1 = integ.tdir * t, integ.tdir * integ.tprev, integ.tdir * integ.t
     if s == s1 || s1 < s <= s1 + _near(integ.t)
@@ -6384,22 +6402,19 @@ function _state_at_unlocked(integ::PETScIntegrator, t, deriv::Type = Val{0})
     elseif s == s0 || s0 - _near(integ.tprev) <= s < s0
         return deriv === Val{0} ? integ.uprev : _interpolate!(integ, s0, deriv)
     end
-    s0 <= s <= s1 || throw(
-        ArgumentError(
-            "PETScDiffEq can only interpolate inside the step just taken, " *
-                "$(integ.tprev) to $(integ.t), but $t was asked for",
-        ),
-    )
-    return _interpolate!(integ, s, deriv)
+    s0 <= s <= s1 && return _interpolate!(integ, s, deriv)
+    ahead && s > s1 && _extrapolates(integ) || throw(_outside_step(integ, t, ahead))
+    ctx = integ.h.ctx
+    return _hermite!(integ.ucache, ctx, s, s0, integ.uprev, ctx.end_s, ctx.end_u, deriv)
 end
 
-function _state_at(integ::PETScIntegrator, t, deriv::Type = Val{0})
+function _state_at(integ::PETScIntegrator, t, deriv::Type = Val{0}, ahead::Bool = false)
     deriv === Val{0} || deriv === Val{1} || throw(_unsupported_deriv(deriv))
-    return _locked(() -> _state_at_unlocked(integ, oftype(integ.t, t), deriv))
+    return _locked(() -> _state_at_unlocked(integ, oftype(integ.t, t), deriv, ahead))
 end
 
 function _checked_state(integ::PETScIntegrator, t, deriv::Type = Val{0})
-    u = _state_at(integ, t, deriv)
+    u = _state_at(integ, t, deriv, true)
     _raise_threw!(integ)
     return u
 end
