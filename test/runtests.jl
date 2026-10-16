@@ -65,6 +65,22 @@ function damped_oscillator_jac!(J, u, p, t)
 end
 const OSCILLATOR_PROTOTYPE = sparse([1, 2, 2], [2, 1, 2], ones(3), 2, 2)
 
+# An array type of its own over a plain Vector, read by name as a ComponentArray is.
+struct Named{T} <: AbstractVector{T}
+    data::Vector{T}
+end
+Base.size(x::Named) = size(getfield(x, :data))
+Base.IndexStyle(::Type{<:Named}) = IndexLinear()
+Base.getindex(x::Named, i::Int) = getfield(x, :data)[i]
+Base.setindex!(x::Named, v, i::Int) = (getfield(x, :data)[i] = v; x)
+Base.similar(::Named, ::Type{T}, dims::Dims{1}) where {T} = Named(Vector{T}(undef, dims))
+Base.BroadcastStyle(::Type{<:Named}) = Broadcast.ArrayStyle{Named}()
+Base.similar(bc::Broadcast.Broadcasted{Broadcast.ArrayStyle{Named}}, ::Type{T}) where {T} =
+    Named(Vector{T}(undef, length(bc)))
+Base.getproperty(x::Named, s::Symbol) =
+    s === :a ? x[1] : s === :b ? view(x, 2:length(x)) : getfield(x, s)
+Base.setproperty!(x::Named, s::Symbol, v) = s === :a ? (x[1] = v) : setfield!(x, s, v)
+
 # GROUP=MPI2 is MPI on 2 ranks, for a workflow that passes only GROUP.
 const GROUP, GROUP_RANKS = let group = get(ENV, "GROUP", ""), ranks = match(r"^MPI([123])$", group)
     isempty(group) ? ("All", "") : ranks === nothing ? (group, "") : ("MPI", String(ranks[1]))
@@ -5148,6 +5164,148 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.reinit!(integ, vec(2 .* u0))
             @test integ.u == 2 .* u0
             SciMLBase.terminate!(integ)
+        end
+    end
+
+    @testset "a u0 of another array type keeps it" begin
+        function osc!(du, u, p, t)
+            du.a = u.b[1]
+            du.b[1] = -u.a - p[1] * u.b[1]
+            du.b[2] = -u.b[2]^2
+            return nothing
+        end
+        osc(u, p, t) = (du = similar(u); osc!(du, u, p, t); du)
+        function osc_jac!(J, u, p, t)
+            fill!(J, 0)
+            J[1, 2], J[2, 1], J[2, 2], J[3, 3] = 1.0, -1.0, -p[1], -2 * u.b[2]
+            return nothing
+        end
+        damp!(du, u, p, t) = (du .= -p[1] .* u; nothing)
+        # The same problems written by hand on the plain vector, which `Named` wraps in place.
+        flat(f!) = (du, u, p, t) -> f!(Named(du), Named(u), p, t)
+        flat_oop(u, p, t) = collect(osc(Named(u), p, t))
+        flat_jac!(J, u, p, t) = osc_jac!(J, Named(u), p, t)
+        u0 = Named([1.0, -1.0, 2.0])
+        ode(f, u; kw...) =
+            SciMLBase.ODEProblem(SciMLBase.ODEFunction(f; kw...), u, (0.0, 1.0), [0.3])
+        same(a, b) = a.t == b.t && length(a.u) == length(b.u) &&
+            all(collect(x) == y for (x, y) in zip(a.u, b.u))
+        rk, bdf = PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf")
+
+        reference = SciMLBase.solve(ode(osc!, u0), Tsit5())
+        @testset "$(nameof(typeof(alg))) matches the problem on the plain vector" for alg in
+            (rk, PETScDiffEq.TSRosW("ra34pw2"), bdf)
+            sol = SciMLBase.solve(ode(osc!, u0), alg)
+            @test sol.u[end] isa Named{Float64} && typeof(sol.u[end]) == typeof(reference.u[end])
+            @test typeof(sol(0.5)) == typeof(reference(0.5)) == Named{Float64}
+            @test typeof(sol(0.5, Val{1})) == typeof(reference(0.5, Val{1}))
+            @test same(sol, SciMLBase.solve(ode(flat(osc!), collect(u0)), alg))
+            oop = SciMLBase.solve(ode(osc, u0), alg)
+            @test oop.u[end] isa Named{Float64}
+            @test same(oop, SciMLBase.solve(ode(flat_oop, collect(u0)), alg))
+        end
+        @test same(
+            SciMLBase.solve(ode(osc!, u0; jac = osc_jac!), bdf),
+            SciMLBase.solve(ode(flat(osc!), collect(u0); jac = flat_jac!), bdf),
+        )
+        mass = Diagonal([1.0, 2.0, 3.0])
+        @test same(
+            SciMLBase.solve(ode(osc!, u0; mass_matrix = mass), bdf),
+            SciMLBase.solve(ode(flat(osc!), collect(u0); mass_matrix = mass), bdf),
+        )
+        parts(f, u) = SciMLBase.SplitODEProblem(f(damp!), f(osc!), u, (0.0, 1.0), [0.3])
+        for alg in (PETScDiffEq.TSARKIMEX("3"), rk)
+            @test same(
+                SciMLBase.solve(parts(identity, u0), alg),
+                SciMLBase.solve(parts(flat, collect(u0)), alg),
+            )
+        end
+        for T in (ComplexF64, Float32)
+            sol = SciMLBase.solve(ode(osc!, Named(T.(collect(u0)))), rk)
+            @test sol.u[end] isa Named{T}
+            @test same(sol, SciMLBase.solve(ode(flat(osc!), T.(collect(u0))), rk))
+        end
+
+        @testset "saving and the functions that see the state" begin
+            kw = (saveat = 0.25, save_idxs = [3, 1])
+            picked = SciMLBase.solve(ode(osc!, u0), rk; kw...)
+            @test picked.u[end] isa Vector{Float64}
+            @test same(picked, SciMLBase.solve(ode(flat(osc!), collect(u0)), rk; kw...))
+            saved = SciMLBase.solve(ode(osc!, u0), rk; saveat = 0.25, dense = false)
+            @test all(u -> u isa Named{Float64}, saved.u) && saved(0.3) isa Named{Float64}
+            seen = Set{Type}()
+            SciMLBase.solve(
+                ode(osc!, u0), rk;
+                isoutofdomain = (u, p, t) -> (push!(seen, typeof(u)); u.a > 10),
+                unstable_check = (dt, u, p, t) -> (push!(seen, typeof(u)); u.a > 10),
+            )
+            @test seen == Set([Named{Float64}])
+        end
+
+        @testset "callbacks and the integrator" begin
+            # `a` reads and `set_a!` writes the first entry of each formulation's state.
+            function run(f, u, a, set_a!)
+                fired = [0, 0]
+                cross = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> a(u) - 0.5, integ -> (fired[1] += 1; set_a!(integ.u, 1.0)),
+                )
+                double = SciMLBase.DiscreteCallback(
+                    (u, t, integ) -> t == 0.5,
+                    integ -> (fired[2] += 1; set_a!(integ.u, 2 * a(integ.u))),
+                )
+                integ = SciMLBase.init(
+                    ode(f, u), rk; callback = SciMLBase.CallbackSet(cross, double), tstops = [0.5],
+                )
+                SciMLBase.step!(integ)
+                seen = (
+                    copy(integ.u), copy(integ.uprev), SciMLBase.get_du(integ), integ(integ.t / 2),
+                    first(SciMLBase.get_tmp_cache(integ)),
+                )
+                SciMLBase.set_u!(integ, 2 .* collect(u))
+                SciMLBase.step!(integ)
+                stepped = copy(integ.u)
+                fill!(fired, 0)
+                SciMLBase.reinit!(integ, collect(u))
+                restarted = copy(integ.u)
+                return (; seen, stepped, restarted, sol = SciMLBase.solve!(integ), fired)
+            end
+            a = run(osc!, u0, u -> u.a, (u, v) -> (u.a = v))
+            b = run(flat(osc!), collect(u0), u -> u[1], (u, v) -> (u[1] = v))
+            @test all(x -> x isa Named{Float64}, (a.seen..., a.stepped, a.restarted))
+            @test all(collect(x) == y for (x, y) in zip(a.seen[1:4], b.seen[1:4]))
+            @test collect(a.stepped) == b.stepped && a.restarted == u0
+            @test same(a.sol, b.sol) && all(u -> u isa Named{Float64}, a.sol.u)
+            @test a.fired == b.fired && a.fired[1] > 0 && a.fired[2] == 1
+            integ = SciMLBase.init(ode(osc!, u0), rk)
+            SciMLBase.reinit!(integ, Named([2, 1, 4]))
+            @test integ.u isa Named{Float64} && integ.u == [2.0, 1.0, 4.0]
+            SciMLBase.terminate!(integ)
+        end
+
+        @testset "a step interpolated in calls f as often as on the plain vector" begin
+            calls = Ref(0)
+            counted!(du, u, p, t) = (calls[] += 1; du .= -u; nothing)
+            function count(u)
+                calls[] = 0
+                integ = SciMLBase.init(ode(counted!, u), PETScDiffEq.TSRK("4"); dt = 0.1)
+                for _ in 1:5
+                    SciMLBase.step!(integ)
+                    integ(integ.t - 0.05)
+                end
+                SciMLBase.terminate!(integ)
+                return calls[]
+            end
+            @test count(u0) == count(collect(u0)) == count(reshape(collect(u0), 1, 3))
+        end
+
+        @testset "PETScAdjoint gives du0 in u0's type" begin
+            run(f, u, of_u) = PETScDiffEq._discrete_adjoint(
+                ode(f, u), rk, PETScAdjoint(); t = [1.0],
+                dgdu_discrete = (out, u, p, t, i) -> (fill!(out, 0); of_u(out, u); nothing),
+            )
+            du0, dp = run(osc!, u0, (out, u) -> (out.a = 2 * u.a))
+            flat_du0, flat_dp = run(flat(osc!), collect(u0), (out, u) -> (out[1] = 2 * u[1]))
+            @test du0 isa Named{Float64} && collect(du0) ≈ flat_du0 && dp ≈ flat_dp
         end
     end
 

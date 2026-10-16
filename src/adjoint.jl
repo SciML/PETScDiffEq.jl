@@ -47,7 +47,9 @@ system on the flat `[v; u]` that these methods step. Its `jac` and `paramjac`, w
 are that system's, taking the state as an `ArrayPartition(v, u)` as the forward solve's
 `jac` does, and are otherwise built from `f1` and `f2`. The cost functions are handed the
 state as an `ArrayPartition` and write its derivative into one, and `du0` comes back as
-one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused.
+one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused. A
+`u0` of another vector type, such as a `ComponentArray`, is handled the same way, with its
+own type in place of the `ArrayPartition`.
 
 The adjoint runs in PETSc's double real build. A `Float32` problem is solved there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
@@ -1170,6 +1172,7 @@ function _discrete_adjoint_unlocked(
         given, checked, Bool(no_start)
     end
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
+    wraps = _wraps(prob, alg)
     is_split = prob.f isa SciMLBase.SplitFunction
     p = prob.p
     np = has_p ? length(p) : 0
@@ -1206,10 +1209,12 @@ function _discrete_adjoint_unlocked(
         adaptive && _set_time_span!(h, cost_s)
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
-        inplace(fun) = _as_inplace(SciMLBase.unwrapped_f(fun.f), iip)
+        inplace(fun) = _shaped(
+            _as_inplace(SciMLBase.unwrapped_f(fun.f), iip), dyn ? nothing : ctx.wrapped_u,
+        )
         f_ad = dyn ? _partitioned(prob.f, iip, length(prob.u0.x[1])) :
             inplace(is_split ? prob.f.f1 : prob.f)
-        user_jac(j) = dyn ? _partitioned_jac(j, prob.u0, iip) : _as_inplace_jac(j, iip)
+        user_jac(j) = wraps ? _partitioned_jac(j, prob.u0, iip) : _as_inplace_jac(j, iip)
         user_t0 = Float64(prob.tspan[1])
         rhs, f_rhs = is_split ? (prob.f.f2, inplace(prob.f.f2)) : (prob.f, f_ad)
         # A partitioned prototype's columns number the whole [v; u], every velocity first.
@@ -1443,12 +1448,12 @@ function _discrete_adjoint_unlocked(
         comm === nothing || (dp .+= MPI.Allreduce(mine, +, comm))
     end
     du0 = _like(prob.u0, du0)
-    return dyn ? _partition(prob.u0, du0) : du0, has_p ? _like(p, dp)' : nothing
+    return wraps ? _partition(prob.u0, du0) : du0, has_p ? _like(p, dp)' : nothing
 end
 
 _like(x, g) = eltype(x) === Float32 ? Float32.(g) : g
 
-# A DynamicalODEProblem's costs see the flat [v; u] as the ArrayPartition `solve` saves.
+# The costs see the flat state in the type `solve` saves it as, such as an ArrayPartition.
 _partitioned_cost(::Nothing, template, of_u) = nothing
 function _partitioned_cost(dg, template, of_u)
     of_u || return (out, u, args...) -> dg(out, _partition(template, u), args...)
@@ -1473,8 +1478,7 @@ _partitioned_costs(
 )
 
 function _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...)
-    costs = prob.f isa SciMLBase.DynamicalODEFunction ?
-        _partitioned_costs(prob.u0; kwargs...) : kwargs
+    costs = _wraps(prob, alg) ? _partitioned_costs(prob.u0; kwargs...) : kwargs
     return _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; costs...))
 end
 
