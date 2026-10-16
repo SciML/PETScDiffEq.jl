@@ -742,6 +742,14 @@ struct COOJacobian{S}
     vals::Vector{S}
 end
 
+# A TSRK tableau and the fractions of a step at which the interpolant takes it.
+struct Restep{R}
+    A::Matrix{R}
+    b::Vector{R}
+    c::Vector{R}
+    nodes::Vector{R}
+end
+
 mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     petsclib::L
     f!::F
@@ -825,6 +833,8 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     ncondition::Int
     own_matchstep::Bool
     shape::Union{Nothing, Dims}
+    restep::Union{Nothing, Restep{R}}
+    inner::Any
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -2050,10 +2060,72 @@ _interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, d
 function _hermite!(out, ctx, s, s0, u0, s1, u1, ::Type{Val{N}} = Val{0}) where {N}
     ctx.fstart === nothing && (ctx.fstart = _derivative(ctx, s0, u0))
     ctx.fend === nothing && (ctx.fend = _derivative(ctx, s1, u1))
+    ctx.restep === nothing ||
+        return _restepped!(vec(out), ctx, s, s0, vec(u0), s1, vec(u1), Val{N})
     _hermite_flat!(
         vec(out), ctx.fstart, ctx.fend, ctx.tdir, s, s0, vec(u0), s1, vec(u1), Val{N},
     )
     return out
+end
+
+# The Hermite interpolant through the step's ends and the points `_inner_points!` adds.
+function _restepped!(out, ctx, s, s0, u0, s1, u1, ::Type{Val{N}}) where {N}
+    us, fs = _inner_points!(ctx, s0, u0, s1)
+    h = s1 - s0
+    θ = (s - s0) / h
+    xs = [zero(θ); ctx.restep.nodes; one(θ)]
+    vs, ds = [[u0]; us; [u1]], [[ctx.fstart]; fs; [ctx.fend]]
+    fill!(out, 0)
+    for j in eachindex(xs)
+        l, dl, w = _lagrange(xs, j, θ)
+        x = θ - xs[j]
+        a, b = N == 0 ? ((1 - 2w * x) * l^2, h * x * l^2) :
+            ((2l * dl * (1 - 2w * x) - 2w * l^2) / h, l^2 + 2x * l * dl)
+        out .+= a .* vs[j] .+ b .* ds[j]
+    end
+    N == 0 || (out .*= ctx.tdir)
+    return out
+end
+
+# `xs[j]`'s Lagrange basis polynomial and its slope at θ, and its slope at `xs[j]` itself.
+function _lagrange(xs, j, θ)
+    l, dl, w = one(θ), zero(θ), zero(θ)
+    for i in eachindex(xs)
+        i == j && continue
+        d = xs[j] - xs[i]
+        dl = dl * (θ - xs[i]) / d + l / d
+        l *= (θ - xs[i]) / d
+        w += 1 / d
+    end
+    return l, dl, w
+end
+
+# States and slopes at the tableau's fractions of the step, each from the method's own step.
+function _inner_points!(ctx, s0, u0, s1)
+    key = (s0, s1, ctx.fstart, ctx.fend)
+    ctx.inner !== nothing && ctx.inner[1] === key && return ctx.inner[2], ctx.inner[3]
+    rs, h = ctx.restep, s1 - s0
+    us = [_restep(ctx, rs, s0, u0, θ * h) for θ in rs.nodes]
+    fs = [_derivative(ctx, s0 + rs.nodes[i] * h, us[i]) for i in eachindex(us)]
+    ctx.inner = (key, us, fs)
+    return us, fs
+end
+
+function _restep(ctx, rs::Restep, s0, u0, h)
+    k = [ctx.fstart]
+    y = similar(u0)
+    for i in 2:length(rs.b)
+        copyto!(y, u0)
+        for j in 1:(i - 1)
+            iszero(rs.A[i, j]) || (y .+= (h * rs.A[i, j]) .* k[j])
+        end
+        push!(k, _derivative(ctx, s0 + rs.c[i] * h, y))
+    end
+    u = copy(u0)
+    for i in eachindex(k)
+        iszero(rs.b[i]) || (u .+= (h * rs.b[i]) .* k[i])
+    end
+    return u
 end
 
 function _hermite_flat!(out, f0, f1, tdir, s, s0, u0, s1, u1, ::Type{Val{N}}) where {N}
@@ -4022,6 +4094,31 @@ function _running_name(petsclib, ts)
     return type
 end
 
+# PETSc's own interpolant for these is linear, and the cubic Hermite is below their order.
+function _restep_tableau(pl, ts, running)
+    type, sub = first(split(running)), last(split(running))
+    type == "rk" && get(_RK_ORDER, sub, 0) >= 5 && !(sub in _RK_CUBIC_INTERP) ||
+        return nothing
+    R = pl.PetscReal
+    n = Ref{LibPETSc.PetscInt}()
+    A, b, c = Ref{Ptr{Cvoid}}(), Ref{Ptr{Cvoid}}(), Ref{Ptr{Cvoid}}()
+    _check_code(
+        ccall(
+            _symbol(pl, :TSRKGetTableau), LibPETSc.PetscErrorCode,
+            (
+                LibPETSc.CTS, Ptr{LibPETSc.PetscInt}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}},
+                Ptr{Ptr{Cvoid}}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid},
+            ),
+            ts, n, A, b, c, C_NULL, C_NULL, C_NULL, C_NULL,
+        ),
+    )
+    s = Int(n[])
+    # A quintic or a septic, of at least the method's order less one.
+    nodes = _RK_ORDER[sub] >= 7 ? R[1 // 3, 2 // 3] : R[1 // 2]
+    copied(p, dims) = copy(unsafe_wrap(Array, Ptr{R}(p[]), dims))
+    return Restep(permutedims(copied(A, (s, s))), copied(b, s), copied(c, s), nodes)
+end
+
 function _irk_stages(pl, ts)
     n = Ref{LibPETSc.PetscInt}()
     _check_code(
@@ -5261,7 +5358,8 @@ function _setup(
         C_NULL, 0, false, nothing, nothing, dyn ? _partition(prob.u0, u0) : nothing,
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, max(abs(t0), abs(tf)),
-        false, false, step_limit, false, nothing, nothing, 0, 0, false, shape,
+        false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
+        nothing,
     )
     h = TSHandles(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
@@ -5535,6 +5633,7 @@ function _setup(
                 ctx.interpolates = nothing
                 ctx.alg_name = running
             end
+            ctx.hermite && (ctx.restep = _restep_tableau(petsclib, ts, running))
             if !dt_given && !any(o -> _names_option(o, "ts_dt"), effective_options)
                 user_t0 = R(prob.tspan[1])
                 est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
@@ -6445,6 +6544,8 @@ function _pin_step!(integ::PETScIntegrator)
     ctx.fstart === nothing &&
         (ctx.fstart = _derivative(ctx, integ.tdir * integ.tprev, integ.uprev))
     ctx.fend === nothing && (ctx.fend = _derivative(ctx, ctx.end_s, ctx.end_u))
+    ctx.restep === nothing ||
+        _inner_points!(ctx, integ.tdir * integ.tprev, vec(integ.uprev), ctx.end_s)
     return nothing
 end
 

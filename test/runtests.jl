@@ -7829,12 +7829,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 PETScDiffEq.TSGeneric(st) for st in ("alpha", "theta", "beuler", "cn", "bdf", "arkimex", "rosw")
             )
             push!(
-                algs, PETScDiffEq.TSRK("5dp", ["-ts_rk_type", "8vr"]),
+                algs, PETScDiffEq.TSRK("5dp", ["-ts_rk_type", "3bs"]),
                 PETScDiffEq.TSRosW("ra34pw2", ["-ts_rosw_type", "rodas3"]),
             )
             # ark3 and the lassp pair are refused, and ars122 needs a split problem.
             families = (
-                (PETScDiffEq.TSRK, PETScDiffEq._RK_ORDER, ("5dp",)),
+                (PETScDiffEq.TSRK, PETScDiffEq._RK_ORDER, ("5dp", "5f", "5bs", "6vr", "7vr", "8vr")),
                 (
                     PETScDiffEq.TSRosW, PETScDiffEq._ROSW_ORDER,
                     ("ra34pw2", "lassp3p4s2c", "llssp3p4s2c", "ark3"),
@@ -7909,6 +7909,60 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
                 SciMLBase.solve(back, alg; fixed..., callback = cb)
                 @test abs(hit[] - dense_root(dense, level)) < 5.0e-15
+            end
+        end
+
+        @testset "TSRK of order 5 and up through points its own steps reach" begin
+            lv = SciMLBase.ODEProblem(
+                lotka_volterra!, [1.0, 1.0], (0.0, 2.0), [1.5, 1.0, 3.0, 1.0],
+            )
+            ref = SciMLBase.solve(lv, Tsit5(); abstol = 1.0e-13, reltol = 1.0e-13)
+            lv_back = SciMLBase.remake(lv; u0 = ref(2.0), tspan = (2.0, 0.0))
+            tol = (abstol = 1.0e-10, reltol = 1.0e-10)
+            want = collect(0.05:0.1:1.95)
+            err(sol) = maximum(norm(sol.u[i] - ref(sol.t[i])) for i in eachindex(sol.t))
+            slope(u, t) = (du = similar(u); lotka_volterra!(du, u, lv.p, t); du)
+            root = dense_root(ref, 2.5)
+            algs = [PETScDiffEq.TSRK(st) for st in ("5f", "5bs", "6vr", "7vr", "8vr")]
+            push!(algs, PETScDiffEq.TSRK("5dp", ["-ts_rk_type", "8vr"]))
+            for alg in algs
+                for (prob, at) in ((lv, want), (lv_back, reverse(want)))
+                    steps = SciMLBase.solve(prob, alg; tol...)
+                    saved = SciMLBase.solve(prob, alg; tol..., saveat = at)
+                    @test err(saved) < 5 * err(steps)
+                    @test saved.u ==
+                        SciMLBase.solve!(SciMLBase.init(prob, alg; tol..., saveat = at)).u
+                end
+                saved = SciMLBase.solve(lv, alg; tol..., saveat = want)
+                integ = SciMLBase.init(lv, alg; tol...)
+                while !SciMLBase.done(integ)
+                    SciMLBase.step!(integ)
+                    for (k, w) in enumerate(want)
+                        integ.tprev < w < integ.t || continue
+                        @test integ(w) == saved.u[k]
+                        @test norm(integ(w, Val{1}) - slope(integ(w), w)) < 1.0e-6
+                    end
+                end
+                hit = Ref(NaN)
+                cb = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> u[1] - 2.5,
+                    integ -> (hit[] = integ.t; SciMLBase.terminate!(integ)),
+                )
+                SciMLBase.solve(lv, alg; tol..., callback = cb)
+                @test abs(hit[] - root) < 5.0e-10
+            end
+            # The interior points cost their stages once for each step a state is taken in.
+            prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+            for (st, stages) in (("5f", 6), ("6vr", 9), ("8vr", 2 * 13))
+                alg = PETScDiffEq.TSRK(st)
+                nf(; kw...) = SciMLBase.solve(prob, alg; fixed..., kw...).stats.nf
+                nf_init(; kw...) =
+                    SciMLBase.solve!(SciMLBase.init(prob, alg; fixed..., kw...)).stats.nf
+                plain = nf(save_everystep = false)
+                for count in (nf, nf_init)
+                    @test count(saveat = [0.25]) == plain + 2 + stages
+                    @test count(saveat = [0.22, 0.25, 0.28]) == count(saveat = [0.25])
+                end
             end
         end
 

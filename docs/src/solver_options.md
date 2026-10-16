@@ -66,6 +66,13 @@ A state between step ends, for `saveat`, `integrator(t)` or a `ContinuousCallbac
 from PETSc's own interpolant for `TSRK("5dp")`, `TSRosW("ra34pw2")`, `TSARKIMEX("4")` and
 `"5"`, `TSImplicit("bdf")` and `TSDAE("bdf")`, and from the cubic Hermite interpolant dense
 output uses for everything else, `TSGeneric` and a type `petsc_options` changes included.
+The exceptions are `TSRK`'s `"5f"`, `"5bs"`, `"6vr"`, `"7vr"` and `"8vr"`, whose interpolant in
+PETSc is linear and on which the cubic Hermite loses three to five digits at tight
+tolerances: their states come from a Hermite interpolant through the step's ends and one
+point inside the step, two for `"7vr"` and `"8vr"`, which the method reaches with a step of
+its own from the step's start. The points cost from 6 calls of `f` for `"5f"` to 26 for
+`"8vr"`, once in each step a state is taken from, and dense output stays the cubic Hermite,
+so for these `sol(t)` between saved points is less accurate than `saveat`.
 With a mass matrix or a `DAEProblem` only PETSc's is available, and a type that has none
 raises an `ArgumentError` when such a state is needed. `integrator(t, Val{1})` is the slope
 of the cubic Hermite interpolant through the step's ends, the interpolant's own derivative
