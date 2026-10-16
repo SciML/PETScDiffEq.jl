@@ -10719,6 +10719,85 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test relerr([du0; vec(dp)], central_differences(loss, [1.0, 1.0])) < 5.0e-9
         end
 
+        # `f` sees every stage of both runs, rejected ones too. Measured: at most 2.0e-10, and
+        # 4.2e-10 for ARKIMEX 3.
+        @testset "with tstops the adjoint's run takes the steps solve takes: $name" for (
+                name, alg, tspan, ts, kw, also,
+            ) in (
+                (
+                    "a stop off the grid", TSRK("4"), (0.0, 1.0), [0.55, 1.0],
+                    (dt = 0.1, adaptive = false, tstops = [0.55]), [],
+                ),
+                (
+                    "backward in time", TSRK("4"), (1.0, 0.0), [0.45, 0.0],
+                    (dt = 0.1, adaptive = false, tstops = [0.45]), [],
+                ),
+                (
+                    "stops on and off the grid", TSRK("4"), (0.0, 1.0), [0.2, 0.33, 0.5, 1.0],
+                    (dt = 0.1, adaptive = false, tstops = [0.97, 0.33, 0.5]), [],
+                ),
+                (
+                    "discontinuities", TSRK("5dp"), (0.0, 1.0), [0.0, 0.55, 1.0],
+                    (dt = 0.1, adaptive = false, d_discontinuities = [0.0, 0.55]), [],
+                ),
+                (
+                    "Crank-Nicolson", TSImplicit("cn", exact), (0.0, 1.0), [0.55, 1.0],
+                    (dt = 0.1, adaptive = false, tstops = [0.55]), [],
+                ),
+                (
+                    "adaptive, cost times among the stops", TSRK("5dp"), (0.0, 1.0),
+                    [0.37, 0.61, 1.0], (abstol = 1.0e-6, reltol = 1.0e-6, tstops = [0.37, 0.61]),
+                    [],
+                ),
+                (
+                    "adaptive backward in time", TSRK("5dp"), (1.0, 0.0), [0.61, 0.37, 0.0],
+                    (abstol = 1.0e-6, reltol = 1.0e-6, tstops = [0.37, 0.61]), [],
+                ),
+                (
+                    "adaptive, cost times off the stops", TSRK("3bs"), (0.0, 1.0),
+                    [0.25, 0.8, 1.0], (abstol = 1.0e-6, reltol = 1.0e-6, tstops = [0.5]),
+                    [0.25, 0.8],
+                ),
+                (
+                    "adaptive ARKIMEX 3 with a discontinuity", TSARKIMEX("3", exact), (0.0, 1.0),
+                    [0.3, 1.0], (abstol = 1.0e-6, reltol = 1.0e-6, d_discontinuities = [0.3]), [],
+                ),
+            )
+            stages = Float64[]
+            function logged!(du, u, p, t)
+                eltype(u) === eltype(p) === Float64 && push!(stages, t)
+                return adj_f!(du, u, p, t)
+            end
+            make(θ) = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(logged!; jac = adj_jac!, paramjac = adj_paramjac!),
+                θ[1:2], tspan, θ[3:6],
+            )
+            x = vcat(u0, p0)
+            # An adaptive run takes its cost times as stops, as `solve` given them does.
+            stops = vcat(get(kw, :tstops, Float64[]), also)
+            stepped(θ; extra...) = SciMLBase.solve(make(θ), alg; kw..., tstops = stops, extra...)
+            steps = stepped(x).t
+            empty!(stages)
+            stepped(x; dense = false, save_everystep = false)
+            taken = copy(stages)
+            empty!(stages)
+            du0, dp = PETScDiffEq._discrete_adjoint(
+                make(x), alg, PETScAdjoint();
+                t = ts, dgdu_discrete = coupled_du!, dgdp_discrete = coupled_dp!, kw...,
+            )
+            @test stages == taken
+            @test length(steps) > 5
+            # An adaptive solve repeated at these fixed steps keeps them as `p` moves.
+            fixed = haskey(kw, :dt) ? (;) : (dt = 1.0, adaptive = false, tstops = steps[2:(end - 1)])
+            fixed == (;) || @test stepped(x; fixed...).t == steps
+            function loss(θ)
+                sol = stepped(θ; fixed..., saveat = ts)
+                return sum(coupled(u, θ[3:6], t) for (t, u) in zip(sol.t, sol.u))
+            end
+            @test stepped(x; fixed..., saveat = ts).t == sort(ts; rev = tspan[2] < tspan[1])
+            @test relerr(vcat(du0, vec(dp)), central_differences(loss, x)) < 2.0e-9
+        end
+
         function quadrature(θ, alg, tspan, cost; dt = 0.01, kwargs...)
             aug!(dz, z, p, t) = (
                 adj_f!(view(dz, 1:2), view(z, 1:2), p, t); dz[3] = cost(view(z, 1:2), p, t); nothing
@@ -10855,6 +10934,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             @test length(steps) > 3
             @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 5.0e-10
+        end
+
+        # Measured: at most 1.5e-10.
+        @testset "an integral cost with tstops sums over the steps solve takes: $name" for (
+                name, alg, tspan, kw,
+            ) in (
+                ("RK4", TSRK("4"), (0.0, 1.0), (dt = 0.1, tstops = [0.55])),
+                (
+                    "RK4 backward in time with a discontinuity", TSRK("4"), (1.0, 0.0),
+                    (dt = 0.1, tstops = [0.45], d_discontinuities = [0.23]),
+                ),
+                ("Crank-Nicolson", TSImplicit("cn", exact), (0.0, 1.0), (dt = 0.1, tstops = [0.55])),
+            )
+            du0, dp = integral(adj_prob(copy(u0), copy(p0), tspan), alg; g = coupled, kw...)
+            loss(θ) = quadrature(θ, alg, tspan, coupled; kw...)
+            @test relerr(vcat(du0, vec(dp)), central_differences(loss, vcat(u0, p0))) < 1.0e-9
         end
 
         function implicit_part!(du, u, p, t)
@@ -11335,6 +11430,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             reference = grad(prob, TSRK("4"))
             thrower(key) = (args...) -> throw(KeyError(key))
             @test_throws KeyError(:dgdu) grad(prob, TSRK("4"); dgdu_discrete = thrower(:dgdu))
+            @test_throws KeyError(:dgdu) grad(
+                prob, TSRK("4"); t = [0.555, 1.0], tstops = [0.555],
+                dgdu_discrete = thrower(:dgdu),
+            )
+            @test isempty(PETScDiffEq.ADJ_STOPS_CTX)
             with(; jac = adj_jac!, paramjac = adj_paramjac!) = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(adj_f!; jac, paramjac), copy(u0), (0.0, 1.0), copy(p0),
             )
@@ -11994,24 +12094,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         () -> grad(SciMLBase.remake(prob; callback = never), TSRK("4")),
                     ),
                     (
-                        "PETScAdjoint does not support `tstops`",
-                        () -> grad(prob, TSRK("4"); tstops = [0.5]),
-                    ),
-                    (
                         "PETScAdjoint does not support `isoutofdomain`",
                         () -> grad(prob, TSRK("4"); isoutofdomain = (u, p, t) -> false),
                     ),
                     (
                         "the forward solve's `unstable_check` fired at t = 0.5",
                         () -> grad(prob, TSRK("4"); unstable_check = (dt, u, p, t) -> t >= 0.5),
-                    ),
-                    (
-                        "PETScAdjoint does not support `tstops`",
-                        () -> grad(SciMLBase.remake(prob; tstops = [0.5]), TSRK("4")),
-                    ),
-                    (
-                        "PETScAdjoint does not support `d_discontinuities`",
-                        () -> grad(prob, TSRK("4"); d_discontinuities = [0.5]),
                     ),
                     (
                         "PETScAdjoint does not support `save_idxs`",
@@ -12071,6 +12159,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     (
                         "cost time t[1] = 0.105 is not a time the solve stepped to",
                         () -> grad(prob, TSRK("4"); t = [0.105]),
+                    ),
+                    (
+                        "cost time t[2] = 0.6 is not a time the solve stepped to",
+                        () -> grad(prob, TSRK("4"); t = [0.555, 0.6], tstops = [0.555]),
+                    ),
+                    (
+                        "`tstops` must be real",
+                        () -> grad(SciMLBase.remake(prob; tstops = [0.5im]), TSRK("4")),
                     ),
                     (
                         "the forward solve stopped with TS_CONVERGED_ITS",
