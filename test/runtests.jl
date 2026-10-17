@@ -5528,6 +5528,43 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         after(t) = 1.5 * exp(-(t - log(6.0)))
         ramp!(du, u, p, t) = (du[1] = 1.0; nothing)
 
+        @testset "idxs hands the condition part of the state" begin
+            fall!(du, u, p, t) = (du[1] = u[2]; du[2] = -9.81; nothing)
+            ball = SciMLBase.ODEProblem(fall!, [1.0, 0.0], (0.0, 1.0))
+            drop = sqrt(2 / 9.81)
+            for (idxs, cond) in (
+                    (1, (u, t, integ) -> u),
+                    ([1], (u, t, integ) -> u[1]),
+                    (1:1, (u, t, integ) -> only(u)),
+                )
+                hits = Float64[]
+                cb = SciMLBase.ContinuousCallback(
+                    cond, integ -> push!(hits, integ.t); idxs,
+                )
+                sol = SciMLBase.solve(
+                    ball, PETScDiffEq.TSRK("5dp"); callback = cb, abstol = 1.0e-10,
+                    reltol = 1.0e-10,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test length(hits) == 1
+                @test hits[1] ≈ drop rtol = 1.0e-8
+            end
+            hits = Float64[]
+            vcb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out .= u .- [0.5, -1.0]; nothing),
+                (integ, i) -> push!(hits, integ.t), 2; idxs = [1, 2],
+            )
+            SciMLBase.solve(ball, PETScDiffEq.TSRK("5dp"); callback = vcb)
+            @test hits ≈ [1 / 9.81, sqrt(1 / 9.81)] rtol = 1.0e-6
+            hits = Float64[]
+            vcb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out[1] = u[1] + 1.0; nothing),
+                (integ, i) -> push!(hits, integ.t), 1; idxs = [2],
+            )
+            SciMLBase.solve(ball, PETScDiffEq.TSRK("5dp"); callback = vcb)
+            @test hits ≈ [1 / 9.81] rtol = 1.0e-6
+        end
+
         @testset "roots are located on the interpolant" begin
             for (alg, tol) in (
                     (PETScDiffEq.TSRK("5dp"), 1.0e-9),
