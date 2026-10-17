@@ -5660,6 +5660,9 @@ function _setup(
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
             end
+            # The integrator resets PETSc's step limit from maxiters before each step.
+            limit = LibPETSc.TSGetMaxSteps(petsclib, ts)
+            limit == _maxsteps(ctx.maxiters) || (ctx.maxiters = Int(limit))
             # An option can change the type or subtype, so refuse on what PETSc runs.
             chosen = LibPETSc.TSGetType(petsclib, ts)
             alg isa Union{TSBasicSymplectic, TSAlpha2} && chosen != _ts_type(alg) && throw(

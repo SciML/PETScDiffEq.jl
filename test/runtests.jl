@@ -1663,6 +1663,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         )
     end
 
+    @testset "-ts_max_steps limits the steps as maxiters does" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        fixed = (dt = 0.01, adaptive = false)
+        counts(sol) = (sol.retcode, sol.stats.naccept)
+        capped = PETScDiffEq.TSRK("5dp", ["-ts_max_steps", "5"])
+        want = counts(SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); maxiters = 5, fixed...))
+        @test want == (SciMLBase.ReturnCode.MaxIters, 5)
+        @test counts(SciMLBase.solve(prob, capped; fixed...)) == want
+        @test counts(SciMLBase.solve(prob, capped; maxiters = 3, fixed...)) == want
+        integ = SciMLBase.init(prob, capped; fixed...)
+        @test integ.opts.maxiters == 5
+        @test counts(SciMLBase.solve!(integ)) == want
+        SciMLBase.reinit!(integ)
+        @test counts(SciMLBase.solve!(integ)) == want
+    end
+
     @testset "the loaded PETSc has the index width the wrappers assume" begin
         lib = PETScDiffEq.PETSc.getlib(PetscScalar = Float64)
         @test PETScDiffEq._check_inttype(lib) === nothing
