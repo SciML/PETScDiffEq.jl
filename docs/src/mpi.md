@@ -160,9 +160,9 @@ Jacobian from the prototype instead, for `TSAlpha2` and for the implicit algorit
 first-order form, as it does for an `ODEProblem`: the columns are coloured in the prototype's
 order, and each rank seeds the entries of its own `[v; u]` that those columns stand for, so
 `f1` and `f2` have to exchange dual numbers as `f` does there. It needs the sparse prototype,
-and other backends are refused. A `dm` is refused for these problems. Split over 1 to 3 ranks,
-unevenly on more than one, a 1-D wave equation and a
-chain of particles gave the serial solve's states to 3e-15 with `TSBasicSymplectic` and fixed
+and other backends are refused. A `dm` runs them as well, as described below. Split over 1 to 3
+ranks, unevenly on more than one, a 1-D wave equation and a chain of particles gave the serial
+solve's states to 3e-15 with `TSBasicSymplectic` and fixed
 steps of `TSRK`, the energy error included, and to 1.2e-9 with adaptive steps of `TSRK("5dp")`.
 `TSAlpha2` and `TSImplicit("bdf")` with a `jac` agreed to 2e-10 with `["-ksp_type", "preonly",
 "-pc_type", "redundant"]` in `petsc_options` and to 8e-8 with the default linear solver, and
@@ -193,9 +193,19 @@ those from a hand-written `jac` and `paramjac` and of the serial adjoint's, for 
 `TSARKIMEX`'s own solve reads; the prototype is needed with or without the `jac`.
 `dgdu_discrete` gets this rank's rows of the state and writes their gradient, and
 `dgdp_discrete` gives this rank's share of the cost's direct derivative with respect to `p`,
-which the ranks add up. `du0` comes back as this rank's rows and `dp` as the whole gradient,
-the same on every rank. The cost times, `no_start`, the length of `p` and whether
-`dgdp_discrete`, `jac` and `paramjac` are given have to agree across the ranks. A `jac`,
+which the ranks add up. An integral cost is split the same way. `g(u, p, t)` gets this
+rank's rows and returns its share of the integrand, the ranks' shares adding up to the
+whole; `dgdu_continuous` writes the integrand's derivative with respect to this rank's rows,
+and `dgdp_continuous` gives this rank's share of its direct derivative. Without them `g` is
+differentiated on each rank, with respect to its own rows and to `p`, so a share that reads
+other ranks' rows, through a halo exchange of its own, needs `dgdu_continuous`. On 1 to 3
+ranks an integral cost on a reaction-diffusion problem gave the serial adjoint's gradient to
+3.1e-16 with fixed steps, whether `g` was differentiated or its derivatives were given and
+with or without discrete costs, and to 2.8e-13 in an adaptive solve, whose steps move with
+the rounding of its error norms. `du0` comes back as this rank's rows and `dp` as the whole
+gradient, the same on every rank. The cost times, `no_start`, the length of `p`, whether
+there is an integral cost and whether `dgdp_discrete`, `jac` and `paramjac` are given have
+to agree across the ranks. A `jac`,
 `paramjac`, cost function or `f` that throws on some ranks makes every rank throw, as in a
 solve. The transposed linear solves of `TSImplicit` and `TSARKIMEX` use the solver above;
 `["-ksp_type", "preonly", "-pc_type", "redundant"]` in `petsc_options` solves them directly.
@@ -217,7 +227,7 @@ six methods, and on one rank that of central differences of the same fixed-step 
 hand-written ones on the same ranks.
 
 A PETSc DM can do the halo exchange instead. Build a DMDA with PETSc.jl and pass it as `dm`,
-which all algorithms but `TSBasicSymplectic` and `TSAlpha2` take. The solve then runs on the DM's
+which every algorithm takes. The solve then runs on the DM's
 communicator, which `comm` may name too but not contradict, and `u0` is the block of the grid
 this rank owns, in the DM's order. `f(du, u, p, t)` gets `u` ghosted: before every call to `f`,
 including the package's own calls for the first step size, dense output, callbacks, `get_du`
@@ -257,9 +267,10 @@ sol_bdf = solve(prob, TSImplicit("bdf"; dm = da))
 
 With a `dm` the implicit algorithms need no `jac_prototype`. Their Jacobian is the DM's own
 matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil. Without a `jac` PETSc
-fills it by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()`;
-the stencil has to cover every point `f` reads. Colouring calls `f` once per colour at every
-Jacobian, and the colours grow with the stencil width and the degrees of freedom at a point.
+fills it by colouring it and differencing `f`, so `autodiff` defaults to `AutoFiniteDiff()`,
+except in `TSIRK`, below; the stencil has to cover every point `f` reads. Colouring calls `f`
+once per colour at every Jacobian, and the colours grow with the stencil width and the degrees
+of freedom at a point.
 The colours are the DM's own where they fit its matrix. PETSc's DMDA colouring repeats along
 an axis with period `2s + 1` for stencil width `s`, or 5 for the 2-D star of width 1, so on a
 periodic axis whose number of points is not a multiple of the period PETSc refuses to colour
@@ -443,7 +454,7 @@ matched with a mass matrix exactly, as a `SplitODEProblem` in `TSARKIMEX` to 5.4
 `DAEProblem` in `TSDAE` to 1.1e-14, and `PETScAdjoint` with a `jac` and a `paramjac` matched the
 adjoint without a DM exactly.
 
-The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSDAE`,
+The rest works as it does without a DM: `TSRK`, `TSRosW`, `TSImplicit`, `TSIRK`, `TSDAE`,
 `TSARKIMEX` and `TSGeneric`, explicit or implicit, `saveat`, dense output, callbacks and
 the integrator interface, a `Diagonal` mass matrix, a `SplitODEProblem`, whose `f2` gets `u`
 ghosted as `f` does, and a `DAEProblem`, whose residual `f(r, du, u, p, t)` gets `u` ghosted
@@ -453,8 +464,64 @@ DM itself stays free for further solves. A DM on `MPI.COMM_SELF`, or on a single
 serial solve. Only a DMDA, a DMStag or a DMPlex is taken so far, and any other DM, such as a
 DMShell, is refused with an `ArgumentError`.
 
-`PETScAdjoint` runs with a `dm` too, for the methods and discrete costs it takes on a `comm`,
-and on a DM of a single rank for integral costs and a `SplitODEProblem` with `TSARKIMEX` as
+`TSIRK` builds its coupled-stage matrix from the DM's, so it needs a `jac` or ForwardDiff, its
+default `autodiff` with a `dm`: `AutoFiniteDiff()` is refused, and so is ForwardDiff on a
+DMStag or a DMPlex without a `jac`. PETSc lays the stage vector out by its own even split, as
+on a `comm`, and strides it by the state's block size, which only a block size of 1 gets right,
+while a DM's vectors have one per degree of freedom at a point. So the solve runs on a plain
+vector: on the DM's split where that is PETSc's, and otherwise on PETSc's, moving the state to
+and from each rank's block around every call to `f` and `jac`, and copying the DM's matrix, as
+`jac` or ForwardDiff fills it, to PETSc's split with `MatCreateSubMatrix` at every Jacobian. On
+1 to 3 ranks a heat equation on an uneven DMDA took the steps and states of the same solve on a
+`comm` bit for bit, through a callback that changes `u`, and gave the same states from a `jac`
+as from ForwardDiff. Under `-ksp_rtol 1e-14` it, a DMDA with two degrees of freedom, the DMStag
+wave and both DMPlex problems above matched the serial solves without a DM to 3.7e-15, and on
+one rank exactly.
+
+A `SecondOrderODEProblem` or `DynamicalODEProblem` runs on a DM as well, with
+`TSBasicSymplectic`, `TSAlpha2` or any algorithm on its first-order form. The velocity and the
+position are each a vector of the DM: the initial `v` and `u` are the blocks of the grid this
+rank owns, and the state PETSc steps holds this rank's velocity and then its position, as on a
+`comm`. `f1(dv, v, u, p, t)` gets both `v` and `u` ghosted, so `reshape_local_array` views
+either by grid point and a damping term can read the neighbouring velocities, and `dv` is the
+owned block. A `DynamicalODEProblem`'s `f2` gets them ghosted too, while a
+`SecondOrderODEProblem`'s, SciMLBase's `du = v`, gets the owned blocks. `TSAlpha2` steps the
+position alone, which the DM lays out, and PETSc colours the DM's matrix for the matrix it
+factors. An implicit algorithm on the first-order form gets a matrix whose four blocks, the
+velocity's and the position's rows and columns, each have the DM's pattern, and PETSc colours
+that. Both build their Jacobian only so: the DM's matrix holds one half of the state, so a
+`jac` and `autodiff` backends other than the default, `AutoFiniteDiff()`, are refused, and so
+is `PETScAdjoint`. The wave equation on the DMDA above:
+
+```julia
+function wave!(ddu, du, u, da, t)
+    U = PETScDiffEq.reshape_local_array(u, da)
+    D = PETScDiffEq.reshape_local_array(ddu, da)
+    for i in axes(D, 2)
+        D[1, i] = (U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2
+    end
+end
+
+u0 = sinpi.((xs .+ (1:xm)) .* dx)
+prob = SecondOrderODEProblem(wave!, zero(u0), u0, (0.0, 1.0), da)
+sol_rk = solve(prob, TSRK("4"; dm = da); dt = 1e-3)
+sol_verlet = solve(prob, TSBasicSymplectic("velverlet"; dm = da); dt = 1e-3)
+sol_alpha = solve(prob, TSAlpha2(; dm = da); dt = 1e-3)
+```
+
+On `MPI.COMM_SELF` and on 1 to 3 ranks, unevenly split, a wave with damping that reads the
+neighbouring velocities took the steps and states of the same solve on a `comm` bit for bit
+with `TSRK`, adaptive or not, and `TSBasicSymplectic`, through a callback that changes `u`, and
+those of the serial solve without a DM exactly. A DMDA with two coupled degrees of freedom, a
+`DynamicalODEProblem` whose `f2` reads the neighbouring momenta, the DMStag wave and the DMPlex
+reaction-diffusion above as accelerations, and reversed spans did the same with these
+algorithms. Under `["-snes_rtol", "1e-14", "-snes_atol", "1e-12", "-ksp_rtol", "1e-14"]`,
+`TSAlpha2` and `TSImplicit`'s `"cn"` and `"bdf"` at fixed steps matched the serial solves to
+2.2e-13, and `TSAlpha2` and `"bdf"` at adaptive ones took the same number of steps, with times
+within 1.9e-9 and states within 2.3e-8.
+
+`PETScAdjoint` runs with a `dm` too, for the methods and costs it takes on a `comm`, and on a
+DM of a single rank for a `SplitODEProblem` with `TSARKIMEX` as
 well. It takes the problem's `jac`, filling the DM's matrix as above, and when there are
 parameters a `paramjac(pJ, u, p, t)` that gets `u` ghosted and fills this rank's rows of `pJ`
 in the DM's order, a column per entry of `p`, which
@@ -481,9 +548,9 @@ on 1-D and 2-D grids with one and two degrees of freedom and ghosted and periodi
 2.9e-16 of the gradient from a hand-written `jac` and `paramjac`, for `TSRK`, `TSImplicit` and
 `TSARKIMEX` in both time directions.
 
-A solve with a `dm` refuses `TSIRK`, `TSMPRK` and an implicit `TSGeneric` of type `"irk"`,
-or of a type refused on a `comm`, with an `ArgumentError`. A distributed solve, with a `dm`
-or without, is refused off the root task
+A solve with a `dm` refuses `TSMPRK` and an implicit `TSGeneric` of a type refused on a `comm`
+with an `ArgumentError`. A distributed solve, with a `dm` or without, is refused off the root
+task
 when Julia has more than one thread, whether inside `Threads.@threads` (as `EnsembleThreads`
 runs its trajectories) or from a `Threads.@spawn` task: nothing there keeps the ranks' solves
 in the same order, and ranks taking them in different orders run different solves as one and
