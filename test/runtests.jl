@@ -9051,6 +9051,18 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test stage_type(integ) == "mpi"
             SciMLBase.terminate!(integ)
         end
+
+        @testset "an adapter that needs its own setup is refused" begin
+            for kind in ("history", "cfl")
+                alg = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", kind])
+                @test_throws "-ts_adapt_type $kind" SciMLBase.solve(prob, alg)
+                @test_throws ArgumentError SciMLBase.init(prob, alg)
+            end
+            for kind in ("basic", "dsp")
+                sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", kind]))
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+            end
+        end
     end
 
     @testset "Integrator interface" begin
