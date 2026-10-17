@@ -140,7 +140,8 @@ otherwise turn it on, since a partial state gives no derivative to interpolate w
 `change_t_via_interpolation!` with `Val{true}` drops what was saved past the new time, and
 saves the new end when `save_everystep` asks for every step. `resize!`, `deleteat!` and
 `addat!` raise an `ArgumentError`, since PETSc sizes its vectors and solvers when the
-integrator is made.
+integrator is made. So does a `reinit!` whose `t0` and `tf` run the other way in time from
+the span the integrator was made for; make a new integrator for that direction.
 
 A callback that names timeseries partitions in `saved_clock_partitions`, as the callbacks
 ModelingToolkit builds for discrete variables do, has those parameters saved where

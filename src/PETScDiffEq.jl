@@ -7204,6 +7204,14 @@ function _reinit_unlocked(
     # `_in_shape` refuses another length for a state of another shape.
     integ.prob.u0 isa AbstractVector && _check_length(integ.prob.u0, u0, integ.h.ctx.comm)
     R = typeof(integ.t)
+    # A reversed span wraps the problem's functions in another type, which `integ.h` cannot hold.
+    t0 == tf || sign(tf - t0) == integ.tdir || throw(
+        ArgumentError(
+            "`reinit!` cannot run the integrator from $t0 to $tf: it was made for a span " *
+                "running $(integ.tdir > 0 ? "forward" : "backward") in time; make a new " *
+                "integrator with `init` for the other direction",
+        ),
+    )
     tstops, d_discontinuities = _times(R, tstops), _times(R, d_discontinuities)
     u0 = _in_shape(integ.prob.u0, u0)
     old = integ.h

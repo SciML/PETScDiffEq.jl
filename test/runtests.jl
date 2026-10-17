@@ -4480,6 +4480,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.terminate!(integ)
         end
 
+        @testset "reinit! refuses a span running the other way" begin
+            for (span, back) in (((0.0, 1.0), (1.0, 0.0)), ((1.0, 0.0), (0.0, 1.0)))
+                integ = SciMLBase.init(
+                    SciMLBase.remake(prob; tspan = span), PETScDiffEq.TSRK("5dp"),
+                )
+                SciMLBase.step!(integ)
+                @test_throws "cannot run the integrator" SciMLBase.reinit!(
+                    integ, [1.0]; t0 = back[1], tf = back[2],
+                )
+                SciMLBase.reinit!(integ)
+                @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
+                @test integ.t == span[2]
+            end
+        end
+
         @testset "reinit!, set_u! and integ.u refuse a state of another length" begin
             wide = SciMLBase.ODEProblem(
                 (du, u, p, t) -> (du .= -u; nothing), [1.0, 2.0, 3.0, 4.0], (0.0, 1.0),
