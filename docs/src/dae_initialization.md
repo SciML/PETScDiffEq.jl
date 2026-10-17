@@ -65,16 +65,19 @@ starts both from the values as given.
 
 `initialize_dae!(integrator, initializealg)` runs the same on the integrator's current state
 and time, with the `initializealg` the solve was given unless another is passed, and writes
-the result into PETSc. It takes `du0` from the problem for a `DAEProblem`, the current
-`abstol` and, for `ShampineCollocationInit()` on an `ODEProblem`, the current `dt / 5`, as
-OrdinaryDiffEq's does. When SNES fails the integrator finishes where it is with
-`ReturnCode.InitialFailure`, and on an `ODEProblem` without a singular mass matrix only
-`OverrideInit()` does anything. After a callback's `affect!` runs without calling
-`derivative_discontinuity!(integrator, false)`, or its `initialize` calls
+the result into PETSc. For a `DAEProblem` it takes the derivative the integrator holds, as
+OrdinaryDiffEq's takes `integrator.du`: the one its last step or initialization paired with
+the state, which `get_du` gives, or the problem's `du0` where it holds none, as after
+`set_t!`. It takes the current `abstol` and, for `ShampineCollocationInit()` on an
+`ODEProblem`, the current `dt / 5`, as OrdinaryDiffEq's does. When SNES fails the integrator
+finishes where it is with `ReturnCode.InitialFailure`, and on an `ODEProblem` without a
+singular mass matrix only `OverrideInit()` does anything. After a callback's `affect!` runs
+without calling `derivative_discontinuity!(integrator, false)`, or its `initialize` calls
 `derivative_discontinuity!(integrator, true)`, the integrator is initialized again with the
 callback's `initializealg`, or the solve's when the callback has none, as OrdinaryDiffEq does.
 So with the default a callback has to leave the algebraic equations satisfied or the solve
 throws `CheckInitFailureError`, and under `BrownFullBasicInit()` the algebraic variables are
-solved for again. On a `DAEProblem`, whose derivative PETSc keeps to itself, `CheckInit()`
-after a callback takes a state the callback left alone as consistent and checks a changed one
-against the problem's `du0`, which is right at `t0` only.
+solved for again. On a `DAEProblem` the derivative is again the one the integrator holds,
+the slope at the end of the step the callback came after, which for a `ContinuousCallback`
+lies past the event, and `CheckInit()` takes a state the callback left alone as consistent.
+The derivative the initialization ends with is the one `get_du` gives afterwards.
