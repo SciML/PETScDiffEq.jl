@@ -5427,7 +5427,6 @@ function _setup(
     else
         _checked_everywhere(comm) do
             v = _save_idxs(prob, save_idxs)
-            isempty(v) && throw(ArgumentError("`save_idxs` must name at least one component"))
             all(i -> 1 <= i <= n, v) || throw(
                 ArgumentError("`save_idxs` has an index outside 1:$n"),
             )

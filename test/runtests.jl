@@ -5036,11 +5036,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
 
         @testset "an index outside the state is rejected" begin
-            for bad in ([0], [3], Int[])
+            for bad in ([0], [3])
                 @test_throws ArgumentError SciMLBase.solve(
                     prob, alg; dt = 0.1, save_idxs = bad,
                 )
             end
+        end
+
+        @testset "an empty save_idxs saves empty states, as in OrdinaryDiffEq" begin
+            sol = SciMLBase.solve(prob, alg; dt = 0.1, save_idxs = Int[])
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test all(isempty, sol.u)
         end
 
         @testset "symbols name the saved states" begin
