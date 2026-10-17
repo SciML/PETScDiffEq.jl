@@ -6352,8 +6352,23 @@ SciMLBase.isadaptive(integ::PETScIntegrator) =
 function (integ::PETScIntegrator)(t, ::Type{deriv} = Val{0}; idxs = nothing) where {deriv}
     t isa Number || return [integ(ti, deriv; idxs) for ti in t]
     u = _checked_state(integ, t, deriv)
-    return idxs === nothing ? copy(u) : u[idxs]
+    idxs === nothing && return copy(u)
+    _symbolic(idxs) || return u[idxs]
+    if deriv !== Val{0}
+        index = j -> j isa Integer ? j : SII.variable_index(integ, j)
+        i = SII.symbolic_type(idxs) == SII.NotSymbolic() ? map(index, collect(idxs)) :
+            index(idxs)
+        (i === nothing || i isa AbstractArray && any(isnothing, i)) && throw(
+            ArgumentError("`integ(t, $deriv; idxs)` takes the slope of states only, not $idxs"),
+        )
+        return u[i]
+    end
+    state = SII.ProblemState(; u = u, p = SII.parameter_values(integ), t = t)
+    return SII.getsym(integ, idxs)(state)
 end
+
+_symbolic(idxs) = SII.symbolic_type(idxs) != SII.NotSymbolic() ||
+    idxs isa Union{AbstractArray, Tuple} && any(_symbolic, idxs)
 
 function (integ::PETScIntegrator)(
         out::AbstractArray, t::Union{Number, AbstractArray}, ::Type{deriv} = Val{0};

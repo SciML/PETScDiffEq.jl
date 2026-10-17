@@ -9232,6 +9232,29 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.terminate!(integ)
         end
 
+        @testset "integ(t; idxs) takes symbols as OrdinaryDiffEq's does" begin
+            scale!(du, u, p, t) = (du .= -p .* u; nothing)
+            sys = SciMLBase.SymbolCache([:x, :y], [:a, :b], :t)
+            named = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(scale!; sys), [1.0, 2.0], (0.0, 1.0), [1.0, 2.0],
+            )
+            integ = SciMLBase.init(named, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            t = (integ.tprev + integ.t) / 2
+            u, du = integ(t), integ(t, Val{1})
+            @test integ(t; idxs = :y) == u[2]
+            @test integ(t; idxs = [:y, :x]) == u[[2, 1]]
+            @test integ(t; idxs = [1, :y]) == u[[1, 2]]
+            @test integ(t; idxs = :t) == t
+            @test integ(t; idxs = :b) == 2.0
+            @test integ(t, Val{1}; idxs = :y) == du[2]
+            @test integ(t, Val{1}; idxs = [:y, :x]) == du[[2, 1]]
+            @test_throws ArgumentError integ(t, Val{1}; idxs = :a)
+            @test integ([integ.tprev, integ.t]; idxs = :x) == [integ.uprev[1], integ.u[1]]
+            SciMLBase.terminate!(integ)
+        end
+
         @testset "init, step! and solve! reproduce solve exactly" begin
             for alg in (
                     PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"),
