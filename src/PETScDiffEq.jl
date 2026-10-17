@@ -5460,7 +5460,8 @@ function _setup(
         like === nothing ? Array{U, ndims(prob.u0)} : typeof(similar(like, U))
     # f scatters through the caller's DM, so the handle holds a reference to it.
     dms = clone === nothing ? Ptr{Cvoid}[] : [clone.ptr, _referenced(petsclib, dm.ptr)]
-    ctx = TSContext(
+    # Inferring these from abstract arguments leaves edges Julia re-verifies on every load.
+    ctx = Base.inferencebarrier(TSContext)(
         petsclib, f1, f2, jac_fn, p,
         similar(u0), copy(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0,
         idx0,
@@ -5483,14 +5484,14 @@ function _setup(
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
         nothing,
-    )
-    h = TSHandles(
+    )::TSContext
+    h = Base.inferencebarrier(TSHandles)(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, save_start, save_end, end_saveat, false, 0, false,
         false,
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init,
-    )
+    )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
     else
