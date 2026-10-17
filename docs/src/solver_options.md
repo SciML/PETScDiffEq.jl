@@ -45,8 +45,9 @@ that count could miss a solve or cannot be taken: with a `-snes_type` other than
 `newtontr`, `ksponly` or `ksptransposeonly`, with a nonlinear preconditioner, and under
 `-snes_ksp_ew`, whose tolerances PETSc sets in the hook the count uses. `stats.ncondition`
 counts the calls of the callbacks' conditions, those of a `ContinuousCallback`'s root search
-included. An integrator's running `sol.stats` holds both as the steps go, and they start
-again at `reinit!`. `stats.nw` stays -1: PETSc counts no matrices `shift * M - J`, builds
+included. An integrator's running `sol.stats`, also `integrator.stats` as in OrdinaryDiffEq,
+holds both as the steps go, and they start again at `reinit!`. `stats.nw` stays -1: PETSc
+counts no matrices `shift * M - J`, builds
 them itself under `AutoFiniteDiff()` and in `TSIRK`, and also asks the package's Jacobian
 for `J` alone. `stats.nfpiter` and `stats.nfpconvfail` stay -1 as well.
 
@@ -83,7 +84,11 @@ its own, and it raises there with a mass matrix, a `DAEProblem` or a finished in
 `change_t_via_interpolation!` stays inside the step.
 On a `DAEProblem`, `get_du` is the derivative its initialization or its last step paired with
 the state, the slope at the step's end for `TSDAE("bdf")` and the step's chord for the other
-subtypes, and it raises an `ArgumentError` once the state has changed since.
+subtypes, and it raises an `ArgumentError` once the state has changed since. With a mass
+matrix `get_du` solves `M du = f(u)` at the state. Where `M` has a zero row, or is a sparse
+one split over a communicator, it is instead the slope `TSImplicit("bdf")` or `"beuler"`
+solved for at its last step's end, and it raises an `ArgumentError` with any other type or
+once the state has changed since.
 `integrator(t; idxs)`, a vector of times and `integrator(out, t)` take the forms
 OrdinaryDiffEq's integrator does.
 
@@ -134,13 +139,16 @@ integrator goes on at its fixed size through both, as OrdinaryDiffEq's does, and
 shows the estimate. `get_proposed_dt` is signed, negative on a reversed span, and
 `set_proposed_dt!` also takes another integrator whose proposed step it copies. `set_abstol!`
 and `set_reltol!` hold for the steps after, until `reinit!` goes back to the tolerances `init`
-was given, where OrdinaryDiffEq's `reinit!` keeps them. With `erase_sol = false`, a solution
+was given, where OrdinaryDiffEq's `reinit!` keeps them. The other options assigned on
+`opts`, such as `maxiters`, `dtmax` or `save_start`, carry through `reinit!` as in
+OrdinaryDiffEq. With `erase_sol = false`, a solution
 saved under `save_idxs` without dense output stays without it when the new `saveat` would
 otherwise turn it on, since a partial state gives no derivative to interpolate with.
 `change_t_via_interpolation!` with `Val{true}` drops what was saved past the new time, and
 saves the new end when `save_everystep` asks for every step. `resize!`, `deleteat!` and
 `addat!` raise an `ArgumentError`, since PETSc sizes its vectors and solvers when the
-integrator is made.
+integrator is made. So does a `reinit!` whose `t0` and `tf` run the other way in time from
+the span the integrator was made for; make a new integrator for that direction.
 
 A callback that names timeseries partitions in `saved_clock_partitions`, as the callbacks
 ModelingToolkit builds for discrete variables do, has those parameters saved where
