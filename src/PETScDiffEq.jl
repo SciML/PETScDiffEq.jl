@@ -243,7 +243,11 @@ There it needs a `jac` or `autodiff = AutoForwardDiff()`, with a sparse `jac_pro
 this rank's rows with global columns. Any split of the state works: PETSc lays out its stage
 vector by its own even split, so on any other the solve runs on that one and moves the state to
 and from each rank's block around every call to `f` and `jac`; see the MPI section of the
-documentation. A `dm` is refused.
+documentation. A `dm` runs it as well, with `autodiff` defaulting to `AutoForwardDiff()`, which
+needs a DMDA; on a DMStag or a DMPlex give it a `jac`. PETSc also strides the stage vector by
+the state's block size, which only a block size of 1 gets right, so the solve runs on a plain
+vector, on PETSc's split when the DM's is another, with the DM's matrix copied to that split at
+every Jacobian.
 """
 struct TSIRK <: PETScTSAlgorithm
     nstages::Int
@@ -256,7 +260,7 @@ end
 TSIRK(
     nstages::Integer = 3, petsc_options::AbstractVector{<:AbstractString} = String[];
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
-    autodiff = _default_autodiff(comm, dm),
+    autodiff = dm === nothing ? _default_autodiff(comm, dm) : AutoForwardDiff(),
 ) = TSIRK(
     nstages >= 1 ? Int(nstages) :
         throw(ArgumentError("`nstages` must be at least 1, got $nstages")),
@@ -456,7 +460,7 @@ const _SYMPLECTIC_TYPES = Dict(
 )
 
 """
-    TSBasicSymplectic(subtype = "velverlet", petsc_options = String[]; comm = MPI.COMM_SELF)
+    TSBasicSymplectic(subtype = "velverlet", petsc_options = String[]; comm = MPI.COMM_SELF, dm = nothing)
 
 PETSc's basic symplectic integrators, `TSBASICSYMPLECTIC`, for a `DynamicalODEProblem`
 or a `SecondOrderODEProblem`. `subtype` is `"sieuler"` (or `"1"`), semi-implicit Euler of
@@ -476,18 +480,21 @@ if you pass a tolerance. Being explicit they ignore a `jac` and refuse a mass ma
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it: the initial `v` and
 `u` hold this rank's blocks of the velocity and the position, and `f1` and `f2` see only those
 blocks and are collective, as `f` is for [`TSRK`](@ref); see the MPI section of the
-documentation.
+documentation. A `dm` runs it on a PETSc DM: `v` and `u` are each the block of the grid this rank
+owns, and `f1`, and a `DynamicalODEProblem`'s `f2`, get both of them ghosted through the DM, as
+`f` gets `u` for `TSRK`.
 """
 struct TSBasicSymplectic <: PETScTSAlgorithm
     subtype::String
     petsc_options::Vector{String}
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 function TSBasicSymplectic(
         subtype::AbstractString = "velverlet",
         petsc_options::AbstractVector{<:AbstractString} = String[];
-        comm::MPI.Comm = MPI.COMM_SELF,
+        comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     )
     name = get(_SYMPLECTIC_TYPES, String(subtype), nothing)
     name === nothing && throw(
@@ -496,11 +503,13 @@ function TSBasicSymplectic(
                 "\"velverlet\", \"3\" or \"4\"",
         ),
     )
-    return TSBasicSymplectic(name, String[String(o) for o in petsc_options], comm)
+    return TSBasicSymplectic(
+        name, String[String(o) for o in petsc_options], _alg_comm(comm, dm), dm,
+    )
 end
 
 """
-    TSAlpha2(petsc_options = String[]; radius = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF)
+    TSAlpha2(petsc_options = String[]; radius = nothing, autodiff = AutoForwardDiff(), comm = MPI.COMM_SELF, dm = nothing)
 
 PETSc's generalized-alpha method for second-order systems, `TSALPHA2`, for a
 `SecondOrderODEProblem` `u'' = f(u', u, p, t)`. Implicit and of order 2. `radius` is the
@@ -531,24 +540,30 @@ A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for
 [`TSBasicSymplectic`](@ref), with this rank's velocity and position of the same length. There
 `autodiff` defaults to `AutoFiniteDiff()`, and a `jac` or `AutoForwardDiff()` fills this rank's
 rows of a sparse `jac_prototype` of the first-order system, whose columns number the whole
-`[v; u]`; see the MPI section of the documentation.
+`[v; u]`; see the MPI section of the documentation. A `dm` runs it on a PETSc DM, which lays out
+the position, the velocity and the acceleration alike: `f` gets `u'` and `u` ghosted, and PETSc
+colours the DM's matrix for the matrix it factors, so `autodiff` stays at its default there,
+`AutoFiniteDiff()`, and a `jac` is refused.
 """
 struct TSAlpha2 <: PETScTSAlgorithm
     radius::Union{Nothing, Float64}
     petsc_options::Vector{String}
     autodiff::ADTypes.AbstractADType
     comm::MPI.Comm
+    dm::Union{Nothing, LibPETSc.AbstractPetscDM}
 end
 
 function TSAlpha2(
         petsc_options::AbstractVector{<:AbstractString} = String[];
-        radius = nothing, comm::MPI.Comm = MPI.COMM_SELF, autodiff = _default_autodiff(comm, nothing),
+        radius = nothing, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
+        autodiff = _default_autodiff(comm, dm),
     )
     radius === nothing || 0 <= radius <= 1 ||
         throw(ArgumentError("`radius` must be between 0 and 1, got $radius"))
     return TSAlpha2(
         radius === nothing ? nothing : Float64(radius),
-        String[String(o) for o in petsc_options], _check_autodiff(autodiff), comm,
+        String[String(o) for o in petsc_options], _check_autodiff(autodiff),
+        _alg_comm(comm, dm), dm,
     )
 end
 
@@ -579,8 +594,7 @@ implicit `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`, `"arkimex"`, `"irk"`,
 implicit types are refused there: `"glle"`'s step control follows the round-off of the
 distributed linear solve, so it takes other steps than a serial solve and ends with another
 error, larger or smaller. A `dm` runs an explicit type as it runs [`TSRK`](@ref) and the same
-implicit types as it runs [`TSImplicit`](@ref), except `"irk"`, which it refuses as it does
-[`TSIRK`](@ref).
+implicit types, `"irk"` as [`TSIRK`](@ref) runs and the others as [`TSImplicit`](@ref) runs.
 """
 struct TSGeneric <: PETScTSAlgorithm
     ts_type::String
@@ -1044,7 +1058,14 @@ struct Ghosted{F, L}
     dm::Ptr{Cvoid}
 end
 
-function _ghosted(call, g::Ghosted, u)
+# A part of a DynamicalODEProblem, which gets the velocity and the position both ghosted.
+struct GhostedPart{F, L}
+    f::F
+    petsclib::L
+    dm::Ptr{Cvoid}
+end
+
+function _ghosted(call, g::Union{Ghosted, GhostedPart}, u)
     pl, dm = g.petsclib, g.dm
     loc = _dm_vec!(pl, :DMGetLocalVector, dm)
     try
@@ -1065,6 +1086,9 @@ end
 (g::Ghosted)(du, u, p, t) = _ghosted(a -> g.f(du, a, p, t), g, u)
 (g::Ghosted)(r, du, u, p, t) = _ghosted(a -> g.f(r, du, a, p, t), g, u)
 (g::Ghosted)(J, du, u, p, gamma, t) = _ghosted(a -> g.f(J, du, a, p, gamma, t), g, u)
+
+(g::GhostedPart)(d, v, u, p, t) =
+    _ghosted(a -> _ghosted(b -> g.f(d, a, b, p, t), g, u), g, v)
 
 """
     PETScDiffEq.reshape_local_array(x, dm)
@@ -3839,17 +3863,20 @@ function _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     pl = ctx.petsclib
     A = LibPETSc.PetscMat(A_ptr, pl)
     B = LibPETSc.PetscMat(B_ptr, pl)
+    # Off the DM's split the DM's own matrix is filled, then copied to PETSc's split.
+    moved = ctx.relayout === nothing ? nothing : ctx.relayout.mat
+    J = something(moved, B)
     try
         t = _stage_time(ctx, ts, t)
-        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        _mat_zero!(pl, B)
+        _readvec!(ctx.u, pl, _own_block(ctx, PETSc.VecPtr(pl, x_ptr, false)))
+        _mat_zero!(pl, J)
         err = nothing
         try
             if ctx.dae
                 _readvec!(ctx.mudot, pl, PETSc.VecPtr(pl, xdot_ptr, false))
-                ctx.jac!(B, ctx.mudot, ctx.u, ctx.p, shift, t)
+                ctx.jac!(J, ctx.mudot, ctx.u, ctx.p, shift, t)
             else
-                ctx.jac!(B, ctx.u, ctx.p, t)
+                ctx.jac!(J, ctx.u, ctx.p, t)
             end
         catch e
             ctx.comm === nothing && rethrow()
@@ -3861,13 +3888,21 @@ function _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
             return LibPETSc.PetscErrorCode(CALLBACK_THREW)
         end
         ctx.njacs += 1
-        PETSc.assemble!(B)
+        PETSc.assemble!(J)
         if !ctx.dae
             S = PETSc.scalartype(pl)
-            ctx.tdir > 0 && _mat_op!(pl, :MatScale, B, -one(S))
-            ctx.M === nothing ? _mat_op!(pl, :MatShift, B, S(shift)) :
-                _mat_add_diagonal!(pl, B, S(shift) .* ctx.M.diag)
+            ctx.tdir > 0 && _mat_op!(pl, :MatScale, J, -one(S))
+            ctx.M === nothing ? _mat_op!(pl, :MatShift, J, S(shift)) :
+                _mat_add_diagonal!(pl, J, S(shift) .* ctx.M.diag)
         end
+        moved === nothing || _check_code(
+            ccall(
+                _symbol(pl, :MatCreateSubMatrix), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Cint, Ptr{Ptr{Cvoid}}),
+                J.ptr, ctx.relayout.rows, ctx.relayout.rows, Cint(LibPETSc.MAT_REUSE_MATRIX),
+                Ref(B.ptr),
+            ),
+        )
         B.ptr == A.ptr || PETSc.assemble!(A)
     catch e
         ctx.err = e
@@ -4533,14 +4568,18 @@ function _destroy!(h::TSHandles)
     end
     h.ctx.work.ptr == C_NULL || PETScCompat.destroy!(h.ctx.work)
     h.u === nothing || PETScCompat.destroy!(h.u)
-    if h.ctx.relayout !== nothing
-        PETScCompat.destroy!(h.ctx.relayout.vec)
-        _check_code(
-            ccall(
-                _symbol(h.petsclib, :VecScatterDestroy), LibPETSc.PetscErrorCode,
-                (Ptr{Ptr{Cvoid}},), Ref(h.ctx.relayout.scatter),
-            ),
-        )
+    relayout = h.ctx.relayout
+    if relayout !== nothing
+        PETScCompat.destroy!(relayout.vec)
+        relayout.mat === nothing || PETScCompat.destroy!(relayout.mat)
+        for (name, obj) in ((:VecScatterDestroy, relayout.scatter), (:ISDestroy, relayout.rows))
+            _check_code(
+                ccall(
+                    _symbol(h.petsclib, name), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},),
+                    Ref(obj),
+                ),
+            )
+        end
     end
     h.ts === nothing || _return_work_vec!(h.ctx, h.ts)
     _release_work_vec!(h.ctx)
@@ -4716,20 +4755,15 @@ const _NOT_SELF = "on a communicator other than MPI.COMM_SELF"
 
 _in_threads_loop() = Threads.threadpoolsize() > 1 && current_task() !== Base.roottask
 
-# TSSetUp_IRK splits its stage vector evenly whatever the state's split, so irk runs on that one.
-function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
+_petsc_split(pl, comm, N) = _plain_mdot(pl) do
+    LibPETSc.VecCreateMPI(
+        pl, comm, LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), LibPETSc.PetscInt(N),
+    )
+end
+
+function _move_state!(h, x)
     pl, ctx = h.petsclib, h.ctx
-    comm, n = ctx.comm, length(h.u0)
-    x = _plain_mdot(pl) do
-        LibPETSc.VecCreateMPI(
-            pl, comm, LibPETSc.PetscInt(LibPETSc.PETSC_DECIDE), LibPETSc.PetscInt(N),
-        )
-    end
-    lo, hi = LibPETSc.VecGetOwnershipRange(pl, x)
-    if _everywhere(comm, hi - lo == n)
-        PETScCompat.destroy!(x)
-        return nothing
-    end
+    n = length(h.u0)
     rstart = first(LibPETSc.VecGetOwnershipRange(pl, h.u))
     is, scatter = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
     _check_code(
@@ -4749,10 +4783,23 @@ function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
     )
     _check_code(ccall(_symbol(pl, :ISDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},), is))
     _check_code(code)
-    ctx.relayout = (; vec = h.u, scatter = scatter[])
+    ctx.relayout = (; vec = h.u, scatter = scatter[], mat = nothing, rows = C_NULL)
     h.u = x
     _relayout!(ctx, ctx.relayout.vec, x, LibPETSc.SCATTER_FORWARD)
     LibPETSc.TSSetSolution(pl, h.ts, x)
+    return nothing
+end
+
+# TSSetUp_IRK splits its stage vector evenly whatever the state's split, so irk runs on that one.
+function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
+    pl, comm = h.petsclib, h.ctx.comm
+    x = _petsc_split(pl, comm, N)
+    lo, hi = LibPETSc.VecGetOwnershipRange(pl, x)
+    if _everywhere(comm, hi - lo == length(h.u0))
+        PETScCompat.destroy!(x)
+        return nothing
+    end
+    _move_state!(h, x)
     PETScCompat.destroy!(h.jac_mat)
     h.jac_mat = LibPETSc.MatCreate(pl, comm)
     _coo_matrix!(h.jac_mat, pl, hi - lo, N, rows, cols)
@@ -4760,13 +4807,52 @@ function _irk_on_petsc_split!(h, N, rows, cols, ijacobian, ctxptr)
     return nothing
 end
 
-function _check_dynamical(prob, alg, has_mass, comm, dm)
-    dm === nothing || throw(
-        ArgumentError(
-            "PETScDiffEq cannot run a DynamicalODEProblem or SecondOrderODEProblem " *
-                "$_WITH_DM yet; pass its communicator as `comm` instead",
+# TSStep_IRK also strides its stage vector by the state's block size, which only 1 gets right, so
+# with a DM irk runs on a plain vector, and off PETSc's split on a copy of the DM's matrix.
+function _irk_on_dm!(h, N, ijacobian, ctxptr)
+    pl, ctx = h.petsclib, h.ctx
+    comm, n = ctx.comm, length(h.u0)
+    x = comm === nothing ? _state_vec(pl, nothing, n) : _petsc_split(pl, comm, N)
+    lo, hi = LibPETSc.VecGetOwnershipRange(pl, x)
+    if _everywhere(comm, hi - lo == n)
+        _check_code(
+            ccall(
+                _symbol(pl, :VecCopy), LibPETSc.PetscErrorCode,
+                (LibPETSc.CVec, LibPETSc.CVec), h.u, x,
+            ),
+        )
+        PETScCompat.destroy!(h.u)
+        h.u = x
+        LibPETSc.TSSetSolution(pl, h.ts, x)
+        return nothing
+    end
+    _move_state!(h, x)
+    rows, sub = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :ISCreateStride), LibPETSc.PetscErrorCode,
+            (
+                MPI.API.MPI_Comm, LibPETSc.PetscInt, LibPETSc.PetscInt, LibPETSc.PetscInt,
+                Ptr{Ptr{Cvoid}},
+            ),
+            comm, hi - lo, lo, 1, rows,
         ),
     )
+    ctx.relayout = (; ctx.relayout..., rows = rows[])
+    _check_code(
+        ccall(
+            _symbol(pl, :MatCreateSubMatrix), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Cint, Ptr{Ptr{Cvoid}}),
+            h.jac_mat.ptr, rows[], rows[], Cint(LibPETSc.MAT_INITIAL_MATRIX), sub,
+        ),
+    )
+    ctx.relayout = (; ctx.relayout..., mat = h.jac_mat)
+    h.jac_mat = LibPETSc.PetscMat(sub[], pl)
+    LibPETSc.TSSetIJacobian(pl, h.ts, h.jac_mat, h.jac_mat, ijacobian, ctxptr)
+    return nothing
+end
+
+function _check_dynamical(prob, alg, has_mass, comm, dm)
     parts = prob.u0 isa AbstractVector && hasproperty(prob.u0, :x) ? prob.u0.x : ()
     length(parts) == 2 && all(x -> x isa AbstractVector, parts) || throw(
         ArgumentError(
@@ -4780,6 +4866,7 @@ function _check_dynamical(prob, alg, has_mass, comm, dm)
                 "SecondOrderODEProblem",
         ),
     )
+    dm === nothing || _check_dynamical_dm(prob, alg)
     alg isa TSAlpha2 || return nothing
     prob.problem_type isa SciMLBase.SecondOrderODEProblem || throw(
         ArgumentError(
@@ -4805,10 +4892,50 @@ function _check_dynamical(prob, alg, has_mass, comm, dm)
     return nothing
 end
 
+# Each block of the first-order form's Jacobian gets the DM's pattern, its rows running as the
+# state does, this rank's velocity and then its position.
+function _pair_matrix(pl, dm, m, comm)
+    rstart, cols, _, _ = _checked_everywhere(() -> _dm_pattern(pl, dm, m), comm)
+    starts = comm === nothing ? [rstart] : MPI.Allgather(rstart, comm)
+    sizes = comm === nothing ? [m] : MPI.Allgather(m, comm)
+    owner(c) = findlast(q -> sizes[q] > 0 && starts[q] <= c, eachindex(starts))
+    at(c, half) = (q = owner(c); 2 * starts[q] + half * sizes[q] + c - starts[q])
+    rows, pair_cols = LibPETSc.PetscInt[], LibPETSc.PetscInt[]
+    for half in 0:1, r in 1:m, c in cols[r], other in 0:1
+        push!(rows, 2 * rstart + half * m + r - 1)
+        push!(pair_cols, at(c, other))
+    end
+    mat = LibPETSc.MatCreate(pl, something(comm, MPI.COMM_SELF))
+    _coo_matrix!(mat, pl, 2m, 2 * sum(sizes), rows, pair_cols)
+    LibPETSc.MatSetValuesCOO(
+        pl, mat, zeros(PETSc.scalartype(pl), length(rows)), LibPETSc.INSERT_VALUES,
+    )
+    PETSc.assemble!(mat)
+    return mat
+end
+
+# The DM's matrix covers one half of the state, so the Jacobian is PETSc's colouring of it.
+function _check_dynamical_dm(prob, alg)
+    _uses_ifunction(alg) || return nothing
+    prob.f.jac === nothing || throw(
+        ArgumentError(
+            "PETScDiffEq cannot take a `jac` for a DynamicalODEProblem or " *
+                "SecondOrderODEProblem $_WITH_DM, whose matrix holds one half of the state; " *
+                "leave it out for PETSc's colouring",
+        ),
+    )
+    _petsc_differences(alg) || throw(
+        ArgumentError(
+            "PETScDiffEq cannot use `$(_autodiff(alg))` for a DynamicalODEProblem or " *
+                "SecondOrderODEProblem $_WITH_DM; leave `autodiff` at its default there, " *
+                "`AutoFiniteDiff()`, for PETSc's colouring",
+        ),
+    )
+    return nothing
+end
+
 const _DISTRIBUTED_IMPLICIT =
     ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "irk", "alpha", "dirk")
-# PETSc's IRK takes an AIJ matrix made here, which would replace the DM's.
-const _DM_IMPLICIT = ("beuler", "cn", "theta", "bdf", "rosw", "arkimex", "alpha", "dirk")
 const _WITH_DM = "with a `dm`"
 
 function _check_diagonal_mass(prob, is_dae, where, or = "")
@@ -4848,7 +4975,8 @@ end
 
 function _refuse_dm_autodiff(prob, alg, is_dae)
     ad, dm = _autodiff(alg), _alg_dm(alg)
-    other = "give the problem a `jac`, or leave `autodiff` at its default there, " *
+    other = _ts_type(alg) == "irk" ? "give the problem a `jac`" :
+        "give the problem a `jac`, or leave `autodiff` at its default there, " *
         "`AutoFiniteDiff()`, for the DM's colouring"
     ADTypes.dense_ad(ad) isa AutoForwardDiff || throw(
         ArgumentError(
@@ -4874,16 +5002,20 @@ function _refuse_dm_autodiff(prob, alg, is_dae)
 end
 
 function _refuse_dm(prob, alg, is_dae)
-    alg isa Union{TSRK, TSRosW, TSImplicit, TSDAE, TSARKIMEX, TSGeneric} || throw(
+    alg isa Union{
+        TSRK, TSRosW, TSImplicit, TSIRK, TSDAE, TSARKIMEX, TSGeneric, TSBasicSymplectic,
+        TSAlpha2,
+    } || throw(
         ArgumentError(
             "PETScDiffEq cannot run $(nameof(typeof(alg))) $_WITH_DM; TSRK, TSRosW, " *
-                "TSImplicit, TSDAE, TSARKIMEX and TSGeneric can",
+                "TSImplicit, TSIRK, TSDAE, TSARKIMEX, TSGeneric, TSBasicSymplectic and " *
+                "TSAlpha2 can",
         ),
     )
-    alg isa TSGeneric && !alg.explicit && !(alg.ts_type in _DM_IMPLICIT) && throw(
+    alg isa TSGeneric && !alg.explicit && !(alg.ts_type in _DISTRIBUTED_IMPLICIT) && throw(
         ArgumentError(
             "TSGeneric(\"$(alg.ts_type)\") cannot run $_WITH_DM; only " *
-                "$(join(_DM_IMPLICIT, ", ")) can",
+                "$(join(_DISTRIBUTED_IMPLICIT, ", ")) can",
         ),
     )
     has_jac = prob.f.jac !== nothing
@@ -4897,6 +5029,13 @@ function _refuse_dm(prob, alg, is_dae)
         ArgumentError("the `dm` gives the Jacobian's pattern, so leave out `jac_prototype`"),
     )
     _uses_ifunction(alg) || return nothing
+    has_jac || !_petsc_differences(alg) || _ts_type(alg) != "irk" || throw(
+        ArgumentError(
+            "TSIRK needs a `jac` or `autodiff = AutoForwardDiff()` $_WITH_DM, since PETSc " *
+                "builds its coupled-stage matrix from one and has no finite-difference " *
+                "fallback for it",
+        ),
+    )
     has_jac || _petsc_differences(alg) || _refuse_dm_autodiff(prob, alg, is_dae)
     _check_diagonal_mass(prob, is_dae, _WITH_DM)
     return nothing
@@ -5285,12 +5424,22 @@ function _setup(
         )
         _checked_everywhere(comm) do
             m = _dm_local_size(petsclib, dm)
-            m == n || throw(
-                ArgumentError(
-                    "`u0` has $n entries on this rank, but the `dm` gives it $m, its own " *
-                        "grid points times the degrees of freedom at each",
-                ),
-            )
+            if dyn
+                nv == n - nv == m || throw(
+                    ArgumentError(
+                        "the initial velocity and position have $nv and $(n - nv) entries " *
+                            "on this rank, but the `dm` gives each $m, its own grid points " *
+                            "times the degrees of freedom at each",
+                    ),
+                )
+            else
+                m == n || throw(
+                    ArgumentError(
+                        "`u0` has $n entries on this rank, but the `dm` gives it $m, its " *
+                            "own grid points times the degrees of freedom at each",
+                    ),
+                )
+            end
         end
     end
 
@@ -5308,7 +5457,14 @@ function _setup(
     f1 = is_dae || dyn ? f1 : _as_inplace(f1, iip)
     f2 = f2 === nothing ? nothing : _as_inplace(f2, iip)
     f1, f2 = _shaped(f1, form), _shaped(f2, form)
-    if dm !== nothing
+    if dm !== nothing && dyn
+        # A SecondOrderODEProblem's f2 is SciMLBase's `du .= v`, on the owned blocks.
+        owned = prob.problem_type isa SciMLBase.SecondOrderODEProblem
+        f1 = Partitioned(
+            GhostedPart(f1.f1, petsclib, dm.ptr),
+            owned ? f1.f2 : GhostedPart(f1.f2, petsclib, dm.ptr), nv,
+        )
+    elseif dm !== nothing
         f1 = Ghosted(f1, petsclib, dm.ptr)
         f2 = f2 === nothing ? nothing : Ghosted(f2, petsclib, dm.ptr)
     end
@@ -5467,7 +5623,9 @@ function _setup(
         )
     end
     clone = dm === nothing ? nothing : _clone_dm(petsclib, dm)
-    uvec = clone === nothing ? _state_vec(petsclib, comm, n) :
+    # The state of a DynamicalODEProblem is the DM's vector twice over, [v; u] on each rank.
+    pair = dyn && clone !== nothing
+    uvec = clone === nothing || pair ? _state_vec(petsclib, comm, n) :
         _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib)
     # A single index saves numbers, as OrdinaryDiffEq does.
     A = kept !== nothing ? (_listed(save_idxs) || length(kept) > 1 ? Vector{U} : U) :
@@ -5481,7 +5639,7 @@ function _setup(
         row_cols0, row_src, row_src2, row_buf, J0,
         R[], A[], A[], nothing, nothing,
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
-        clone === nothing ? _work_vec(petsclib, comm, uvec, n) :
+        clone === nothing || pair ? _work_vec(petsclib, comm, uvec, n) :
             _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib),
         !has_mass && !is_dae && !_petsc_interpolant(alg), _interpolates(alg), _warn_name(alg),
         R(NaN), similar(u0), t0, copy(u0), nothing, du0 === nothing ? nothing : tdir .* du0,
@@ -5515,7 +5673,8 @@ function _setup(
     try
         h.ts = LibPETSc.TSCreate(petsclib, something(comm, MPI.COMM_SELF))
         ts = h.ts
-        clone === nothing || LibPETSc.TSSetDM(petsclib, ts, clone)
+        # TSAlpha2 steps the position alone, which the DM lays out and colours.
+        clone === nothing || pair && !(alg isa TSAlpha2) || LibPETSc.TSSetDM(petsclib, ts, clone)
         LibPETSc.TSSetProblemType(petsclib, ts, LibPETSc.TS_NONLINEAR)
         _check_ts_type(petsclib, _ts_type(alg))
         LibPETSc.TSSetType(petsclib, ts, _ts_type(alg))
@@ -5563,7 +5722,10 @@ function _setup(
                 LibPETSc.TSSetRHSFunction(petsclib, ts, nothing, ptrs.split_rhs, ctxptr)
             end
             if alg isa TSAlpha2
-                if comm !== nothing
+                if clone !== nothing
+                    h.fd_mat = LibPETSc.DMCreateMatrix(petsclib, clone)
+                    _difference_jacobian!(petsclib, ts, h.fd_mat, ctxptr)
+                elseif comm !== nothing
                     P = has_jac ? J0 : SparseMatrixCSC(prob.f.jac_prototype)
                     _distributed_second_order!(h, nv, P, has_jac, ptrs, ctxptr)
                 elseif has_jac
@@ -5577,6 +5739,9 @@ function _setup(
                 else
                     _difference_jacobian!(petsclib, ts, nothing, ctxptr)
                 end
+            elseif pair && _uses_ifunction(alg)
+                h.fd_mat = _pair_matrix(petsclib, dm.ptr, nv, comm)
+                _difference_jacobian!(petsclib, ts, h.fd_mat, ctxptr)
             elseif clone !== nothing && _uses_ifunction(alg)
                 mat = LibPETSc.DMCreateMatrix(petsclib, clone)
                 if has_jac
@@ -5658,7 +5823,8 @@ function _setup(
                 ],
             )
             clone !== nothing && _uses_ifunction(alg) && !has_jac &&
-                !_dm_coloured(petsclib, clone.ptr, h.fd_mat, n, comm, S) &&
+                (!pair || alg isa TSAlpha2) &&
+                !_dm_coloured(petsclib, clone.ptr, h.fd_mat, pair ? nv : n, comm, S) &&
                 append!(effective_options, ["-snes_fd_color_use_mat"])
             append!(effective_options, alg.petsc_options)
             append!(effective_options, extra_options)
@@ -5701,7 +5867,7 @@ function _setup(
                 ),
             )
             distributable = alg isa Union{TSBasicSymplectic, TSAlpha2} ? (_ts_type(alg),) :
-                _uses_ifunction(alg) ? (dm === nothing ? _DISTRIBUTED_IMPLICIT : _DM_IMPLICIT) :
+                _uses_ifunction(alg) ? _DISTRIBUTED_IMPLICIT :
                 alg isa TSMPRK ? ("mprk", _EXPLICIT_ONLY...) : _EXPLICIT_ONLY
             comm === nothing && dm === nothing || chosen in distributable || throw(
                 ArgumentError(
@@ -5712,10 +5878,13 @@ function _setup(
             )
             running = _running_name(petsclib, ts)
             _refuse_method(running, has_mass, has_jac, is_split, is_dae)
-            comm === nothing || chosen != "irk" ||
+            if chosen == "irk" && dm !== nothing
+                _irk_on_dm!(h, N, ptrs.dm_ijacobian, ctxptr)
+            elseif chosen == "irk" && comm !== nothing
                 _irk_on_petsc_split!(h, N, rows, cols, ptrs.sparse_ijacobian, ctxptr)
+            end
             # PETSc's IRK needs an AIJ Jacobian, even when picked by an option.
-            if chosen == "irk" && has_jac && !uses_sparse_jac
+            if chosen == "irk" && has_jac && !uses_sparse_jac && !dm_jac
                 PETScCompat.destroy!(h.jac_mat)
                 h.jac_mat = PETScCompat.PetscMat(petsclib, n, n, n)
                 LibPETSc.TSSetIJacobian(
