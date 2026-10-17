@@ -177,6 +177,13 @@ function _bdf_order(subtype, order)
     return Int(order)
 end
 
+function _theta(subtype, theta)
+    subtype == "theta" ||
+        throw(ArgumentError("`theta` applies to TSImplicit(\"theta\"), not \"$subtype\""))
+    0 < theta <= 1 || throw(ArgumentError("PETSc takes `theta` in (0, 1], got $theta"))
+    return Float64(theta)
+end
+
 TSImplicit(
     subtype::AbstractString = "beuler"; order = nothing,
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
@@ -190,7 +197,7 @@ TSImplicit(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
-    String(subtype), Float64(theta), _bdf_order(subtype, order), String[],
+    String(subtype), _theta(subtype, theta), _bdf_order(subtype, order), String[],
     _check_autodiff(autodiff), _alg_comm(comm, dm), dm,
 )
 TSImplicit(
@@ -208,7 +215,7 @@ TSImplicit(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
-    String(subtype), Float64(theta), _bdf_order(subtype, order),
+    String(subtype), _theta(subtype, theta), _bdf_order(subtype, order),
     String[String(o) for o in petsc_options], _check_autodiff(autodiff),
     _alg_comm(comm, dm), dm,
 )

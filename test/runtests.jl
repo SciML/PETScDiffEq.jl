@@ -186,6 +186,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test all(o -> isapprox(o, 3; atol = 0.15), orders)
     end
 
+    @testset "TSImplicit takes theta in (0, 1] and for theta only" begin
+        for theta in (0.0, -1.0, 1.5, NaN)
+            @test_throws "(0, 1]" PETScDiffEq.TSImplicit("theta", theta)
+            @test_throws "(0, 1]" PETScDiffEq.TSImplicit("theta", theta, ["-ts_adapt_type", "none"])
+        end
+        for subtype in ("cn", "beuler", "bdf")
+            @test_throws "applies to TSImplicit(\"theta\")" PETScDiffEq.TSImplicit(subtype, 0.7)
+        end
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for theta in (0.25, 1)
+            sol = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("theta", theta); dt = 0.01)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.u[end][1] ≈ exp(-1.0) rtol = 1.0e-2
+        end
+    end
+
     @testset "TSARKIMEX keeps order when tspan starts away from 0" begin
         f!(du, u, p, t) = (du[1] = cos(t); nothing)
         t0 = 1.0
