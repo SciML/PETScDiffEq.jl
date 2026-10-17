@@ -318,6 +318,16 @@ const METHODS = (
                 TSDAE("bdf"; autodiff = ad), heat_exact(SPAN[2]), 1.5e-6; TOL...,
             )
         end
+        prob = dae(rows, heat!; jac = true)
+        integ = SciMLBase.init(prob, TSDAE("bdf"; comm); TOL...)
+        @test SciMLBase.get_du(integ) == prob.du0
+        foreach(_ -> SciMLBase.step!(integ), 1:5)
+        slope = similar(integ.u)
+        heat!(slope, integ.u, nothing, integ.t)
+        @test maximum(abs, SciMLBase.get_du(integ) - slope) <= 1.0e-8 * maximum(abs, slope)
+        SciMLBase.set_u!(integ, 2 .* integ.u)
+        @test refused(() -> SciMLBase.get_du(integ), "has changed since")
+        SciMLBase.terminate!(integ)
     end
 
     @testset "a Diagonal mass matrix" begin

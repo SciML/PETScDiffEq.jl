@@ -47,7 +47,9 @@ system on the flat `[v; u]` that these methods step. Its `jac` and `paramjac`, w
 are that system's, taking the state as an `ArrayPartition(v, u)` as the forward solve's
 `jac` does, and are otherwise built from `f1` and `f2`. The cost functions are handed the
 state as an `ArrayPartition` and write its derivative into one, and `du0` comes back as
-one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused.
+one. PETSc has no adjoint for `TSBasicSymplectic` or `TSAlpha2`, so those are refused. A
+`u0` of another vector type, such as a `ComponentArray`, is handled the same way, with its
+own type in place of the `ArrayPartition`.
 
 The adjoint runs in PETSc's double real build. A `Float32` problem is solved there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
@@ -192,6 +194,7 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     held_until::Float64
     held_u::Vector{Float64}
     clock::DataType
+    adaptive::Bool
     cost_at_step::Dict{Int, Vector{Int}}
     u_at_step::Dict{Int, Vector{Float64}}
     u::Vector{Float64}
@@ -361,25 +364,25 @@ const ADJ_RHSJACOBIANP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 const ADJ_IJACOBIANP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _adjoint_record!(
-        ::LibPETSc.CTS,
+        ts_ptr::LibPETSc.CTS,
         step::LibPETSc.PetscInt,
         s::Float64,
         x_ptr::LibPETSc.CVec,
         ctx_ptr::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode
     adj = unsafe_pointer_to_objref(ctx_ptr)::AdjointContext
-    return _adjoint_record_body!(adj, Int(step), Float64(s), x_ptr)
+    return _adjoint_record_body!(adj, Int(step), Float64(s), x_ptr, ts_ptr)
 end
 
+_cost_tol(R, step, s, h) =
+    max(sqrt(Float64(eps(R))) * h, (step + 100) * Float64(eps(R(max(1.0, abs(s))))))
+
 # Each cost time goes to the nearest step within the tolerance, so a step is held until the next.
-function _adjoint_record_body!(adj, step, s, x_ptr)
+function _adjoint_record_body!(adj, step, s, x_ptr, ts_ptr)
     pl = adj.petsclib
     try
         R = adj.clock
-        tol = max(
-            sqrt(Float64(eps(R))) * (s - adj.s_prev),
-            (step + 100) * Float64(eps(R(max(1.0, abs(s))))),
-        )
+        tol = _cost_tol(R, step, s, s - adj.s_prev)
         x = PETSc.VecPtr(pl, x_ptr, false)
         order, cost_s = adj.order, adj.cost_s
         while adj.next <= length(order) && cost_s[order[adj.next]] <= s
@@ -397,12 +400,22 @@ function _adjoint_record_body!(adj, step, s, x_ptr)
         if adj.next <= length(order) && cost_s[order[adj.next]] <= s + tol
             adj.held_step, adj.held_until = step, s + tol
             _readvec!(adj.held_u, pl, x)
+        elseif adj.adaptive && adj.next <= length(order)
+            _land_on!(adj, LibPETSc.TS(ts_ptr, pl), step, s, cost_s[order[adj.next]])
         end
     catch e
         adj.err = e
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
+end
+
+# PETSc takes a span time within 1e-6 * dt * |t| of a step as reached, and steps over it.
+function _land_on!(adj, ts, step, s, c)
+    pl = adj.petsclib
+    h = LibPETSc.TSGetTimeStep(pl, ts)
+    s + h - c > _cost_tol(adj.clock, step + 1, s + h, h) && LibPETSc.TSSetTimeStep(pl, ts, c - s)
+    return nothing
 end
 
 function _record_cost!(adj, k, step, state)
@@ -1170,6 +1183,7 @@ function _discrete_adjoint_unlocked(
         given, checked, Bool(no_start)
     end
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
+    wraps = _wraps(prob, alg)
     is_split = prob.f isa SciMLBase.SplitFunction
     p = prob.p
     np = has_p ? length(p) : 0
@@ -1206,10 +1220,12 @@ function _discrete_adjoint_unlocked(
         adaptive && _set_time_span!(h, cost_s)
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
-        inplace(fun) = _as_inplace(SciMLBase.unwrapped_f(fun.f), iip)
+        inplace(fun) = _shaped(
+            _as_inplace(SciMLBase.unwrapped_f(fun.f), iip), dyn ? nothing : ctx.wrapped_u,
+        )
         f_ad = dyn ? _partitioned(prob.f, iip, length(prob.u0.x[1])) :
             inplace(is_split ? prob.f.f1 : prob.f)
-        user_jac(j) = dyn ? _partitioned_jac(j, prob.u0, iip) : _as_inplace_jac(j, iip)
+        user_jac(j) = wraps ? _partitioned_jac(j, prob.u0, iip) : _as_inplace_jac(j, iip)
         user_t0 = Float64(prob.tspan[1])
         rhs, f_rhs = is_split ? (prob.f.f2, inplace(prob.f.f2)) : (prob.f, f_ad)
         # A partitioned prototype's columns number the whole [v; u], every velocity first.
@@ -1267,7 +1283,8 @@ function _discrete_adjoint_unlocked(
         context(jac, J, rows, paramjac, pscale, coo) = AdjointContext(
             pl, h.tdir, p, jac, J, rows..., paramjac, zeros(n, np), pscale, dgdu_discrete,
             skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, -1, h.t0, zeros(n),
-            first(_eltypes(prob)),
+            # At the problem's precision, also on i686, which leaves the single build out.
+            first(_eltypes(prob, Type[Float32, ComplexF32])), adaptive,
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
@@ -1360,7 +1377,8 @@ function _discrete_adjoint_unlocked(
             s_end = LibPETSc.TSGetSolveTime(pl, ts)
             # PETSc reports TS_CONVERGED_ITS when the last step maxiters allows lands on tf.
             reached = reason == LibPETSc.TS_CONVERGED_TIME ||
-                reason == LibPETSc.TS_CONVERGED_ITS && s_end >= h.tf - _near(h.tf)
+                reason == LibPETSc.TS_CONVERGED_ITS &&
+                s_end >= h.tf - _near(h.tf, h.ctx.tbound)
             reached || throw(
                 ArgumentError(
                     "the forward solve stopped with $reason at t = $(_user_t(h.tdir, s_end)), " *
@@ -1443,12 +1461,12 @@ function _discrete_adjoint_unlocked(
         comm === nothing || (dp .+= MPI.Allreduce(mine, +, comm))
     end
     du0 = _like(prob.u0, du0)
-    return dyn ? _partition(prob.u0, du0) : du0, has_p ? _like(p, dp)' : nothing
+    return wraps ? _partition(prob.u0, du0) : du0, has_p ? _like(p, dp)' : nothing
 end
 
 _like(x, g) = eltype(x) === Float32 ? Float32.(g) : g
 
-# A DynamicalODEProblem's costs see the flat [v; u] as the ArrayPartition `solve` saves.
+# The costs see the flat state in the type `solve` saves it as, such as an ArrayPartition.
 _partitioned_cost(::Nothing, template, of_u) = nothing
 function _partitioned_cost(dg, template, of_u)
     of_u || return (out, u, args...) -> dg(out, _partition(template, u), args...)
@@ -1473,8 +1491,7 @@ _partitioned_costs(
 )
 
 function _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...)
-    costs = prob.f isa SciMLBase.DynamicalODEFunction ?
-        _partitioned_costs(prob.u0; kwargs...) : kwargs
+    costs = _wraps(prob, alg) ? _partitioned_costs(prob.u0; kwargs...) : kwargs
     return _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; costs...))
 end
 
