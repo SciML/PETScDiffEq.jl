@@ -194,6 +194,7 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     held_until::Float64
     held_u::Vector{Float64}
     clock::DataType
+    tbound::Float64
     adaptive::Bool
     cost_at_step::Dict{Int, Vector{Int}}
     u_at_step::Dict{Int, Vector{Float64}}
@@ -374,15 +375,21 @@ function _adjoint_record!(
     return _adjoint_record_body!(adj, Int(step), Float64(s), x_ptr, ts_ptr)
 end
 
-_cost_tol(R, step, s, h) =
-    max(sqrt(Float64(eps(R))) * h, (step + 100) * Float64(eps(R(max(1.0, abs(s))))))
+# PETSc 3.22 fails a step ending within 10 eps of the next span time; closer times share one.
+const _SPAN_GAP = 20 * eps(1.0)
+
+# Floored at `bound`, the span's largest |t|, below 1, as `_near` is.
+_cost_tol(R, step, s, h, bound) = max(
+    sqrt(Float64(eps(R))) * h, (step + 100) * Float64(eps(R(max(min(1.0, bound), abs(s))))),
+    _SPAN_GAP,
+)
 
 # Each cost time goes to the nearest step within the tolerance, so a step is held until the next.
 function _adjoint_record_body!(adj, step, s, x_ptr, ts_ptr)
     pl = adj.petsclib
     try
         R = adj.clock
-        tol = _cost_tol(R, step, s, s - adj.s_prev)
+        tol = _cost_tol(R, step, s, s - adj.s_prev, adj.tbound)
         x = PETSc.VecPtr(pl, x_ptr, false)
         order, cost_s = adj.order, adj.cost_s
         while adj.next <= length(order) && cost_s[order[adj.next]] <= s
@@ -414,7 +421,8 @@ end
 function _land_on!(adj, ts, step, s, c)
     pl = adj.petsclib
     h = LibPETSc.TSGetTimeStep(pl, ts)
-    s + h - c > _cost_tol(adj.clock, step + 1, s + h, h) && LibPETSc.TSSetTimeStep(pl, ts, c - s)
+    s + h - c > _cost_tol(adj.clock, step + 1, s + h, h, adj.tbound) &&
+        LibPETSc.TSSetTimeStep(pl, ts, c - s)
     return nothing
 end
 
@@ -878,7 +886,7 @@ function _check_adjoint_problem(
     )
     tdir = prob.tspan[1] <= prob.tspan[2] ? 1.0 : -1.0
     s0, sf = tdir * Float64(prob.tspan[1]), tdir * Float64(prob.tspan[2])
-    tol = 100 * eps(max(1.0, abs(s0), abs(sf)))
+    tol = 100 * eps(max(abs(s0), abs(sf)))
     for ti in t
         s0 - tol <= tdir * ti <= sf + tol ||
             throw(ArgumentError("cost time $ti lies outside tspan = $(prob.tspan)"))
@@ -1010,7 +1018,7 @@ end
 # PETSc's adaptor ends a step on each time of the span, which the trajectory then holds.
 function _set_time_span!(h::TSHandles{<:Any, <:Any, R}, cost_s) where {R}
     # Closer than this to a time of the span, a cost time is matched to that step instead.
-    near(s) = 100 * Float64(eps(R(max(1.0, abs(s)))))
+    near(s) = max(100 * Float64(eps(R(max(min(1.0, h.ctx.tbound), abs(s))))), _SPAN_GAP)
     span = R[h.t0]
     for s in sort(cost_s)
         last(span) + near(s) < s < h.tf - near(s) && push!(span, s)
@@ -1284,7 +1292,7 @@ function _discrete_adjoint_unlocked(
             pl, h.tdir, p, jac, J, rows..., paramjac, zeros(n, np), pscale, dgdu_discrete,
             skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, -1, h.t0, zeros(n),
             # At the problem's precision, also on i686, which leaves the single build out.
-            first(_eltypes(prob, Type[Float32, ComplexF32])), adaptive,
+            first(_eltypes(prob, Type[Float32, ComplexF32])), h.ctx.tbound, adaptive,
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
