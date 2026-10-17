@@ -7212,7 +7212,13 @@ function _reinit_unlocked(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
         p = integ.p,
     )
-    setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
+    # As in OrdinaryDiffEq, a new saveat keeps the save_start and save_end init worked out.
+    setup_kwargs = integ.kwargs
+    saveat === nothing || (
+        setup_kwargs = merge(
+            setup_kwargs, (saveat = saveat, save_start = old.save_start, save_end = old.save_end),
+        )
+    )
     reinit_dae || (setup_kwargs = merge(setup_kwargs, (initializealg = SciMLBase.NoInit(),)))
     if !erase_sol && !old.ctx.dense && old.ctx.save_idxs !== nothing && !isempty(old.ctx.ts)
         setup_kwargs = merge(setup_kwargs, (dense = false,))

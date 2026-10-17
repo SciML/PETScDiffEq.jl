@@ -1967,6 +1967,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test SciMLBase.solve!(integ).t == [0.0, 0.5, 1.0]
             SciMLBase.reinit!(integ; saveat = 0.25)
             @test SciMLBase.solve!(integ).t == [0.0, 0.25, 0.5, 0.75, 1.0]
+            # OrdinaryDiffEq keeps the save flags init worked out.
+            for (kw, want) in (
+                    ((saveat = 0.5,), [0.0, 0.3, 1.0]),
+                    ((saveat = 0.5, save_start = false), [0.3, 1.0]),
+                    ((saveat = [0.5],), [0.3]),
+                )
+                integ = SciMLBase.init(prob, alg; kw...)
+                SciMLBase.reinit!(integ; saveat = [0.3])
+                @test SciMLBase.solve!(integ).t == want
+                theirs = SciMLBase.init(prob, Tsit5(); kw...)
+                SciMLBase.reinit!(theirs; saveat = [0.3])
+                @test SciMLBase.solve!(theirs).t == want
+            end
         end
 
         @testset "callbacks are initialised again unless told not to" begin
