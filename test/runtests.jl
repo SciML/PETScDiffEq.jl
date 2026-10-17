@@ -10020,6 +10020,20 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test maximum(sol.t) <= 1.0 + 1.0e-10
             @test sol.t[end] ≈ 1.0
         end
+        @testset "options that move the ends of tspan are refused" begin
+            for (opts, msg) in (
+                    (["-ts_init_time", "0.5"], "-ts_init_time"),
+                    (["-ts_max_time", "2"], "-ts_max_time"),
+                    (["-ts_max_time", "0.5"], "-ts_max_time"),
+                    (["-ts_exact_final_time", "stepover"], "stepover"),
+                )
+                @test_throws msg SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp", opts); dt = 0.3)
+            end
+            rev = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
+            sol = SciMLBase.solve(rev, PETScDiffEq.TSRK("5dp", ["-ts_exact_final_time", "matchstep"]))
+            @test sol.t[end] == 0.0
+            @test sol.u[end][1] ≈ exp(1.0) rtol = 1.0e-3
+        end
         @testset "a cancelled monitor still yields the final state" begin
             sol = SciMLBase.solve(
                 prob,
