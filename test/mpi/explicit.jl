@@ -224,6 +224,11 @@ crossing_last_row(idx, level) =
         @test same_everywhere(sol.t)
         u = gathered(sol.u[end], counts0)
         rank == 0 && @test maximum(abs, u - decay_exact(1:N, 1.0)) <= DECAY_ERR
+        # A rank without rows has no index to save.
+        mine = isempty(rows0) ? Int[] : [length(rows0)]
+        part = solve(decay_problem(rows0), TSRK("5dp"; comm); save_idxs = mine, tol...)
+        @test part.t == sol.t
+        @test part.u == [v[mine] for v in sol.u]
     end
 
     @testset "a check that fires on one rank stops every rank" begin
