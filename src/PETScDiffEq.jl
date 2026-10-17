@@ -269,7 +269,9 @@ TSIRK(
 
 Fully implicit methods applied to a `DAEProblem`, whose residual `G(t, u, u') = 0`
 is exactly the form PETSc's `IFunction` takes. `subtype` is `"beuler"`, `"cn"`,
-`"theta"` or `"bdf"`, as for [`TSImplicit`](@ref).
+`"theta"` or `"bdf"`. There is no `theta` argument as [`TSImplicit`](@ref) has: `"theta"`
+runs PETSc's default of 0.5, and `petsc_options` such as `["-ts_theta_theta", "1.0"]` set
+another.
 
 A `DAEFunction`'s `jac(J, du, u, p, gamma, t)` is `gamma * dG/du' + dG/du`,
 which is what PETSc's `IJacobian` wants whole, so it is passed straight through

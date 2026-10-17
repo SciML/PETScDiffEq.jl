@@ -2517,6 +2517,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test all(o -> isapprox(o, 1; atol = 0.1), orders)
         end
 
+        @testset "theta takes its parameter from an option, not an argument" begin
+            prob = SciMLBase.DAEProblem(withjac, du0, u0, tspan)
+            last(alg) = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false).u[end]
+            @test last(PETScDiffEq.TSDAE("theta", ["-ts_theta_theta", "1.0"])) ==
+                last(PETScDiffEq.TSDAE("beuler"))
+            @test last(PETScDiffEq.TSDAE("theta")) ==
+                last(PETScDiffEq.TSDAE("theta", ["-ts_theta_theta", "0.5"]))
+            @test_throws MethodError PETScDiffEq.TSDAE("theta", 0.3)
+            @test occursin("-ts_theta_theta", string(@doc PETScDiffEq.TSDAE))
+        end
+
         @testset "what a DAE cannot ask for" begin
             prob = SciMLBase.DAEProblem(withjac, du0, u0, tspan)
             @test_throws Exception SciMLBase.solve(
