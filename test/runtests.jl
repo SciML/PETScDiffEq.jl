@@ -10592,6 +10592,31 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "alg_order of TSARKIMEX's DIRK tableaux" begin
+        orders = Dict(
+            "s212" => 2, "es122sal" => 1, "es213sal" => 2, "es324sal" => 3, "es325sal" => 3,
+            "657a" => 6, "es648sa" => 6, "658a" => 6, "s659a" => 6, "7510sal" => 7,
+            "es7510sa" => 7, "759a" => 7, "s7511sal" => 7, "8614a" => 8, "8616sal" => 8,
+            "es8516sal" => 8,
+        )
+        @test Set(keys(orders)) == Set(PETScDiffEq._ARKIMEX_DIRK)
+        for (s, p) in orders
+            @test SciMLBase.alg_order(PETScDiffEq.TSARKIMEX(s)) == p
+        end
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for s in ("es122sal", "es213sal", "es324sal")
+            alg = PETScDiffEq.TSARKIMEX(s)
+            errs = [
+                abs(SciMLBase.solve(prob, alg; dt, adaptive = false).u[end][1] - exp(-1.0))
+                    for dt in (0.04, 0.02)
+            ]
+            @test isapprox(log2(errs[1] / errs[2]), SciMLBase.alg_order(alg); atol = 0.2)
+        end
+        sol = SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX("es325sal"); abstol = 1.0e-8, reltol = 1.0e-8)
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        @test sol.u[end][1] ≈ exp(-1.0) rtol = 1.0e-7
+    end
+
     @testset "The first step without dt" begin
         sinf!(du, u, p, t) = (du[1] = -u[1] + sin(10t); nothing)
         lv!(du, u, p, t) = (du[1] = 1.5u[1] - u[1] * u[2]; du[2] = -3u[2] + u[1] * u[2]; nothing)

@@ -716,9 +716,14 @@ function _order(table, family, subtype)
     return table[subtype]
 end
 
+# A DIRK tableau's name starts with its order, after any letters.
+_arkimex_order(subtype) = subtype in _ARKIMEX_DIRK ?
+    parse(Int, first(filter(isdigit, subtype))) :
+    _order(_ARKIMEX_ORDER, "TSARKIMEX", subtype)
+
 SciMLBase.alg_order(alg::TSRK) = _order(_RK_ORDER, "TSRK", alg.subtype)
 SciMLBase.alg_order(alg::TSRosW) = _order(_ROSW_ORDER, "TSRosW", alg.subtype)
-SciMLBase.alg_order(alg::TSARKIMEX) = _order(_ARKIMEX_ORDER, "TSARKIMEX", alg.subtype)
+SciMLBase.alg_order(alg::TSARKIMEX) = _arkimex_order(alg.subtype)
 SciMLBase.alg_order(alg::TSMPRK) = _order(_MPRK_ORDER, "TSMPRK", alg.subtype)
 SciMLBase.alg_order(alg::TSIRK) = 2 * alg.nstages
 SciMLBase.alg_order(alg::TSBasicSymplectic) = parse(Int, alg.subtype)
@@ -4251,7 +4256,7 @@ function _running_order(pl, ts, name)
     type, sub = first(split(name)), last(split(name))
     type == "rk" && return _order(_RK_ORDER, "TSRK", sub)
     type == "rosw" && return _order(_ROSW_ORDER, "TSRosW", sub)
-    type == "arkimex" && return _order(_ARKIMEX_ORDER, "TSARKIMEX", sub)
+    type == "arkimex" && return _arkimex_order(sub)
     type == "bdf" && return Int(LibPETSc.TSBDFGetOrder(pl, ts))
     type == "beuler" && return 1
     type in ("cn", "alpha2") && return 2
