@@ -6362,6 +6362,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "TSARKIMEX's DIRK tableaux keep f2 of a SplitODEProblem" begin
+        f1!(du, u, p, t) = (du[1] = -u[1]; nothing)
+        f2!(du, u, p, t) = (du[1] = cos(t); nothing)
+        exact = 0.5 * (cos(1.0) + sin(1.0)) + 0.5 * exp(-1.0)
+        prob = SciMLBase.SplitODEProblem(f1!, f2!, [1.0], (0.0, 1.0))
+        for (s, p) in (("es122sal", 1), ("es213sal", 2), ("es324sal", 3))
+            errs = map((0.04, 0.02)) do dt
+                sol = SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX(s); dt, adaptive = false)
+                abs(sol.u[end][1] - exact)
+            end
+            @test errs[2] < 1.0e-2
+            @test isapprox(log2(errs[1] / errs[2]), p; atol = 0.2)
+        end
+    end
+
     @testset "every algorithm but TSARKIMEX solves a SplitODEProblem as the sum of its parts" begin
         fast!(du, u, p, t) = (du[1] = -p * u[1]; du[2] = -2p * u[2]; nothing)
         slow!(du, u, p, t) = (du[1] = u[2] * cos(t); du[2] = -u[1] * u[2]; nothing)

@@ -332,6 +332,9 @@ implicit.
 `"bpr3"` is refused on a `SplitODEProblem`, where it converges at first order. On a
 plain `ODEProblem` PETSc does not use its explicit tableau, and it keeps order 3.
 
+PETSc's DIRK tableaux, such as `"es213sal"`, have no explicit part, so they take a
+`SplitODEProblem`'s `f2` implicitly along with `f1`.
+
 A `comm` other than `MPI.COMM_SELF` runs the solve distributed over it, as for [`TSRK`](@ref).
 There `autodiff` defaults to `AutoFiniteDiff()`, `AutoForwardDiff()` colours the whole pattern of
 a sparse `jac_prototype` holding this rank's rows with global columns, and a `jac` fills those
@@ -4414,6 +4417,9 @@ _default_options(::AnyPETScTS) = String[]
 _default_options(alg::TSMPRK) =
     ["-ts_mprk_type", alg.subtype, "-ts_use_splitrhsfunction", "true"]
 _default_options(alg::TSBasicSymplectic) = ["-ts_basicsymplectic_type", alg.subtype]
+# A DIRK tableau has no explicit part, so PETSc would drop a split problem's f2.
+_default_options(alg::TSARKIMEX) =
+    alg.subtype in _ARKIMEX_DIRK ? ["-ts_arkimex_fully_implicit"] : String[]
 # PETSc estimates alpha2's error but leaves its adaptor off unless asked.
 _default_options(::TSAlpha2) = ["-ts_adapt_type", "basic"]
 
