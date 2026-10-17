@@ -1969,6 +1969,24 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test SciMLBase.solve!(integ).t == [0.0, 0.25, 0.5, 0.75, 1.0]
         end
 
+        @testset "options assigned on opts survive reinit!" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); saveat = 0.25)
+            integ.opts.maxiters = 2
+            integ.opts.save_start = false
+            integ.opts.save_end = false
+            integ.opts.dtmax = 0.01
+            SciMLBase.reinit!(integ)
+            @test integ.opts.maxiters == 2
+            @test integ.opts.dtmax == 0.01
+            sol = SciMLBase.solve!(integ)
+            @test sol.retcode == SciMLBase.ReturnCode.MaxIters
+            integ.opts.maxiters = 10^6
+            SciMLBase.reinit!(integ)
+            sol = SciMLBase.solve!(integ)
+            @test sol.t == [0.25, 0.5, 0.75]
+            @test sol.stats.naccept >= 100
+        end
+
         @testset "callbacks are initialised again unless told not to" begin
             n_init = Ref(0)
             cb = SciMLBase.DiscreteCallback(

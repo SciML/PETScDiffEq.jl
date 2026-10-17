@@ -6134,10 +6134,12 @@ mutable struct PETScIntegratorOpts{H, R}
     tstops::Vector{R}
     saveat::Vector{R}
     d_discontinuities::Vector{R}
+    written::Vector{Symbol}
 end
 
 const FIXED_OPTS = (
     :dense, :save_idxs, :calck, :internalnorm, :callback, :tstops, :saveat, :d_discontinuities,
+    :written,
 )
 
 function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {H, R}
@@ -6151,6 +6153,7 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
     setfield!(
         o, name, name in (:dtmin, :dtmax) ? R(v) : name === :maxiters ? _step_limit(v) : v,
     )
+    name in getfield(o, :written) || push!(getfield(o, :written), name)
     (h === nothing || h.destroyed) && return v
     pl = h.petsclib
     if name === :abstol || name === :reltol
@@ -6342,7 +6345,7 @@ function _make_opts(
         ctx.hermite || ctx.interpolates === true, _internalnorm(ctx.comm),
         ctx.unstable, ctx.domain,
         callback isa SciMLBase.CallbackSet ? callback : SciMLBase.CallbackSet(callback),
-        tstops, ctx.saveat, d_discontinuities,
+        tstops, ctx.saveat, d_discontinuities, Symbol[],
     )
 end
 
@@ -7212,7 +7215,10 @@ function _reinit_unlocked(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
         p = integ.p,
     )
-    setup_kwargs = saveat === nothing ? integ.kwargs : merge(integ.kwargs, (saveat = saveat,))
+    written = filter(!in((:abstol, :reltol)), getfield(integ.opts, :written))
+    kept = NamedTuple{Tuple(written)}(map(k -> getfield(integ.opts, k), Tuple(written)))
+    setup_kwargs = merge(integ.kwargs, kept)
+    saveat === nothing || (setup_kwargs = merge(setup_kwargs, (saveat = saveat,)))
     reinit_dae || (setup_kwargs = merge(setup_kwargs, (initializealg = SciMLBase.NoInit(),)))
     if !erase_sol && !old.ctx.dense && old.ctx.save_idxs !== nothing && !isempty(old.ctx.ts)
         setup_kwargs = merge(setup_kwargs, (dense = false,))
@@ -7237,7 +7243,7 @@ function _reinit_unlocked(
         initialize_save && _initial_save!(h)
         if reset_dt === true
             dt = _estimate_dt(
-                h, _make_opts(h, integ.kwargs), h.u0, h.t0,
+                h, _make_opts(h, setup_kwargs), h.u0, h.t0,
                 _tstops(vcat(tstops, d_discontinuities), h),
             )
         end
@@ -7265,9 +7271,10 @@ function _reinit_unlocked(
     integ.tstops = _tstops(vcat(tstops, d_discontinuities), h)
     integ.d_discontinuities = d_discontinuities
     integ.opts = _make_opts(
-        h, integ.kwargs; tstops = integ.tstops, d_discontinuities = d_discontinuities,
+        h, setup_kwargs; tstops = integ.tstops, d_discontinuities = d_discontinuities,
         callback = getfield(integ.opts, :callback),
     )
+    append!(getfield(integ.opts, :written), written)
     integ.finished = false
     integ.iter = 0
     dt === nothing || _use_dt!(integ, dt, reset_dt === true)
