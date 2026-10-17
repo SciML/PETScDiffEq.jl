@@ -7070,6 +7070,25 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test all(o -> isapprox(o, 2; atol = 0.15), orders)
         end
 
+        @testset "a jac_prototype of another size than the state is refused" begin
+            algs = (
+                PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW("ra34pw2"),
+                PETScDiffEq.TSImplicit("bdf"; autodiff = PETScDiffEq.AutoFiniteDiff()),
+            )
+            protos = (sparse(1.0I, 4, 4), sparse([1, 2], [1, 2], [1.0, 1.0], 3, 4), ones(2, 2))
+            for proto in protos
+                msg = "the `jac_prototype` is $(join(size(proto), " x ")), but the state has 3 " *
+                    "entries, so it must be 3 x 3"
+                for jac in (nothing, chain_jac!), alg in algs
+                    prob = SciMLBase.ODEProblem(
+                        SciMLBase.ODEFunction(chain!; jac, jac_prototype = proto),
+                        [1.0, 0.0, 0.0], (0.0, 2.0),
+                    )
+                    @test_throws msg SciMLBase.solve(prob, alg)
+                end
+            end
+        end
+
         @testset "sparse prototype handles a structural zero on the diagonal" begin
             proto_prob = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(

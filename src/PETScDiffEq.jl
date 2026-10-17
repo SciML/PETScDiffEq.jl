@@ -4982,6 +4982,13 @@ _check_local_rows(proto, n, N) = size(proto) == (n, N) || throw(
     ),
 )
 
+_check_square(proto, n) = !(proto isa AbstractMatrix) || size(proto) == (n, n) || throw(
+    ArgumentError(
+        "the `jac_prototype` is $(join(size(proto), " x ")), but the state has $n entries, " *
+            "so it must be $n x $n",
+    ),
+)
+
 # On i686 PETSc_jll's single builds fail BDF and ARKIMEX at stops.
 const _SINGLE_BUILDS = Sys.ARCH !== :i686
 
@@ -5261,6 +5268,7 @@ function _setup(
     slow_idxs, medium_idxs, fast_idxs =
         alg isa TSMPRK ? _mprk_splits(alg, n, comm) : (Int[], Int[], Int[])
 
+    comm === nothing && dm === nothing && _check_square(prob.f.jac_prototype, n)
     petsclib = _petsclib(S)
     _check_inttype(petsclib)
     PETScCompat.isinitialized(petsclib) || PETSc.initialize(petsclib)
