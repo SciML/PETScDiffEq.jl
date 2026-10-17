@@ -5958,6 +5958,29 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
     @testset "tstops" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
 
+        @testset "tstops as a function of p and tspan" begin
+            stops(p, tspan) = [tspan[1] + p * (tspan[2] - tspan[1])]
+            sol = SciMLBase.solve(
+                SciMLBase.remake(prob; p = 0.3), PETScDiffEq.TSRK("5dp");
+                tstops = stops,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test 0.3 in sol.t
+            seen = Float64[]
+            cb = SciMLBase.DiscreteCallback((u, t, integ) -> true, integ -> push!(seen, integ.t))
+            integ = SciMLBase.init(
+                SciMLBase.remake(prob; p = 0.3), PETScDiffEq.TSRK("5dp");
+                tstops = stops, callback = cb,
+            )
+            SciMLBase.solve!(integ)
+            @test 0.3 in seen
+            empty!(seen)
+            SciMLBase.reinit!(integ; t0 = 1.0, tf = 2.0)
+            SciMLBase.solve!(integ)
+            @test 1.3 in seen
+            @test !(0.3 in seen)
+        end
+
         @testset "solve lands on every stop exactly" begin
             for (alg, kw) in (
                     (PETScDiffEq.TSRK("5dp"), (reltol = 1.0e-8, abstol = 1.0e-10)),

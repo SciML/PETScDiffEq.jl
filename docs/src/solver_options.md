@@ -10,6 +10,8 @@ and `abstol` (either may be a vector of per-component tolerances), `saveat`, `sa
 ends early gives is logged at the `instability` level of a `DEVerbosity`, so
 `verbose = DEVerbosity(SciMLLogging.None())` silences it, as do `SciMLLogging.None()` and
 `false`. Keywords it cannot honour emit a warning rather than being silently dropped.
+`tstops` can also be a function `tstops(p, tspan)`, called once the problem is initialized
+and again at each `reinit!`, as in OrdinaryDiffEq.
 
 Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
 only when it names them or `save_start` or `save_end` asks, and `save_everystep = true`

@@ -727,6 +727,7 @@ SciMLBase.alg_order(alg::TSImplicit) = _implicit_order(alg.subtype, alg.theta, a
 SciMLBase.alg_order(alg::TSDAE) = _implicit_order(alg.subtype, nothing, alg.order)
 
 SciMLBase.allowscomplex(::AnyPETScTS) = true
+SciMLBase.allows_late_binding_tstops(::AnyPETScTS) = true
 
 function _implicit_order(subtype, theta, order)
     subtype == "beuler" && return 1
@@ -5944,7 +5945,8 @@ function _solve_unlocked(
     )
     # MPRK and basicsymplectic miss tf, Float32 landing refuses short steps, and
     # isoutofdomain retries steps.
-    if !_no_callback(callback) || !isempty(tstops) || !isempty(d_discontinuities) ||
+    if !_no_callback(callback) || _late(tstops) || !isempty(tstops) ||
+            !isempty(d_discontinuities) ||
             alg isa Union{TSMPRK, TSBasicSymplectic} ||
             get(kwargs, :isoutofdomain, nothing) !== nothing ||
             first(_eltypes(prob)) === Float32
@@ -6241,7 +6243,7 @@ mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractArray{
     event_residual::Vector{Vector{Float64}}
     kwargs::Any
     tstops::Vector{R}
-    tstops_cache::Vector{R}
+    tstops_cache::Any
     d_discontinuities::Vector{R}
     d_discontinuities_cache::Vector{R}
     dtcache::R
@@ -6987,14 +6989,27 @@ function _init_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
-    _check_real(tstops, :tstops)
+    late = _late(tstops) ? tstops : nothing
+    late === nothing && _check_real(tstops, :tstops)
     _check_real(d_discontinuities, :d_discontinuities)
     R = first(_eltypes(prob))
-    tstops, d_discontinuities = _times(R, tstops), _times(R, d_discontinuities)
+    tstops = late === nothing ? _times(R, tstops) : R[]
+    d_discontinuities = _times(R, d_discontinuities)
     stops_given = vcat(tstops, d_discontinuities)
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = stops_given, kwargs...)
     prob = _with_p(prob, h.ctx.p)
+    if late !== nothing
+        tstops = try
+            given = late(h.ctx.p, prob.tspan)
+            _check_real(given, :tstops)
+            _times(R, given)
+        catch
+            _destroy!(h)
+            rethrow()
+        end
+        stops_given = vcat(tstops, d_discontinuities)
+    end
     _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
     _match_steps_here!(h)
     _initial_save!(h)
@@ -7014,7 +7029,7 @@ function _init_unlocked(
         _integ_state(h.ctx, h.u0, similar),
         Vector{R}[fill(R(NaN), _ncond(cb)) for cb in continuous],
         Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
-        stops, tstops, d_discontinuities, d_discontinuities, dt0,
+        stops, something(late, tstops), d_discontinuities, d_discontinuities, dt0,
         _initial_solution(prob, alg, h, kwargs), false, false, nothing, 0,
     )
     if h.init_failed
@@ -7104,6 +7119,9 @@ function _take_written_state!(integ::PETScIntegrator)
 end
 
 _times(R, ts) = ts isa Number ? [R(ts)] : collect(R, ts)
+
+# SciMLBase's late-binding form: `tstops(p, tspan)`, called once the problem is initialized.
+_late(tstops) = !(tstops isa Union{AbstractArray, Tuple, Number})
 
 # d_discontinuities are right-continuous, so the next step starts an ulp past one.
 function _past_discontinuity!(integ::PETScIntegrator)
@@ -7199,6 +7217,7 @@ function _reinit_unlocked(
         d_discontinuities = integ.d_discontinuities_cache,
         reinit_callbacks = true, initialize_save = true, reinit_dae = true,
     )
+    _late(tstops) && (tstops = tstops(integ.p, (t0, tf)))
     _check_real(tstops, :tstops)
     _check_real(d_discontinuities, :d_discontinuities)
     # `_in_shape` refuses another length for a state of another shape.
