@@ -333,6 +333,28 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
             ) < 2.0e-9
         end
 
+        # With the saved times as `tstops` both runs end a step on each, and the gradient is
+        # that of the saved states at steps held fixed. Measured: 2.0e-10 at most.
+        for (alg, stepping) in (
+                (TSRK("4"), (dt = 0.03, adaptive = false)),
+                (TSImplicit("cn", EXACT), (dt = 0.03, adaptive = false)),
+                (TSRK("5dp"), (abstol = 1.0e-8, reltol = 1.0e-8)),
+            )
+            steps = solve(prob, alg; stepping..., tstops = TS).t
+            held(x) = fit(
+                prob, alg, x[1:2], x[3:6]; dt = 1.0, adaptive = false,
+                tstops = steps[2:(end - 1)],
+            )
+            differences = map(eachindex(x)) do i
+                h = 1.0e-5 .* (eachindex(x) .== i)
+                (held(x + h) - held(x - h)) / 2.0e-5
+            end
+            @test relerr(
+                gradient(fit, prob, alg; sensealg = PETScAdjoint(), stepping..., tstops = TS),
+                differences,
+            ) < 1.0e-9
+        end
+
         summed(problem, alg; kwargs...) =
             p -> sum(Array(solve(problem, alg; p, sensealg = PETScAdjoint(), kwargs...)))
         never = SciMLBase.DiscreteCallback((u, t, integrator) -> false, integrator -> nothing)
