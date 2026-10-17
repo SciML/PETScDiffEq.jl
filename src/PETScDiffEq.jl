@@ -6210,7 +6210,8 @@ in OrdinaryDiffEq. An array-shaped `u0` gives `u`, `uprev` and every state read 
 integrator as an `Array` of its size, and a `u0` of another array type, such as a
 `ComponentArray`, gives them as `similar(u0)` makes them.
 
-`iter` counts every step attempted, accepted, rejected or failed, as `maxiters` does. `opts`
+`iter` counts every step attempted, accepted, rejected or failed, as `maxiters` does, and
+`stats` is the running `sol.stats`. `opts`
 carries the options OrdinaryDiffEq's integrator exposes where PETSc has them. Assigning
 `maxiters`, `save_everystep`, `save_start`, `save_end`, `save_discretes`, `unstable_check` or
 `isoutofdomain` takes effect at once; `tstops` and `saveat` are the live queues keyed by
@@ -6301,6 +6302,12 @@ function Base.setproperty!(integ::PETScIntegrator, name::Symbol, v)
     name === :u && _check_length(getfield(integ, :u), v)
     return setfield!(integ, name, convert(fieldtype(typeof(integ), name), v))
 end
+
+Base.getproperty(integ::PETScIntegrator, name::Symbol) =
+    name === :stats ? getfield(integ, :sol).stats : getfield(integ, name)
+Base.propertynames(integ::PETScIntegrator, private::Bool = false) =
+    (fieldnames(typeof(integ))..., :stats)
+SciMLBase.has_stats(::PETScIntegrator) = true
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
 function _proposed_dt_unlocked(integ::PETScIntegrator)

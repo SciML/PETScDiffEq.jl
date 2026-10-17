@@ -9097,6 +9097,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.DtLessThanMin
         end
 
+        @testset "integ.stats is the running solution's stats" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            @test SciMLBase.has_stats(integ)
+            @test :stats in propertynames(integ)
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            @test integ.stats === integ.sol.stats
+            @test integ.stats.naccept == 2
+            SciMLBase.reinit!(integ)
+            @test integ.stats.naccept == 0
+            SciMLBase.solve!(integ)
+            @test integ.stats === integ.sol.stats
+            @test integ.stats.naccept > 0
+        end
+
         @testset "the last step after the integrator has finished" begin
             for alg in (
                     PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),

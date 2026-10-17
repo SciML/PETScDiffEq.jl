@@ -45,8 +45,9 @@ that count could miss a solve or cannot be taken: with a `-snes_type` other than
 `newtontr`, `ksponly` or `ksptransposeonly`, with a nonlinear preconditioner, and under
 `-snes_ksp_ew`, whose tolerances PETSc sets in the hook the count uses. `stats.ncondition`
 counts the calls of the callbacks' conditions, those of a `ContinuousCallback`'s root search
-included. An integrator's running `sol.stats` holds both as the steps go, and they start
-again at `reinit!`. `stats.nw` stays -1: PETSc counts no matrices `shift * M - J`, builds
+included. An integrator's running `sol.stats`, also `integrator.stats` as in OrdinaryDiffEq,
+holds both as the steps go, and they start again at `reinit!`. `stats.nw` stays -1: PETSc
+counts no matrices `shift * M - J`, builds
 them itself under `AutoFiniteDiff()` and in `TSIRK`, and also asks the package's Jacobian
 for `J` alone. `stats.nfpiter` and `stats.nfpconvfail` stay -1 as well.
 
