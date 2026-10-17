@@ -44,15 +44,21 @@ _resolve_init(init, f) = init isa DiffEqBase.DefaultInit ?
 _overrides(init, f) = SciMLBase.has_initialization_data(f) &&
     _resolve_init(init, f) isa SciMLBase.OverrideInit
 
+_start_du(prob, u0) =
+    prob isa SciMLBase.AbstractDAEProblem ? Vector{eltype(u0)}(vec(prob.du0)) : nothing
+
 # `valp` is what the problem's initialization hooks read: the problem, or the integrator.
+# A DAE's `du0` ends as the derivative paired with the initialized `u0`.
 function _initialize!(
         u0, prob, valp, init, f, jac, pl, comm, t0, tf, abstol, reltol, dt, dtmax,
+        du0 = _start_du(prob, u0),
     )
     init = _resolve_init(init, prob.f)
     init isa SciMLBase.NoInit && return prob.p, true
     init isa SciMLBase.OverrideInit &&
         return _override!(u0, prob, valp, init, pl, comm, abstol, reltol)
-    return prob.p, _consistent!(u0, prob, init, f, jac, pl, comm, t0, tf, abstol, dt, dtmax)
+    return prob.p,
+        _consistent!(u0, du0, prob, init, f, jac, pl, comm, t0, tf, abstol, dt, dtmax)
 end
 
 struct PETScSNES{L} <: SciMLBase.AbstractNonlinearAlgorithm
@@ -152,7 +158,7 @@ end
 
 # `f` and `jac` are the user's in-place functions, in user time.
 function _consistent!(
-        u0::Vector{S}, prob, init, f, jac, pl, comm, t0, tf, abstol, dt, dtmax,
+        u0::Vector{S}, du0, prob, init, f, jac, pl, comm, t0, tf, abstol, dt, dtmax,
     ) where {S}
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     mass = is_dae ? nothing : prob.f.mass_matrix
@@ -174,7 +180,6 @@ function _consistent!(
     init isa SciMLBase.CheckInit || init.nlsolve === nothing || throw(
         ArgumentError("PETScDiffEq solves `$name` with PETSc's SNES and takes no `nlsolve`"),
     )
-    du0 = is_dae ? Vector{S}(vec(prob.du0)) : nothing
     r = similar(u0)
     _checked_everywhere(comm) do
         is_dae ? f(r, du0, u0, prob.p, t0) : f(r, u0, prob.p, t0)
@@ -203,7 +208,7 @@ function _consistent!(
         return _brown_mass!(u0, prob, f, jac, pl, t0, atol, pattern, eqs, vars)
     end
     h = _collocation_step(init, is_dae, t0, tf, dt, dtmax)
-    return _shampine!(u0, prob, f, jac, pl, t0, atol, pattern, h)
+    return _shampine!(u0, du0, prob, f, jac, pl, t0, atol, pattern, h)
 end
 
 function _collocation_step(init, is_dae, t0, tf, dt, dtmax)
@@ -279,11 +284,12 @@ function _brown_dae!(u0::Vector{S}, du0, prob, f, jac, pl, t0, atol, pattern) wh
     x = ifelse.(dv, du0, u0)
     full = pattern === nothing ? nothing : _jacobian_pattern(pattern, n)
     _snes_solve!(x, residual!, _or_nothing(jac, jacobian), full, pl, atol) || return false
+    @. du0 = ifelse(dv, x, du0)
     @. u0 = ifelse(dv, u0, x)
     return true
 end
 
-function _shampine!(u0::Vector{S}, prob, f, jac, pl, t0, atol, pattern, h) where {S}
+function _shampine!(u0::Vector{S}, du0, prob, f, jac, pl, t0, atol, pattern, h) where {S}
     p, n = prob.p, length(u0)
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     M = is_dae ? nothing : _serial_mass(S, prob.f.mass_matrix)
@@ -312,6 +318,7 @@ function _shampine!(u0::Vector{S}, prob, f, jac, pl, t0, atol, pattern, h) where
     full = pattern === nothing ? nothing : _jacobian_pattern(pattern, n, M)
     x = copy(u0)
     _snes_solve!(x, residual!, _or_nothing(jac, jacobian), full, pl, atol) || return false
+    is_dae && (@. du0 = (x - start) / h)
     copyto!(u0, x)
     return true
 end
@@ -553,10 +560,12 @@ function _consistent_on!(
         )
     end
     if brown && is_dae
+        @. du0 = ifelse(dv, x, du0)
         @. u0 = ifelse(dv, u0, x)
     elseif brown
         @. u0 = ifelse(eqs, x, u0)
     else
+        is_dae && (@. du0 = (x - start) / h)
         copyto!(u0, x)
     end
     return true

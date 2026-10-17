@@ -44,10 +44,10 @@ sol = solve(prob, TSAlpha2(; radius = 0.5); dt = 0.1, adaptive = false)
 
 The states come back as OrdinaryDiffEq returns them: `sol.u[i]`, `sol(t)`, `integrator.u` and
 `get_du(integrator)` are `ArrayPartition(v, u)`, so `sol.u[i].x[2]` is the position, while
-`save_idxs` indexes the flat `[v; u]` and saves plain vectors. Between steps `sol(t)` is the
-cubic Hermite interpolant of the velocity and the position, which is also what OrdinaryDiffEq
-gives for `VelocityVerlet`. `stats.nf` counts evaluations of `f1`, or of the whole system,
-and `stats.nf2` those of `f2` alone.
+`save_idxs` indexes the flat `[v; u]` and saves plain vectors, or numbers for a single index.
+Between steps `sol(t)` is the cubic Hermite interpolant of the velocity and the position, which
+is also what OrdinaryDiffEq gives for `VelocityVerlet`. `stats.nf` counts evaluations of `f1`,
+or of the whole system, and `stats.nf2` those of `f2` alone.
 
 These problems take no mass matrix. They run distributed over a `comm` as the [MPI](@ref) section
 describes, though not with a `dm`. Both algorithms take a reversed `tspan`. PETSc only steps
