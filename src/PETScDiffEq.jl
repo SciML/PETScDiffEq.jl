@@ -6491,6 +6491,7 @@ SciMLBase.initialize_dae!(integ::PETScIntegrator, init = _initializealg(integ)) 
     _locked(() -> _initialize_dae_unlocked(integ, init))
 
 function _set_t_unlocked(integ::PETScIntegrator, t)
+    isnan(t) && throw(ArgumentError("`set_t!` was given a NaN time"))
     integ.t = oftype(integ.t, t)
     _end_step_here!(integ)
     integ.finished || LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * integ.t)
@@ -6500,6 +6501,7 @@ end
 SciMLBase.set_t!(integ::PETScIntegrator, t) = _locked(() -> _set_t_unlocked(integ, t))
 
 function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
+    isnan(t) && throw(ArgumentError("cannot add a saveat at NaN"))
     t = oftype(integ.t, t)
     ctx = integ.h.ctx
     s = integ.tdir * t
@@ -6599,6 +6601,7 @@ SciMLBase.savevalues!(integ::PETScIntegrator, force_save = false) =
     _locked(() -> _savevalues_unlocked(integ, force_save))
 
 function SciMLBase.step!(integ::PETScIntegrator, dt, stop_at_tdt = false)
+    isnan(dt) && throw(ArgumentError("`step!` was given a NaN step"))
     integ.tdir * dt < 0 && throw(ArgumentError("cannot step backward in time"))
     next_t = integ.t + oftype(integ.t, dt)
     tf = _user_t(integ.tdir, integ.h.tf)
@@ -7125,6 +7128,7 @@ function _tstops(tstops, h::TSHandles{<:Any, <:Any, R}) where {R}
 end
 
 function _add_tstop_unlocked(integ::PETScIntegrator, t)
+    isnan(t) && throw(ArgumentError("cannot add a tstop at NaN"))
     t = oftype(integ.t, t)
     s = integ.tdir * t
     s < integ.tdir * integ.t &&

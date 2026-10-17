@@ -6068,6 +6068,18 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.terminate!(integ)
         end
 
+        @testset "a NaN time is refused" begin
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            @test_throws "cannot add a tstop at NaN" SciMLBase.add_tstop!(integ, NaN)
+            @test_throws "cannot add a saveat at NaN" SciMLBase.add_saveat!(integ, NaN)
+            @test_throws "`step!` was given a NaN step" SciMLBase.step!(integ, NaN)
+            @test_throws "`set_t!` was given a NaN time" SciMLBase.set_t!(integ, NaN)
+            @test integ.t == 0.0
+            @test integ.tstops == [1.0]
+            sol = SciMLBase.solve!(integ)
+            @test sol.t == SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1).t
+        end
+
         @testset "the queue is keyed on the direction of integration" begin
             back = SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0))
             integ = SciMLBase.init(back, PETScDiffEq.TSRK("5dp"); dt = 0.1)
