@@ -10406,6 +10406,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test sol.retcode == Terminated
         # A collocation step on the whole span would land on the equilibrium.
         @test abs(sol.u[1][1] - 1) < 1.0e-2
+        for t0 in (-Inf, Inf)
+            msg = "`tspan[1]` is $t0; the solve has to start at a finite time"
+            @test_throws msg SciMLBase.solve(SciMLBase.remake(prob; tspan = (t0, 1.0)), alg)
+        end
+        integ = SciMLBase.init(SciMLBase.remake(prob; tspan = (0.0, 1.0)), alg)
+        @test_throws "`tspan[1]` is NaN" SciMLBase.reinit!(integ; t0 = NaN)
+        @test_throws "`tspan[2]` is NaN" SciMLBase.reinit!(integ; tf = NaN)
+        SciMLBase.reinit!(integ)
+        @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
     end
 
     # On i686 a Float32 problem steps on PETSc's double build, so its times come back Float64.

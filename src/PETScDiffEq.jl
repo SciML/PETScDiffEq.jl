@@ -5248,6 +5248,8 @@ function _setup(
     R, S, U = eltypes
     t0, tf = R(prob.tspan[1]), R(prob.tspan[2])
     t0 == tf && throw(ArgumentError("PETScDiffEq requires tspan[1] != tspan[2]"))
+    isfinite(t0) || throw(ArgumentError("`tspan[1]` is $t0; the solve has to start at a finite time"))
+    isnan(tf) && throw(ArgumentError("`tspan[2]` is NaN"))
     # From here on, times are PETSc's forward-running s = tdir * t.
     tdir = t0 < tf ? one(R) : -one(R)
     t0, tf = tdir * t0, tdir * tf
