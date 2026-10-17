@@ -49,8 +49,8 @@ Between steps `sol(t)` is the cubic Hermite interpolant of the velocity and the 
 is also what OrdinaryDiffEq gives for `VelocityVerlet`. `stats.nf` counts evaluations of `f1`,
 or of the whole system, and `stats.nf2` those of `f2` alone.
 
-These problems take no mass matrix. They run distributed over a `comm` as the [MPI](@ref) section
-describes, though not with a `dm`. Both algorithms take a reversed `tspan`. PETSc only steps
+These problems take no mass matrix. They run distributed over a `comm` or on a PETSc DM as the
+[MPI](@ref) section describes. Both algorithms take a reversed `tspan`. PETSc only steps
 forward, so `TSAlpha2` then integrates `w(s) = u(-s)`, whose velocity is `-u'`, and gives back
 `u'`: the states, `jac` and callbacks are those of the problem as written. `PETScAdjoint`
 differentiates them through the first-order form with `TSRK`, `TSARKIMEX` or `TSImplicit`'s
