@@ -9809,6 +9809,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "assigning integ.t moves the clock as set_t! does" begin
+            ramp!(du, u, p, t) = (du[1] = 1.0; nothing)
+            ramp = SciMLBase.ODEProblem(ramp!, [0.0], (0.0, 2.0))
+            integ = SciMLBase.init(ramp, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            SciMLBase.step!(integ)
+            integ.t = 1.0
+            SciMLBase.step!(integ)
+            @test integ.tprev == 1.0
+            @test integ.u[1] ≈ 0.1 + (integ.t - 1.0)
+            sol = SciMLBase.solve!(integ)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.t[end] == 2.0
+            @test sol.u[end][1] ≈ 1.1
+        end
+
         @testset "iter and opts read as OrdinaryDiffEq's do" begin
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
             @test integ.iter == 0
