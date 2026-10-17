@@ -8956,6 +8956,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "-ts_dt gives a fixed-step solve its dt" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        for (alg, kw) in (
+                (PETScDiffEq.TSRK("4", ["-ts_dt", "0.1"]), (;)),
+                (PETScDiffEq.TSImplicit("beuler", ["-ts_dt", "0.1"]), (;)),
+                (PETScDiffEq.TSRK("5dp", ["-ts_dt", "0.1", "-ts_adapt_type", "none"]), (;)),
+                (PETScDiffEq.TSRK("5dp", ["-ts_dt", "0.1"]), (; adaptive = false)),
+            )
+            sol = SciMLBase.solve(prob, alg; kw...)
+            ref = SciMLBase.solve(prob, alg; dt = 0.1, kw...)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.t ≈ 0:0.1:1
+            @test sol.u ≈ ref.u
+        end
+    end
+
     @testset "dtmin and dtmax reach the controller" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         alg = PETScDiffEq.TSRK("5dp")

@@ -5717,7 +5717,8 @@ function _setup(
             _count_solves!(petsclib, ts.ptr, ctx, ctxptr)
             fixed = LibPETSc.TSAdaptGetType(petsclib, LibPETSc.TSGetAdapt(petsclib, ts)) == "none"
             adapts = _adapts(running)
-            if !dt_given && !(adaptive && adapts === true)
+            dt_option = any(o -> _names_option(o, "ts_dt"), effective_options)
+            if !dt_given && !dt_option && !(adaptive && adapts === true)
                 throw(
                     ArgumentError(
                         "PETScDiffEq needs `dt` unless the solve adapts on an error estimate " *
@@ -5726,7 +5727,7 @@ function _setup(
                     ),
                 )
             end
-            if !dt_given && fixed
+            if !dt_given && !dt_option && fixed
                 throw(
                     ArgumentError(
                         "PETScDiffEq needs `dt` here: PETSc will step this solve at a fixed " *
@@ -5757,7 +5758,7 @@ function _setup(
                 ctx.alg_name = running
             end
             ctx.hermite && (ctx.restep = _restep_tableau(petsclib, ts, running))
-            if !dt_given && !any(o -> _names_option(o, "ts_dt"), effective_options)
+            if !dt_given && !dt_option
                 user_t0 = R(prob.tspan[1])
                 est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
                 dt = if is_dae
