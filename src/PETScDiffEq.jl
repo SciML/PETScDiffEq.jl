@@ -4559,10 +4559,14 @@ _check_real_tol(tol, name) = _check_real(tol, name; accept = isreal)
 function _check_tol(tol, n, name)
     _check_real_tol(tol, name)
     # TSSetTolerances reads -1 and -2 as PETSC_DETERMINE and PETSC_CURRENT.
+    tol isa Number && isnan(tol) && throw(ArgumentError("`$name` is NaN"))
     tol isa Number && real(tol) < 0 && throw(ArgumentError("`$name` is negative"))
+    tol isa Number && isinf(tol) &&
+        throw(ArgumentError("`$name` is infinite; give a finite tolerance"))
     tol isa AbstractVector || return nothing
     length(tol) == n ||
         throw(ArgumentError("`$name` has length $(length(tol)), but the state has $n"))
+    any(isnan, tol) && throw(ArgumentError("`$name` has a NaN entry"))
     all(t -> real(t) >= 0, tol) || throw(ArgumentError("`$name` has a negative entry"))
     return nothing
 end

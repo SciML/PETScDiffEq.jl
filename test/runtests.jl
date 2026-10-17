@@ -10557,6 +10557,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test sol.t == [0.0]
             end
         end
+
+        @testset "a NaN or infinite tolerance" begin
+            pair = SciMLBase.ODEProblem((du, u, p, t) -> (du .= -u), [1.0, 2.0], (0.0, 1.0))
+            alg = PETScDiffEq.TSRK("5dp")
+            for name in (:abstol, :reltol)
+                for (tol, msg) in (
+                        (NaN, "`$name` is NaN"), (Inf, "`$name` is infinite"),
+                        ([NaN, 1.0e-6], "`$name` has a NaN entry"),
+                    )
+                    @test_throws msg SciMLBase.solve(pair, alg; (; name => tol)...)
+                    integ = SciMLBase.init(pair, alg)
+                    @test_throws msg setproperty!(integ.opts, name, tol)
+                    SciMLBase.terminate!(integ)
+                end
+            end
+        end
     end
 
     @testset "alg_order is the order PETSc registers" begin
