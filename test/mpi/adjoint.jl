@@ -32,6 +32,9 @@ const SPLIT_AD_GAP = 5.0e-14
 # within 3.3e-14 with `jac` and `paramjac` built.
 const WAVE_GAP = 2.0e-13
 const FD_GAP = 2.0e-9
+# Measured at 2 ranks: an adaptive run with tstops is within 1.4e-13 of the serial adjoint
+# repeating its steps, whose sizes come back as differences of their times.
+const HELD_GAP = 1.0e-12
 # Measured at 1 to 3 ranks: an adaptive solve with an integral cost is within 2.8e-13 of the
 # serial adjoint, whose steps differ by its error norms' rounding.
 const ADAPTIVE_GAP = 1.0e-12
@@ -598,6 +601,43 @@ end
         rank == 0 && @test relerr(mine, ref) <= SERIAL_GAP
     end
 
+    # unstable_check sees every step of both runs but the last.
+    @testset "with tstops it takes the steps solve takes and matches the serial adjoint: $name, $dir" for (
+                name, make, opts,
+            ) in (
+                ("TSRK", c -> TSRK("4"; comm = c), (;)),
+                ("Crank-Nicolson", c -> TSImplicit("cn", exact(c); comm = c), (;)),
+                (
+                    "adaptive 3bs", c -> TSRK("3bs"; comm = c),
+                    (adaptive = true, abstol = 1.0e-6, reltol = 1.0e-6),
+                ),
+            ), (dir, (tspan, times, p)) in (("forward", FORWARD), ("backward", BACKWARD))
+        stops = [0.03766, 0.0771]
+        at = vcat(tspan[1], stops, tspan[2])
+        kw = (; opts..., tstops = stops)
+        steps, taken = Float64[], Float64[]
+        record(into) = (dt, u, p, t) -> (push!(into, t); false)
+        du0, dp = gradient(
+            heat_problem(rows, halo; tspan, p), make(comm), at, rows;
+            kw..., unstable_check = record(steps),
+        )
+        solve(
+            heat_problem(rows, halo; tspan, p), make(comm);
+            dt = DT, adaptive = false, kw..., unstable_check = record(taken),
+        )
+        @test length(steps) > 30
+        @test steps == taken
+        @test same_everywhere(dp)
+        mine = vcat(gathered(du0, counts), vec(dp))
+        # An adaptive run on more ranks can step otherwise than on one, so one repeats its steps.
+        adaptive = haskey(opts, :adaptive)
+        held = adaptive ? (dt = 0.1, tstops = steps) : kw
+        if rank == 0
+            serial = gradient(heat_problem(1:N, walls; tspan, p), make(MPI.COMM_SELF), at, 1:N; held...)
+            @test relerr(mine, vcat(serial[1], vec(serial[2]))) <= (adaptive ? HELD_GAP : SERIAL_GAP)
+        end
+    end
+
     @testset "an integral cost matches the serial adjoint: $name, $dir, $what" for (name, make) in
             METHODS[1:4], (dir, (tspan, times, p)) in (("forward", FORWARD), ("backward", BACKWARD)),
             (what, costs) in INTEGRALS
@@ -973,6 +1013,7 @@ end
 
     @testset "every handle is freed" begin
         @test isempty(PETScDiffEq.PARALLEL_HANDLES)
+        @test isempty(PETScDiffEq.ADJ_STOPS_CTX)
         @test all(h -> h.destroyed, keys(PETScDiffEq.LIVE_HANDLES))
     end
 end

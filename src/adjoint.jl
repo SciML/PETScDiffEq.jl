@@ -17,9 +17,9 @@ The result is the gradient of the solution PETSc computes at these steps, not of
 solution, so it agrees with finite differences of the same fixed-step `solve`. PETSc runs
 the forward solve again, saving a trajectory, and then the adjoint. Only the problem is
 taken from `sol`, so the keywords that set the steps (`dt`, `adaptive`, `abstol`,
-`reltol`, `dtmin`, `dtmax`, `maxiters`) must be repeated exactly as `solve` was given
-them; otherwise the gradient belongs to a different discretization and nothing says so.
-Saving keywords are ignored, and `callback`, `tstops`, `d_discontinuities` and
+`reltol`, `dtmin`, `dtmax`, `maxiters`, `tstops`, `d_discontinuities`) must be repeated
+exactly as `solve` was given them; otherwise the gradient belongs to a different
+discretization and nothing says so. Saving keywords are ignored, and `callback` and
 `save_idxs` are refused, whether given here or to the problem.
 
 Supported: an `ODEProblem` without a mass matrix, in place or out of place, solved with
@@ -68,6 +68,14 @@ one. Those steps are this run's own. `solve` with the same tolerances takes othe
 interpolates to its `saveat` times, so the gradient is that of the cost on the states this
 run steps to, which differ from the ones `solve` saves by the error of the two solves. It
 treats the accepted step sizes as constants rather than differentiating the controller.
+
+`tstops` and `d_discontinuities` are stepped to as `solve` steps to them in its own loop:
+a step ends on each stop, the next one starts at the size that loop resumes with, and a
+step after a discontinuity starts one floating-point step past it. The run then takes
+exactly the steps of `solve` given the same keywords, and with fixed steps a stop can be a
+cost time. An adaptive run takes its cost times as stops too, in place of the time span,
+so its steps are those of `solve` with the cost times added to `tstops`, and `solve`'s own
+when they are among them already; the gradient is then that of the states `solve` saves.
 
 An integral cost, the integral of `g(u, p, t)` from `tspan[1]` to `tspan[2]`, is given as
 `g` or as its derivatives `dgdu_continuous(out, u, p, t)` and `dgdp_continuous(out, u, p, t)`.
@@ -163,10 +171,12 @@ respect to `u0` and `p`. Saved times the loss does not depend on are left out, a
 `save_idxs` is taken. With fixed steps the saved times have to be step ends. In an adaptive
 solve the saved states are interpolated while the adjoint's run steps to their times, so the
 gradient is off by about the error of the solve, and the times of steps saved without
-`saveat` are held fixed. A loss that calls `sol(t)` or reads `sol.prob` is refused, since
-only the saved states carry a derivative, and so are a `Float32` problem, a
-`DynamicalODEProblem` or `SecondOrderODEProblem`, a `comm` other than `MPI.COMM_SELF`, a
-`dm`, and Enzyme, ReverseDiff, Tracker and Mooncake, which it has not been verified with.
+`saveat` are held fixed. With the `saveat` times also given as `tstops`, both runs end a
+step on each and the gradient is that of the saved states. A loss that calls `sol(t)` or
+reads `sol.prob` is refused, since only the saved states carry a derivative, and so are a
+`Float32` problem, a `DynamicalODEProblem` or `SecondOrderODEProblem`, a `comm` other than
+`MPI.COMM_SELF`, a `dm`, and Enzyme, ReverseDiff, Tracker and Mooncake, which it has not
+been verified with.
 """
 struct PETScAdjoint <: SciMLBase.AbstractAdjointSensitivityAlgorithm{0, false, Val{:central}}
     petsc_options::Vector{String}
@@ -174,6 +184,19 @@ end
 
 PETScAdjoint(; petsc_options::AbstractVector{<:AbstractString} = String[]) =
     PETScAdjoint(String[String(o) for o in petsc_options])
+
+# The stops of `solve`'s own loop, as `tdir * t`, which the adjoint's TSSolve steps to as that
+# loop does; `stop` is the one the step in progress ends on, if any.
+mutable struct StopQueue
+    stops::Vector{Float64}
+    jumps::Vector{Float64}
+    tf::Float64
+    fixed::Bool
+    dtcache::Float64
+    stop::Union{Nothing, Float64}
+    started::Bool
+    tbound::Float64
+end
 
 mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     petsclib::T
@@ -198,6 +221,7 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     held_until::Float64
     held_u::Vector{Float64}
     clock::DataType
+    tbound::Float64
     adaptive::Bool
     cost_at_step::Dict{Int, Vector{Int}}
     u_at_step::Dict{Int, Vector{Float64}}
@@ -215,6 +239,7 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     err::Any
     coo::Union{Nothing, COOJacobian{Float64}}
     comm::Union{Nothing, MPI.Comm}
+    stops::Union{Nothing, StopQueue}
 end
 
 # A throwing rank fills NaN and keeps making PETSc's collective calls until the ranks agree.
@@ -378,15 +403,21 @@ function _adjoint_record!(
     return _adjoint_record_body!(adj, Int(step), Float64(s), x_ptr, ts_ptr)
 end
 
-_cost_tol(R, step, s, h) =
-    max(sqrt(Float64(eps(R))) * h, (step + 100) * Float64(eps(R(max(1.0, abs(s))))))
+# PETSc 3.22 fails a step ending within 10 eps of the next span time; closer times share one.
+const _SPAN_GAP = 20 * eps(1.0)
+
+# Floored at `bound`, the span's largest |t|, below 1, as `_near` is.
+_cost_tol(R, step, s, h, bound) = max(
+    sqrt(Float64(eps(R))) * h, (step + 100) * Float64(eps(R(max(min(1.0, bound), abs(s))))),
+    _SPAN_GAP,
+)
 
 # Each cost time goes to the nearest step within the tolerance, so a step is held until the next.
 function _adjoint_record_body!(adj, step, s, x_ptr, ts_ptr)
     pl = adj.petsclib
     try
         R = adj.clock
-        tol = _cost_tol(R, step, s, s - adj.s_prev)
+        tol = _cost_tol(R, step, s, s - adj.s_prev, adj.tbound)
         x = PETSc.VecPtr(pl, x_ptr, false)
         order, cost_s = adj.order, adj.cost_s
         while adj.next <= length(order) && cost_s[order[adj.next]] <= s
@@ -404,9 +435,12 @@ function _adjoint_record_body!(adj, step, s, x_ptr, ts_ptr)
         if adj.next <= length(order) && cost_s[order[adj.next]] <= s + tol
             adj.held_step, adj.held_until = step, s + tol
             _readvec!(adj.held_u, pl, x)
-        elseif adj.adaptive && adj.next <= length(order)
+        elseif adj.adaptive && adj.stops === nothing && adj.next <= length(order)
             _land_on!(adj, LibPETSc.TS(ts_ptr, pl), step, s, cost_s[order[adj.next]])
         end
+        # A trajectory of states only steps again from step 0 during the adjoint.
+        step == 0 && adj.stops !== nothing && !adj.stops.started &&
+            _start_stops!(adj.stops, pl, LibPETSc.TS(ts_ptr, pl), s)
     catch e
         adj.err = e
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
@@ -418,7 +452,87 @@ end
 function _land_on!(adj, ts, step, s, c)
     pl = adj.petsclib
     h = LibPETSc.TSGetTimeStep(pl, ts)
-    s + h - c > _cost_tol(adj.clock, step + 1, s + h, h) && LibPETSc.TSSetTimeStep(pl, ts, c - s)
+    s + h - c > _cost_tol(adj.clock, step + 1, s + h, h, adj.tbound) &&
+        LibPETSc.TSSetTimeStep(pl, ts, c - s)
+    return nothing
+end
+
+# `_step_unlocked`'s choice of the stop to end the next step on, and its cut of a step past it.
+function _next_stop!(q::StopQueue, pl, ts, s)
+    while !isempty(q.stops) && q.stops[1] <= s + _near(s, q.tbound)
+        popfirst!(q.stops)
+    end
+    q.stop = !isempty(q.stops) && q.stops[1] < q.tf - _near(q.tf, q.tbound) ? q.stops[1] : nothing
+    target = something(q.stop, q.tf)
+    smax = target == -1 ? nextfloat(target) : _max_time(target)
+    LibPETSc.TSSetMaxTime(pl, ts, smax)
+    LibPETSc.TSGetTimeStep(pl, ts) > smax - s && LibPETSc.TSSetTimeStep(pl, ts, smax - s)
+    return nothing
+end
+
+# The integrator takes its first step uncut by TSSolve and starts past a discontinuity at t0.
+function _start_stops!(q::StopQueue, pl, ts, s)
+    q.started = true
+    LibPETSc.TSSetTimeStep(pl, ts, q.dtcache)
+    if s in q.jumps
+        s = nextfloat(s)
+        LibPETSc.TSSetTime(pl, ts, s)
+        LibPETSc.TSRestartStep(pl, ts)
+    end
+    _next_stop!(q, pl, ts, s)
+    return nothing
+end
+
+# `_step_unlocked` after its TSStep: the landing on a stop and the step it resumes with. It runs
+# before TSSolve compares the time with the max time, which `_next_stop!` has moved on.
+function _end_step!(q::StopQueue, pl, ts)
+    Int(LibPETSc.TSGetConvergedReason(pl, ts)) < 0 && return nothing
+    s = LibPETSc.TSGetTime(pl, ts)
+    if q.stop === nothing
+        s != q.tf && s >= q.tf - _near(q.tf, q.tbound) && LibPETSc.TSSetTime(pl, ts, q.tf)
+        return nothing
+    elseif s >= q.stop - _near(q.stop, q.tbound)
+        resumed = q.fixed || s < LibPETSc.TSGetMaxTime(pl, ts) ? q.dtcache :
+            max(q.dtcache, LibPETSc.TSGetTimeStep(pl, ts))
+        s = q.stop
+        LibPETSc.TSSetTime(pl, ts, s)
+        LibPETSc.TSSetTimeStep(pl, ts, resumed)
+    elseif !q.fixed
+        q.dtcache = LibPETSc.TSGetTimeStep(pl, ts)
+    end
+    if s in q.jumps
+        s = nextfloat(s)
+        LibPETSc.TSSetTime(pl, ts, s)
+        LibPETSc.TSRestartStep(pl, ts)
+    end
+    _next_stop!(q, pl, ts, s)
+    return nothing
+end
+
+# TSSetPostEvaluate passes no context.
+const ADJ_STOPS_CTX = Dict{LibPETSc.CTS, Any}()
+
+function _adjoint_post_evaluate!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
+    adj = ADJ_STOPS_CTX[ts_ptr]::AdjointContext
+    pl = adj.petsclib
+    try
+        _end_step!(adj.stops, pl, LibPETSc.TS(ts_ptr, pl))
+    catch e
+        adj.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+const ADJ_POST_EVALUATE_PTR = Ref{Ptr{Cvoid}}(C_NULL)
+
+function _set_stops!(adj::AdjointContext, pl, ts)
+    ADJ_STOPS_CTX[ts.ptr] = adj
+    code = ccall(
+        _symbol(pl, :TSSetPostEvaluate), LibPETSc.PetscErrorCode,
+        (LibPETSc.CTS, Ptr{Cvoid}), ts, ADJ_POST_EVALUATE_PTR[],
+    )
+    _check_code(code, "TSSetPostEvaluate")
     return nothing
 end
 
@@ -611,6 +725,9 @@ function _init_adjoint_pointers!()
         LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, LibPETSc.PetscInt, Float64, LibPETSc.CVec, Ptr{Cvoid})
     )
+    ADJ_POST_EVALUATE_PTR[] = @cfunction(
+        _adjoint_post_evaluate!, LibPETSc.PetscErrorCode, (LibPETSc.CTS,)
+    )
     ADJ_JUMP_PTR[] = @cfunction(
         _adjoint_jump!,
         LibPETSc.PetscErrorCode,
@@ -686,11 +803,6 @@ const _ADJOINT_REFUSED_KWARGS = (
     callback = "PETScAdjoint does not support callbacks: this package applies them " *
         "between PETSc steps, where the saved trajectory does not see what they change; " *
         "remove the callback from the call and from the problem",
-    tstops = "PETScAdjoint does not support `tstops`: a solve with stops is stepped " *
-        "outside PETSc's own loop, which saves no trajectory; remove them, and choose a " *
-        "`dt` whose steps land on the cost times or solve adaptively, which ends a step " *
-        "on each cost time",
-    d_discontinuities = "PETScAdjoint does not support `d_discontinuities`; remove them",
     isoutofdomain = "PETScAdjoint does not support `isoutofdomain`: its forward solve is " *
         "PETSc's own, which does not take a step again that leaves the domain; remove it",
     save_idxs = "PETScAdjoint does not support `save_idxs`: `dgdu_discrete` is given " *
@@ -883,7 +995,7 @@ function _check_adjoint_problem(
     )
     tdir = prob.tspan[1] <= prob.tspan[2] ? 1.0 : -1.0
     s0, sf = tdir * Float64(prob.tspan[1]), tdir * Float64(prob.tspan[2])
-    tol = 100 * eps(max(1.0, abs(s0), abs(sf)))
+    tol = 100 * eps(max(abs(s0), abs(sf)))
     for ti in t
         s0 - tol <= tdir * ti <= sf + tol ||
             throw(ArgumentError("cost time $ti lies outside tspan = $(prob.tspan)"))
@@ -1015,7 +1127,7 @@ end
 # PETSc's adaptor ends a step on each time of the span, which the trajectory then holds.
 function _set_time_span!(h::TSHandles{<:Any, <:Any, R}, cost_s) where {R}
     # Closer than this to a time of the span, a cost time is matched to that step instead.
-    near(s) = 100 * Float64(eps(R(max(1.0, abs(s)))))
+    near(s) = max(100 * Float64(eps(R(max(min(1.0, h.ctx.tbound), abs(s))))), _SPAN_GAP)
     span = R[h.t0]
     for s in sort(cost_s)
         last(span) + near(s) < s < h.tf - near(s) && push!(span, s)
@@ -1043,8 +1155,8 @@ function _check_agreement(comm, args)
     throw(
         ArgumentError(
             "PETScAdjoint $_NOT_SELF needs the same cost times `t`, `no_start`, number of " *
-                "parameters, presence of an integral cost and choice of `dgdp_discrete`, " *
-                "`jac` and `paramjac` on every rank",
+                "parameters, `tstops`, `d_discontinuities`, presence of an integral cost and " *
+                "choice of `dgdp_discrete`, `jac` and `paramjac` on every rank",
         ),
     )
 end
@@ -1198,8 +1310,15 @@ function _discrete_adjoint_unlocked(
             prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, g, dgdu_continuous,
             dgdp_continuous, comm, dm,
         )
+        for key in (:tstops, :d_discontinuities)
+            _check_real(get(given, key, ()), key)
+        end
         given, checked, Bool(no_start)
     end
+    R = first(_eltypes(prob))
+    tstops = _times(R, get(solve_kwargs, :tstops, ()))
+    jumps = _times(R, get(solve_kwargs, :d_discontinuities, ()))
+    solve_kwargs = Base.structdiff(solve_kwargs, NamedTuple{(:tstops, :d_discontinuities)})
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
     wraps = _wraps(prob, alg)
     is_split = prob.f isa SciMLBase.SplitFunction
@@ -1213,12 +1332,15 @@ function _discrete_adjoint_unlocked(
         (
             cost_t, skip_start, np, dgdp_discrete === nothing, prob.f.jac === nothing,
             prob.f.paramjac === nothing, is_split && prob.f.f2.jac === nothing,
-            is_split && prob.f.f2.paramjac === nothing, integral,
+            is_split && prob.f.f2.paramjac === nothing, tstops, jumps, integral,
         ),
     )
 
+    stopping = !isempty(tstops) || !isempty(jumps)
+    # With stops an adaptive run takes the cost times as stops too, so its first step is
+    # estimated with them as `solve` given them would estimate it.
     h = _setup(
-        prob, alg; solve_kwargs...,
+        prob, alg; solve_kwargs..., tstops = stopping ? vcat(tstops, jumps, cost_t) : (),
         saveat = Float64[], save_everystep = false, save_start = true, save_end = true,
         dense = false, extra_options = vcat(_ADJOINT_TRAJECTORY, sensealg.petsc_options),
         jac_advice = _ADJOINT_JAC_ADVICE, eltypes = (Float64, Float64, Float64),
@@ -1235,7 +1357,12 @@ function _discrete_adjoint_unlocked(
             _check_explicit_prototype(prob.f.f2.jac_prototype, n, N)
         end
         # PETSc 3.22 allocates the span's states in TSSetUp, which the solve below is first to call.
-        adaptive && _set_time_span!(h, cost_s)
+        adaptive && !stopping && _set_time_span!(h, cost_s)
+        queue = stopping ? StopQueue(
+                _tstops(adaptive ? vcat(tstops, jumps, cost_t) : vcat(tstops, jumps), h),
+                h.tdir .* Float64.(jumps), h.tf, !adaptive, LibPETSc.TSGetTimeStep(pl, ts),
+                nothing, false, Float64(h.ctx.tbound),
+            ) : nothing
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
         inplace(fun) = _shaped(
@@ -1298,19 +1425,21 @@ function _discrete_adjoint_unlocked(
             _ad_comm_paramjacobian(
                 backend, f, h.u0, p, user_t0, _ADJOINT_PARAMJAC_ADVICE, comm,
             )
-        context(jac, J, rows, paramjac, pscale, coo) = AdjointContext(
+        context(jac, J, rows, paramjac, pscale, coo, stops = nothing) = AdjointContext(
             pl, h.tdir, p, jac, J, rows..., paramjac, zeros(n, np), pscale, dgdu_discrete,
             skip_start, cost_t, cost_s, sortperm(cost_s), 1, h.t0, -1, h.t0, zeros(n),
             # At the problem's precision, also on i686, which leaves the single build out.
-            first(_eltypes(prob, Type[Float32, ComplexF32])), adaptive,
+            first(_eltypes(prob, Type[Float32, ComplexF32])), h.ctx.tbound, adaptive,
             Dict{Int, Vector{Int}}(), Dict{Int, Vector{Float64}}(),
             zeros(n), zeros(n), zeros(n), zeros(n), zeros(np),
             LibPETSc.CVec[], LibPETSc.CVec[], nothing, nothing, nothing, nothing, nothing,
-            coo, comm,
+            coo, comm, stops,
         )
         adj = implicit ?
-            context(nothing, zeros(0, 0), no_rows, paramjac(prob.f, f_ad), -h.tdir, nothing) :
-            context(jac, J, rows, paramjac(prob.f, f_ad), h.tdir, coo)
+            context(
+                nothing, zeros(0, 0), no_rows, paramjac(prob.f, f_ad), -h.tdir, nothing, queue,
+            ) :
+            context(jac, J, rows, paramjac(prob.f, f_ad), h.tdir, coo, queue)
         # PETSc's ARKIMEX adjoint segfaults without an explicit part's parameter Jacobian.
         if is_split
             ex = context(jac, J, rows, paramjac(rhs, f_rhs), h.tdir, coo)
@@ -1366,6 +1495,7 @@ function _discrete_adjoint_unlocked(
                 ts, ADJ_JUMP_PTR[], adjptr, C_NULL,
             )
             _check_code(code, "TSAdjointMonitorSet")
+            queue === nothing || _set_stops!(adj, pl, ts)
 
             try
                 _quiet_errors(h) do
@@ -1422,7 +1552,7 @@ function _discrete_adjoint_unlocked(
                     "cost time t[$k] = $(cost_t[k]) is not a time the solve stepped to; " *
                         "PETSc's adjoint has no derivative of interpolation, so with fixed " *
                         "steps every cost time must fall on a step, such as tspan[1] plus " *
-                        "a multiple of dt",
+                        "a multiple of dt, or on one of `tstops`",
                 ),
             )
 
@@ -1459,6 +1589,7 @@ function _discrete_adjoint_unlocked(
                 _gathered(pl, adj.mu, np, comm)
         end
     finally
+        delete!(ADJ_STOPS_CTX, ts.ptr)
         _destroy!(h)
         adj === nothing || _destroy_adjoint!(adj)
         ex === nothing || _destroy_adjoint!(ex)
