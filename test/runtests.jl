@@ -8954,6 +8954,13 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws msg SciMLBase.solve(prob, alg; kw...)
             @test_throws msg SciMLBase.init(prob, alg; kw...)
         end
+        integ = SciMLBase.init(prob, alg)
+        @test_throws "`set_proposed_dt!` was given a NaN step" SciMLBase.set_proposed_dt!(
+            integ, NaN,
+        )
+        SciMLBase.step!(integ)
+        @test integ.t > 0
+        SciMLBase.terminate!(integ)
     end
 
     @testset "dtmin and dtmax reach the controller" begin

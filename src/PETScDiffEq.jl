@@ -6310,6 +6310,9 @@ end
 
 SciMLBase.get_proposed_dt(integ::PETScIntegrator) = _locked(() -> _proposed_dt_unlocked(integ))
 function _set_proposed_dt_unlocked(integ::PETScIntegrator, dt)
+    _checked_everywhere(integ.h.ctx.comm) do
+        isnan(dt) && throw(ArgumentError("`set_proposed_dt!` was given a NaN step"))
+    end
     integ.finished || LibPETSc.TSSetTimeStep(
         integ.h.petsclib, integ.h.ts, _smallest(integ.h.ctx.comm, abs(oftype(integ.t, dt))),
     )

@@ -463,6 +463,10 @@ crossing_last_row(idx, level) =
         step!(integ)
         @test same_everywhere(integ.t)
         @test abs(integ.dt - 1.0e-5) <= ROUNDOFF
+        e = caught(() -> set_proposed_dt!(integ, rank == thrower ? NaN : 1.0e-4))
+        @test rank == thrower ? e isa ArgumentError : remote(e)
+        step!(integ)
+        @test same_everywhere(integ.t)
         terminate!(integ)
         @test integ.sol.retcode == ReturnCode.Terminated
         @test same_everywhere(integ.sol.t)
