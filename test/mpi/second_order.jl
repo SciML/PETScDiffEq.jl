@@ -524,7 +524,7 @@ end
             pl, comm, (LibPETSc.DM_BOUNDARY_NONE,), (2N,), 1, 1;
             points_per_proc = (LibPETSc.PetscInt.(2 .* counts),),
         )
-        @test refused(() -> solve(chain, TSRK("5dp"; dm = da)), "with a `dm` yet")
+        @test refused(() -> solve(chain, TSRK("5dp"; dm = da)), "but the `dm` gives each")
         PETScCompat.destroy!(da)
     end
 
