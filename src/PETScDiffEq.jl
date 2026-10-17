@@ -6919,6 +6919,9 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
         (_stop!(integ, best_cb, stop, pre, best_crossing, modified); return true)
     modified && _reinitialize!(integ, best_cb.initializealg, before)
     integ.finished && return true
+    if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
+        dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
+    end
     _rollback!(integ, integ.t, dt, false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
     if best_cb.save_positions[2]

@@ -5696,6 +5696,24 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test n[] <= 30
         end
 
+        @testset "dtrelax scales the step after an event" begin
+            proposed = map((1, 0.01)) do dtrelax
+                cb = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> u[1] - 0.5, integ -> (integ.u[1] = 1.0); dtrelax,
+                )
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); callback = cb)
+                SciMLBase.step!(integ)
+                while integ.u[1] != 1.0
+                    SciMLBase.step!(integ)
+                end
+                @test integ.t ≈ log(2.0) rtol = 1.0e-3
+                dt = SciMLBase.get_proposed_dt(integ)
+                @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
+                dt
+            end
+            @test proposed[2] ≈ proposed[1] / 100
+        end
+
         @testset "a bouncing ball" begin
             function ball!(du, u, p, t)
                 du[1] = u[2]
