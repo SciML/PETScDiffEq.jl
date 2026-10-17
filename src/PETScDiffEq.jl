@@ -728,6 +728,9 @@ SciMLBase.alg_order(alg::TSDAE) = _implicit_order(alg.subtype, nothing, alg.orde
 
 SciMLBase.allowscomplex(::AnyPETScTS) = true
 
+SciMLBase.isadaptive(alg::AnyPETScTS) = _adapts(_warn_name(alg)) === true
+
+
 function _implicit_order(subtype, theta, order)
     subtype == "beuler" && return 1
     subtype == "cn" && return 2

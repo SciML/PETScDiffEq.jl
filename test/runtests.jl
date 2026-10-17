@@ -9958,6 +9958,29 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test integ.u == SciMLBase.solve(prob, bdf; dt = 0.01, adaptive = false).u[end]
     end
 
+    @testset "isadaptive is whether PETSc adapts the method" begin
+        for alg in (
+                PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"), PETScDiffEq.TSARKIMEX("3"),
+                PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSDAE("bdf"), PETScDiffEq.TSAlpha2(),
+                PETScDiffEq.TSGeneric("rosw"),
+            )
+            @test SciMLBase.isadaptive(alg)
+        end
+        for alg in (
+                PETScDiffEq.TSRK("4"), PETScDiffEq.TSRosW("theta1"), PETScDiffEq.TSARKIMEX("ars443"),
+                PETScDiffEq.TSImplicit("beuler"), PETScDiffEq.TSImplicit("cn"),
+                PETScDiffEq.TSImplicit("theta", 0.7), PETScDiffEq.TSDAE("beuler"), PETScDiffEq.TSIRK(2),
+                PETScDiffEq.TSMPRK([1], "p2"), PETScDiffEq.TSBasicSymplectic(),
+                PETScDiffEq.TSGeneric("euler"; explicit = true),
+            )
+            @test !SciMLBase.isadaptive(alg)
+        end
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0, 1))
+        sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("4"); dt = 0.1)
+        @test sol.t[end] === 1.0
+        @test sol.u[end][1] ≈ exp(-1.0) rtol = 1.0e-5
+    end
+
     @testset "Only methods with an error estimate adapt" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         steps(alg, rt) = SciMLBase.solve(
