@@ -191,6 +191,7 @@ mutable struct StopQueue
     dtcache::Float64
     stop::Union{Nothing, Float64}
     started::Bool
+    tbound::Float64
 end
 
 mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
@@ -446,10 +447,10 @@ end
 
 # `_step_unlocked`'s choice of the stop to end the next step on, and its cut of a step past it.
 function _next_stop!(q::StopQueue, pl, ts, s)
-    while !isempty(q.stops) && q.stops[1] <= s + _near(s)
+    while !isempty(q.stops) && q.stops[1] <= s + _near(s, q.tbound)
         popfirst!(q.stops)
     end
-    q.stop = !isempty(q.stops) && q.stops[1] < q.tf - _near(q.tf) ? q.stops[1] : nothing
+    q.stop = !isempty(q.stops) && q.stops[1] < q.tf - _near(q.tf, q.tbound) ? q.stops[1] : nothing
     target = something(q.stop, q.tf)
     smax = target == -1 ? nextfloat(target) : _max_time(target)
     LibPETSc.TSSetMaxTime(pl, ts, smax)
@@ -476,9 +477,9 @@ function _end_step!(q::StopQueue, pl, ts)
     Int(LibPETSc.TSGetConvergedReason(pl, ts)) < 0 && return nothing
     s = LibPETSc.TSGetTime(pl, ts)
     if q.stop === nothing
-        s != q.tf && s >= q.tf - _near(q.tf) && LibPETSc.TSSetTime(pl, ts, q.tf)
+        s != q.tf && s >= q.tf - _near(q.tf, q.tbound) && LibPETSc.TSSetTime(pl, ts, q.tf)
         return nothing
-    elseif s >= q.stop - _near(q.stop)
+    elseif s >= q.stop - _near(q.stop, q.tbound)
         resumed = q.fixed || s < LibPETSc.TSGetMaxTime(pl, ts) ? q.dtcache :
             max(q.dtcache, LibPETSc.TSGetTimeStep(pl, ts))
         s = q.stop
@@ -1335,7 +1336,7 @@ function _discrete_adjoint_unlocked(
         queue = stopping ? StopQueue(
                 _tstops(adaptive ? vcat(tstops, jumps, cost_t) : vcat(tstops, jumps), h),
                 h.tdir .* Float64.(jumps), h.tf, !adaptive, LibPETSc.TSGetTimeStep(pl, ts),
-                nothing, false,
+                nothing, false, Float64(h.ctx.tbound),
             ) : nothing
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
