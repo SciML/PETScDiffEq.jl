@@ -5654,6 +5654,15 @@ function _setup(
                 push!(h.opts)
                 try
                     LibPETSc.TSSetFromOptions(petsclib, ts)
+                catch e
+                    e isa LibPETSc.PetscError || rethrow()
+                    throw(
+                        ArgumentError(
+                            "PETSc refused the options $(repr(alg.petsc_options)) with " *
+                                "PetscError($(e.code)); a value may be missing or not one " *
+                                "PETSc knows, and PETSc's message is printed above",
+                        ),
+                    )
                 finally
                     pop!(h.opts)
                 end

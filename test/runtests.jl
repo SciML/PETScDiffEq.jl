@@ -9009,6 +9009,18 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-4
         end
 
+        @testset "options PETSc refuses at setup are an ArgumentError" begin
+            for alg in (
+                    PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "s212"]),
+                    PETScDiffEq.TSRK("5dp", ["-ts_rk_type", "bogus"]),
+                    PETScDiffEq.TSRK("5dp", ["-ts_type"]),
+                    PETScDiffEq.TSImplicit("beuler", ["-snes_type", "bogus"]),
+                )
+                @test_throws "PETSc refused the options" SciMLBase.solve(prob, alg; dt = 0.1)
+                @test_throws ArgumentError SciMLBase.init(prob, alg; dt = 0.1)
+            end
+        end
+
         @testset "an option PETSc reads inside the solve is in force there" begin
             n = 8
             A = spdiagm(-1 => ones(n - 1), 0 => fill(-2.0, n), 1 => ones(n - 1))
