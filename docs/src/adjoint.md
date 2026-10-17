@@ -55,8 +55,9 @@ The gradient is that of the solution PETSc computes at these steps. It agrees wi
 differences of the same fixed-step `solve`, and it differs from a continuous adjoint such as
 `GaussAdjoint` by the discretization error, which shrinks at the method's order. Because
 `PETScAdjoint` runs the forward solve again and takes only the problem from `sol`, the
-keywords that set the steps, `dt`, `adaptive`, `abstol`, `reltol`, `dtmin`, `dtmax` and
-`maxiters`, have to be passed to `adjoint_sensitivities` exactly as they were to `solve`.
+keywords that set the steps, `dt`, `adaptive`, `abstol`, `reltol`, `dtmin`, `dtmax`,
+`maxiters`, `tstops` and `d_discontinuities`, have to be passed to `adjoint_sensitivities`
+exactly as they were to `solve`.
 
 With fixed steps every cost time must be a time the solve steps to, since PETSc's adjoint
 has no derivative of interpolation. An adaptive solve takes cost times anywhere in `tspan`.
@@ -79,8 +80,30 @@ steps at fixed size, for `TSRK` and `TSARKIMEX` alike. The steps are those of th
 own forward solve. `solve` with the same tolerances does not end a step on its `saveat`
 times but interpolates to them, so the states it saves differ from the ones the cost is
 taken on by the error of the two solves; at tolerances of 1e-5 the two sums of
-`|u|^2 / 2` over eleven times differed by 1.2e-7 of their value. `tstops` do not make
-`solve` take the adjoint's steps either, since `solve` steps to them in its own loop.
+`|u|^2 / 2` over eleven times differed by 1.2e-7 of their value.
+
+`tstops` and `d_discontinuities` are taken as `solve` takes them. `solve` steps to them in
+its own loop rather than PETSc's, and the adjoint's forward solve repeats that loop's
+choices inside PETSc's: it ends a step on each stop, resumes at the step size `solve`
+resumes at, and starts one floating-point step past a discontinuity. The two runs then take
+the same steps: every stage time of the two agreed exactly in the tests, with fixed and
+adaptive steps, forward and backward in time, and the gradient agreed with central
+differences of `solve` at those steps to 4.2e-10. With fixed steps a stop can be a cost
+time, such as a jump in a forcing off the step grid:
+
+```julia
+sol = solve(prob, TSRK("4"); dt = 0.1, adaptive = false, tstops = [0.55])
+du0, dp = adjoint_sensitivities(
+    sol, TSRK("4"); sensealg = PETScAdjoint(), t = [0.55, 1.0], dgdu_discrete = dg!,
+    dt = 0.1, adaptive = false, tstops = [0.55],
+)
+```
+
+An adaptive run with stops takes its cost times as stops as well, in place of the time span,
+so its steps are those of `solve` with the cost times added to `tstops`. Giving them to
+both, `tstops = data_t` beside `saveat = data_t`, makes `solve` end a step on each data time
+too, and the gradient is then that of the states `solve` saves, with the accepted step sizes
+held fixed.
 
 `TSARKIMEX` is the one stiff family `PETScAdjoint` takes that has an error estimate, so the
 one stiff method whose adaptive solve it differentiates. It takes a `SplitODEProblem` as
@@ -130,8 +153,7 @@ It runs distributed over a `comm` and with a `dm` as well, with a `jac` and `par
 fill each rank's rows, as the [MPI](@ref) section describes. On a `comm` it builds a missing
 one with ForwardDiff, the `jac` from the sparse `jac_prototype`, and on a DMDA from the DM's
 colours, where an implicit method needs `autodiff = AutoForwardDiff()` for it; on a DMStag or
-a DMPlex both have to be given. Callbacks, `tstops`, mass matrices and `DAEProblem` are
-refused. Passing
+a DMPlex both have to be given. Callbacks, mass matrices and `DAEProblem` are refused. Passing
 `sensealg = PETScAdjoint()` to `solve` itself does nothing until a reverse-mode AD package
 differentiates that `solve`, which the last section of this page describes.
 
@@ -218,7 +240,9 @@ were as far from that reference, 3.8e-6, 4.1e-7, 1.7e-8 and 3.7e-9 for `TSRK("5d
 1.1e-3, 1.5e-5, 1.5e-7 and 1.5e-9 for `TSARKIMEX("3")`, so the mismatch stays at the size of
 the solve's own error. The saved states could be taken from the adjoint's stepping instead,
 by having `solve` end a step on each `saveat` time, but a differentiated `solve` would then
-return other states than a plain one, so `solve` is left as it is.
+return other states than a plain one, so `solve` is left as it is. Passing the `saveat`
+times as `tstops` as well does this by hand, for the plain `solve` and the differentiated
+one alike, and the gradient is then that of the saved states.
 
 Without `saveat` an adaptive solve saves its own steps, whose times move with `p`. The
 gradient holds those times fixed, as it holds the step sizes. A loss on the last state is
