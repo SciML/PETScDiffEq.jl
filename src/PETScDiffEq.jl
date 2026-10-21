@@ -7830,27 +7830,35 @@ function _match_steps_here!(h::TSHandles{<:Any, <:Any, R}) where {R}
 end
 
 # PETSc's MATCHSTEP rule, so no sliver is left before the stop.
+function _match_step!(pl, ts, remaining, s, fixed)
+    p = LibPETSc.TSGetTimeStep(pl, ts)
+    q = p * oftype(p, 1.01) > remaining ? remaining : 2p > remaining ? remaining / 2 : p
+    fixed || (q = max(q, min(remaining, _min_step(s))))
+    q == p || LibPETSc.TSSetTimeStep(pl, ts, q)
+    return p
+end
+
 function _match_step!(integ::PETScIntegrator, remaining)
     h = integ.h
-    pl, s = h.petsclib, integ.tdir * integ.t
-    p = LibPETSc.TSGetTimeStep(pl, h.ts)
+    p = _match_step!(h.petsclib, h.ts, remaining, integ.tdir * integ.t, h.fixed)
     h.fixed || (integ.dtcache = integ.tdir * p)
-    q = p * oftype(p, 1.01) > remaining ? remaining : 2p > remaining ? remaining / 2 : p
-    h.fixed || (q = max(q, min(remaining, _min_step(s))))
-    q == p || LibPETSc.TSSetTimeStep(pl, h.ts, q)
     return nothing
+end
+
+function _resumed_step(pl, ts, dtcache, stop, matches, fixed)
+    matches && return fixed ? dtcache : max(dtcache, _min_step(stop))
+    fixed && return dtcache
+    # PETSc cuts its proposal only while its clock is short of its max time.
+    LibPETSc.TSGetTime(pl, ts) < LibPETSc.TSGetMaxTime(pl, ts) && return dtcache
+    return max(dtcache, LibPETSc.TSGetTimeStep(pl, ts))
 end
 
 function _resumed_step(integ::PETScIntegrator, stop)
     h = integ.h
-    h.matches && return h.fixed ? integ.tdir * integ.dtcache :
-        max(integ.tdir * integ.dtcache, _min_step(stop))
-    _fixed_step(h) && return integ.tdir * integ.dtcache
-    pl = h.petsclib
-    # PETSc cuts its proposal only while its clock is short of its max time.
-    LibPETSc.TSGetTime(pl, h.ts) < LibPETSc.TSGetMaxTime(pl, h.ts) &&
-        return integ.tdir * integ.dtcache
-    return max(integ.tdir * integ.dtcache, LibPETSc.TSGetTimeStep(pl, h.ts))
+    return _resumed_step(
+        h.petsclib, h.ts, integ.tdir * integ.dtcache, stop, h.matches,
+        h.matches ? h.fixed : _fixed_step(h),
+    )
 end
 
 _fixed_step(h::TSHandles) =
