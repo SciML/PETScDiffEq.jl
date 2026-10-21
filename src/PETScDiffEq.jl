@@ -690,6 +690,12 @@ const _ROSW_NO_INTERP = (
     "r34prw", "r3prl2", "rodas3", "rodaspr", "rodaspr2", "grk4t", "shamp4", "veldd4", "4l",
 )
 const _ARKIMEX_NO_INTERP = ("prssp2", "ars443", "bpr3")
+# PETSc's ARKIMEX interpolant starts from the first stage, which these tableaux solve for, so
+# it misses the step's start.
+const _IMPLICIT_FIRST_STAGE = (
+    "1bee", "l2", "s212", "657a", "658a", "s659a", "7510sal", "759a", "s7511sal", "8614a",
+    "8616sal",
+)
 
 _petsc_interpolant(alg::TSRK) = alg.subtype in _RK_CUBIC_INTERP
 _petsc_interpolant(alg::TSRosW) = alg.subtype in _ROSW_CUBIC_INTERP
@@ -704,6 +710,12 @@ _interpolates(alg::TSARKIMEX) = !(alg.subtype in _ARKIMEX_NO_INTERP)
 _interpolates(::Union{TSImplicit, TSDAE}) = true
 _interpolates(::Union{TSIRK, TSMPRK, TSBasicSymplectic, TSAlpha2}) = false
 _interpolates(::TSGeneric) = nothing
+
+function _implicit_first_stage(pl, ts, running)
+    type, sub = first(split(running)), last(split(running))
+    type == "dirk" && (sub = LibPETSc.TSDIRKGetType(pl, ts))
+    return type in ("arkimex", "dirk") && sub in _IMPLICIT_FIRST_STAGE
+end
 
 const _RK_ORDER = Dict(
     "1fe" => 1, "2a" => 2, "2b" => 2, "3" => 3, "3bs" => 3, "4" => 4,
@@ -6003,6 +6015,7 @@ function _setup(
                 ctx.interpolates = nothing
                 ctx.alg_name = running
             end
+            _implicit_first_stage(petsclib, ts, running) && (ctx.interpolates = false)
             ctx.hermite && (ctx.restep = _restep_tableau(petsclib, ts, running))
             if !dt_given && !dt_option
                 user_t0 = R(prob.tspan[1])

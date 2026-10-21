@@ -8912,7 +8912,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
 
             none = (
                 "r34prw", "r3prl2", "rodas3", "rodaspr", "rodaspr2", "grk4t", "shamp4",
-                "veldd4", "4l", "prssp2", "ars443", "bpr3",
+                "veldd4", "4l", "prssp2", "ars443", "bpr3", "1bee", "l2",
             )
             refused = ("lassp3p4s2c", "llssp3p4s2c", "ark3", "assp3p3s1c", "ars122")
             families = (
@@ -9248,6 +9248,44 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test (@allocated run(M)) < 16_000_000
             end
         end
+    end
+
+    @testset "an ARKIMEX tableau whose interpolant misses the step's start counts as none" begin
+        twice!(du, u, p, t) = (du[1] = -2u[1]; du[2] = -2u[2]; nothing)
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(twice!; mass_matrix = [2.0 0.0; 0.0 1.0]), [1.0, 1.0],
+            (0.0, 1.0),
+        )
+        exact(t) = [exp(-t), exp(-2t)]
+        fixed = (dt = 0.05, adaptive = false)
+        crossing = SciMLBase.ContinuousCallback(
+            (u, t, integ) -> u[1] - 0.6, integ -> SciMLBase.terminate!(integ),
+        )
+        for alg in (
+                PETScDiffEq.TSARKIMEX("1bee"), PETScDiffEq.TSARKIMEX("l2"),
+                PETScDiffEq.TSARKIMEX("8614a"),
+                PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "1bee"]),
+                PETScDiffEq.TSGeneric("dirk", ["-ts_dirk_type", "657a"]),
+            )
+            @test_throws "no interpolant" SciMLBase.solve(mass, alg; fixed..., saveat = [0.525])
+            @test_throws "no interpolant" SciMLBase.solve(mass, alg; fixed..., callback = crossing)
+            sol = SciMLBase.solve(mass, alg; fixed...)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.u[end] ≈ exact(1.0) rtol = 0.05
+        end
+        residual!(r, du, u, p, t) = (r[1] = du[1] + u[1]; r[2] = u[2] - 2u[1]; nothing)
+        dae = SciMLBase.DAEProblem(
+            residual!, [-1.0, 0.0], [1.0, 2.0], (0.0, 1.0); differential_vars = [true, false],
+        )
+        @test_throws "no interpolant" SciMLBase.solve(
+            dae, PETScDiffEq.TSDAE("dirk", ["-ts_dirk_type", "8614a"]); fixed..., saveat = [0.525],
+        )
+        # Measured 1.0e-3 at 0.525, PETSc's linear interpolant for this tableau.
+        sol = SciMLBase.solve(mass, PETScDiffEq.TSARKIMEX("es213sal"); fixed..., saveat = [0.525])
+        @test maximum(abs.(sol.u[1] .- exact(0.525))) < 2.0e-3
+        plain = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        sol = SciMLBase.solve(plain, PETScDiffEq.TSARKIMEX("8614a"); fixed..., saveat = [0.525])
+        @test sol.u[1][1] ≈ exp(-0.525) rtol = 1.0e-6
     end
 
     @testset "An operator-valued right-hand side is rejected" begin
