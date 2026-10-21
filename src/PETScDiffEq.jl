@@ -876,6 +876,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     restep::Union{Nothing, Restep{R}}
     inner::Any
     mass_slope::Bool
+    tend::R
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -917,6 +918,9 @@ function _call!(f, ctx::TSContext, out, args...)
 end
 
 _call_f!(ctx::TSContext, du, u, t) = _call!(ctx.f!, ctx, du, u, ctx.p, t)
+
+# PETSc sums some tableaus' stage fractions to just over 1, putting a stage past the span.
+_in_span(ctx::TSContext, t) = ctx.tend < t <= ctx.tend + 64 * eps(ctx.tbound) ? ctx.tend : t
 
 _guard_f(f, ::Nothing, _) = f
 _guard_f(f, ::MPI.Comm, box) = function (du, args...)
@@ -2101,6 +2105,7 @@ _select(u, idxs::Vector{Int}) = u[idxs]
 function _derivative(ctx::TSContext{R, S}, t, u) where {R, S}
     u = convert(Vector{S}, vec(u))
     du = similar(u)
+    t = _in_span(ctx, t)
     _call_f!(ctx, du, u, t)
     if ctx.f2! !== nothing
         _call!(ctx.f2!, ctx, ctx.du, u, ctx.p, t)
@@ -3479,7 +3484,7 @@ function _rhs_body!(ctx, t, x_ptr, f_ptr)
     pl = ctx.petsclib
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        _call_f!(ctx, ctx.du, ctx.u, t)
+        _call_f!(ctx, ctx.du, ctx.u, _in_span(ctx, t))
         _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), ctx.du)
         ctx.nf += 1
     catch e
@@ -3504,7 +3509,7 @@ function _split_rhs_body!(ctx, t, x_ptr, f_ptr)
     pl = ctx.petsclib
     try
         _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
-        _call!(ctx.f2!, ctx, ctx.du, ctx.u, ctx.p, t)
+        _call!(ctx.f2!, ctx, ctx.du, ctx.u, ctx.p, _in_span(ctx, t))
         _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), ctx.du)
         ctx.nf2 += 1
     catch e
@@ -3554,7 +3559,7 @@ end
 function _ifunction_body!(ctx, ts, t, x_ptr, xdot_ptr, f_ptr)
     pl = ctx.petsclib
     try
-        t = _stage_time(ctx, ts, t)
+        t = _in_span(ctx, _stage_time(ctx, ts, t))
         _readvec!(ctx.u, pl, _own_block(ctx, PETSc.VecPtr(pl, x_ptr, false)))
         udot = _readvec!(ctx.mudot, pl, _own_block(ctx, PETSc.VecPtr(pl, xdot_ptr, false)))
         if ctx.dae
@@ -3845,7 +3850,7 @@ function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
-        t = _stage_time(ctx, ts, t)
+        t = _in_span(ctx, _stage_time(ctx, ts, t))
         _readvec!(ctx.u, ctx.petsclib, x)
         _call_jac!(ctx, xdot_ptr, shift, t)
         ctx.njacs += 1
@@ -3893,7 +3898,7 @@ function _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     moved = ctx.relayout === nothing ? nothing : ctx.relayout.mat
     J = something(moved, B)
     try
-        t = _stage_time(ctx, ts, t)
+        t = _in_span(ctx, _stage_time(ctx, ts, t))
         _readvec!(ctx.u, pl, _own_block(ctx, PETSc.VecPtr(pl, x_ptr, false)))
         _mat_zero!(pl, J)
         err = nothing
@@ -3956,7 +3961,7 @@ function _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_pt
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
-        t = _stage_time(ctx, ts, t)
+        t = _in_span(ctx, _stage_time(ctx, ts, t))
         _readvec!(ctx.u, ctx.petsclib, _own_block(ctx, x))
         if ctx.coo === nothing
             _call_jac!(ctx, xdot_ptr, shift, t)
@@ -5697,7 +5702,7 @@ function _setup(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
-        nothing, mass_slope,
+        nothing, mass_slope, tf,
     )::TSContext
     h = Base.inferencebarrier(TSHandles)(
         ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
