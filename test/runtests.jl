@@ -2270,6 +2270,31 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test_throws "`irk` is an implicit PETSc type" PETScDiffEq.TSGeneric("irk"; explicit = true)
     end
 
+    @testset "glle, which PETSc has no single step for, is refused where steps are taken" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        glle = PETScDiffEq.TSGeneric("glle")
+        fixed = (dt = 0.1, adaptive = false)
+        @test SciMLBase.solve(prob, glle; fixed..., saveat = 0.25).retcode ==
+            SciMLBase.ReturnCode.Success
+        idle = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+        why = "PETSc runs `glle` only as a whole solve"
+        for kw in (
+                (; callback = idle), (; tstops = [0.35]), (; d_discontinuities = [0.35]),
+                (; isoutofdomain = (u, p, t) -> false),
+            )
+            @test_throws why SciMLBase.solve(prob, glle; fixed..., kw...)
+        end
+        @test_throws why SciMLBase.init(prob, glle; fixed...)
+        @test_throws why SciMLBase.init(
+            prob, PETScDiffEq.TSGeneric("bdf", ["-ts_type", "glle"]); fixed...,
+        )
+        single = SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0))
+        @test_throws why SciMLBase.solve(single, glle; dt = 0.1f0, adaptive = false)
+        residual!(r, du, u, p, t) = (r[1] = du[1] + u[1]; nothing)
+        dae = SciMLBase.DAEProblem(residual!, [-1.0], [1.0], (0.0, 1.0))
+        @test_throws why SciMLBase.solve(dae, PETScDiffEq.TSDAE("glle"); fixed..., tstops = [0.5])
+    end
+
     @testset "the same types are refused when an option selects them" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         solve_at(alg; kw...) = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, kw...)

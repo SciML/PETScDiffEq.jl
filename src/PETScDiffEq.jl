@@ -598,7 +598,9 @@ package's own convergence tests.
 PETSc setup call this package does not make, and without it they crash or integrate to
 zero rather than saying anything. `"alpha2"` and `"basicsymplectic"` are refused too, since
 they need a second-order or partitioned problem; use [`TSAlpha2`](@ref) or
-[`TSBasicSymplectic`](@ref).
+[`TSBasicSymplectic`](@ref). PETSc runs `"glle"` only as a whole solve, with no single step,
+so `init` refuses it, as does a solve that takes its steps one at a time: one with a callback,
+`tstops`, `d_discontinuities`, `isoutofdomain` or a Float32 clock.
 
 A `comm` other than `MPI.COMM_SELF` runs an explicit type as [`TSRK`](@ref) runs, and an
 implicit `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`, `"arkimex"`, `"irk"`, `"alpha"` or
@@ -7312,6 +7314,18 @@ function _init_unlocked(
     stops_given = vcat(tstops, d_discontinuities)
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = stops_given, kwargs...)
+    # PETSc's GLLE has a whole solve and no single step.
+    if LibPETSc.TSGetType(h.petsclib, h.ts) == "glle"
+        _destroy!(h)
+        throw(
+            ArgumentError(
+                "PETSc runs `glle` only as a whole solve, with no single step, so it cannot " *
+                    "take `init` and `step!`, nor what a solve needs them for: a callback, " *
+                    "`tstops`, `d_discontinuities`, `isoutofdomain` or a Float32 clock; " *
+                    "solve without them, or use another type such as `TSImplicit(\"bdf\")`",
+            ),
+        )
+    end
     prob = _with_p(prob, h.ctx.p)
     if late !== nothing
         tstops = try
