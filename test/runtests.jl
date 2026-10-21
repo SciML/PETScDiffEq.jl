@@ -9263,6 +9263,40 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         )
     end
 
+    @testset "a mass matrix that is a multiple of I or a constant operator is its matrix" begin
+        rhs!(du, u, p, t) = (du[1] = -u[1]; du[2] = u[2] - 2u[1]; nothing)
+        M = Diagonal([1.0, 0.0])
+        problem(mass, u0 = [1.0, 2.0]; f = rhs!) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(f; mass_matrix = mass), u0, (0.0, 1.0),
+        )
+        brown = DiffEqBase.BrownFullBasicInit()
+        algs = (PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW())
+        for op in (
+                    SciMLOperators.MatrixOperator(M), SciMLOperators.MatrixOperator(Matrix(M)),
+                    SciMLOperators.MatrixOperator(sparse(M)),
+                ),
+                alg in algs
+            sol = SciMLBase.solve(problem(op), alg)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.u == SciMLBase.solve(problem(convert(AbstractMatrix, op)), alg).u
+            @test_throws SciMLBase.CheckInitFailureError SciMLBase.solve(
+                problem(op, [1.0, 0.0]), alg,
+            )
+            fixed = SciMLBase.solve(problem(op, [1.0, 0.0]), alg; initializealg = brown)
+            @test fixed.u[1] ≈ [1.0, 2.0]
+        end
+        changing = SciMLOperators.MatrixOperator(
+            Matrix(M); update_func! = (A, u, p, t) -> (A[1, 1] = 1 + t; nothing),
+        )
+        @test_throws ArgumentError SciMLBase.solve(problem(changing), first(algs))
+        for alg in algs, scale in (2I, 2.0I)
+            sol = SciMLBase.solve(problem(scale; f = decay!), alg)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.u == SciMLBase.solve(problem(Diagonal([2.0, 2.0]); f = decay!), alg).u
+            @test sol.u[end] ≈ exp(-0.5) .* [1.0, 2.0] rtol = 1.0e-2
+        end
+    end
+
     @testset "a discrete problem is refused" begin
         halve!(du, u, p, t) = (du .= u ./ 2; nothing)
         for prob in (

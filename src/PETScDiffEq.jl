@@ -2898,6 +2898,22 @@ function _distributed_mass(::Type{S}, mass, n, N, comm) where {S}
     return sparse(1:n, rstart .+ (1:n), d, n, N)
 end
 
+# A multiple of I or a constant SciMLOperator is taken as its matrix, as in OrdinaryDiffEq.
+function _mass_of(prob)
+    M = prob.f.mass_matrix
+    M isa LinearAlgebra.UniformScaling && M != LinearAlgebra.I &&
+        return LinearAlgebra.Diagonal(fill(M.λ, length(prob.u0)))
+    M isa SciMLOperators.AbstractSciMLOperator || return M
+    SciMLOperators.isconstant(M) || throw(
+        ArgumentError(
+            "PETScDiffEq takes a mass matrix that does not change with u, p or t, and this " *
+                "`$(nameof(typeof(M)))` has an update function; pass its matrix if it is " *
+                "constant",
+        ),
+    )
+    return convert(AbstractMatrix, M)
+end
+
 # A serial solve keeps a copy of a Diagonal or sparse M as that; any other kind is made dense.
 _serial_mass(::Type{S}, M::LinearAlgebra.Diagonal) where {S} =
     LinearAlgebra.Diagonal(Vector{S}(M.diag))
@@ -4973,7 +4989,7 @@ const _WITH_DM = "with a `dm`"
 
 function _check_diagonal_mass(prob, is_dae, where, or = "")
     n = length(prob.u0)
-    mass = is_dae ? nothing : prob.f.mass_matrix
+    mass = is_dae ? nothing : _mass_of(prob)
     (mass === nothing || mass == LinearAlgebra.I) && return nothing
     mass isa LinearAlgebra.Diagonal || throw(
         ArgumentError(
@@ -4993,7 +5009,7 @@ end
 # Like the `jac_prototype`, a sparse mass matrix holds this rank's rows, with global columns.
 function _check_local_mass(prob, is_dae, N)
     n = length(prob.u0)
-    mass = is_dae ? nothing : prob.f.mass_matrix
+    mass = is_dae ? nothing : _mass_of(prob)
     (mass === nothing || mass == LinearAlgebra.I) && return nothing
     mass isa SparseArrays.AbstractSparseMatrix ||
         return _check_diagonal_mass(prob, is_dae, _NOT_SELF, " or a sparse one")
@@ -5390,7 +5406,7 @@ function _setup(
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     comm = _distributed(alg) ? alg.comm : nothing
     shape === nothing || _refuse_shaped(is_dae, comm, _alg_dm(alg))
-    mass_matrix = is_dae ? nothing : prob.f.mass_matrix
+    mass_matrix = is_dae ? nothing : _mass_of(prob)
     own_mass = !(mass_matrix === nothing || mass_matrix == LinearAlgebra.I)
     has_mass = _anywhere(comm, own_mass)
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
