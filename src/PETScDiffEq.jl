@@ -6698,6 +6698,7 @@ function _set_u_unlocked(integ::PETScIntegrator, u)
     integ.finished && return nothing
     _write_state!(integ.h, integ.u)
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
+    integ.derivative_discontinuity = true
     return nothing
 end
 
@@ -7229,6 +7230,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
         (_stop!(integ, best_cb, stop, pre, best_crossing, modified); return true)
     modified && _reinitialize!(integ, best_cb.initializealg, before, slope)
     integ.finished && return true
+    integ.derivative_discontinuity = false
     if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
         dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
     end
@@ -7266,6 +7268,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
             # A cleared flag keeps BDF's past states and an FSAL slope, as OrdinaryDiffEq's do.
             _take_written_state!(integ, false)
         end
+        integ.derivative_discontinuity = false
         if cb.save_positions[2]
             _save_here!(integ)
             _save_discretes!(integ, cb)
@@ -7435,6 +7438,18 @@ function _take_written_state!(integ::PETScIntegrator, restart::Bool = true)
         return nothing
     _write_state!(h, integ.u)
     restart && LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    _dirty!(h.ctx)
+    return nothing
+end
+
+function _take_discontinuity!(integ::PETScIntegrator)
+    h = integ.h
+    integ.derivative_discontinuity = false
+    # `set_u!` leaves `end_u` behind, so only a state nothing touched passes as consistent.
+    _reinitialize!(integ, nothing, copy(h.ctx.end_u))
+    integ.finished && return nothing
+    _write_state!(h, integ.u)
+    LibPETSc.TSRestartStep(h.petsclib, h.ts)
     _dirty!(h.ctx)
     return nothing
 end
@@ -7869,6 +7884,10 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     if _attempts(ctx, pl, h.ts) >= ctx.maxiters
         _finish!(integ)
         return nothing
+    end
+    if outer === nothing && _anywhere(ctx.comm, integ.derivative_discontinuity)
+        _take_discontinuity!(integ)
+        integ.finished && return nothing
     end
     outer === nothing && _take_written_time!(integ)
     outer === nothing && _take_written_state!(integ)
