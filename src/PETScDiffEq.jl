@@ -4724,6 +4724,15 @@ function _set_first_step!(h::TSHandles{<:Any, <:Any, R}, dt, dtmin, force_dtmin)
     return nothing
 end
 
+# PETSc's ceiling, like its floor, bounds only the steps its adaptor picks.
+function _cap_step!(pl, ts)
+    adapt = LibPETSc.TSGetAdapt(pl, ts)
+    _, hi = LibPETSc.TSAdaptGetStepLimits(pl, adapt)
+    LibPETSc.TSGetTimeStep(pl, ts) > hi && LibPETSc.TSAdaptGetType(pl, adapt) != "none" &&
+        LibPETSc.TSSetTimeStep(pl, ts, hi)
+    return nothing
+end
+
 _internalnorm(::Nothing) = DiffEqBase.ODE_DEFAULT_NORM
 _internalnorm(comm::MPI.Comm) = (u, t) -> _global_norm(comm, u, t)
 
@@ -6035,6 +6044,7 @@ function _setup(
                 end
                 _set_first_step!(h, dt, dtmin, force_dtmin)
             end
+            _cap_step!(petsclib, ts)
         end
     catch
         _destroy!(h)
@@ -7873,6 +7883,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     outer === nothing && _take_written_time!(integ)
     outer === nothing && _take_written_state!(integ)
     outer === nothing && _take_written_tolerances!(integ)
+    _cap_step!(pl, h.ts)
     dtprev = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     before = (
         Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty,
@@ -8031,9 +8042,10 @@ end
 function _estimate_dt(h::TSHandles{<:Any, <:Any, R}, opts, u, s, stops) where {R}
     ctx = h.ctx
     dtmin = abs(getfield(opts, :dtmin))
-    ctx.dae && return max(R(1.0e-6) * _span(h.t0, h.tf), _min_step(s))
+    dtmax = abs(getfield(opts, :dtmax))
+    ctx.dae && return max(min(R(1.0e-6) * _span(h.t0, h.tf), dtmax), _min_step(s))
     ctx.M === nothing ||
-        return max(nextfloat(max(dtmin, eps(s))), R(1.0e-6), _min_step(s))
+        return max(nextfloat(max(dtmin, eps(s))), min(R(1.0e-6), dtmax), _min_step(s))
     i = findfirst(>(s), stops)
     stop = i === nothing ? h.tf : min(stops[i], h.tf)
     threw, calls = Ref{Any}(nothing), [0, 0]

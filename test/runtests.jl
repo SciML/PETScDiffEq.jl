@@ -9336,6 +9336,44 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test capped.stats.naccept > free.stats.naccept
     end
 
+    @testset "dtmax bounds a step PETSc is handed, as OrdinaryDiffEq's does" begin
+        loose = (abstol = 0.1, reltol = 0.1)
+        rk, rosw = PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW()
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0], (0.0, 1.0),
+        )
+        res!(r, du, u, p, t) = (r .= du .+ u; nothing)
+        dae = SciMLBase.DAEProblem(res!, [-1.0], [1.0], (0.0, 100.0))
+        for (pr, alg) in (
+                (prob, rk), (prob, rosw), (mass, rosw), (mass, PETScDiffEq.TSImplicit("bdf")),
+                (dae, PETScDiffEq.TSDAE()),
+            )
+            sol = SciMLBase.solve(pr, alg; dt = 0.5, dtmax = 0.01, loose..., maxiters = 10)
+            @test sol.t[2] <= 0.01
+        end
+        for (pr, alg, top) in ((mass, rosw, 1.0e-7), (dae, PETScDiffEq.TSDAE(), 1.0e-5))
+            integ = SciMLBase.init(pr, alg; dtmax = top)
+            @test integ.dt <= top
+            SciMLBase.step!(integ)
+            @test integ.t <= top
+            SciMLBase.auto_dt_reset!(integ)
+            @test integ.dt <= top
+            SciMLBase.terminate!(integ)
+        end
+        integ = SciMLBase.init(prob, rk; dtmax = 0.01, loose...)
+        SciMLBase.step!(integ)
+        SciMLBase.set_proposed_dt!(integ, 0.5)
+        SciMLBase.step!(integ)
+        @test integ.dt <= 0.01 + 1.0e-12
+        integ.opts.dtmax = 0.001
+        SciMLBase.step!(integ)
+        @test integ.dt <= 0.001 + 1.0e-12
+        SciMLBase.terminate!(integ)
+        fixed = SciMLBase.solve(prob, rk; dt = 0.5, dtmax = 0.01, adaptive = false)
+        @test fixed.t == [0.0, 0.5, 1.0]
+    end
+
     @testset "Subtype setters take effect" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         exact = exp(-1.0)
