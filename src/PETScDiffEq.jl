@@ -531,7 +531,10 @@ smaller one damps the highest frequencies more.
 Adapts on PETSc's error estimate for the method, which PETSc leaves off unless asked, so
 `reltol` and `abstol` apply. PETSc weighs the velocity and the position with one tolerance
 per component of the position, so a vector tolerance on the state `[v; u]` takes the smaller
-of each velocity and position pair. `adaptive = false` steps at the `dt` you give.
+of each velocity and position pair. `adaptive = false` steps at the `dt` you give. PETSc
+forms the velocity and the acceleration from the step's change in position, so a tolerance
+that asks for steps whose change is below the position's floating point spacing, as `1e-9`
+does in `Float32`, ends an adaptive solve with `Unstable`.
 
 Each step solves for the acceleration, with the Jacobian of `f` in `u` and `u'`. That comes
 from a `jac`, which is the Jacobian of the first-order system `[v; u]' = [f(v, u, p, t); v]`,
@@ -2483,6 +2486,83 @@ function _adapt_real(pl, ts_ptr, name, ::Type{R}) where {R}
     return lo[]
 end
 
+# alpha2 takes the velocity from the change in position, which an SNORM stop leaves zero.
+function _lost_update(pl, ts, ::Type{R}) where {R}
+    snes, reason = _snes(pl, ts.ptr), Ref{Cint}(0)
+    _check_code(
+        ccall(
+            _symbol(pl, :SNESGetConvergedReason), LibPETSc.PetscErrorCode,
+            (LibPETSc.CSNES, Ptr{Cint}), snes, reason,
+        ),
+    )
+    reason[] == Cint(LibPETSc.SNES_CONVERGED_SNORM_RELATIVE) || return false
+    x, x0 = Ref{LibPETSc.CVec}(C_NULL), Ref{LibPETSc.CVec}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :SNESGetSolution), LibPETSc.PetscErrorCode,
+            (LibPETSc.CSNES, Ptr{LibPETSc.CVec}), snes, x,
+        ),
+    )
+    _check_code(
+        ccall(
+            _symbol(pl, :TSGetSolution), LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts.ptr, x0,
+        ),
+    )
+    same = Ref(LibPETSc.PETSC_FALSE)
+    _check_code(
+        ccall(
+            _symbol(pl, :VecEqual), LibPETSc.PetscErrorCode,
+            (LibPETSc.CVec, LibPETSc.CVec, Ptr{LibPETSc.PetscBool}), x[], x0[], same,
+        ),
+    )
+    same[] == LibPETSc.PETSC_TRUE || return false
+    atol, vatol = Ref{R}(0), Ref{LibPETSc.CVec}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :TSGetTolerances), LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, Ptr{R}, Ptr{LibPETSc.CVec}, Ptr{R}, Ptr{LibPETSc.CVec}),
+            ts.ptr, atol, vatol, C_NULL, C_NULL,
+        ),
+    )
+    tol = if vatol[] == C_NULL
+        n = Ref{PETSc.inttype(pl)}(0)
+        _check_code(
+            ccall(
+                _symbol(pl, :VecGetSize), LibPETSc.PetscErrorCode,
+                (LibPETSc.CVec, Ptr{Cvoid}), x[], n,
+            ),
+        )
+        atol[] * sqrt(R(n[]))
+    else
+        norm2 = Ref{R}(0)
+        _check_code(
+            ccall(
+                _symbol(pl, :VecNorm), LibPETSc.PetscErrorCode,
+                (LibPETSc.CVec, Cint, Ptr{R}), vatol[], Cint(LibPETSc.NORM_2), norm2,
+            ),
+        )
+        norm2[]
+    end
+    fnorm = Ref{R}(0)
+    _check_code(
+        ccall(
+            _symbol(pl, :SNESGetFunctionNorm), LibPETSc.PetscErrorCode,
+            (LibPETSc.CSNES, Ptr{R}), snes, fnorm,
+        ),
+    )
+    # dt times the residual is the velocity change left out; at rest it is below abstol.
+    return LibPETSc.TSGetTimeStep(pl, ts) * fnorm[] > tol
+end
+
+function _lost_update_message(R, t)
+    why = "its Newton update fell below the floating point spacing of the position at " *
+        "t = $t, so the step's velocity and acceleration are lost; loosen `abstol` and " *
+        "`reltol`"
+    R === Float32 || return why
+    return why * ", or give the problem a Float64 span to solve it in double precision"
+end
+
 # TSAdaptCheckStage calls this before reading the SNES reason and skips its shrink once a
 # reason is set.
 function _check_stage!(
@@ -2503,11 +2583,13 @@ function _check_stage_body!(ctx, ts_ptr, t::R, y, accept) where {R}
         snes = _snes_failed(pl, ts_ptr)
         snes === nothing || _stale_failure!(pl, snes, y) && (snes = nothing)
         if snes === nothing
-            s + h == s || return LibPETSc.PetscErrorCode(0)
+            lost = ctx.alg_name == "alpha2" && _lost_update(pl, ts, R)
+            lost || s + h == s || return LibPETSc.PetscErrorCode(0)
             # PetscBool is 4 bytes before PETSc 3.24 and 1 after, and PETSc set it true.
             unsafe_store!(Ptr{UInt8}(accept), 0x00)
             ctx.unstable_hit = true
-            ctx.stuck = "its step fell below the floating point spacing at t = " *
+            ctx.stuck = lost ? _lost_update_message(R, _user_t(ctx.tdir, s)) :
+                "its step fell below the floating point spacing at t = " *
                 "$(_user_t(ctx.tdir, s))"
             LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_DIVERGED_STEP_REJECTED)
             return LibPETSc.PetscErrorCode(0)
