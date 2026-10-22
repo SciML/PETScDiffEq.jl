@@ -2939,31 +2939,46 @@ end
 
 # The shift lands on the diagonal and M's nonzeros, so those always get a slot (src 0).
 function _row_structure(J::SparseMatrixCSC, n, M = nothing, rstart = 0, colmap = nothing)
-    cols = [Int[] for _ in 1:n]
-    src = [Int[] for _ in 1:n]
-    for j in axes(J, 2), k in J.colptr[j]:(J.colptr[j + 1] - 1)
+    start = zeros(Int, n + 1)
+    for k in 1:(J.colptr[end] - 1)
+        start[J.rowval[k] + 1] += 1
+    end
+    start[1] = 1
+    cumsum!(start, start)
+    next = start[1:n]
+    jcol, jsrc = Vector{Int}(undef, start[end] - 1), Vector{Int}(undef, start[end] - 1)
+    for j in axes(J, 2), k in nzrange(J, j)
         i = J.rowval[k]
-        push!(cols[i], colmap === nothing ? j : colmap[j])
-        push!(src[i], k)
+        jcol[next[i]], jsrc[next[i]] = colmap === nothing ? j : colmap[j], k
+        next[i] += 1
     end
-    shifted = [CartesianIndex(i, rstart + i) for i in 1:n]
-    M === nothing || append!(shifted, _mass_nonzeros(M))
-    for ij in shifted
-        i, j = ij[1], ij[2]
-        j in cols[i] && continue
-        push!(cols[i], j)
-        push!(src[i], 0)
-    end
+    mass = M === nothing ? CartesianIndex{2}[] : sort!(_mass_nonzeros(M); by = ij -> ij[1])
+    cols0 = Vector{Vector{_PetscInt}}(undef, n)
+    src = Vector{Vector{Int}}(undef, n)
+    buf = Vector{Vector{eltype(J)}}(undef, n)
+    c, s, m = Int[], Int[], 1
     for i in 1:n
-        issorted(cols[i]) && continue
-        perm = sortperm(cols[i])
-        cols[i] = cols[i][perm]
-        src[i] = src[i][perm]
+        r = start[i]:(start[i + 1] - 1)
+        append!(empty!(c), view(jcol, r))
+        append!(empty!(s), view(jsrc, r))
+        _slot!(c, s, rstart + i)
+        while m <= length(mass) && mass[m][1] == i
+            _slot!(c, s, mass[m][2])
+            m += 1
+        end
+        if !issorted(c)
+            perm = sortperm(c)
+            copyto!(c, c[perm])
+            copyto!(s, s[perm])
+        end
+        cols0[i] = _PetscInt[j - 1 for j in c]
+        src[i] = copy(s)
+        buf[i] = zeros(eltype(J), length(c))
     end
-    cols0 = Vector{_PetscInt}[_PetscInt[c - 1 for c in cols[i]] for i in 1:n]
-    buf = [zeros(eltype(J), length(cols[i])) for i in 1:n]
     return cols0, src, buf
 end
+
+_slot!(c, s, j) = j in c || (push!(c, j); push!(s, 0))
 
 # (i, j) of df/dv and (i, NV + j) of df/du share a slot, as does the diagonal for shift_a.
 function _second_order_rows(J::SparseMatrixCSC, nv, NV = nv, rstart = 0)
