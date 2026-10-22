@@ -4176,21 +4176,24 @@ for R in (Float32, Float64), (name, (f, args)) in pairs(_CALLBACK_SIGNATURES)
 end
 
 const CALLBACKS = Dict{Tuple{Symbol, DataType}, Ptr{Cvoid}}()
+const CALLBACKS_LOCK = ReentrantLock()
 
 # A package image's `@cfunction` calls through dynamic dispatch and loses a static parameter
 # in its signature, so these are compiled at run time. Another package's precompilation
 # cannot evaluate here, so it takes the untyped entry points.
 function _callback(name::Symbol, ::Type{C}) where {R, C <: TSContext{R}}
-    haskey(CALLBACKS, (name, C)) && return CALLBACKS[(name, C)]
-    f, args = _CALLBACK_SIGNATURES[name]
-    types = map(a -> _callback_type(a, R, C), args)
-    ptr = try
-        Core.eval(@__MODULE__, :(@cfunction($f, $_Err, ($(types...),))))
-    catch
-        ccall(:jl_generating_output, Cint, ()) == 1 || rethrow()
-        return _untyped_callback(Val(name), R)
+    return lock(CALLBACKS_LOCK) do
+        haskey(CALLBACKS, (name, C)) && return CALLBACKS[(name, C)]
+        f, args = _CALLBACK_SIGNATURES[name]
+        types = map(a -> _callback_type(a, R, C), args)
+        ptr = try
+            Core.eval(@__MODULE__, :(@cfunction($f, $_Err, ($(types...),))))
+        catch
+            ccall(:jl_generating_output, Cint, ()) == 1 || rethrow()
+            return _untyped_callback(Val(name), R)
+        end
+        return CALLBACKS[(name, C)] = ptr
     end
-    return CALLBACKS[(name, C)] = ptr
 end
 
 # `@cfunction` pointers do not survive precompilation.
