@@ -2955,11 +2955,12 @@ function _row_structure(J::SparseMatrixCSC, n, M = nothing, rstart = 0, colmap =
         push!(src[i], 0)
     end
     for i in 1:n
+        issorted(cols[i]) && continue
         perm = sortperm(cols[i])
         cols[i] = cols[i][perm]
         src[i] = src[i][perm]
     end
-    cols0 = Vector{LibPETSc.PetscInt}[LibPETSc.PetscInt[c - 1 for c in cols[i]] for i in 1:n]
+    cols0 = Vector{_PetscInt}[_PetscInt[c - 1 for c in cols[i]] for i in 1:n]
     buf = [zeros(eltype(J), length(cols[i])) for i in 1:n]
     return cols0, src, buf
 end
@@ -2974,7 +2975,7 @@ function _second_order_rows(J::SparseMatrixCSC, nv, NV = nv, rstart = 0)
     end
     at(cs, ks, j) = (s = searchsortedfirst(cs, j); s <= length(cs) && cs[s] == j ? ks[s] : 0)
     cols = [sort!(unique!(vcat(cv[i], cu[i], rstart + i))) for i in 1:nv]
-    cols0 = [LibPETSc.PetscInt[j - 1 for j in cols[i]] for i in 1:nv]
+    cols0 = [_PetscInt[j - 1 for j in cols[i]] for i in 1:nv]
     src_v = [[at(cv[i], kv[i], j) for j in cols[i]] for i in 1:nv]
     src_u = [[at(cu[i], ku[i], j) for j in cols[i]] for i in 1:nv]
     buf = [zeros(eltype(J), length(cols[i])) for i in 1:nv]
@@ -2995,8 +2996,8 @@ _mass_entry(::Type{S}, M, i, c, rstart) where {S} =
 function _coo_structure(J::SparseMatrixCSC{S}, rstart, M, colmap = nothing) where {S}
     n = size(J, 1)
     cols0, src, _ = _row_structure(J, n, M isa SparseMatrixCSC ? M : nothing, rstart, colmap)
-    rows = LibPETSc.PetscInt[rstart + i - 1 for i in 1:n for _ in cols0[i]]
-    cols = LibPETSc.PetscInt[c for i in 1:n for c in cols0[i]]
+    rows = _PetscInt[rstart + i - 1 for i in 1:n for _ in cols0[i]]
+    cols = _PetscInt[c for i in 1:n for c in cols0[i]]
     mass = S[_mass_entry(S, M, i, c, rstart) for i in 1:n for c in cols0[i]]
     coo = COOJacobian(Int[k for i in 1:n for k in src[i]], mass, zeros(S, length(rows)))
     return rows, cols, coo
@@ -5644,7 +5645,7 @@ function _setup(
     m = alg isa TSAlpha2 ? nv : n
     W0 = has_jac && !uses_sparse_jac && !dm_jac ? zeros(S, m, m) : zeros(S, 0, 0)
     idx0 = has_jac && !uses_sparse_jac && !dm_jac ?
-        LibPETSc.PetscInt[i - 1 for i in 1:m] : LibPETSc.PetscInt[]
+        _PetscInt[i - 1 for i in 1:m] : _PetscInt[]
     row_cols0, row_src, row_src2, row_buf = if !(uses_sparse_jac && comm === nothing)
         (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Int}[], Vector{S}[])
     elseif alg isa TSAlpha2
