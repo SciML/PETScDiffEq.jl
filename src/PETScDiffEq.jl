@@ -2898,20 +2898,29 @@ function _distributed_mass(::Type{S}, mass, n, N, comm) where {S}
     return sparse(1:n, rstart .+ (1:n), d, n, N)
 end
 
-# A multiple of I or a constant SciMLOperator is taken as its matrix, as in OrdinaryDiffEq.
+# Takes a multiple of I (a ScalarOperator too) or a constant SciMLOperator as its matrix.
 function _mass_of(prob)
     M = prob.f.mass_matrix
+    if M isa SciMLOperators.AbstractSciMLOperator
+        M isa SciMLOperators.FunctionOperator && !SciMLOperators.isconvertible(M) && throw(
+            ArgumentError(
+                "PETScDiffEq needs the entries of the mass matrix, which this matrix-free " *
+                    "`FunctionOperator` does not give; pass the matrix itself",
+            ),
+        )
+        SciMLOperators.isconstant(M) || throw(
+            ArgumentError(
+                "PETScDiffEq takes a mass matrix that does not change with u, p or t, and " *
+                    "`SciMLOperators.isconstant` is false for this `$(nameof(typeof(M)))`; " *
+                    "pass its matrix if that does not change",
+            ),
+        )
+        M = M isa SciMLOperators.AbstractSciMLScalarOperator ?
+            convert(Number, M) * LinearAlgebra.I : convert(AbstractMatrix, M)
+    end
     M isa LinearAlgebra.UniformScaling && M != LinearAlgebra.I &&
         return LinearAlgebra.Diagonal(fill(M.λ, length(prob.u0)))
-    M isa SciMLOperators.AbstractSciMLOperator || return M
-    SciMLOperators.isconstant(M) || throw(
-        ArgumentError(
-            "PETScDiffEq takes a mass matrix that does not change with u, p or t, and this " *
-                "`$(nameof(typeof(M)))` has an update function; pass its matrix if it is " *
-                "constant",
-        ),
-    )
-    return convert(AbstractMatrix, M)
+    return M
 end
 
 # A serial solve keeps a copy of a Diagonal or sparse M as that; any other kind is made dense.

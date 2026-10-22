@@ -9288,8 +9288,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         changing = SciMLOperators.MatrixOperator(
             Matrix(M); update_func! = (A, u, p, t) -> (A[1, 1] = 1 + t; nothing),
         )
-        @test_throws ArgumentError SciMLBase.solve(problem(changing), first(algs))
-        for alg in algs, scale in (2I, 2.0I)
+        @test_throws "`SciMLOperators.isconstant` is false for this `MatrixOperator`" SciMLBase.solve(
+            problem(changing), first(algs),
+        )
+        twice(w, v, u, p, t) = (w .= 2 .* v; w)
+        for isconstant in (false, true)
+            free = SciMLOperators.FunctionOperator(twice, zeros(2), zeros(2); isconstant)
+            @test_throws "matrix-free `FunctionOperator`" SciMLBase.solve(
+                problem(free; f = decay!), first(algs),
+            )
+        end
+        for alg in algs, scale in (2I, 2.0I, SciMLOperators.ScalarOperator(2.0))
             sol = SciMLBase.solve(problem(scale; f = decay!), alg)
             @test sol.retcode == SciMLBase.ReturnCode.Success
             @test sol.u == SciMLBase.solve(problem(Diagonal([2.0, 2.0]); f = decay!), alg).u
