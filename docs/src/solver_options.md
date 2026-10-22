@@ -138,6 +138,15 @@ since a direct factorization can fill in: on a 2-D Brusselator with 2048 states 
 took 5 to 9 times as long. A `-ksp_type`, `-pc_type`, `-snes_mf` or `-snes_mf_operator` in
 `petsc_options` replaces this choice.
 
+PETSc's Newton solver forms a new Jacobian at every iteration. An adaptive BDF solve, through
+`TSImplicit("bdf")` or `TSDAE`, sets `-snes_lag_jacobian 5`: one Jacobian per nonlinear
+solve, formed again only after five iterations, since BDF's extrapolated guess starts close
+and a failed solve is taken again with a smaller step. It halves the Jacobians on HIRES and
+Robertson's problem at the same steps and errors. Other methods, and BDF at a fixed step,
+keep a Jacobian per iteration: on Van der Pol and the Oregonator the lag cost
+`TSARKIMEX`'s stages, which start from the previous stage, more steps, and it made a
+fixed-step backward Euler solve fail. A `-snes_lag_jacobian` in `petsc_options` replaces it.
+
 `DiscreteCallback`, `ContinuousCallback`, `VectorContinuousCallback` and `CallbackSet`
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`,
 `terminate!` and `initialize_dae!`. After a step the running solution's retcode is `Success`, as

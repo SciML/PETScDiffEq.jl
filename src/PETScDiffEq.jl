@@ -2438,14 +2438,16 @@ function _jacobian_lag(pl, snes)
     return lag[]
 end
 
+_set_jacobian_lag!(pl, snes, lag) = _check_code(
+    ccall(
+        _symbol(pl, :SNESSetLagJacobian), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, LibPETSc.PetscInt), snes, LibPETSc.PetscInt(lag),
+    ),
+)
+
 # TSStep_RosW lifts its Jacobian lag only after its last stage, so a failed stage leaves it frozen.
 function _unfreeze_jacobian!(pl, snes)
-    _jacobian_lag(pl, snes) < 0 && _check_code(
-        ccall(
-            _symbol(pl, :SNESSetLagJacobian), LibPETSc.PetscErrorCode,
-            (LibPETSc.CSNES, LibPETSc.PetscInt), snes, LibPETSc.PetscInt(1),
-        ),
-    )
+    _jacobian_lag(pl, snes) < 0 && _set_jacobian_lag!(pl, snes, 1)
     return nothing
 end
 
@@ -6067,6 +6069,12 @@ function _setup(
             end
             fixed || !_uses_ifunction(alg) ||
                 _retry_failed_solves!(petsclib, ts, ctx, ptrs.stage_check, effective_options)
+            # PETSc's Newton forms a Jacobian at every iteration. From BDF's extrapolated guess
+            # one per solve, formed again after five iterations, takes about the same steps; a
+            # fixed step cannot retry a solve that fails, so it keeps one per iteration.
+            !fixed && running == "bdf" &&
+                !any(o -> _names_option(o, "snes_lag_jacobian"), effective_options) &&
+                _set_jacobian_lag!(petsclib, _snes(petsclib, ts.ptr), 5)
             fixed || _uses_ifunction(alg) ||
                 _set_stage_check!(petsclib, ts, ctx, ptrs.attempt_check)
             ctx.linear = _uses_ifunction(alg) &&
