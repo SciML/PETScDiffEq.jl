@@ -14320,6 +14320,26 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing), dt = 0.1, adaptive = false,
             )
         end
+
+        @testset "alpha and alpha2 refuse ksponly, which leaves their velocity stale" begin
+            osc = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
+            pair!(du, u, p, t) = (du[1] = u[2]; du[2] = -u[1]; nothing)
+            plain = SciMLBase.ODEProblem(pair!, [1.0, 0.0], (0.0, 1.0))
+            ksponly = ["-snes_type", "ksponly"]
+            fixed = (; dt = 0.01, adaptive = false)
+            for (prob, alg) in (
+                    (osc, PETScDiffEq.TSAlpha2(ksponly)),
+                    (osc, PETScDiffEq.TSAlpha2([ksponly; "-pc_type"; "lu"])),
+                    (osc, PETScDiffEq.TSAlpha2(["-snes_type", "ksptransposeonly"])),
+                    (plain, PETScDiffEq.TSGeneric("alpha", ksponly)),
+                    (plain, PETScDiffEq.TSImplicit("cn", ["-ts_type"; "alpha"; ksponly])),
+                )
+                @test_throws "stale velocity" SciMLBase.solve(prob, alg; fixed...)
+                @test_throws "stale velocity" SciMLBase.init(prob, alg; fixed...)
+            end
+            newton = PETScDiffEq.TSAlpha2(["-snes_max_it", "1"])
+            @test final_err(SciMLBase.solve(osc, newton; fixed...), osc_exact(1.0)) < 1.0e-5
+        end
     end
 
     @testset "MPI" begin

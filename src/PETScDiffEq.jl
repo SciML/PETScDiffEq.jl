@@ -539,7 +539,9 @@ from a `jac`, which is the Jacobian of the first-order system `[v; u]' = [f(v, u
 without one from `autodiff`, as for [`TSImplicit`](@ref). A sparse `jac_prototype` of that
 system keeps the `n` by `n` matrix PETSc factors sparse: a `jac` fills the prototype's
 structure, and without one the Jacobian is coloured, by SparseMatrixColorings under AD or by
-PETSc under `AutoFiniteDiff`, as for `TSImplicit`. A mass matrix is refused. Until
+PETSc under `AutoFiniteDiff`, as for `TSImplicit`. A mass matrix is refused, and so is
+`-snes_type ksponly`, since PETSc forms each step's velocity while evaluating the residual,
+which ksponly never does at its solution. Until
 SciMLBase's `DynamicalODEFunction` can be rebuilt with a `jac_prototype`, `solve` and `init`
 fail on one before reaching this package, so give such a problem to `SciMLBase.__solve` or
 `SciMLBase.__init`.
@@ -592,7 +594,8 @@ a `jac` gets its Jacobian from `autodiff`, as for [`TSImplicit`](@ref).
 A type another constructor covers, such as `"bdf"` or `"beuler"`, is treated as that
 constructor treats it. Whether any other type adapts is not known here, so it needs `dt`
 and gets no tolerance warning. Only `"euler"` and `"alpha"` have been run through this
-package's own convergence tests.
+package's own convergence tests. `"alpha"` refuses `-snes_type ksponly`, as
+[`TSAlpha2`](@ref) does.
 
 `"discgrad"`, `"eimex"`, `"mimex"` and `"mprk"` are refused: each is driven through a
 PETSc setup call this package does not make, and without it they crash or integrate to
@@ -5954,6 +5957,17 @@ function _setup(
             _refuse_span_options(petsclib, ts, t0, _max_time(tf))
             running = _running_name(petsclib, ts)
             _refuse_method(running, has_mass, has_jac, is_split, is_dae)
+            if running in ("alpha", "alpha2")
+                snes_type = _snes_type(petsclib, ts.ptr)
+                snes_type in ("ksponly", "ksptransposeonly") && throw(
+                    ArgumentError(
+                        "PETSc's `$running` forms each step's velocity while evaluating " *
+                            "its residual, which `-snes_type $snes_type` never does at " *
+                            "its solution, so every step would start from a stale " *
+                            "velocity; use the default Newton solve",
+                    ),
+                )
+            end
             if chosen == "irk" && dm !== nothing
                 _irk_on_dm!(h, N, ptrs.dm_ijacobian, ctxptr)
             elseif chosen == "irk" && comm !== nothing
