@@ -2790,6 +2790,16 @@ function _option_flag(opts, name)
     return value
 end
 
+# PETSc refuses a negative, infinite or NaN value itself, so `tol` stays for those.
+function _option_tol(opts, name, tol)
+    i = findlast(o -> _names_option(o, name), opts)
+    i === nothing && return tol
+    value = occursin("=", opts[i]) ? last(split(opts[i], "="; limit = 2)) :
+        i < length(opts) && !startswith(opts[i + 1], "-") ? opts[i + 1] : ""
+    x = tryparse(Float64, value)
+    return x !== nothing && 0 <= x < Inf ? x : tol
+end
+
 const QUIET_FAILED_STEPS = Ref(true)
 
 # Printing nothing also stops PETSc treating the next traceback as part of this one.
@@ -4539,6 +4549,8 @@ mutable struct TSHandles{CTX, L, R, S}
     init_failed::Bool
     f_init::Any
     jac_init::Any
+    abstol::Any
+    reltol::Any
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -5557,6 +5569,9 @@ function _setup(
         _check_tol(abstol, n, "abstol")
         _check_tol(reltol, n, "reltol")
     end
+    options = vcat(alg.petsc_options, extra_options)
+    abstol = _option_tol(options, "ts_atol", abstol)
+    reltol = _option_tol(options, "ts_rtol", reltol)
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
     jac_init = jac_fn
     du0 = _start_du(prob, u0)
@@ -5704,7 +5719,7 @@ function _setup(
         t0, tf, tdir, u0, save_start, save_end, end_saveat, false, 0, false,
         false,
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
-        !initialized, f_init, jac_init,
+        !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -5842,7 +5857,6 @@ function _setup(
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
             )
-            _set_tolerances!(h, something(abstol, 1.0e-6), something(reltol, 1.0e-3))
             # With a dm the Krylov vectors come from the DM inside the solve, under these options.
             effective_options = ["-ts_error_if_step_fails", "false", "-vec_mdot_use_gemv", "0"]
             # TSSetMaxTime reads -1 as PETSC_DETERMINE; the option is stored as given.
@@ -5895,6 +5909,8 @@ function _setup(
             # The integrator resets PETSc's step limit from maxiters before each step.
             limit = LibPETSc.TSGetMaxSteps(petsclib, ts)
             limit == _maxsteps(ctx.maxiters) || (ctx.maxiters = Int(limit))
+            # Set after the options, so PETSc runs with the tolerances `_option_tol` read.
+            _set_tolerances!(h, h.abstol, h.reltol)
             # An option can change the type or subtype, so refuse on what PETSc runs.
             chosen = LibPETSc.TSGetType(petsclib, ts)
             alg isa Union{TSBasicSymplectic, TSAlpha2} && chosen != _ts_type(alg) && throw(
@@ -6592,8 +6608,7 @@ function _make_opts(
     ctx = h.ctx
     return PETScIntegratorOpts(
         h, get(kwargs, :adaptive, true) === true,
-        _own_tol(_flat_tol(get(kwargs, :abstol, 1.0e-6), _state_size(h), "abstol")),
-        _own_tol(_flat_tol(get(kwargs, :reltol, 1.0e-3), _state_size(h), "reltol")),
+        _own_tol(h.abstol), _own_tol(h.reltol),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
         get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,

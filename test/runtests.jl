@@ -1695,6 +1695,45 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test counts(SciMLBase.solve!(integ)) == want
     end
 
+    @testset "-ts_atol and -ts_rtol are the tolerances, as abstol and reltol are" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        opts = ["-ts_rtol", "1e-2", "-ts_atol", "1e-2"]
+        given = PETScDiffEq.TSRK("5dp", opts)
+        want = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); abstol = 1.0e-2, reltol = 1.0e-2)
+        same(sol) = sol.t == want.t && sol.u == want.u
+        @test same(SciMLBase.solve(prob, given))
+        @test same(SciMLBase.solve(prob, given; abstol = 1.0e-10, reltol = 1.0e-10))
+        @test same(SciMLBase.solve(prob, given; abstol = [1.0e-10], reltol = [1.0e-10]))
+        @test same(
+            SciMLBase.solve(
+                prob, PETScDiffEq.TSRK("5dp", ["-TS_RTOL=1e-2", "-ts_atol=1e-2"]);
+                abstol = 1.0e-10, reltol = 1.0e-10,
+            ),
+        )
+        integ = SciMLBase.init(prob, given; abstol = 1.0e-10, reltol = 1.0e-10)
+        @test (integ.opts.abstol, integ.opts.reltol) == (1.0e-2, 1.0e-2)
+        @test same(SciMLBase.solve!(integ))
+        SciMLBase.reinit!(integ)
+        @test (integ.opts.abstol, integ.opts.reltol) == (1.0e-2, 1.0e-2)
+        @test same(SciMLBase.solve!(integ))
+        lag!(du, u, p, t) = (du[1] = -u[1]; du[2] = u[1] - u[2]; nothing)
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(lag!; mass_matrix = Diagonal([1.0, 0.0])), [1.0, 1.001],
+            (0.0, 1.0),
+        )
+        @test_throws SciMLBase.CheckInitFailureError SciMLBase.solve(
+            mass, PETScDiffEq.TSImplicit("bdf"),
+        )
+        sol = SciMLBase.solve(mass, PETScDiffEq.TSImplicit("bdf", opts))
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        # The keywords the options replace are still checked, as maxiters is under -ts_max_steps.
+        for kw in (
+                (; abstol = -1.0), (; abstol = NaN), (; reltol = Inf), (; abstol = [1.0e-6, 1.0e-6]),
+            )
+            @test_throws ArgumentError SciMLBase.solve(prob, given; kw...)
+        end
+    end
+
     @testset "the loaded PETSc has the index width the wrappers assume" begin
         lib = PETScDiffEq.PETSc.getlib(PetscScalar = Float64)
         @test PETScDiffEq._check_inttype(lib) === nothing
