@@ -2305,6 +2305,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         )
         @test SciMLBase.solve(dae, PETScDiffEq.TSDAE("bdf"); fixed..., tstops = [0.5]).retcode ==
             SciMLBase.ReturnCode.Success
+        # PETSc's previous time stays at zero through glle's solve.
+        for (span, dt) in (((-1.0, 0.0), 0.125), ((1.0, 0.0), -0.125)), adaptive in (false, true)
+            sol = SciMLBase.solve(SciMLBase.ODEProblem(decay!, [1.0], span), glle; dt, adaptive)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.u[end][1] ≈ exp(span[1] - span[2]) rtol = 1.0e-2
+        end
         # A first step past the span is cut only by TSSolve's MATCHSTEP.
         for (tf, kw) in ((1.0f0, (; saveat = 0.25f0)), (0.05f0, (;)))
             single = SciMLBase.solve(

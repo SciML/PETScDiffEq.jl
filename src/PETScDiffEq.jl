@@ -6232,7 +6232,8 @@ function _solve_unlocked(
     try
         fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
         _match_steps_here!(h)
-        ctx.halt_stalled = ctx.comm === nothing
+        # glle never moves PETSc's previous time, and its loop reads no stop.
+        ctx.halt_stalled = ctx.comm === nothing && LibPETSc.TSGetType(pl, h.ts) != "glle"
         if fixed || ctx.halt_stalled
             ctx.halt_nonfinite = fixed
             _set_post_step!(pl, h.ts, ctx)
