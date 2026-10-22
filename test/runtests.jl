@@ -10489,6 +10489,59 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test SciMLBase.solve(prob, rk; tol..., callback = flagged).stats.nf >= nf + n
     end
 
+    @testset "a discontinuity flagged between steps is taken before the next step" begin
+        scaled!(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
+        for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSARKIMEX("3"))
+            scaled = SciMLBase.ODEProblem(scaled!, [1.0], (0.0, 1.0), [1.0])
+            integ = SciMLBase.init(scaled, alg; dt = 0.1, adaptive = false)
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            integ.p[1] = 3.0
+            SciMLBase.derivative_discontinuity!(integ, true)
+            SciMLBase.step!(integ)
+            # Measured: 2.0e-7 and 1.1e-4, against 1.1e-2 and 2.7e-2 from the old p's slope.
+            @test abs(integ.u[1] - exp(-0.5)) < 1.0e-3
+            SciMLBase.terminate!(integ)
+        end
+        mass!(du, u, p, t) = (du[1] = -u[1]; du[2] = u[2] - 2u[1]; nothing)
+        residual!(r, du, u, p, t) = (r[1] = du[1] + u[1]; r[2] = u[2] - 2u[1]; nothing)
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(mass!; mass_matrix = Diagonal([1.0, 0.0])), [1.0, 2.0],
+            (0.0, 1.0),
+        )
+        dae = SciMLBase.DAEProblem(
+            residual!, [-1.0, 0.0], [1.0, 2.0], (0.0, 1.0); differential_vars = [true, false],
+        )
+        brown = DiffEqBase.BrownFullBasicInit()
+        balanced(u) = abs(u[2] - 2u[1]) < 1.0e-8
+        for (prob, alg) in (
+                (mass, PETScDiffEq.TSImplicit("bdf")), (mass, PETScDiffEq.TSRosW()),
+                (dae, PETScDiffEq.TSDAE()),
+            )
+            integ = SciMLBase.init(prob, alg; initializealg = brown)
+            SciMLBase.step!(integ, 0.5, true)
+            integ.u[1] *= 2
+            SciMLBase.derivative_discontinuity!(integ, true)
+            SciMLBase.step!(integ)
+            @test integ.t > 0.5
+            @test balanced(integ.u)
+            SciMLBase.set_u!(integ, [integ.u[1], 5.0])
+            SciMLBase.step!(integ)
+            @test balanced(integ.u)
+            @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
+
+            integ = SciMLBase.init(prob, alg)
+            SciMLBase.step!(integ, 0.5, true)
+            SciMLBase.derivative_discontinuity!(integ, true)
+            SciMLBase.step!(integ)
+            @test integ.t > 0.5
+            integ.u[2] = 5.0
+            SciMLBase.derivative_discontinuity!(integ, true)
+            @test_throws SciMLBase.CheckInitFailureError SciMLBase.step!(integ)
+            SciMLBase.terminate!(integ)
+        end
+    end
+
     @testset "isadaptive is whether PETSc adapts the method" begin
         for alg in (
                 PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"), PETScDiffEq.TSARKIMEX("3"),
