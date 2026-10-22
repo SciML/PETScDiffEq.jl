@@ -9312,6 +9312,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             ), [1.0, 2.0], (0.0, 1.0),
         )
         @test_throws "not a MatrixOperator of a Array" SciMLBase.solve(dense, world)
+        scaled!(du, u, p, t) = (du .= -p[1] .* u; nothing)
+        gradient(mass) = PETScDiffEq._discrete_adjoint(
+            SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(scaled!; mass_matrix = mass), [1.0, 2.0], (0.0, 1.0), [1.0],
+            ), PETScDiffEq.TSImplicit("cn"), PETScAdjoint(); t = [1.0],
+            dgdu_discrete = (out, u, p, t, i) -> (out .= u; nothing), dt = 0.01, adaptive = false,
+        )
+        identities = (
+            SciMLOperators.IdentityOperator(2), SciMLOperators.MatrixOperator(Diagonal(ones(2))),
+        )
+        for mass in identities
+            @test gradient(mass) == gradient(I)
+        end
+        @test_throws "PETScAdjoint does not support a mass matrix" gradient(
+            SciMLOperators.ScalarOperator(2.0),
+        )
     end
 
     @testset "a discrete problem is refused" begin
