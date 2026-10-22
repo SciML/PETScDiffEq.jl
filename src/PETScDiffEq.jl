@@ -5417,7 +5417,8 @@ function _setup(
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     comm = _distributed(alg) ? alg.comm : nothing
     shape === nothing || _refuse_shaped(is_dae, comm, _alg_dm(alg))
-    mass_matrix = is_dae ? nothing : _mass_of(prob)
+    # Each rank has its own mass matrix, so one rank alone can refuse it.
+    mass_matrix = is_dae ? nothing : _checked_everywhere(() -> _mass_of(prob), comm)
     own_mass = !(mass_matrix === nothing || mass_matrix == LinearAlgebra.I)
     has_mass = _anywhere(comm, own_mass)
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
