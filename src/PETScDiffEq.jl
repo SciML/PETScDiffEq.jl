@@ -2607,31 +2607,30 @@ function _retry_failed_solves!(pl, ts, ctx, ptr, opts)
 end
 
 function _pivot_raises(pl, ts)
-    lib = Libdl.dlopen(pl.petsc_library)
     snes, ksp = Ref{LibPETSc.CSNES}(C_NULL), Ref{LibPETSc.CKSP}(C_NULL)
     raises = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE)
     snes_raises = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE)
     _check_code(
         ccall(
-            Libdl.dlsym(lib, :TSGetSNES), LibPETSc.PetscErrorCode,
+            _symbol(pl, :TSGetSNES), LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
         ),
     )
     _check_code(
         ccall(
-            Libdl.dlsym(lib, :SNESGetKSP), LibPETSc.PetscErrorCode,
+            _symbol(pl, :SNESGetKSP), LibPETSc.PetscErrorCode,
             (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}), snes[], ksp,
         ),
     )
     _check_code(
         ccall(
-            Libdl.dlsym(lib, :KSPGetErrorIfNotConverged), LibPETSc.PetscErrorCode,
+            _symbol(pl, :KSPGetErrorIfNotConverged), LibPETSc.PetscErrorCode,
             (LibPETSc.CKSP, Ptr{LibPETSc.PetscBool}), ksp[], raises,
         ),
     )
     _check_code(
         ccall(
-            Libdl.dlsym(lib, :SNESGetErrorIfNotConverged), LibPETSc.PetscErrorCode,
+            _symbol(pl, :SNESGetErrorIfNotConverged), LibPETSc.PetscErrorCode,
             (LibPETSc.CSNES, Ptr{LibPETSc.PetscBool}), snes[], snes_raises,
         ),
     )
@@ -2675,29 +2674,28 @@ function _count_solves!(pl, ts, ctx, ctxptr)
 end
 
 function _set_pc_type!(pl, ts, type)
-    lib = Libdl.dlopen(pl.petsc_library)
     snes, ksp = Ref{LibPETSc.CSNES}(C_NULL), Ref{LibPETSc.CKSP}(C_NULL)
     pc = Ref{Ptr{Cvoid}}(C_NULL)
     _check_code(
         ccall(
-            Libdl.dlsym(lib, :TSGetSNES), LibPETSc.PetscErrorCode,
+            _symbol(pl, :TSGetSNES), LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
         ),
     )
     _check_code(
         ccall(
-            Libdl.dlsym(lib, :SNESGetKSP), LibPETSc.PetscErrorCode,
+            _symbol(pl, :SNESGetKSP), LibPETSc.PetscErrorCode,
             (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}), snes[], ksp,
         ),
     )
     _check_code(
         ccall(
-            Libdl.dlsym(lib, :KSPGetPC), LibPETSc.PetscErrorCode,
+            _symbol(pl, :KSPGetPC), LibPETSc.PetscErrorCode,
             (LibPETSc.CKSP, Ptr{Ptr{Cvoid}}), ksp[], pc,
         ),
     )
     code = ccall(
-        Libdl.dlsym(lib, :PCSetType), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Cstring), pc[], type,
+        _symbol(pl, :PCSetType), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Cstring), pc[], type,
     )
     code == 0 || throw(LibPETSc.PetscError(code))
     return nothing
@@ -2761,16 +2759,15 @@ _dense_jacobian_cb(
 
 # Without a matrix PETSc makes a dense one for the SNES, which it differences column by column.
 function _difference_jacobian!(pl, ts, mat, ctxptr)
-    lib = Libdl.dlopen(pl.petsc_library)
     snes = Ref{LibPETSc.CSNES}(C_NULL)
     _check_code(
         ccall(
-            Libdl.dlsym(lib, :TSGetSNES), LibPETSc.PetscErrorCode,
+            _symbol(pl, :TSGetSNES), LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
         ),
     )
     code = ccall(
-        Libdl.dlsym(lib, :SNESSetJacobian), LibPETSc.PetscErrorCode,
+        _symbol(pl, :SNESSetJacobian), LibPETSc.PetscErrorCode,
         (LibPETSc.CSNES, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid}, Ptr{Cvoid}),
         snes[], something(mat, C_NULL), something(mat, C_NULL),
         mat === nothing ? DENSE_JACOBIAN_PTR[] : COLOUR_JACOBIAN_PTR[], ctxptr,
@@ -2849,11 +2846,10 @@ function _petsc_interpolate!(ctx, ts, s)
     # PETSc prints a traceback before refusing, so ask with printing off. Some types
     # register an interpolant that writes nothing, so prefill NaN to catch that.
     PETScCompat.with_local_array!(w -> fill!(w, NaN), ctx.work; read = false, write = true)
-    lib = Libdl.dlopen(pl.petsc_library)
     _check_code(
         ccall(
-            Libdl.dlsym(lib, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
-            (Ptr{Cvoid}, Ptr{Cvoid}), Libdl.dlsym(lib, :PetscReturnErrorHandler), C_NULL,
+            _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Cvoid}), _symbol(pl, :PetscReturnErrorHandler), C_NULL,
         ),
     )
     try
@@ -2863,7 +2859,7 @@ function _petsc_interpolate!(ctx, ts, s)
         ctx.interpolates = false
         return nothing
     finally
-        _check_code(ccall(Libdl.dlsym(lib, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ()))
+        _check_code(ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ()))
     end
     written = _anywhere(
         ctx.comm,
