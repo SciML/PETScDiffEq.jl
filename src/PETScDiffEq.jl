@@ -3079,6 +3079,10 @@ function _checked_jac(A, J)
     )
 end
 
+# Another AbstractODEFunction, such as SciMLSensitivity's forward sensitivity one, is called whole.
+_rhs(f::Union{SciMLBase.ODEFunction, SciMLBase.DAEFunction}) = f.f
+_rhs(f) = f
+
 _as_inplace(f, iip::Bool) = iip ? f :
     (du, u, p, t) -> (du .= _checked_rhs(f(u, p, t), length(du)); nothing)
 _as_inplace_jac(j, iip::Bool) = iip ? j :
@@ -5502,7 +5506,7 @@ function _setup(
     # SciMLBase's wrapper is typed for the problem's types, so unwrap where PETSc's differ.
     unwrap = prob.u0 isa Array && eltype(prob.u0) === S && eltype(prob.tspan) === R ?
         identity : SciMLBase.unwrapped_f
-    f1 = dyn ? _partitioned(prob.f, iip, nv) : unwrap(is_split ? prob.f.f1.f : prob.f.f)
+    f1 = dyn ? _partitioned(prob.f, iip, nv) : unwrap(is_split ? prob.f.f1.f : _rhs(prob.f))
     is_dae && !iip &&
         throw(ArgumentError("PETScDiffEq requires an in-place DAEProblem residual"))
     f2 = is_split ? unwrap(prob.f.f2.f) : nothing
@@ -5533,7 +5537,7 @@ function _setup(
         nothing
     elseif builds_jac
         # Dual numbers need the unwrapped function.
-        f_ad = dyn ? f1 : SciMLBase.unwrapped_f(is_split ? prob.f.f1.f : prob.f.f)
+        f_ad = dyn ? f1 : SciMLBase.unwrapped_f(is_split ? prob.f.f1.f : _rhs(prob.f))
         user_t0 = R(prob.tspan[1])
         advice = something(jac_advice, is_dae ? _DAE_ADVICE : _ODE_ADVICE)
         if dm !== nothing
