@@ -2793,6 +2793,16 @@ function _option_flag(opts, name)
     return value
 end
 
+# PETSc refuses a negative, infinite or NaN value itself, so `tol` stays for those.
+function _option_tol(opts, name, tol)
+    i = findlast(o -> _names_option(o, name), opts)
+    i === nothing && return tol
+    value = occursin("=", opts[i]) ? last(split(opts[i], "="; limit = 2)) :
+        i < length(opts) && !startswith(opts[i + 1], "-") ? opts[i + 1] : ""
+    x = tryparse(Float64, value)
+    return x !== nothing && 0 <= x < Inf ? x : tol
+end
+
 const QUIET_FAILED_STEPS = Ref(true)
 
 # Printing nothing also stops PETSc treating the next traceback as part of this one.
@@ -3071,6 +3081,10 @@ function _checked_jac(A, J)
         ),
     )
 end
+
+# Another AbstractODEFunction, such as SciMLSensitivity's forward sensitivity one, is called whole.
+_rhs(f::Union{SciMLBase.ODEFunction, SciMLBase.DAEFunction}) = f.f
+_rhs(f) = f
 
 _as_inplace(f, iip::Bool) = iip ? f :
     (du, u, p, t) -> (du .= _checked_rhs(f(u, p, t), length(du)); nothing)
@@ -4542,6 +4556,8 @@ mutable struct TSHandles{CTX, L, R, S}
     init_failed::Bool
     f_init::Any
     jac_init::Any
+    abstol::Any
+    reltol::Any
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -5365,6 +5381,7 @@ function _setup(
         jac_advice = nothing,
         eltypes = _eltypes(problem),
         initializealg = DiffEqBase.DefaultInit(),
+        direction = 1,
         kwargs...,
     )
     prob = _summed(problem, alg)
@@ -5441,11 +5458,10 @@ function _setup(
 
     R, S, U = eltypes
     t0, tf = R(prob.tspan[1]), R(prob.tspan[2])
-    t0 == tf && throw(ArgumentError("PETScDiffEq requires tspan[1] != tspan[2]"))
     isfinite(t0) || throw(ArgumentError("`tspan[1]` is $t0; the solve has to start at a finite time"))
     isnan(tf) && throw(ArgumentError("`tspan[2]` is NaN"))
     # From here on, times are PETSc's forward-running s = tdir * t.
-    tdir = t0 < tf ? one(R) : -one(R)
+    tdir = t0 == tf ? R(direction) : t0 < tf ? one(R) : -one(R)
     t0, tf = tdir * t0, tdir * tf
 
     u0 = Vector{S}(vec(prob.u0))
@@ -5493,7 +5509,7 @@ function _setup(
     # SciMLBase's wrapper is typed for the problem's types, so unwrap where PETSc's differ.
     unwrap = prob.u0 isa Array && eltype(prob.u0) === S && eltype(prob.tspan) === R ?
         identity : SciMLBase.unwrapped_f
-    f1 = dyn ? _partitioned(prob.f, iip, nv) : unwrap(is_split ? prob.f.f1.f : prob.f.f)
+    f1 = dyn ? _partitioned(prob.f, iip, nv) : unwrap(is_split ? prob.f.f1.f : _rhs(prob.f))
     is_dae && !iip &&
         throw(ArgumentError("PETScDiffEq requires an in-place DAEProblem residual"))
     f2 = is_split ? unwrap(prob.f.f2.f) : nothing
@@ -5524,7 +5540,7 @@ function _setup(
         nothing
     elseif builds_jac
         # Dual numbers need the unwrapped function.
-        f_ad = dyn ? f1 : SciMLBase.unwrapped_f(is_split ? prob.f.f1.f : prob.f.f)
+        f_ad = dyn ? f1 : SciMLBase.unwrapped_f(is_split ? prob.f.f1.f : _rhs(prob.f))
         user_t0 = R(prob.tspan[1])
         advice = something(jac_advice, is_dae ? _DAE_ADVICE : _ODE_ADVICE)
         if dm !== nothing
@@ -5560,6 +5576,9 @@ function _setup(
         _check_tol(abstol, n, "abstol")
         _check_tol(reltol, n, "reltol")
     end
+    options = vcat(alg.petsc_options, extra_options)
+    abstol = _option_tol(options, "ts_atol", abstol)
+    reltol = _option_tol(options, "ts_rtol", reltol)
     ad_before = ad_calls === nothing ? 0 : ad_calls[]
     jac_init = jac_fn
     du0 = _start_du(prob, u0)
@@ -5707,7 +5726,7 @@ function _setup(
         t0, tf, tdir, u0, save_start, save_end, end_saveat, false, 0, false,
         false,
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
-        !initialized, f_init, jac_init,
+        !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -5845,7 +5864,6 @@ function _setup(
             LibPETSc.TSSetExactFinalTime(
                 petsclib, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP,
             )
-            _set_tolerances!(h, something(abstol, 1.0e-6), something(reltol, 1.0e-3))
             # With a dm the Krylov vectors come from the DM inside the solve, under these options.
             effective_options = ["-ts_error_if_step_fails", "false", "-vec_mdot_use_gemv", "0"]
             # TSSetMaxTime reads -1 as PETSC_DETERMINE; the option is stored as given.
@@ -5898,6 +5916,8 @@ function _setup(
             # The integrator resets PETSc's step limit from maxiters before each step.
             limit = LibPETSc.TSGetMaxSteps(petsclib, ts)
             limit == _maxsteps(ctx.maxiters) || (ctx.maxiters = Int(limit))
+            # Set after the options, so PETSc runs with the tolerances `_option_tol` read.
+            _set_tolerances!(h, h.abstol, h.reltol)
             # An option can change the type or subtype, so refuse on what PETSc runs.
             chosen = LibPETSc.TSGetType(petsclib, ts)
             alg isa Union{TSBasicSymplectic, TSAlpha2} && chosen != _ts_type(alg) && throw(
@@ -6119,7 +6139,8 @@ function _assemble(
         end
         _record!(ctx, tend, uend)
     end
-    if !h.save_end && !isempty(ctx.ts) && abs(ctx.ts[end] - tf) <= tol
+    # A zero span's point at tf is its start, which save_start keeps.
+    if !h.save_end && t0 != tf && !isempty(ctx.ts) && abs(ctx.ts[end] - tf) <= tol
         pop!(ctx.ts)
         pop!(ctx.us)
         ctx.dense && pop!(ctx.dus)
@@ -6203,13 +6224,14 @@ function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
-    # MPRK and basicsymplectic miss tf, Float32 landing refuses short steps, and
-    # isoutofdomain retries steps.
+    R = first(_eltypes(prob))
+    # MPRK and basicsymplectic miss tf, Float32 landing refuses short steps,
+    # isoutofdomain retries steps, and the integrator ends a zero span without a step.
     if !_no_callback(callback) || _late(tstops) || !isempty(tstops) ||
             !isempty(d_discontinuities) ||
             alg isa Union{TSMPRK, TSBasicSymplectic} ||
             get(kwargs, :isoutofdomain, nothing) !== nothing ||
-            first(_eltypes(prob)) === Float32
+            R === Float32 || R(prob.tspan[1]) == R(prob.tspan[2])
         integ = _init_unlocked(
             prob, alg; callback = callback, tstops = tstops,
             d_discontinuities = d_discontinuities, kwargs...,
@@ -6606,8 +6628,7 @@ function _make_opts(
     ctx = h.ctx
     return PETScIntegratorOpts(
         h, get(kwargs, :adaptive, true) === true,
-        _own_tol(_flat_tol(get(kwargs, :abstol, 1.0e-6), _state_size(h), "abstol")),
-        _own_tol(_flat_tol(get(kwargs, :reltol, 1.0e-3), _state_size(h), "reltol")),
+        _own_tol(h.abstol), _own_tol(h.reltol),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
         get(kwargs, :verbose, true), get(kwargs, :force_dtmin, false) === true,
@@ -6712,6 +6733,7 @@ function _set_u_unlocked(integ::PETScIntegrator, u)
     integ.finished && return nothing
     _write_state!(integ.h, integ.u)
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
+    integ.derivative_discontinuity = true
     return nothing
 end
 
@@ -7243,6 +7265,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
         (_stop!(integ, best_cb, stop, pre, best_crossing, modified); return true)
     modified && _reinitialize!(integ, best_cb.initializealg, before, slope)
     integ.finished && return true
+    integ.derivative_discontinuity = false
     if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
         dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
     end
@@ -7280,6 +7303,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
             # A cleared flag keeps BDF's past states and an FSAL slope, as OrdinaryDiffEq's do.
             _take_written_state!(integ, false)
         end
+        integ.derivative_discontinuity = false
         if cb.save_positions[2]
             _save_here!(integ)
             _save_discretes!(integ, cb)
@@ -7453,6 +7477,18 @@ function _take_written_state!(integ::PETScIntegrator, restart::Bool = true)
     return nothing
 end
 
+function _take_discontinuity!(integ::PETScIntegrator)
+    h = integ.h
+    integ.derivative_discontinuity = false
+    # `set_u!` leaves `end_u` behind, so only a state nothing touched passes as consistent.
+    _reinitialize!(integ, nothing, copy(h.ctx.end_u))
+    integ.finished && return nothing
+    _write_state!(h, integ.u)
+    LibPETSc.TSRestartStep(h.petsclib, h.ts)
+    _dirty!(h.ctx)
+    return nothing
+end
+
 _times(R, ts) = ts isa Number ? [R(ts)] : collect(R, ts)
 
 # SciMLBase's late-binding form: `tstops(p, tspan)`, called once the problem is initialized.
@@ -7588,7 +7624,10 @@ function _reinit_unlocked(
     if !erase_sol && !old.ctx.dense && old.ctx.save_idxs !== nothing && !isempty(old.ctx.ts)
         setup_kwargs = merge(setup_kwargs, (dense = false,))
     end
-    h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
+    h = _setup(
+        prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...,
+        direction = integ.tdir,
+    )
     try
         _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
         _match_steps_here!(h)
@@ -7844,27 +7883,35 @@ function _match_steps_here!(h::TSHandles{<:Any, <:Any, R}) where {R}
 end
 
 # PETSc's MATCHSTEP rule, so no sliver is left before the stop.
+function _match_step!(pl, ts, remaining, s, fixed)
+    p = LibPETSc.TSGetTimeStep(pl, ts)
+    q = p * oftype(p, 1.01) > remaining ? remaining : 2p > remaining ? remaining / 2 : p
+    fixed || (q = max(q, min(remaining, _min_step(s))))
+    q == p || LibPETSc.TSSetTimeStep(pl, ts, q)
+    return p
+end
+
 function _match_step!(integ::PETScIntegrator, remaining)
     h = integ.h
-    pl, s = h.petsclib, integ.tdir * integ.t
-    p = LibPETSc.TSGetTimeStep(pl, h.ts)
+    p = _match_step!(h.petsclib, h.ts, remaining, integ.tdir * integ.t, h.fixed)
     h.fixed || (integ.dtcache = integ.tdir * p)
-    q = p * oftype(p, 1.01) > remaining ? remaining : 2p > remaining ? remaining / 2 : p
-    h.fixed || (q = max(q, min(remaining, _min_step(s))))
-    q == p || LibPETSc.TSSetTimeStep(pl, h.ts, q)
     return nothing
+end
+
+function _resumed_step(pl, ts, dtcache, stop, matches, fixed)
+    matches && return fixed ? dtcache : max(dtcache, _min_step(stop))
+    fixed && return dtcache
+    # PETSc cuts its proposal only while its clock is short of its max time.
+    LibPETSc.TSGetTime(pl, ts) < LibPETSc.TSGetMaxTime(pl, ts) && return dtcache
+    return max(dtcache, LibPETSc.TSGetTimeStep(pl, ts))
 end
 
 function _resumed_step(integ::PETScIntegrator, stop)
     h = integ.h
-    h.matches && return h.fixed ? integ.tdir * integ.dtcache :
-        max(integ.tdir * integ.dtcache, _min_step(stop))
-    _fixed_step(h) && return integ.tdir * integ.dtcache
-    pl = h.petsclib
-    # PETSc cuts its proposal only while its clock is short of its max time.
-    LibPETSc.TSGetTime(pl, h.ts) < LibPETSc.TSGetMaxTime(pl, h.ts) &&
-        return integ.tdir * integ.dtcache
-    return max(integ.tdir * integ.dtcache, LibPETSc.TSGetTimeStep(pl, h.ts))
+    return _resumed_step(
+        h.petsclib, h.ts, integ.tdir * integ.dtcache, stop, h.matches,
+        h.matches ? h.fixed : _fixed_step(h),
+    )
 end
 
 _fixed_step(h::TSHandles) =
@@ -7879,10 +7926,16 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         ),
     )
     h = integ.h
+    # TSStep cannot move a zero span, which ends where it starts.
+    h.t0 == h.tf && return _finish!(integ)
     ctx, pl = h.ctx, h.petsclib
     if _attempts(ctx, pl, h.ts) >= ctx.maxiters
         _finish!(integ)
         return nothing
+    end
+    if outer === nothing && _anywhere(ctx.comm, integ.derivative_discontinuity)
+        _take_discontinuity!(integ)
+        integ.finished && return nothing
     end
     outer === nothing && _take_written_time!(integ)
     outer === nothing && _take_written_state!(integ)
