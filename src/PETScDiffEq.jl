@@ -5374,6 +5374,7 @@ function _setup(
         jac_advice = nothing,
         eltypes = _eltypes(problem),
         initializealg = DiffEqBase.DefaultInit(),
+        direction = 1,
         kwargs...,
     )
     prob = _summed(problem, alg)
@@ -5450,11 +5451,10 @@ function _setup(
 
     R, S, U = eltypes
     t0, tf = R(prob.tspan[1]), R(prob.tspan[2])
-    t0 == tf && throw(ArgumentError("PETScDiffEq requires tspan[1] != tspan[2]"))
     isfinite(t0) || throw(ArgumentError("`tspan[1]` is $t0; the solve has to start at a finite time"))
     isnan(tf) && throw(ArgumentError("`tspan[2]` is NaN"))
     # From here on, times are PETSc's forward-running s = tdir * t.
-    tdir = t0 < tf ? one(R) : -one(R)
+    tdir = t0 == tf ? R(direction) : t0 < tf ? one(R) : -one(R)
     t0, tf = tdir * t0, tdir * tf
 
     u0 = Vector{S}(vec(prob.u0))
@@ -6121,7 +6121,8 @@ function _assemble(
         end
         _record!(ctx, tend, uend)
     end
-    if !h.save_end && !isempty(ctx.ts) && abs(ctx.ts[end] - tf) <= tol
+    # A zero span's point at tf is its start, which save_start keeps.
+    if !h.save_end && t0 != tf && !isempty(ctx.ts) && abs(ctx.ts[end] - tf) <= tol
         pop!(ctx.ts)
         pop!(ctx.us)
         ctx.dense && pop!(ctx.dus)
@@ -6205,13 +6206,14 @@ function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
-    # MPRK and basicsymplectic miss tf, Float32 landing refuses short steps, and
-    # isoutofdomain retries steps.
+    R = first(_eltypes(prob))
+    # MPRK and basicsymplectic miss tf, Float32 landing refuses short steps,
+    # isoutofdomain retries steps, and the integrator ends a zero span without a step.
     if !_no_callback(callback) || _late(tstops) || !isempty(tstops) ||
             !isempty(d_discontinuities) ||
             alg isa Union{TSMPRK, TSBasicSymplectic} ||
             get(kwargs, :isoutofdomain, nothing) !== nothing ||
-            first(_eltypes(prob)) === Float32
+            R === Float32 || R(prob.tspan[1]) == R(prob.tspan[2])
         integ = _init_unlocked(
             prob, alg; callback = callback, tstops = tstops,
             d_discontinuities = d_discontinuities, kwargs...,
@@ -7589,7 +7591,10 @@ function _reinit_unlocked(
     if !erase_sol && !old.ctx.dense && old.ctx.save_idxs !== nothing && !isempty(old.ctx.ts)
         setup_kwargs = merge(setup_kwargs, (dense = false,))
     end
-    h = _setup(prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...)
+    h = _setup(
+        prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...,
+        direction = integ.tdir,
+    )
     try
         _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
         _match_steps_here!(h)
@@ -7888,6 +7893,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         ),
     )
     h = integ.h
+    # TSStep cannot move a zero span, which ends where it starts.
+    h.t0 == h.tf && return _finish!(integ)
     ctx, pl = h.ctx, h.petsclib
     if _attempts(ctx, pl, h.ts) >= ctx.maxiters
         _finish!(integ)

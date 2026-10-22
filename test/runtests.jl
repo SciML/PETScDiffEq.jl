@@ -11425,10 +11425,87 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test_throws ArgumentError SciMLBase.solve(
             pair, PETScDiffEq.TSRK("5dp"); abstol = [1.0e-6, 1.0e-6, 1.0e-6],
         )
-        @test_throws ArgumentError SciMLBase.solve(
-            SciMLBase.ODEProblem(decay!, [1.0], (1.0, 1.0)),
-            PETScDiffEq.TSRK("5dp"); dt = 0.1,
+    end
+
+    @testset "a zero-length tspan holds u0 at t0, as OrdinaryDiffEq's solution does" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.5, 0.5))
+        rk = PETScDiffEq.TSRK("5dp")
+        quiet(f) = Logging.with_logger(f, Logging.NullLogger())
+        for kw in (
+                (;), (save_start = false,), (save_end = false,),
+                (save_start = false, save_end = false), (saveat = [0.5],), (saveat = [0.5, 1.0],),
+                (saveat = [1.0],), (saveat = [0.5], save_end = false), (save_everystep = false,),
+                (dense = false,), (save_idxs = 1,), (dt = 0.1, adaptive = false),
+                (tstops = [0.5],),
+            )
+            theirs = quiet(() -> SciMLBase.solve(prob, Tsit5(); kw...))
+            ours = SciMLBase.solve(prob, rk; kw...)
+            @test ours.retcode == theirs.retcode == SciMLBase.ReturnCode.Success
+            @test ours.t == theirs.t
+            @test ours.u == theirs.u
+            @test ours.dense == theirs.dense
+        end
+        sol = SciMLBase.solve(prob, rk)
+        @test sol.u == [[1.0]]
+        @test sol.u[1] !== prob.u0
+        @test sol(0.5) == [1.0]
+        @test SciMLBase.solve(prob, rk; saveat = 0.1).t == [0.5]
+        for alg in (PETScDiffEq.TSRosW(), PETScDiffEq.TSImplicit("bdf"))
+            @test SciMLBase.solve(prob, alg).u == [[1.0]]
+        end
+        @test SciMLBase.solve(
+            SciMLBase.ODEProblem(decay!, Float32[1.0], (0.5f0, 0.5f0)), rk,
+        ).u == [Float32[1.0]]
+        resid!(r, du, u, p, t) = (r[1] = du[1] + u[1]; nothing)
+        dae = SciMLBase.DAEProblem(resid!, [-1.0], [1.0], (0.5, 0.5))
+        @test SciMLBase.solve(dae, PETScDiffEq.TSDAE()).u == [[1.0]]
+
+        calls = String[]
+        cb = SciMLBase.DiscreteCallback(
+            (u, t, integ) -> (push!(calls, "condition"); true), integ -> push!(calls, "affect");
+            initialize = (c, u, t, integ) -> begin
+                push!(calls, "initialize")
+                integ.u[1] = 2.0
+                SciMLBase.u_modified!(integ, true)
+            end,
+            finalize = (c, u, t, integ) -> push!(calls, "finalize"),
         )
+        for alg in (Tsit5(), rk)
+            empty!(calls)
+            sol = quiet(() -> SciMLBase.solve(prob, alg; callback = cb))
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test (sol.t, sol.u) == ([0.5, 0.5], [[1.0], [2.0]])
+            @test calls == ["initialize", "finalize"]
+        end
+
+        integ = SciMLBase.init(prob, rk)
+        @test (integ.t, integ.u, integ.sol.retcode) == (0.5, [1.0], SciMLBase.ReturnCode.Default)
+        SciMLBase.step!(integ)
+        @test integ.finished
+        @test (integ.sol.retcode, integ.sol.t) == (SciMLBase.ReturnCode.Success, [0.5])
+        integ = SciMLBase.init(SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0)), rk)
+        SciMLBase.reinit!(integ, [3.0]; t0 = 0.5, tf = 0.5)
+        @test (SciMLBase.solve!(integ).t, integ.sol.u) == ([0.5], [[3.0]])
+        SciMLBase.reinit!(integ; t0 = 0.0, tf = 1.0)
+        @test SciMLBase.solve!(integ).t == SciMLBase.solve(integ.prob, rk).t
+        back = SciMLBase.init(SciMLBase.ODEProblem(decay!, [1.0], (1.0, 0.0)), rk)
+        SciMLBase.reinit!(back, [3.0]; t0 = 0.5, tf = 0.5)
+        @test (SciMLBase.solve!(back).t, back.sol.u) == ([0.5], [[3.0]])
+
+        scaled!(du, u, p, t) = (du .= -p[1] .* u; nothing)
+        withp = SciMLBase.ODEProblem(scaled!, [1.0, 2.0], (0.5, 0.5), [3.0])
+        dgdu(out, u, p, t, i) = (out .= u; nothing)
+        for alg in (rk, PETScDiffEq.TSImplicit("beuler"))
+            du0, dp = PETScDiffEq._discrete_adjoint(
+                withp, alg, PETScAdjoint(); dt = 0.1, t = [0.5], dgdu_discrete = dgdu,
+            )
+            @test du0 == [1.0, 2.0]
+            @test iszero(dp)
+        end
+        du0, dp = PETScDiffEq._discrete_adjoint(
+            withp, rk, PETScAdjoint(); g = (u, p, t) -> p[1] * sum(u),
+        )
+        @test iszero(du0) && iszero(dp)
     end
 
     @testset "PETScAdjoint" begin
