@@ -2073,6 +2073,7 @@ _lib_type(::Type{<:TSContext{R, S, A, F, F2, J, B, P, L}}) where {R, S, A, F, F2
 
 _hooked(ts_ptr::Ptr{C}) where {C <: TSContext} =
     POST_STEP_CTX[LibPETSc.CTS(ts_ptr)]::Tuple{C, LibPETSc.TS{_lib_type(C)}}
+_hooked(ts_ptr::LibPETSc.CTS) = POST_STEP_CTX[ts_ptr]::Tuple
 
 function _set_post_step!(pl, ts, ctx)
     POST_STEP_CTX[ts.ptr] = (ctx, ts)
@@ -2498,8 +2499,8 @@ end
 # TSAdaptCheckStage calls this before reading the SNES reason and skips its shrink once a
 # reason is set.
 function _check_stage!(
-        ts_ptr::Ptr{C}, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
-    )::LibPETSc.PetscErrorCode where {C <: TSContext}
+        ts_ptr::Ptr, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
     ctx, ts = _hooked(ts_ptr)
     return _check_stage_body!(ctx, ts, t, y, accept)
 end
@@ -2577,8 +2578,8 @@ function _out_of_attempts!(ctx, pl, ts, accept)
 end
 
 function _check_attempts!(
-        ts_ptr::Ptr{C}, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
-    )::LibPETSc.PetscErrorCode where {C <: TSContext}
+        ts_ptr::Ptr, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode
     ctx, ts = _hooked(ts_ptr)
     # Every stage asks, so the common case skips the `try`; a failed count falls through.
     code, taken = _taken(ctx.petsclib, ts.ptr)
@@ -4159,20 +4160,37 @@ const _CALLBACK_SIGNATURES = (
     attempt_check = (:_check_attempts!, (:PtrC, :R, :CVec, :Ptr)),
 )
 
+_callback_type(a, R, C) = a === :R ? R : a === :RefC ? Ref{C} : a === :PtrC ? Ptr{C} :
+    a === :Ptr ? Ptr{Cvoid} : a === :PetscInt ? LibPETSc.PetscInt : getfield(LibPETSc, a)
+
+# The untyped entry points, for code another package precompiles.
+for (f, args) in values(_CALLBACK_SIGNATURES)
+    last(args) === :RefC || continue
+    xs = [Symbol(:x, i) for i in 1:(length(args) - 1)]
+    @eval $f($(xs...), ctx::Ptr{Cvoid}) = $f($(xs...), unsafe_pointer_to_objref(ctx)::TSContext)
+end
+for R in (Float32, Float64), (name, (f, args)) in pairs(_CALLBACK_SIGNATURES)
+    types = map(a -> a === :RefC ? Ptr{Cvoid} : _callback_type(a, R, Cvoid), args)
+    @eval _untyped_callback(::Val{$(QuoteNode(name))}, ::Type{$R}) =
+        @cfunction($f, _Err, ($(types...),))
+end
+
 const CALLBACKS = Dict{Tuple{Symbol, DataType}, Ptr{Cvoid}}()
 
 # A package image's `@cfunction` calls through dynamic dispatch and loses a static parameter
-# in its signature, so these are compiled at run time.
+# in its signature, so these are compiled at run time. Another package's precompilation
+# cannot evaluate here, so it takes the untyped entry points.
 function _callback(name::Symbol, ::Type{C}) where {R, C <: TSContext{R}}
-    return get!(CALLBACKS, (name, C)) do
-        f, args = _CALLBACK_SIGNATURES[name]
-        types = map(args) do a
-            a === :R ? R : a === :RefC ? Ref{C} : a === :PtrC ? Ptr{C} :
-                a === :Ptr ? Ptr{Cvoid} : a === :PetscInt ? LibPETSc.PetscInt :
-                getfield(LibPETSc, a)
-        end
+    haskey(CALLBACKS, (name, C)) && return CALLBACKS[(name, C)]
+    f, args = _CALLBACK_SIGNATURES[name]
+    types = map(a -> _callback_type(a, R, C), args)
+    ptr = try
         Core.eval(@__MODULE__, :(@cfunction($f, $_Err, ($(types...),))))
+    catch
+        ccall(:jl_generating_output, Cint, ()) == 1 || rethrow()
+        return _untyped_callback(Val(name), R)
     end
+    return CALLBACKS[(name, C)] = ptr
 end
 
 # `@cfunction` pointers do not survive precompilation.
