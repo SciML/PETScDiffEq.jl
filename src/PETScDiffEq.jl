@@ -2880,7 +2880,7 @@ _mass(ctx::TSContext{R, S}, i, j) where {R, S} =
 # An ODE's J is turned into `shift * M - J` by the callers.
 function _call_jac!(ctx, xdot_ptr, shift, t)
     if ctx.dae
-        _readvec!(ctx.mudot, ctx.petsclib, PETSc.VecPtr(ctx.petsclib, xdot_ptr, false))
+        _readvec!(ctx.mudot, ctx.petsclib, _lent(ctx.petsclib, xdot_ptr))
         ctx.jac!(ctx.J, ctx.mudot, ctx.u, ctx.p, shift, t)
     else
         ctx.jac!(ctx.J, ctx.u, ctx.p, t)
@@ -3455,6 +3455,46 @@ function _writevec!(pl, v, src)
     return nothing
 end
 
+# A Vec lent to a callback, without `PETSc.VecPtr`'s allocation and communicator query.
+struct _Lent{L} <: LibPETSc.AbstractPetscVec{L}
+    ptr::LibPETSc.CVec
+end
+
+_lent(::L, ptr::LibPETSc.CVec) where {L} = _Lent{L}(ptr)
+
+for pl in PETSc.petsclibs
+    L, lib, T, I = typeof(pl), pl.petsc_library, PETSc.scalartype(pl), PETSc.inttype(pl)
+    @eval begin
+        function _local_size(::$L, v)
+            n = Ref{$I}(0)
+            _check_code(ccall((:VecGetLocalSize, $lib), _Err, (LibPETSc.CVec, Ptr{$I}), v, n))
+            return Int(n[])
+        end
+
+        function _readvec!(dest::Vector{$T}, pl::$L, v)
+            n, a = _local_size(pl, v), Ref{Ptr{$T}}(C_NULL)
+            n <= length(dest) || throw(BoundsError(dest, n))
+            _check_code(ccall((:VecGetArrayRead, $lib), _Err, (LibPETSc.CVec, Ptr{Ptr{$T}}), v, a))
+            GC.@preserve dest unsafe_copyto!(pointer(dest), a[], n)
+            _check_code(
+                ccall((:VecRestoreArrayRead, $lib), _Err, (LibPETSc.CVec, Ptr{Ptr{$T}}), v, a),
+            )
+            return dest
+        end
+
+        function _writevec!(pl::$L, v, src::Vector{$T})
+            n, a = length(src), Ref{Ptr{$T}}(C_NULL)
+            n <= _local_size(pl, v) || throw(BoundsError(1:_local_size(pl, v), n))
+            _check_code(ccall((:VecGetArrayWrite, $lib), _Err, (LibPETSc.CVec, Ptr{Ptr{$T}}), v, a))
+            GC.@preserve src unsafe_copyto!(a[], pointer(src), n)
+            _check_code(
+                ccall((:VecRestoreArrayWrite, $lib), _Err, (LibPETSc.CVec, Ptr{Ptr{$T}}), v, a),
+            )
+            return nothing
+        end
+    end
+end
+
 function _relayout!(ctx, from, to, mode)
     for call in (:VecScatterBegin, :VecScatterEnd)
         _check_code(
@@ -3495,9 +3535,9 @@ end
 function _rhs_body!(ctx, t, x_ptr, f_ptr)
     pl = ctx.petsclib
     try
-        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _readvec!(ctx.u, pl, _lent(pl, x_ptr))
         _call_f!(ctx, ctx.du, ctx.u, t)
-        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), ctx.du)
+        _writevec!(pl, _lent(pl, f_ptr), ctx.du)
         ctx.nf += 1
     catch e
         ctx.err = e
@@ -3520,9 +3560,9 @@ end
 function _split_rhs_body!(ctx, t, x_ptr, f_ptr)
     pl = ctx.petsclib
     try
-        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _readvec!(ctx.u, pl, _lent(pl, x_ptr))
         _call!(ctx.f2!, ctx, ctx.du, ctx.u, ctx.p, t)
-        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), ctx.du)
+        _writevec!(pl, _lent(pl, f_ptr), ctx.du)
         ctx.nf2 += 1
     catch e
         ctx.err = e
@@ -3572,8 +3612,8 @@ function _ifunction_body!(ctx, ts, t, x_ptr, xdot_ptr, f_ptr)
     pl = ctx.petsclib
     try
         t = _stage_time(ctx, ts, t)
-        _readvec!(ctx.u, pl, _own_block(ctx, PETSc.VecPtr(pl, x_ptr, false)))
-        udot = _readvec!(ctx.mudot, pl, _own_block(ctx, PETSc.VecPtr(pl, xdot_ptr, false)))
+        _readvec!(ctx.u, pl, _own_block(ctx, _lent(pl, x_ptr)))
+        udot = _readvec!(ctx.mudot, pl, _own_block(ctx, _lent(pl, xdot_ptr)))
         if ctx.dae
             _call!(ctx.f!, ctx, ctx.resid, udot, ctx.u, ctx.p, t)
         else
@@ -3586,11 +3626,11 @@ function _ifunction_body!(ctx, ts, t, x_ptr, xdot_ptr, f_ptr)
             else
                 # This rank's rows of M reach other ranks' entries of udot.
                 _mat_mult!(pl, ctx.mass_mat, xdot_ptr, f_ptr)
-                _readvec!(ctx.resid, pl, PETSc.VecPtr(pl, f_ptr, false))
+                _readvec!(ctx.resid, pl, _lent(pl, f_ptr))
                 @. ctx.resid = ctx.resid - ctx.du
             end
         end
-        _write_block!(ctx, PETSc.VecPtr(pl, f_ptr, false), ctx.resid)
+        _write_block!(ctx, _lent(pl, f_ptr), ctx.resid)
         ctx.nf += 1
     catch e
         ctx.err = e
@@ -3858,7 +3898,7 @@ function _sparse_mass_block!(W, J, M::SparseMatrixCSC, shift, n)
 end
 
 function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
-    x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
+    x = _lent(ctx.petsclib, x_ptr)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
@@ -4008,7 +4048,7 @@ end
 
 function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
-    x = ctx.flat_vec === nothing ? PETSc.VecPtr(ctx.petsclib, x_ptr, false) : ctx.flat_vec
+    x = ctx.flat_vec === nothing ? _lent(ctx.petsclib, x_ptr) : ctx.flat_vec
     try
         (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
             _hold_work_vec!(ctx, ts_ptr)
