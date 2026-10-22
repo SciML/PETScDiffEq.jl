@@ -4500,7 +4500,7 @@ _drops(key, value) = key in UNSUPPORTED_KWARGS ||
 mutable struct TSHandles{CTX, L, R, S}
     ctx::CTX
     petsclib::L
-    ts::Any
+    ts::LibPETSc.TS{L}
     u::Any
     jac_mat::Any
     fd_mat::Any
@@ -4574,7 +4574,7 @@ function _destroy!(h::TSHandles)
     h.destroyed && return nothing
     h.destroyed = true
     delete!(PARALLEL_HANDLES, h)
-    h.ts === nothing || delete!(POST_STEP_CTX, h.ts.ptr)
+    h.ts.ptr == C_NULL || delete!(POST_STEP_CTX, h.ts.ptr)
     (PETScCompat.isfinalized(h.petsclib) || MPI.Finalized()) && return nothing
     h.opts === nothing || PETScCompat.destroy!(h.opts)
     h.jac_mat === nothing || PETScCompat.destroy!(h.jac_mat)
@@ -4598,9 +4598,9 @@ function _destroy!(h::TSHandles)
             )
         end
     end
-    h.ts === nothing || _return_work_vec!(h.ctx, h.ts)
+    h.ts.ptr == C_NULL || _return_work_vec!(h.ctx, h.ts)
     _release_work_vec!(h.ctx)
-    h.ts === nothing || LibPETSc.TSDestroy(h.petsclib, h.ts)
+    h.ts.ptr == C_NULL || LibPETSc.TSDestroy(h.petsclib, h.ts)
     for dm in h.dms
         _check_code(
             ccall(
@@ -5691,7 +5691,7 @@ function _setup(
         nothing, mass_slope,
     )::TSContext
     h = Base.inferencebarrier(TSHandles)(
-        ctx, petsclib, nothing, uvec, nothing, nothing, ad_calls, nothing,
+        ctx, petsclib, LibPETSc.TS(petsclib), uvec, nothing, nothing, ad_calls, nothing,
         t0, tf, tdir, u0, save_start, save_end, end_saveat, false, 0, false,
         false,
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
