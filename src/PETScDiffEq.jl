@@ -1963,9 +1963,15 @@ function _undo_failed_irk!(ctx, pl, ts_ptr)
 end
 
 # PETSc's `dt_min` clamps and takes the step whatever its error, so check the floor here.
-function _post_step!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
+_post_step!(ts_ptr::Ptr{C}) where {C <: TSContext} = _post_step!(_hooked(ts_ptr)...)
+
+function _post_step!(ts_ptr::LibPETSc.CTS)
     ctx, ts = POST_STEP_CTX[ts_ptr]::Tuple
-    ctx.comm === nothing || return _post_step_collective!(ctx, ts_ptr)
+    return _post_step!(ctx, ts)
+end
+
+function _post_step!(ctx, ts)::LibPETSc.PetscErrorCode
+    ctx.comm === nothing || return _post_step_collective!(ctx, ts.ptr)
     return _post_step_serial!(ctx, ts)
 end
 
@@ -2059,18 +2065,21 @@ function _post_step_collective!(ctx, ts_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
-const POST_STEP_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-
 # The post-step and domain-error callbacks get no context, and asking the TS may use another
 # build's symbol.
 const POST_STEP_CTX = Dict{LibPETSc.CTS, Any}()
+
+_lib_type(::Type{<:TSContext{R, S, A, F, F2, J, B, P, L}}) where {R, S, A, F, F2, J, B, P, L} = L
+
+_hooked(ts_ptr::Ptr{C}) where {C <: TSContext} =
+    POST_STEP_CTX[LibPETSc.CTS(ts_ptr)]::Tuple{C, LibPETSc.TS{_lib_type(C)}}
 
 function _set_post_step!(pl, ts, ctx)
     POST_STEP_CTX[ts.ptr] = (ctx, ts)
     _check_code(
         ccall(
             _symbol(pl, :TSSetPostStep), LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, Ptr{Cvoid}), ts, POST_STEP_PTR[],
+            (LibPETSc.CTS, Ptr{Cvoid}), ts, _callbacks(ctx).post_step,
         ),
     )
     return nothing
@@ -2489,18 +2498,18 @@ end
 # TSAdaptCheckStage calls this before reading the SNES reason and skips its shrink once a
 # reason is set.
 function _check_stage!(
-        ts_ptr::LibPETSc.CTS, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
-    )::LibPETSc.PetscErrorCode
-    ctx, _ = POST_STEP_CTX[ts_ptr]::Tuple
-    return _check_stage_body!(ctx, ts_ptr, t, y, accept)
+        ts_ptr::Ptr{C}, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode where {C <: TSContext}
+    ctx, ts = _hooked(ts_ptr)
+    return _check_stage_body!(ctx, ts, t, y, accept)
 end
 
-function _check_stage_body!(ctx, ts_ptr, t::R, y, accept) where {R}
+function _check_stage_body!(ctx, ts, t::R, y, accept) where {R}
     ctx.comm === nothing && ctx.err !== nothing && return LibPETSc.PetscErrorCode(0)
+    ts_ptr = ts.ptr
     try
         pl = ctx.petsclib
         ctx.retry_fp && _last_stage(ctx, pl, ts_ptr, y) && _rehold_work_vec!(ctx, ts_ptr)
-        ts = LibPETSc.TS(ts_ptr, pl)
         _out_of_attempts!(ctx, pl, ts, accept) && return LibPETSc.PetscErrorCode(0)
         h, s = LibPETSc.TSGetTimeStep(pl, ts), LibPETSc.TSGetTime(pl, ts)
         snes = _snes_failed(pl, ts_ptr)
@@ -2568,9 +2577,9 @@ function _out_of_attempts!(ctx, pl, ts, accept)
 end
 
 function _check_attempts!(
-        ts_ptr::LibPETSc.CTS, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
-    )::LibPETSc.PetscErrorCode
-    ctx, ts = POST_STEP_CTX[ts_ptr]::Tuple
+        ts_ptr::Ptr{C}, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
+    )::LibPETSc.PetscErrorCode where {C <: TSContext}
+    ctx, ts = _hooked(ts_ptr)
     try
         _out_of_attempts!(ctx, ctx.petsclib, ts, accept)
     catch e
@@ -2638,12 +2647,9 @@ function _pivot_raises(pl, ts)
     return raises[] == LibPETSc.PETSC_TRUE || snes_raises[] == LibPETSc.PETSC_TRUE
 end
 
-const PRE_SOLVE_PTR = Ref{Ptr{Cvoid}}(C_NULL)
-
 function _pre_solve!(
-        ::LibPETSc.CKSP, ::LibPETSc.CVec, ::LibPETSc.CVec, ctx_ptr::Ptr{Cvoid},
+        ::LibPETSc.CKSP, ::LibPETSc.CVec, ::LibPETSc.CVec, ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     ctx.nsolve += 1
     return LibPETSc.PetscErrorCode(0)
 end
@@ -2668,7 +2674,7 @@ function _count_solves!(pl, ts, ctx, ctxptr)
     _check_code(
         ccall(
             _symbol(pl, :KSPSetPreSolve), LibPETSc.PetscErrorCode,
-            (LibPETSc.CKSP, Ptr{Cvoid}, Ptr{Cvoid}), ksp[], PRE_SOLVE_PTR[], ctxptr,
+            (LibPETSc.CKSP, Ptr{Cvoid}, Ptr{Cvoid}), ksp[], _callbacks(ctx).pre_solve, ctxptr,
         ),
     )
     return nothing
@@ -3526,9 +3532,8 @@ function _rhs!(
         t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _rhs_body!(ctx, t, x_ptr, f_ptr)
 end
 
@@ -3551,9 +3556,8 @@ function _split_rhs!(
         t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _split_rhs_body!(ctx, t, x_ptr, f_ptr)
 end
 
@@ -3602,9 +3606,8 @@ function _ifunction!(
         x_ptr::LibPETSc.CVec,
         xdot_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _ifunction_body!(ctx, ts, t, x_ptr, xdot_ptr, f_ptr)
 end
 
@@ -3671,9 +3674,8 @@ function _mprk_slow!(
         t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _mprk_part!(ctx, t, x_ptr, f_ptr, ctx.slow_idxs)
 end
 
@@ -3682,9 +3684,8 @@ function _mprk_medium!(
         t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _mprk_part!(ctx, t, x_ptr, f_ptr, ctx.medium_idxs)
 end
 
@@ -3693,9 +3694,8 @@ function _mprk_fast!(
         t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _mprk_part!(ctx, t, x_ptr, f_ptr, ctx.fast_idxs)
 end
 
@@ -3727,9 +3727,8 @@ function _momentum!(
         t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _symplectic_part!(ctx, sub_ts, t, x_ptr, f_ptr, true)
 end
 
@@ -3738,9 +3737,8 @@ function _position!(
         t,
         x_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _symplectic_part!(ctx, sub_ts, t, x_ptr, f_ptr, false)
 end
 
@@ -3775,9 +3773,8 @@ function _i2function!(
         v_ptr::LibPETSc.CVec,
         a_ptr::LibPETSc.CVec,
         f_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _i2function_body!(ctx, t, u_ptr, v_ptr, a_ptr, f_ptr)
 end
 
@@ -3811,9 +3808,8 @@ function _i2jacobian!(
         shift_a,
         A_ptr::LibPETSc.CMat,
         B_ptr::LibPETSc.CMat,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _i2jacobian_body!(ctx, t, u_ptr, v_ptr, shift_v, shift_a, A_ptr, B_ptr)
 end
 
@@ -3877,9 +3873,8 @@ function _ijacobian!(
         shift,
         A_ptr::LibPETSc.CMat,
         B_ptr::LibPETSc.CMat,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
@@ -3935,9 +3930,8 @@ function _dm_ijacobian!(
         shift,
         A_ptr::LibPETSc.CMat,
         B_ptr::LibPETSc.CMat,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
@@ -4002,9 +3996,8 @@ function _sparse_ijacobian!(
         shift,
         A_ptr::LibPETSc.CMat,
         B_ptr::LibPETSc.CMat,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
@@ -4040,19 +4033,22 @@ function _monitor!(
         step::LibPETSc.PetscInt,
         t,
         x_ptr::LibPETSc.CVec,
-        ctx_ptr::Ptr{Cvoid},
+        ctx::TSContext,
     )::LibPETSc.PetscErrorCode
-    ctx = unsafe_pointer_to_objref(ctx_ptr)::TSContext
     return _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
 end
 
 function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     ctx.err === nothing || return LibPETSc.PetscErrorCode(0)
-    x = ctx.flat_vec === nothing ? _lent(ctx.petsclib, x_ptr) : ctx.flat_vec
+    ctx.flat_vec === nothing &&
+        return _monitor_at!(ctx, ts_ptr, step, t, _lent(ctx.petsclib, x_ptr))
+    return _monitor_at!(ctx, ts_ptr, step, t, ctx.flat_vec)
+end
+
+function _monitor_at!(ctx, ts_ptr, step, t, x)
     try
         (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
             _hold_work_vec!(ctx, ts_ptr)
-        ts = LibPETSc.TS(ts_ptr, ctx.petsclib)
         tol = _near(t, ctx.tbound)
         landed = false
         while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= t + tol
@@ -4062,16 +4058,16 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
                 landed = true
             elseif ctx.hermite
                 # -ts_exact_final_time interpolate steps past tf and reports tf later.
-                tmax = LibPETSc.TSGetMaxTime(ctx.petsclib, ts)
+                tmax = LibPETSc.TSGetMaxTime(ctx.petsclib, LibPETSc.TS(ts_ptr, ctx.petsclib))
                 want >= tmax - tol && t > tmax + tol && break
                 u1 = _read_state!(ctx.u, ctx, x)
                 _record!(
                     ctx, want, _hermite!(similar(u1), ctx, want, ctx.step_t, ctx.step_u, t, u1),
                 )
-            elseif _petsc_interpolate!(ctx, ts, want) === nothing
+            elseif _petsc_interpolate!(ctx, LibPETSc.TS(ts_ptr, ctx.petsclib), want) === nothing
                 ctx.err = _no_interpolant(ctx)
                 # A failing monitor makes PETSc print a traceback, so stop a step later.
-                LibPETSc.TSSetMaxSteps(ctx.petsclib, ts, step + 1)
+                LibPETSc.TSSetMaxSteps(ctx.petsclib, LibPETSc.TS(ts_ptr, ctx.petsclib), step + 1)
                 return LibPETSc.PetscErrorCode(0)
             else
                 _record!(ctx, want, _readvec!(ctx.u, ctx.petsclib, ctx.work))
@@ -4103,135 +4099,55 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
     return LibPETSc.PetscErrorCode(0)
 end
 
-struct Callbacks
-    rhs::Ptr{Cvoid}
-    split_rhs::Ptr{Cvoid}
-    monitor::Ptr{Cvoid}
-    ifunction::Ptr{Cvoid}
-    ijacobian::Ptr{Cvoid}
-    sparse_ijacobian::Ptr{Cvoid}
-    dm_ijacobian::Ptr{Cvoid}
-    mprk_slow::Ptr{Cvoid}
-    mprk_medium::Ptr{Cvoid}
-    mprk_fast::Ptr{Cvoid}
-    momentum::Ptr{Cvoid}
-    position::Ptr{Cvoid}
-    i2function::Ptr{Cvoid}
-    i2jacobian::Ptr{Cvoid}
-    stage_check::Ptr{Cvoid}
-    attempt_check::Ptr{Cvoid}
-end
+# PETSc hands the context back as a `Ref{C}`, so each callback is compiled for its type.
+struct Callbacks{C} end
 
-const CALLBACKS = Dict{DataType, Callbacks}()
+_callbacks(::C) where {C <: TSContext} = Callbacks{C}()
 
-function _callbacks(petsclib)
-    R = petsclib.PetscReal
-    return get!(() -> _make_callbacks(R), CALLBACKS, R)
-end
+Base.getproperty(::Callbacks{C}, name::Symbol) where {C} = _callback(name, C)
 
-for R in (Float32, Float64)
-    @eval _make_callbacks(::Type{$R}) = Callbacks(
-        @cfunction(
-            _rhs!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-        @cfunction(
-            _split_rhs!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-        @cfunction(
-            _monitor!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, LibPETSc.PetscInt, $R, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-        @cfunction(
-            _ifunction!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-        @cfunction(
-            _ijacobian!,
-            LibPETSc.PetscErrorCode,
-            (
-                LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, $R, LibPETSc.CMat,
-                LibPETSc.CMat, Ptr{Cvoid},
-            )
-        ),
-        @cfunction(
-            _sparse_ijacobian!,
-            LibPETSc.PetscErrorCode,
-            (
-                LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, $R, LibPETSc.CMat,
-                LibPETSc.CMat, Ptr{Cvoid},
-            )
-        ),
-        @cfunction(
-            _dm_ijacobian!,
-            LibPETSc.PetscErrorCode,
-            (
-                LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, $R, LibPETSc.CMat,
-                LibPETSc.CMat, Ptr{Cvoid},
-            )
-        ),
-        @cfunction(
-            _mprk_slow!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-        @cfunction(
-            _mprk_medium!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-        @cfunction(
-            _mprk_fast!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-        @cfunction(
-            _momentum!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-        @cfunction(
-            _position!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-        @cfunction(
-            _i2function!,
-            LibPETSc.PetscErrorCode,
-            (
-                LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, LibPETSc.CVec,
-                LibPETSc.CVec, Ptr{Cvoid},
-            )
-        ),
-        @cfunction(
-            _i2jacobian!,
-            LibPETSc.PetscErrorCode,
-            (
-                LibPETSc.CTS, $R, LibPETSc.CVec, LibPETSc.CVec, LibPETSc.CVec, $R, $R,
-                LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid},
-            )
-        ),
-        @cfunction(
-            _check_stage!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, $R, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-        @cfunction(
-            _check_attempts!,
-            LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, $R, LibPETSc.CVec, Ptr{Cvoid})
-        ),
-    )
+# Hooks that get no context take the TS pointer as a `Ptr{C}`, which carries the type.
+const _CALLBACK_SIGNATURES = (
+    rhs = (:_rhs!, (:CTS, :R, :CVec, :CVec, :RefC)),
+    split_rhs = (:_split_rhs!, (:CTS, :R, :CVec, :CVec, :RefC)),
+    mprk_slow = (:_mprk_slow!, (:CTS, :R, :CVec, :CVec, :RefC)),
+    mprk_medium = (:_mprk_medium!, (:CTS, :R, :CVec, :CVec, :RefC)),
+    mprk_fast = (:_mprk_fast!, (:CTS, :R, :CVec, :CVec, :RefC)),
+    momentum = (:_momentum!, (:CTS, :R, :CVec, :CVec, :RefC)),
+    position = (:_position!, (:CTS, :R, :CVec, :CVec, :RefC)),
+    monitor = (:_monitor!, (:CTS, :PetscInt, :R, :CVec, :RefC)),
+    ifunction = (:_ifunction!, (:CTS, :R, :CVec, :CVec, :CVec, :RefC)),
+    ijacobian = (:_ijacobian!, (:CTS, :R, :CVec, :CVec, :R, :CMat, :CMat, :RefC)),
+    sparse_ijacobian = (:_sparse_ijacobian!, (:CTS, :R, :CVec, :CVec, :R, :CMat, :CMat, :RefC)),
+    dm_ijacobian = (:_dm_ijacobian!, (:CTS, :R, :CVec, :CVec, :R, :CMat, :CMat, :RefC)),
+    i2function = (:_i2function!, (:CTS, :R, :CVec, :CVec, :CVec, :CVec, :RefC)),
+    i2jacobian = (
+        :_i2jacobian!, (:CTS, :R, :CVec, :CVec, :CVec, :R, :R, :CMat, :CMat, :RefC),
+    ),
+    pre_solve = (:_pre_solve!, (:CKSP, :CVec, :CVec, :RefC)),
+    post_step = (:_post_step!, (:PtrC,)),
+    stage_check = (:_check_stage!, (:PtrC, :R, :CVec, :Ptr)),
+    attempt_check = (:_check_attempts!, (:PtrC, :R, :CVec, :Ptr)),
+)
+
+const CALLBACKS = Dict{Tuple{Symbol, DataType}, Ptr{Cvoid}}()
+
+# A package image's `@cfunction` calls through dynamic dispatch and loses a static parameter
+# in its signature, so these are compiled at run time.
+function _callback(name::Symbol, ::Type{C}) where {R, C <: TSContext{R}}
+    return get!(CALLBACKS, (name, C)) do
+        f, args = _CALLBACK_SIGNATURES[name]
+        types = map(args) do a
+            a === :R ? R : a === :RefC ? Ref{C} : a === :PtrC ? Ptr{C} :
+                a === :Ptr ? Ptr{Cvoid} : a === :PetscInt ? LibPETSc.PetscInt :
+                getfield(LibPETSc, a)
+        end
+        Core.eval(@__MODULE__, :(@cfunction($f, $_Err, ($(types...),))))
+    end
 end
 
 # `@cfunction` pointers do not survive precompilation.
 function __init__()
-    POST_STEP_PTR[] = @cfunction(_post_step!, LibPETSc.PetscErrorCode, (LibPETSc.CTS,))
     COLOUR_JACOBIAN_PTR[] = @cfunction(
         _colour_jacobian_cb, LibPETSc.PetscErrorCode,
         (LibPETSc.CSNES, LibPETSc.CVec, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid})
@@ -4239,10 +4155,6 @@ function __init__()
     DENSE_JACOBIAN_PTR[] = @cfunction(
         _dense_jacobian_cb, LibPETSc.PetscErrorCode,
         (LibPETSc.CSNES, LibPETSc.CVec, LibPETSc.CMat, LibPETSc.CMat, Ptr{Cvoid})
-    )
-    PRE_SOLVE_PTR[] = @cfunction(
-        _pre_solve!, LibPETSc.PetscErrorCode,
-        (LibPETSc.CKSP, LibPETSc.CVec, LibPETSc.CVec, Ptr{Cvoid})
     )
     ZERO_PIVOT_HANDLER_PTR[] = @cfunction(
         _zero_pivot_handler,
@@ -5793,7 +5705,7 @@ function _setup(
             LibPETSc.TSSetSolution(petsclib, ts, u)
 
         ctxptr = pointer_from_objref(ctx)
-        ptrs = _callbacks(petsclib)
+        ptrs = _callbacks(ctx)
         GC.@preserve ctx begin
             if alg isa TSAlpha2
                 _check_code(
