@@ -9304,6 +9304,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.u == SciMLBase.solve(problem(Diagonal([2.0, 2.0]); f = decay!), alg).u
             @test sol.u[end] ≈ exp(-0.5) .* [1.0, 2.0] rtol = 1.0e-2
         end
+        world = PETScDiffEq.TSImplicit("bdf"; comm = MPI.COMM_WORLD)
+        dense = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(
+                decay!; jac_prototype = sparse(Diagonal(ones(2))),
+                mass_matrix = SciMLOperators.MatrixOperator([2.0 0.0; 0.0 2.0]),
+            ), [1.0, 2.0], (0.0, 1.0),
+        )
+        @test_throws "not a MatrixOperator of a Array" SciMLBase.solve(dense, world)
     end
 
     @testset "a discrete problem is refused" begin

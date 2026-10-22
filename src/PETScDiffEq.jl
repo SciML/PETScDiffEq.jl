@@ -5000,10 +5000,12 @@ function _check_diagonal_mass(prob, is_dae, where, or = "")
     n = length(prob.u0)
     mass = is_dae ? nothing : _mass_of(prob)
     (mass === nothing || mass == LinearAlgebra.I) && return nothing
+    given = prob.f.mass_matrix
+    op = given isa SciMLOperators.AbstractSciMLOperator ? "$(nameof(typeof(given))) of a " : ""
     mass isa LinearAlgebra.Diagonal || throw(
         ArgumentError(
             "PETScDiffEq takes only a `Diagonal` mass matrix$or $where, not a " *
-                "$(nameof(typeof(mass)))",
+                "$op$(nameof(typeof(mass)))",
         ),
     )
     size(mass) == (n, n) || throw(
