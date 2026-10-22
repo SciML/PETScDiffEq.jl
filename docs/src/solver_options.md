@@ -128,6 +128,16 @@ the default with a `dm` or on a communicator, where `autodiff = PETScDiffEq.Auto
 asks for the exact Jacobian: with a DMDA as the `dm` it is seeded by the DM's colouring, and
 on a communicator by the colouring of a sparse `jac_prototype`.
 
+A dense Jacobian, which a serial solve without a sparse `jac_prototype` or a `dm` has, is
+factored directly, with `-ksp_type preonly -pc_type lu`. PETSc's own default, GMRES with
+ILU(0), does the same factorization, since ILU(0) of a dense matrix is its full LU, and runs
+a Krylov iteration on top. `TSRosW`, and any solve whose SNES is `ksponly`, keeps GMRES,
+whose residual norm is what notices a NaN right-hand side so that a smaller step is tried.
+A sparse, DM or distributed Jacobian keeps GMRES with ILU(0), block Jacobi in parallel,
+since a direct factorization can fill in: on a 2-D Brusselator with 2048 states PETSc's LU
+took 5 to 9 times as long. A `-ksp_type`, `-pc_type`, `-snes_mf` or `-snes_mf_operator` in
+`petsc_options` replaces this choice.
+
 `DiscreteCallback`, `ContinuousCallback`, `VectorContinuousCallback` and `CallbackSet`
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`,
 `terminate!` and `initialize_dae!`. After a step the running solution's retcode is `Success`, as
