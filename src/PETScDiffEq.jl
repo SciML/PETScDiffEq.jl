@@ -711,11 +711,10 @@ _interpolates(::Union{TSImplicit, TSDAE}) = true
 _interpolates(::Union{TSIRK, TSMPRK, TSBasicSymplectic, TSAlpha2}) = false
 _interpolates(::TSGeneric) = nothing
 
-function _implicit_first_stage(pl, ts, running)
-    type, sub = first(split(running)), last(split(running))
-    type == "dirk" && (sub = LibPETSc.TSDIRKGetType(pl, ts))
-    return type in ("arkimex", "dirk") && sub in _IMPLICIT_FIRST_STAGE
-end
+_tableau_name(pl, ts, name) = name == "dirk" ? "dirk $(LibPETSc.TSDIRKGetType(pl, ts))" : name
+
+_implicit_first_stage(name) =
+    first(split(name)) in ("arkimex", "dirk") && last(split(name)) in _IMPLICIT_FIRST_STAGE
 
 const _RK_ORDER = Dict(
     "1fe" => 1, "2a" => 2, "2b" => 2, "3" => 3, "3bs" => 3, "4" => 4,
@@ -2223,12 +2222,18 @@ function _hermite_flat!(out, f0, f1, tdir, s, s0, u0, s1, u1, ::Type{Val{N}}) wh
     return out
 end
 
-_no_interpolant(ctx) = ArgumentError(
-    "`$(ctx.alg_name)` has no interpolant in PETSc, and a mass matrix or a DAEProblem " *
-        "gives no derivative to build one from, so it has no state between step ends for " *
-        "saveat, a ContinuousCallback or integrator(t); use a type that interpolates, such " *
-        "as BDF, or keep saveat times on step ends and pass `rootfind = NoRootFind`",
-)
+function _no_interpolant(ctx, ts)
+    name = _tableau_name(ctx.petsclib, ts, ctx.alg_name)
+    first_stage = _implicit_first_stage(name) ?
+        " that starts at the step's start, as its first stage is implicit" : ""
+    return ArgumentError(
+        "`$name` has no interpolant in PETSc$first_stage, and a mass matrix or a " *
+            "DAEProblem gives no derivative to build one from, so it has no state between " *
+            "step ends for saveat, a ContinuousCallback or integrator(t); use a type that " *
+            "interpolates, such as BDF, or keep saveat times on step ends and pass " *
+            "`rootfind = NoRootFind`",
+    )
+end
 
 _no_du() = ArgumentError(
     "a DAEProblem gives no derivative to evaluate, so `get_du` has only the one its " *
@@ -4024,7 +4029,7 @@ function _monitor_body!(ctx, ts_ptr, step, t, x_ptr)
                     ctx, want, _hermite!(similar(u1), ctx, want, ctx.step_t, ctx.step_u, t, u1),
                 )
             elseif _petsc_interpolate!(ctx, ts, want) === nothing
-                ctx.err = _no_interpolant(ctx)
+                ctx.err = _no_interpolant(ctx, ts)
                 # A failing monitor makes PETSc print a traceback, so stop a step later.
                 LibPETSc.TSSetMaxSteps(ctx.petsclib, ts, step + 1)
                 return LibPETSc.PetscErrorCode(0)
@@ -6015,7 +6020,17 @@ function _setup(
                 ctx.interpolates = nothing
                 ctx.alg_name = running
             end
-            _implicit_first_stage(petsclib, ts, running) && (ctx.interpolates = false)
+            tableau = _tableau_name(petsclib, ts, running)
+            if _implicit_first_stage(tableau)
+                ctx.interpolates = false
+                _exact_final_time(petsclib, ts) == LibPETSc.TS_EXACTFINALTIME_INTERPOLATE && throw(
+                    ArgumentError(
+                        "`-ts_exact_final_time interpolate` takes the final state from " *
+                            "PETSc's interpolant, which for `$tableau` starts from its " *
+                            "implicit first stage rather than the step's start; use `matchstep`",
+                    ),
+                )
+            end
             ctx.hermite && (ctx.restep = _restep_tableau(petsclib, ts, running))
             if !dt_given && !dt_option
                 user_t0 = R(prob.tspan[1])
@@ -6975,7 +6990,7 @@ function _interpolate!(integ::PETScIntegrator, s, deriv::Type = Val{0})
         integ.finished && return _interpolate_finished!(integ, s, deriv)
         if deriv === Val{0}
             v = _petsc_interpolate!(ctx, h.ts, s)
-            v === nothing && throw(_no_interpolant(ctx))
+            v === nothing && throw(_no_interpolant(ctx, h.ts))
             return _readvec!(integ.ucache, h.petsclib, v)
         end
         (ctx.M === nothing && !ctx.dae) || throw(_no_slope(ctx))
