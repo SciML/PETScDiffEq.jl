@@ -15,7 +15,11 @@ and again at each `reinit!`, as in OrdinaryDiffEq.
 
 Saving follows OrdinaryDiffEq: a `saveat` keeps only its own points, adding `t0` or `tf`
 only when it names them or `save_start` or `save_end` asks, and `save_everystep = true`
-saves every step alongside it. `dtmin` is a floor the solve keeps: once PETSc proposes a
+saves every step alongside it. A span with `tspan[1] == tspan[2]` takes no step: the
+callbacks' `initialize` and `finalize` run, the state at `t0` is saved when `save_start` or
+`save_end` asks, as OrdinaryDiffEq saves it, and the solve ends with `ReturnCode.Success`.
+`PETScAdjoint` gives the gradient of the costs at `t0` there.
+`dtmin` is a floor the solve keeps: once PETSc proposes a
 smaller step, the solve ends there with `ReturnCode.DtLessThanMin`. A step shortened to
 land on a stop or the final time does not count, and a fixed-step solve has no floor, as in
 OrdinaryDiffEq. With `force_dtmin = true` the solve goes on at `dtmin` instead, and the floor
