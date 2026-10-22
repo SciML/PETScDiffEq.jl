@@ -7111,8 +7111,8 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
     for k in 1:n
         tk = k == n ? t1 : t0 + (t1 - t0) * oftype(t0, k / n)
         _fill_conditions!(sk, integ, cb, tk)
-        hit = [i for i in 1:m if past(i, tk) && _is_event(s0[i], sk[i], cb)]
-        if !isempty(hit)
+        if any(i -> past(i, tk) && _is_event(s0[i], sk[i], cb), 1:m)
+            hit = [i for i in 1:m if past(i, tk) && _is_event(s0[i], sk[i], cb)]
             roots = [
                 sk[i] == 0 ? tk :
                     _event_root(integ, cb, past(i, lo) ? lo : start[i], tk, i, buf)
