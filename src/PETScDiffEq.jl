@@ -5387,6 +5387,7 @@ function _setup(
         eltypes = _eltypes(problem),
         initializealg = DiffEqBase.DefaultInit(),
         direction = 1,
+        transient = false,
         kwargs...,
     )
     prob = _summed(problem, alg)
@@ -5735,10 +5736,12 @@ function _setup(
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
-    else
+        LIVE_HANDLES[h] = (HANDLES_MADE[] += 1)
+    # The caller frees a transient handle; a finalizer would keep its arrays through a GC.
+    elseif !transient
         finalizer(_finalize!, h)
+        LIVE_HANDLES[h] = (HANDLES_MADE[] += 1)
     end
-    LIVE_HANDLES[h] = (HANDLES_MADE[] += 1)
 
     try
         h.ts = LibPETSc.TSCreate(petsclib, something(comm, MPI.COMM_SELF))
@@ -6248,15 +6251,15 @@ function _solve_unlocked(
             rethrow()
         end
     end
-    h = _setup(prob, alg; kwargs...)
-    prob = _with_p(prob, h.ctx.p)
-    h.init_failed && return _initial_failure(prob, alg, h, kwargs)
+    h = _setup(prob, alg; kwargs..., transient = true)
     ctx, pl = h.ctx, h.petsclib
-    floor = abs(oftype(h.t0, something(get(kwargs, :dtmin, nothing), 0.0)))
-    forced = get(kwargs, :force_dtmin, false) === true
-    verbose = get(kwargs, :verbose, true)
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
+        prob = _with_p(prob, h.ctx.p)
+        h.init_failed && return _initial_failure(prob, alg, h, kwargs)
+        floor = abs(oftype(h.t0, something(get(kwargs, :dtmin, nothing), 0.0)))
+        forced = get(kwargs, :force_dtmin, false) === true
+        verbose = get(kwargs, :verbose, true)
         fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
         _match_steps_here!(h)
         ctx.halt_stalled = ctx.comm === nothing
