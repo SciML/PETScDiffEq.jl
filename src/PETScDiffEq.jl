@@ -5752,7 +5752,7 @@ function _setup(
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
         LIVE_HANDLES[h] = (HANDLES_MADE[] += 1)
-    # The caller frees a transient handle; a finalizer would keep its arrays through a GC.
+        # The caller frees a transient handle; a finalizer would keep its arrays through a GC.
     elseif !transient
         finalizer(_finalize!, h)
         LIVE_HANDLES[h] = (HANDLES_MADE[] += 1)
