@@ -2580,6 +2580,10 @@ function _check_attempts!(
         ts_ptr::Ptr{C}, t, y::LibPETSc.CVec, accept::Ptr{Cvoid},
     )::LibPETSc.PetscErrorCode where {C <: TSContext}
     ctx, ts = _hooked(ts_ptr)
+    # Every stage asks, so the common case skips the `try`; a failed count falls through.
+    code, taken = _taken(ctx.petsclib, ts.ptr)
+    code == 0 && ctx.maxiters - (taken + ctx.nreject + ctx.nfail) > 1 &&
+        return LibPETSc.PetscErrorCode(0)
     try
         _out_of_attempts!(ctx, ctx.petsclib, ts, accept)
     catch e
@@ -3471,6 +3475,14 @@ _lent(::L, ptr::LibPETSc.CVec) where {L} = _Lent{L}(ptr)
 for pl in PETSc.petsclibs
     L, lib, T, I = typeof(pl), pl.petsc_library, PETSc.scalartype(pl), PETSc.inttype(pl)
     @eval begin
+        function _taken(::$L, ts)
+            n, r = Ref{$I}(0), Ref{$I}(0)
+            code = ccall((:TSGetStepNumber, $lib), _Err, (Ptr{Cvoid}, Ptr{$I}), ts, n)
+            code == 0 || return code, 0
+            code = ccall((:TSGetStepRejections, $lib), _Err, (Ptr{Cvoid}, Ptr{$I}), ts, r)
+            return code, Int(n[]) + Int(r[])
+        end
+
         function _local_size(::$L, v)
             n = Ref{$I}(0)
             _check_code(ccall((:VecGetLocalSize, $lib), _Err, (LibPETSc.CVec, Ptr{$I}), v, n))
