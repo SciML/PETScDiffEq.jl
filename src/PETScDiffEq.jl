@@ -4211,6 +4211,7 @@ function __init__()
     )
     _init_adjoint_pointers!()
     _init_initialization_pointers!()
+    _BUILDS[] = nothing
     _note_skipped_workload()
     return nothing
 end
@@ -5192,11 +5193,18 @@ _check_square(proto, n) = !(proto isa AbstractMatrix) || size(proto) == (n, n) |
 # On i686 PETSc_jll's single builds fail BDF and ARKIMEX at stops.
 const _SINGLE_BUILDS = Sys.ARCH !== :i686
 
-_loaded_builds() = Type[
-    PETSc.scalartype(pl) for pl in PETSc.petsclibs if
-        PETSc.inttype(pl) === LibPETSc.PetscInt &&
-        (_SINGLE_BUILDS || real(PETSc.scalartype(pl)) !== Float32)
-]
+# Fixed once PETSc.jl has loaded; callers must not mutate the shared vector.
+const _BUILDS = Ref{Union{Nothing, Vector{Type}}}(nothing)
+
+function _loaded_builds()
+    builds = _BUILDS[]
+    builds === nothing || return builds
+    return _BUILDS[] = Type[
+        PETSc.scalartype(pl) for pl in PETSc.petsclibs if
+            PETSc.inttype(pl) === LibPETSc.PetscInt &&
+            (_SINGLE_BUILDS || real(PETSc.scalartype(pl)) !== Float32)
+    ]
+end
 
 function _eltypes(prob, builds = _loaded_builds())
     E, tE = eltype(prob.u0), eltype(prob.tspan)
