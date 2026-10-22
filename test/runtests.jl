@@ -11719,9 +11719,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
 
         # `f` sees every stage of both runs, rejected ones too. Measured: at most 2.0e-10, and
-        # 4.2e-10 for ARKIMEX 3.
-        # On i686 `solve` lands on stops by its own rule, which the adjoint's run does not repeat (#289).
-        Sys.ARCH === :i686 || @testset "with tstops the adjoint's run takes the steps solve takes: $name" for (
+        # 4.2e-10 for ARKIMEX 3; for Float32 4.0e-8, with stage times at most 1.6e-7 apart.
+        @testset "with tstops the adjoint's run takes the steps solve takes: $name" for (
                 name, alg, tspan, ts, kw, also,
             ) in (
                 (
@@ -11762,17 +11761,41 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     "adaptive ARKIMEX 3 with a discontinuity", TSARKIMEX("3", exact), (0.0, 1.0),
                     [0.3, 1.0], (abstol = 1.0e-6, reltol = 1.0e-6, d_discontinuities = [0.3]), [],
                 ),
+                # `solve` runs these in PETSc's single build where it has one.
+                (
+                    "Float32, stops on and off the grid", TSRK("4"), (0.0f0, 1.0f0),
+                    Float32[0.2, 0.33, 0.5, 1.0],
+                    (dt = 0.1f0, adaptive = false, tstops = Float32[0.97, 0.33, 0.5]), [],
+                ),
+                (
+                    "Float32, a first step halved before a stop", TSRK("4"), (0.0f0, 1.6f0),
+                    Float32[0.5, 1.6], (dt = 0.3f0, adaptive = false, tstops = [0.5f0]), [],
+                ),
+                (
+                    "Float32 backward in time", TSRK("4"), (1.0f0, 0.0f0), Float32[0.45, 0.3, 0.0],
+                    (dt = 0.1f0, adaptive = false, tstops = Float32[0.45, 0.3]), [],
+                ),
+                (
+                    "Float32, adaptive", TSRK("3bs"), (0.0f0, 1.0f0), Float32[0.25, 0.8, 1.0],
+                    (abstol = 1.0f-4, reltol = 1.0f-4, tstops = [0.5f0]), Float32[0.25, 0.8],
+                ),
+                (
+                    "Float32, adaptive backward in time", TSRK("3bs"), (1.0f0, 0.0f0),
+                    Float32[0.8, 0.25, 0.0], (abstol = 1.0f-4, reltol = 1.0f-4, tstops = [0.5f0]),
+                    Float32[0.25, 0.8],
+                ),
             )
+            T = eltype(tspan)
             stages = Float64[]
             function logged!(du, u, p, t)
-                eltype(u) === eltype(p) === Float64 && push!(stages, t)
+                eltype(u) <: AbstractFloat && push!(stages, t)
                 return adj_f!(du, u, p, t)
             end
             make(θ) = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(logged!; jac = adj_jac!, paramjac = adj_paramjac!),
                 θ[1:2], tspan, θ[3:6],
             )
-            x = vcat(u0, p0)
+            x = T.(vcat(u0, p0))
             # An adaptive run takes its cost times as stops, as `solve` given them does.
             stops = vcat(get(kw, :tstops, Float64[]), also)
             stepped(θ; extra...) = SciMLBase.solve(make(θ), alg; kw..., tstops = stops, extra...)
@@ -11785,17 +11808,24 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 make(x), alg, PETScAdjoint();
                 t = ts, dgdu_discrete = coupled_du!, dgdp_discrete = coupled_dp!, kw...,
             )
-            @test stages == taken
+            if T === Float64
+                @test stages == taken
+            else
+                @test length(stages) == length(taken) && maximum(abs.(stages - taken)) < 1.0e-6
+            end
             @test length(steps) > 5
-            # An adaptive solve repeated at these fixed steps keeps them as `p` moves.
-            fixed = haskey(kw, :dt) ? (;) : (dt = 1.0, adaptive = false, tstops = steps[2:(end - 1)])
-            fixed == (;) || @test stepped(x; fixed...).t == steps
+            # Repeated at these fixed steps in Float64, the solve keeps them as `p` moves.
+            fixed = haskey(kw, :dt) && T === Float64 ? (;) :
+                (dt = 1.0, adaptive = false, tstops = steps[2:(end - 1)])
+            y = Float64.(x)
+            fixed == (;) || @test stepped(y; fixed...).t == steps
             function loss(θ)
                 sol = stepped(θ; fixed..., saveat = ts)
                 return sum(coupled(u, θ[3:6], t) for (t, u) in zip(sol.t, sol.u))
             end
-            @test stepped(x; fixed..., saveat = ts).t == sort(ts; rev = tspan[2] < tspan[1])
-            @test relerr(vcat(du0, vec(dp)), central_differences(loss, x)) < 2.0e-9
+            @test stepped(y; fixed..., saveat = ts).t == sort(ts; rev = tspan[2] < tspan[1])
+            @test relerr(vcat(du0, vec(dp)), central_differences(loss, y)) <
+                (T === Float64 ? 2.0e-9 : 5.0e-7)
         end
 
         function quadrature(θ, alg, tspan, cost; dt = 0.01, kwargs...)
