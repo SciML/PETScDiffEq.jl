@@ -3520,6 +3520,16 @@ end
 _own_block(ctx, x) = ctx.relayout === nothing ? x :
     _relayout!(ctx, x, ctx.relayout.vec, LibPETSc.SCATTER_REVERSE)
 
+# `relayout` is untyped, so the plain case is kept off `_own_block`'s result.
+function _read_block!(dest, ctx, x)
+    if ctx.relayout === nothing
+        _readvec!(dest, ctx.petsclib, x)
+    else
+        _readvec!(dest, ctx.petsclib, _own_block(ctx, x))
+    end
+    return dest
+end
+
 function _write_block!(ctx, x, src)
     ctx.relayout === nothing && return _writevec!(ctx.petsclib, x, src)
     _writevec!(ctx.petsclib, ctx.relayout.vec, src)
@@ -3615,8 +3625,8 @@ function _ifunction_body!(ctx, ts, t, x_ptr, xdot_ptr, f_ptr)
     pl = ctx.petsclib
     try
         t = _stage_time(ctx, ts, t)
-        _readvec!(ctx.u, pl, _own_block(ctx, _lent(pl, x_ptr)))
-        udot = _readvec!(ctx.mudot, pl, _own_block(ctx, _lent(pl, xdot_ptr)))
+        _read_block!(ctx.u, ctx, _lent(pl, x_ptr))
+        udot = _read_block!(ctx.mudot, ctx, _lent(pl, xdot_ptr))
         if ctx.dae
             _call!(ctx.f!, ctx, ctx.resid, udot, ctx.u, ctx.p, t)
         else
@@ -3756,8 +3766,7 @@ function _flip_velocity!(ctx, x)
     return x
 end
 
-_read_state!(dest, ctx, x) =
-    _flip_velocity!(ctx, _readvec!(dest, ctx.petsclib, _own_block(ctx, x)))
+_read_state!(dest, ctx, x) = _flip_velocity!(ctx, _read_block!(dest, ctx, x))
 
 function _write_state!(h, x)
     h.ctx.relayout === nothing || return _write_block!(h.ctx, h.u, x)
@@ -3945,7 +3954,7 @@ function _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     J = something(moved, B)
     try
         t = _stage_time(ctx, ts, t)
-        _readvec!(ctx.u, pl, _own_block(ctx, PETSc.VecPtr(pl, x_ptr, false)))
+        _read_block!(ctx.u, ctx, _lent(pl, x_ptr))
         _mat_zero!(pl, J)
         err = nothing
         try
@@ -4007,7 +4016,7 @@ function _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_pt
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
         t = _stage_time(ctx, ts, t)
-        _readvec!(ctx.u, ctx.petsclib, _own_block(ctx, x))
+        _read_block!(ctx.u, ctx, x)
         if ctx.coo === nothing
             _call_jac!(ctx, xdot_ptr, shift, t)
             ctx.njacs += 1
