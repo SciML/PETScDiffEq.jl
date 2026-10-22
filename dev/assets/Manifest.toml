@@ -382,10 +382,10 @@ uuid = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
 version = "1.0.7"
 
 [[deps.EnzymeCore]]
-git-tree-sha1 = "156ede9181d50b3b21b74d98a7edb08bc7bbdbf1"
+git-tree-sha1 = "04c4269956f90d8f5c9acc73b774c5293481f4d7"
 registries = "General"
 uuid = "f151be2c-9106-41f4-ab19-57ee4f262869"
-version = "0.8.23"
+version = "0.8.26"
 
     [deps.EnzymeCore.extensions]
     AdaptExt = "Adapt"
@@ -397,10 +397,10 @@ version = "0.8.23"
 
 [[deps.Expat_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "2bfb1e047e2ad0a5ca94365340bde8005d637568"
+git-tree-sha1 = "d0f666deaf8099a7d7ac229a74402ada88898be1"
 registries = "General"
 uuid = "2e619515-83b5-522b-bb60-26c02a35a201"
-version = "2.8.4+0"
+version = "2.9.0+0"
 
 [[deps.ExprTools]]
 git-tree-sha1 = "d2e49e7efd29719d6f28b891b0e0e159daa9d2b4"
@@ -531,10 +531,10 @@ version = "1.5.0"
 
 [[deps.Git_LFS_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "8c66e385d631bb934ff05e76d4a566c640c8df69"
+git-tree-sha1 = "246c7a13f927d780f3f77a029664cda98c5f0f22"
 registries = "General"
 uuid = "020c3dae-16b3-5ae5-87b3-4cb189e250b2"
-version = "3.7.1+0"
+version = "3.8.0+0"
 
 [[deps.Git_jll]]
 deps = ["Artifacts", "Expat_jll", "JLLWrappers", "LibCURL_jll", "Libdl", "Libiconv_jll", "OpenSSL_jll", "PCRE2_jll", "Zlib_jll"]
@@ -584,10 +584,10 @@ uuid = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
 version = "1.11.0"
 
 [[deps.InverseFunctions]]
-git-tree-sha1 = "a779299d77cd080bf77b97535acecd73e1c5e5cb"
+git-tree-sha1 = "5cc6ad3e2bfc75a11eed92632ee341d37f4a4536"
 registries = "General"
 uuid = "3587e190-3f89-42d0-90ee-14403ec27112"
-version = "0.1.17"
+version = "0.1.18"
 weakdeps = ["Dates", "Test"]
 
     [deps.InverseFunctions.extensions]
@@ -595,10 +595,10 @@ weakdeps = ["Dates", "Test"]
     InverseFunctionsTestExt = "Test"
 
 [[deps.IrrationalConstants]]
-git-tree-sha1 = "b2d91fe939cae05960e760110b328288867b5758"
+git-tree-sha1 = "d22e8bdb3f03c300a103ff23c0dd5a654c6701de"
 registries = "General"
 uuid = "92d709cd-6900-40b7-9082-c6be49f344b6"
-version = "0.2.6"
+version = "0.2.7"
 
 [[deps.IteratorInterfaceExtensions]]
 git-tree-sha1 = "a3f24677c21f5bbe9d2a714f95dcd58337fb2856"
@@ -615,10 +615,10 @@ version = "1.8.0"
 
 [[deps.JSON]]
 deps = ["Dates", "Logging", "Parsers", "PrecompileTools", "StructUtils", "UUIDs", "Unicode"]
-git-tree-sha1 = "9939eb6f799a963b3392ac4a1d49d3fc0646eb80"
+git-tree-sha1 = "8c60c3ccb8c4bca0a31fc67aee1bbdb071e53119"
 registries = "General"
 uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-version = "1.11.0"
+version = "1.12.0"
 
     [deps.JSON.extensions]
     JSONArrowExt = ["ArrowTypes"]
@@ -778,10 +778,10 @@ version = "5.5.7+0"
 
 [[deps.MUMPS_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LLVMOpenMP_jll", "Libdl", "METIS_jll", "MPIABI_jll", "MPICH_jll", "MPIPreferences", "MPItrampoline_jll", "MicrosoftMPI_jll", "OpenMPI_jll", "PARMETIS_jll", "SCALAPACK32_jll", "SCOTCH_jll", "TOML", "libblastrampoline_jll", "mpif_jll"]
-git-tree-sha1 = "66425d72aaee1de4d95704a6049cdb3423d2c227"
+git-tree-sha1 = "032f6fdc1918f6250cf2fd09da8b77963098c631"
 registries = "General"
 uuid = "ca64183c-ec4f-5579-95d5-17e128c21291"
-version = "5.9.4+0"
+version = "5.9.6+0"
 
 [[deps.MacroTools]]
 git-tree-sha1 = "1e0228a030642014fe5cfe68c2c0a818f9e3f522"
@@ -832,10 +832,10 @@ version = "0.2.7"
 
 [[deps.NaNMath]]
 deps = ["OpenLibm_jll"]
-git-tree-sha1 = "dbd2e8cd2c1c27f0b584f6661b4309609c5a685e"
+git-tree-sha1 = "676c0f1c1c34224d6869675047a54b42fdc7b8c5"
 registries = "General"
 uuid = "77ba4419-2d1f-58cd-9bb1-8ffee604a2e3"
-version = "1.1.4"
+version = "1.1.5"
 
 [[deps.NetworkOptions]]
 uuid = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
@@ -947,10 +947,10 @@ version = "10.46.0+0"
 
 [[deps.PETSc]]
 deps = ["Libdl", "LinearAlgebra", "MPI", "OffsetArrays", "PETSc_jll", "Preferences", "SparseArrays"]
-git-tree-sha1 = "871cad81be8bdf89cb7d939243714fec0802b323"
+git-tree-sha1 = "1f8828711c0f7341b72675952b6ea75358999a1d"
 registries = "General"
 uuid = "ace2c81b-2b5f-4b1e-a30d-d662738edfe0"
-version = "0.5.2"
+version = "0.5.3"
 
     [deps.PETSc.extensions]
     PETScCUDAExt = "CUDA"
@@ -1308,10 +1308,10 @@ version = "0.4.29"
 
 [[deps.SpecialFunctions]]
 deps = ["IrrationalConstants", "LogExpFunctions", "OpenLibm_jll", "OpenSpecFun_jll"]
-git-tree-sha1 = "429071b23f4c9a13fb6582f807cc2ef454082408"
+git-tree-sha1 = "88ef0d98204515bc53dd4aaea5f7788882d1b66c"
 registries = "General"
 uuid = "276daf66-3868-5448-9aa4-cd146d93841b"
-version = "2.9.0"
+version = "2.9.1"
 
     [deps.SpecialFunctions.extensions]
     SpecialFunctionsChainRulesCoreExt = "ChainRulesCore"
@@ -1345,10 +1345,10 @@ version = "0.6.1"
 
 [[deps.StructUtils]]
 deps = ["Dates", "UUIDs"]
-git-tree-sha1 = "ad435e30854ed0f50f4b7f67edd71664afecc5d8"
+git-tree-sha1 = "9372decd34a91c0e1183fcb0e826182b89699150"
 registries = "General"
 uuid = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
-version = "2.10.0"
+version = "2.11.0"
 
     [deps.StructUtils.extensions]
     StructUtilsDataFramesExt = ["DataFrames"]
@@ -1583,11 +1583,11 @@ uuid = "8e850b90-86db-534c-a0d3-1478176c7d93"
 version = "5.15.0+0"
 
 [[deps.mpif_jll]]
-deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "MPIABI_jll", "MPICH_jll", "MPIPreferences", "MPItrampoline_jll", "MicrosoftMPI_jll", "OpenMPI_jll", "TOML"]
-git-tree-sha1 = "a06fcd368cfe6fe2c0eb7b63320d4d27ddcd010d"
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "Libdl", "MPIABI_jll", "MPICH_jll", "MPIPreferences", "MPItrampoline_jll", "MicrosoftMPI_jll", "OpenMPI_jll", "TOML"]
+git-tree-sha1 = "52e322f7a6d418576cdeb043dd2a7f7ad9a8abd0"
 registries = "General"
 uuid = "9aeb927a-4695-514f-a259-621a69f20ec0"
-version = "1.0.0+0"
+version = "1.0.1+0"
 
 [[deps.nghttp2_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
@@ -1601,10 +1601,10 @@ version = "17.8.3+0"
 
 [[deps.s2n_tls_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "d6cfe0874f96962fe4b20ed8bdb71c467e09c2c6"
+git-tree-sha1 = "6f9611b1b99beb089154f19a4031579f3a818cbd"
 registries = "General"
 uuid = "cddc5d3d-934d-5d3a-9747-62fc12ea3f48"
-version = "1.7.11+0"
+version = "1.7.12+0"
 
 [registries.General]
 url = "https://github.com/JuliaRegistries/General.git"
