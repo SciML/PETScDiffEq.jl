@@ -3887,6 +3887,17 @@ function _ijacobian!(
     return _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
 end
 
+# MatSetValues reads the block row-major, hence W[j, i].
+function _dense_block!(W::Matrix{S}, J, M, shift, n, dae) where {S}
+    @inbounds for j in 1:n, i in 1:n
+        W[j, i] = dae ? J[i, j] : shift * _mass_at(S, M, i, j) - J[i, j]
+    end
+    return nothing
+end
+
+_mass_at(::Type{S}, ::Nothing, i, j) where {S} = i == j ? one(S) : zero(S)
+_mass_at(::Type, M, i, j) = M[i, j]
+
 # `W[j, i] = shift * M[i, j] - J[i, j]` without searching M for each of the n^2 entries.
 function _sparse_mass_block!(W, J, M::SparseMatrixCSC, shift, n)
     unset = shift * zero(eltype(M))
@@ -3915,10 +3926,7 @@ function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         if M isa SparseMatrixCSC
             _sparse_mass_block!(ctx.W, ctx.J, M, shift, n)
         else
-            # MatSetValues reads the block row-major, hence W[j, i].
-            @inbounds for j in 1:n, i in 1:n
-                ctx.W[j, i] = ctx.dae ? ctx.J[i, j] : shift * _mass(ctx, i, j) - ctx.J[i, j]
-            end
+            _dense_block!(ctx.W, ctx.J, M, shift, n, ctx.dae)
         end
         _setblock!(ctx, B, n)
         PETSc.assemble!(B)
