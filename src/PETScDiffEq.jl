@@ -598,9 +598,10 @@ package's own convergence tests.
 PETSc setup call this package does not make, and without it they crash or integrate to
 zero rather than saying anything. `"alpha2"` and `"basicsymplectic"` are refused too, since
 they need a second-order or partitioned problem; use [`TSAlpha2`](@ref) or
-[`TSBasicSymplectic`](@ref). PETSc runs `"glle"` only as a whole solve, with no single step,
-so `init` refuses it, as does a solve that takes its steps one at a time: one with a callback,
-`tstops`, `d_discontinuities`, `isoutofdomain` or a Float32 clock.
+[`TSBasicSymplectic`](@ref). PETSc runs `"glle"` only as a whole solve, with no single step
+and no stop between steps. So `init` refuses it, and so does a solve with a callback, `tstops`,
+`d_discontinuities`, `isoutofdomain`, `unstable_check` or an adaptive `dtmin`, or a solve on a
+Float32 clock where `"glle"` comes from an option rather than from the algorithm.
 
 A `comm` other than `MPI.COMM_SELF` runs an explicit type as [`TSRK`](@ref) runs, and an
 implicit `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`, `"arkimex"`, `"irk"`, `"alpha"` or
@@ -5905,6 +5906,12 @@ function _setup(
                         "cannot change it to `$chosen`",
                 ),
             )
+            alg isa TSMPRK && chosen == "glle" && throw(
+                ArgumentError(
+                    "TSMPRK takes its steps one at a time, and PETSc runs `glle` only as a " *
+                        "whole solve, so an option cannot change it to `glle`",
+                ),
+            )
             alg isa TSBasicSymplectic && _set_kicks!(ctx.f!, _symplectic_type(petsclib, ts))
             chosen != _ts_type(alg) && haskey(_NEEDS_OTHER_SETUP, chosen) && throw(
                 ArgumentError(
@@ -6191,13 +6198,13 @@ function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
     )
-    # MPRK and basicsymplectic miss tf, Float32 landing refuses short steps, and
-    # isoutofdomain retries steps.
+    # MPRK and basicsymplectic miss tf, Float32 landing refuses short steps (glle lands
+    # by itself), and isoutofdomain retries steps.
     if !_no_callback(callback) || _late(tstops) || !isempty(tstops) ||
             !isempty(d_discontinuities) ||
             alg isa Union{TSMPRK, TSBasicSymplectic} ||
             get(kwargs, :isoutofdomain, nothing) !== nothing ||
-            first(_eltypes(prob)) === Float32
+            first(_eltypes(prob)) === Float32 && _ts_type(alg) != "glle"
         integ = _init_unlocked(
             prob, alg; callback = callback, tstops = tstops,
             d_discontinuities = d_discontinuities, kwargs...,
@@ -6210,6 +6217,11 @@ function _solve_unlocked(
         end
     end
     h = _setup(prob, alg; kwargs...)
+    (h.ctx.unstable !== nothing || h.ctx.dtmin > 0) && _refuse_glle(
+        h, prob,
+        "which does not stop between steps, so it cannot take `unstable_check` or an " *
+            "adaptive `dtmin`",
+    )
     prob = _with_p(prob, h.ctx.p)
     h.init_failed && return _initial_failure(prob, alg, h, kwargs)
     ctx, pl = h.ctx, h.petsclib
@@ -7301,6 +7313,19 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     return nothing
 end
 
+# PETSc's GLLE has a whole solve, with no single step and no stop between steps.
+function _refuse_glle(h, prob, cannot)
+    LibPETSc.TSGetType(h.petsclib, h.ts) == "glle" || return nothing
+    _destroy!(h)
+    other = prob isa SciMLBase.AbstractDAEProblem ? "TSDAE(\"bdf\")" : "TSImplicit(\"bdf\")"
+    throw(
+        ArgumentError(
+            "PETSc runs `glle` only as a whole solve, $cannot; solve without them, or use " *
+                "another type such as `$other`",
+        ),
+    )
+end
+
 function _init_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
@@ -7314,18 +7339,12 @@ function _init_unlocked(
     stops_given = vcat(tstops, d_discontinuities)
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = stops_given, kwargs...)
-    # PETSc's GLLE has a whole solve and no single step.
-    if LibPETSc.TSGetType(h.petsclib, h.ts) == "glle"
-        _destroy!(h)
-        throw(
-            ArgumentError(
-                "PETSc runs `glle` only as a whole solve, with no single step, so it cannot " *
-                    "take `init` and `step!`, nor what a solve needs them for: a callback, " *
-                    "`tstops`, `d_discontinuities`, `isoutofdomain` or a Float32 clock; " *
-                    "solve without them, or use another type such as `TSImplicit(\"bdf\")`",
-            ),
-        )
-    end
+    _refuse_glle(
+        h, prob,
+        "with no single step, so it cannot take `init` and `step!`, nor what a solve needs " *
+            "them for: a callback, `tstops`, `d_discontinuities`, `isoutofdomain`, or a " *
+            "Float32 clock when `glle` comes from an option rather than from the algorithm",
+    )
     prob = _with_p(prob, h.ctx.p)
     if late !== nothing
         tstops = try
@@ -7837,6 +7856,8 @@ function _match_steps_here!(h::TSHandles{<:Any, <:Any, R}) where {R}
     (R === Float32 || _bad_hmax()) &&
         _exact_final_time(pl, ts) == LibPETSc.TS_EXACTFINALTIME_MATCHSTEP || return nothing
     R === Float32 || return _take_matchstep!(h)
+    # glle never reaches TSAdaptChoose; TSSolve's MATCHSTEP cut is its first step's only cut.
+    LibPETSc.TSGetType(pl, ts) == "glle" && return nothing
     LibPETSc.TSSetExactFinalTime(pl, ts, LibPETSc.TS_EXACTFINALTIME_STEPOVER)
     h.matches = true
     h.fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, ts)) == "none"

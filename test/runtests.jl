@@ -2270,7 +2270,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test_throws "`irk` is an implicit PETSc type" PETScDiffEq.TSGeneric("irk"; explicit = true)
     end
 
-    @testset "glle, which PETSc has no single step for, is refused where steps are taken" begin
+    @testset "glle, which PETSc runs only as a whole solve" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         glle = PETScDiffEq.TSGeneric("glle")
         fixed = (dt = 0.1, adaptive = false)
@@ -2281,18 +2281,49 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         for kw in (
                 (; callback = idle), (; tstops = [0.35]), (; d_discontinuities = [0.35]),
                 (; isoutofdomain = (u, p, t) -> false),
+                (; unstable_check = (dt, u, p, t) -> false), (; dtmin = 0.01, adaptive = true),
             )
             @test_throws why SciMLBase.solve(prob, glle; fixed..., kw...)
         end
+        @test SciMLBase.solve(prob, glle; fixed..., dtmin = 0.2).retcode ==
+            SciMLBase.ReturnCode.Success
         @test_throws why SciMLBase.init(prob, glle; fixed...)
         @test_throws why SciMLBase.init(
             prob, PETScDiffEq.TSGeneric("bdf", ["-ts_type", "glle"]); fixed...,
         )
-        single = SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0))
-        @test_throws why SciMLBase.solve(single, glle; dt = 0.1f0, adaptive = false)
+        @test_throws "TSMPRK takes its steps one at a time" SciMLBase.solve(
+            SciMLBase.ODEProblem(decay!, [1.0, 2.0], (0.0, 1.0)),
+            PETScDiffEq.TSMPRK([1], "p2", ["-ts_type", "glle"]); fixed...,
+        )
+        @test_throws "such as `TSImplicit(\"bdf\")`" SciMLBase.solve(
+            prob, glle; fixed..., tstops = [0.35],
+        )
         residual!(r, du, u, p, t) = (r[1] = du[1] + u[1]; nothing)
         dae = SciMLBase.DAEProblem(residual!, [-1.0], [1.0], (0.0, 1.0))
-        @test_throws why SciMLBase.solve(dae, PETScDiffEq.TSDAE("glle"); fixed..., tstops = [0.5])
+        @test_throws "such as `TSDAE(\"bdf\")`" SciMLBase.solve(
+            dae, PETScDiffEq.TSDAE("glle"); fixed..., tstops = [0.5],
+        )
+        @test SciMLBase.solve(dae, PETScDiffEq.TSDAE("bdf"); fixed..., tstops = [0.5]).retcode ==
+            SciMLBase.ReturnCode.Success
+        # A first step past the span is cut only by TSSolve's MATCHSTEP.
+        for (tf, kw) in ((1.0f0, (; saveat = 0.25f0)), (0.05f0, (;)))
+            single = SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, tf)), glle;
+                dt = 0.1f0, adaptive = false, kw...,
+            )
+            double = SciMLBase.solve(
+                SciMLBase.ODEProblem(decay!, [1.0], (0.0, Float64(tf))), glle;
+                dt = Float64(0.1f0), adaptive = false, kw...,
+            )
+            @test single.retcode == SciMLBase.ReturnCode.Success
+            @test single.t[end] == tf
+            @test single.t == double.t
+            @test single.u[end][1] ≈ double.u[end][1] rtol = 1.0e-6
+        end
+        @test_throws why SciMLBase.solve(
+            SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0)),
+            PETScDiffEq.TSGeneric("bdf", ["-ts_type", "glle"]); dt = 0.1f0, adaptive = false,
+        )
     end
 
     @testset "the same types are refused when an option selects them" begin

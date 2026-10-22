@@ -27,6 +27,8 @@ step, and the step after a stop, are at least four ulps of `t`, since PETSc cann
 step whose stages have no room between its ends; a single-precision solve is stepped by
 this package's integrator, which lands on each stop and on the final time itself, where
 PETSc's own landing would refuse a step under about `1e-6` before a final time below 1.
+The exception is an algorithm naming `"glle"`, which PETSc runs as a whole solve when there
+are no stops or callbacks, since `"glle"` lands on the final time by its own step control.
 Tolerances finer than single precision can resolve, about `1e-7`, are accepted but buy
 nothing past its rounding, and can drive PETSc's adaptive step below what the clock can
 tell apart, which ends the solve with a failed retcode. PETSc's single build also takes the
