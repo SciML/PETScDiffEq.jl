@@ -4163,6 +4163,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test maximum(abs(u[1] - exp(-1000t)) for (t, u) in zip(sol.t, sol.u)) < 1.0e-3
         end
 
+        @testset "a generalized-alpha step whose Newton solve failed" begin
+            first_order(g) = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = g(u[1], t); nothing), [1.0], (0.0, 1.0),
+            )
+            second_order(g) = SciMLBase.SecondOrderODEProblem(
+                (ddu, du, u, p, t) -> (ddu[1] = g(u[1], t); nothing), [0.0], [1.0], (0.0, 1.0),
+            )
+            alpha(o) = PETScDiffEq.TSGeneric("alpha", ["-ts_adapt_type"; "basic"; o])
+            for (problem, alg) in ((first_order, alpha), (second_order, PETScDiffEq.TSAlpha2))
+                sol = @test_logs (:warn, r"nonlinear solve failed at every step size") SciMLBase.solve(
+                    problem((u, t) -> t > 0.5 ? NaN : -u), alg(String[]); dt = 0.05,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Unstable
+                @test 0.5 < sol.t[end] < 0.52
+                @test sol.stats.nnonlinconvfail > 10
+                sol = SciMLBase.solve(
+                    problem((u, t) -> t < 0.5 ? -u : -u - 5u^3), alg(["-snes_max_it", "1"]);
+                    dt = 0.05,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.stats.nnonlinconvfail > 100
+            end
+        end
+
         @testset "a Newton solve that diverges at the first step" begin
             square = SciMLBase.ODEProblem(
                 (du, u, p, t) -> (du[1] = u[1]^2; nothing), [1.0], (0.0, 0.9),

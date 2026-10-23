@@ -2516,7 +2516,9 @@ function _check_stage_body!(ctx, ts, t::R, y, accept) where {R}
         _out_of_attempts!(ctx, pl, ts, accept) && return LibPETSc.PetscErrorCode(0)
         h, s = LibPETSc.TSGetTimeStep(pl, ts), LibPETSc.TSGetTime(pl, ts)
         snes = _snes_failed(pl, ts_ptr)
-        snes === nothing || _stale_failure!(pl, snes, y) && (snes = nothing)
+        # TSAlpha and TSAlpha2 solve for X1 but check Xa, and solve before every check.
+        snes === nothing || ctx.alg_name in ("alpha", "alpha2") ||
+            _stale_failure!(pl, snes, y) && (snes = nothing)
         if snes === nothing
             s + h == s || return LibPETSc.PetscErrorCode(0)
             # PetscBool is 4 bytes before PETSc 3.24 and 1 after, and PETSc set it true.
