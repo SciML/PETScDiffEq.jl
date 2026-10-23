@@ -139,10 +139,10 @@ du0, dp = adjoint_sensitivities(
 )
 ```
 
-`TSImplicit` and `TSARKIMEX` solve transposed linear systems with the Krylov solver their
-Newton steps use, by default GMRES with ILU(0) stopping at a relative residual of 1e-5, so
-the gradient can be off by up to about that tolerance while the forward states are far more
-accurate. With Crank-Nicolson and default options, the gradient's relative error was 4e-8
+`TSImplicit` and `TSARKIMEX` solve transposed linear systems with the linear solver their
+Newton steps use. A dense Jacobian is factored directly. A sparse one is solved by default
+with GMRES and ILU(0) stopping at a relative residual of 1e-5, so the gradient can be off by
+up to about that tolerance while the forward states are far more accurate. With Crank-Nicolson and default options, the gradient's relative error was 4e-8
 for a 2-D heat equation on a 7 by 7 grid, 2.5e-6 on a 24 by 24 grid and 1.1e-5 for
 advection-diffusion on a 16 by 16 grid, while the forward states were within 8e-12, 5e-10
 and 1e-9 of a direct solve. A 1-D heat equation with 50 unknowns gave the same gradient as a
