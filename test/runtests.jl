@@ -9068,6 +9068,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             all(in(PETScDiffEq.DiffEqBase.allowedkeywords), keys(kw)) || continue
             @test_logs min_level = Logging.Warn SciMLBase.solve(prob, alg; dt = 0.1, kw...)
         end
+        differentiated = SciMLBase.remake(prob; sensealg = PETScDiffEq.PETScAdjoint())
+        @test_logs min_level = Logging.Warn SciMLBase.solve(differentiated, alg; dt = 0.1)
+        @test_logs min_level = Logging.Warn SciMLBase.solve!(
+            SciMLBase.init(differentiated, alg; dt = 0.1),
+        )
     end
 
     @testset "error norms follow OrdinaryDiffEq's defaults and switches" begin

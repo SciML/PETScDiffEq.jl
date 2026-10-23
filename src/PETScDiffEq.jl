@@ -4633,7 +4633,7 @@ _default_options(alg::TSARKIMEX) =
 _default_options(::TSAlpha2) = ["-ts_adapt_type", "basic"]
 
 const UNSUPPORTED_KWARGS = (
-    :internalnorm, :calck, :alias_u0, :sensealg,
+    :internalnorm, :calck, :alias_u0,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2, :failfactor,
     :step_limiter, :stage_limiter,
 )
