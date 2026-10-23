@@ -379,6 +379,9 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
         @test_throws "ArgumentError: PETSc has no adjoint for TSRosW" Zygote.gradient(
             summed(prob, TSRosW()), P0,
         )
+        @test_throws "ArgumentError: PETScAdjoint runs PETSc's own adjoint, so it needs one of PETScDiffEq's algorithms such as TSRK, but got Tsit5" Zygote.gradient(
+            summed(prob, Tsit5()), P0,
+        )
         @test_throws "ArgumentError: PETScAdjoint differentiates `solve` of a Float64 problem only" Zygote.gradient(
             summed(single, TSRK("4"); dt = 0.01f0, adaptive = false), Float32.(P0),
         )
@@ -396,4 +399,18 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
         mine = filter(pair -> any(m -> occursin("PETScAdjoint", string(m.sig)), pair), ambiguous)
         @test isempty(mine)
     end
+end
+
+@testset "ODEForwardSensitivityProblem and ForwardSensitivity" begin
+    fsp = ODEForwardSensitivityProblem(prob.f, U0, (0.0, 1.0), P0)
+    tol = (abstol = 1.0e-10, reltol = 1.0e-10)
+    ref = Array(solve(fsp, Tsit5(); saveat = TS, tol...))
+    for alg in (TSRK("5dp"), TSImplicit("bdf"; autodiff = PETScDiffEq.AutoFiniteDiff()))
+        sol = Array(solve(fsp, alg; saveat = TS, tol...))
+        @test size(sol) == size(ref) && relerr(sol, ref) < 1.0e-6
+    end
+    grad(alg) = Zygote.gradient(P0) do p
+        sum(abs2, Array(solve(prob, alg; p, saveat = TS, sensealg = ForwardSensitivity(), tol...)))
+    end
+    @test relerr(grad(TSRK("5dp"))[1], grad(Tsit5())[1]) < 1.0e-8
 end
