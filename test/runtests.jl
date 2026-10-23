@@ -14169,6 +14169,63 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws "needs `dt`" SciMLBase.solve(prob, PETScDiffEq.TSBasicSymplectic())
         end
 
+        @testset "TSAlpha2 ends where its update falls below the position's spacing" begin
+            spacing = r"floating point spacing of the position"
+            single_build = Float32 in PETScDiffEq._loaded_builds()
+            for (T, tol) in ((Float32, 1.0e-9), (Float32, 1.0e-12), (Float64, 1.0e-12))
+                T === Float32 && !single_build && continue
+                prob = SciMLBase.SecondOrderODEProblem(osc!, T[0], T[1], (T(0), T(1)))
+                kw = (; dt = T(0.01), abstol = tol, reltol = tol)
+                sol = @test_logs (:warn, spacing) SciMLBase.solve(
+                    prob, PETScDiffEq.TSAlpha2(); kw...,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Unstable
+                @test sol.t[end] < 1.0e-5
+                integ = SciMLBase.init(prob, PETScDiffEq.TSAlpha2(); kw...)
+                @test_logs (:warn, spacing) SciMLBase.solve!(integ)
+                @test integ.sol.retcode == SciMLBase.ReturnCode.Unstable
+            end
+            rest!(ddu, du, u, p, t) = (ddu .= 1 .- u .- 0.3; nothing)
+            for T in (Float32, Float64)
+                T === Float32 && !single_build && continue
+                rest = SciMLBase.SecondOrderODEProblem(rest!, T[0], T[0.7], (T(0), T(100)))
+                for kw in ((;), (; abstol = 0.0, reltol = 1.0e-6))
+                    sol = @test_logs min_level = Logging.Warn SciMLBase.solve(
+                        rest, PETScDiffEq.TSAlpha2(); kw...,
+                    )
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test sol.t[end] == 100
+                    @test collect(sol.u[end]) ≈ [0, 0.7] atol = 1.0e-6
+                end
+            end
+            # Round-off residual at rest, from u - 1 cancelling.
+            grav!(ddu, du, u, p, t) = (ddu .= -9.81 .- 1.0e9 .* (u .- 1); nothing)
+            hung = SciMLBase.SecondOrderODEProblem(
+                grav!, [0.0], [1 - 9.81 / 1.0e9], (0.0, 100.0),
+            )
+            sol = @test_logs min_level = Logging.Warn SciMLBase.solve(hung, PETScDiffEq.TSAlpha2())
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.t[end] == 100
+            if single_build
+                part!(ddu, du, u, p, t) = (ddu[1] = -u[1]; ddu[2] = -0.1f0; nothing)
+                part = SciMLBase.SecondOrderODEProblem(
+                    part!, Float32[1, 0], Float32[0, 1000], (0.0f0, 10.0f0),
+                )
+                sol = @test_logs (:warn, spacing) SciMLBase.solve(
+                    part, PETScDiffEq.TSAlpha2(); abstol = 1.0e-5, reltol = 1.0e-5,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Unstable
+            end
+            forced = SciMLBase.SecondOrderODEProblem(
+                forced!, Float32[0], Float32[1], (0.0f0, 10.0f0),
+            )
+            sol = @test_logs min_level = Logging.Warn SciMLBase.solve(
+                forced, PETScDiffEq.TSAlpha2(); abstol = 1.0e-3, reltol = 1.0e-3,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test final_err(sol, forced_exact(10.0)) < 5.0e-3
+        end
+
         @testset "states are ArrayPartitions, as in OrdinaryDiffEq" begin
             prob = SciMLBase.SecondOrderODEProblem(osc!, [0.0], [1.0], (0.0, 1.0))
             oop = SciMLBase.SecondOrderODEProblem((du, u, p, t) -> -u, [0.0], [1.0], (0.0, 1.0))

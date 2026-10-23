@@ -64,7 +64,9 @@ for `J` alone. `stats.nfpiter` and `stats.nfpconvfail` stay -1 as well.
 
 A solve that stops short of the final time says why in its retcode: `Unstable` when the
 state stops being finite, a step overflows, turns NaN or fails its Newton or linear solve at
-every size tried, with a warning, an adaptive step is too small to move `t`, or `unstable_check(dt, u, p, t)`
+every size tried, with a warning, an adaptive step is too small to move `t`, an adaptive
+`TSAlpha2` step loses its velocity change to the position's floating point spacing, or
+`unstable_check(dt, u, p, t)`
 returns true, which is asked before each step with the step about to be taken, as
 OrdinaryDiffEq asks it, `ConvergenceFailure` when a fixed-step nonlinear
 solve fails, `DtLessThanMin` as above, `MaxIters` after `maxiters` step attempts, accepted,
