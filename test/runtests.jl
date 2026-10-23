@@ -12054,6 +12054,39 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 (T === Float64 ? 2.0e-9 : 5.0e-7)
         end
 
+        # Measured: at most 2.5e-8.
+        @testset "a Float32 adjoint at fixed steps takes the steps solve takes: $name" for (
+                name, tspan, dt,
+            ) in (
+                ("a first step halved", (0.0f0, 0.5f0), 0.3f0),
+                ("a first step halved onto the middle", (0.0f0, 1.0f0), 0.6f0),
+                ("backward in time", (1.0f0, 0.0f0), 0.6f0),
+            )
+            x = Float32.(vcat(u0, p0))
+            sol = SciMLBase.solve(adj_prob(x[1:2], x[3:6], tspan), TSRK("4"); dt, adaptive = false)
+            y = Float64.(x)
+            stepped(θ) = SciMLBase.solve(
+                adj_prob(θ[1:2], θ[3:6], Float64.(tspan)), TSRK("4");
+                dt = 1.0, adaptive = false, tstops = Float64.(sol.t[2:(end - 1)]),
+            )
+            @test length(sol.t) == 3
+            for ts in (sol.t[end:end], sol.t)
+                steps = [Float64(tspan[1])]
+                du0, dp = PETScDiffEq._discrete_adjoint(
+                    adj_prob(x[1:2], x[3:6], tspan), TSRK("4"), PETScAdjoint();
+                    t = ts, dgdu_discrete = coupled_du!, dgdp_discrete = coupled_dp!, dt,
+                    adaptive = false, unstable_check = (dt, u, p, t) -> (push!(steps, t); false),
+                )
+                push!(steps, tspan[2])
+                @test steps == sol.t
+                function loss(θ)
+                    s = stepped(θ)
+                    return sum(coupled(s.u[i], θ[3:6], s.t[i]) for i in findall(in(ts), sol.t))
+                end
+                @test relerr(vcat(du0, vec(dp)), central_differences(loss, y)) < 1.0e-7
+            end
+        end
+
         function quadrature(θ, alg, tspan, cost; dt = 0.01, kwargs...)
             aug!(dz, z, p, t) = (
                 adj_f!(view(dz, 1:2), view(z, 1:2), p, t); dz[3] = cost(view(z, 1:2), p, t); nothing

@@ -55,8 +55,8 @@ The adjoint runs in PETSc's double real build. A `Float32` problem is solved the
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
 `du0` and `dp` come back as `Float32` where `u0` and `p` are. Its cost times are matched to
 the steps at single precision, so the times its own `solve` saved are accepted with `dt`
-repeated as that `solve` was given it, and with `tstops` it takes that `solve`'s steps to
-single precision. A complex state is refused.
+repeated as that `solve` was given it, and at fixed steps or with `tstops` it takes that
+`solve`'s steps to single precision. A complex state is refused.
 
 Costs are discrete, integral or both. At each `t[i]`, `dgdu_discrete(out, u, p, t, i)`
 writes the cost's derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`,
@@ -1386,12 +1386,14 @@ function _discrete_adjoint_unlocked(
         adaptive && !stopping && _set_time_span!(h, cost_s)
         # The rules `_match_steps_here!` gives `solve` in place of PETSc's MATCHSTEP.
         matches, own = R === Float32, R !== Float32 && _bad_hmax()
-        queue = stopping ? StopQueue{R}(
+        # A fixed-step Float32 `solve` keeps that rule without stops too.
+        queued = stopping || matches && !adaptive
+        queue = queued ? StopQueue{R}(
                 _tstops(adaptive ? vcat(tstops, jumps, cost_t) : vcat(tstops, jumps), h),
                 h.tdir .* Float64.(jumps), h.tf, !adaptive, LibPETSc.TSGetTimeStep(pl, ts),
                 nothing, false, Float64(h.ctx.tbound), matches, own,
             ) : nothing
-        stopping && (matches || own) &&
+        queued && (matches || own) &&
             LibPETSc.TSSetExactFinalTime(pl, ts, LibPETSc.TS_EXACTFINALTIME_STEPOVER)
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
