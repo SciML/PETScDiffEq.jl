@@ -2913,19 +2913,23 @@ function _call_jac!(ctx, xdot_ptr, shift, t)
     return nothing
 end
 
-function _fill_rows!(ctx, shift, n)
+# Writes `shift * M - J` straight into SeqAIJ's values, rows by ascending column.
+function _shifted_rows!(vals, cols0, srcs, J::Vector{S}, M, dae, shift, n) where {S}
+    k = 1
     @inbounds for i in 1:n
-        cols = ctx.row_cols0[i]
-        src = ctx.row_src[i]
-        buf = ctx.row_buf[i]
-        for k in eachindex(cols)
-            j = Int(cols[k]) + 1
-            jv = src[k] == 0 ? zero(eltype(ctx.J)) : ctx.J.nzval[src[k]]
-            buf[k] = ctx.dae ? jv : shift * _mass(ctx, i, j) - jv
+        cols, src = cols0[i], srcs[i]
+        for m in eachindex(src)
+            jv = src[m] == 0 ? zero(S) : J[src[m]]
+            vals[k] = dae ? jv : shift * _mass_at(S, M, i, Int(cols[m]) + 1) - jv
+            k += 1
         end
     end
     return nothing
 end
+
+_mass_at(::Type{S}, ::Nothing, i, j) where {S} = i == j ? one(S) : zero(S)
+_mass_at(::Type{S}, M::LinearAlgebra.Diagonal, i, j) where {S} = i == j ? S(M.diag[i]) : zero(S)
+_mass_at(::Type{S}, M, i, j) where {S} = S(M[i, j])
 
 # This rank's rows of M, with global columns; a Diagonal or identity block sits on its own.
 function _distributed_mass(::Type{S}, mass, n, N, comm) where {S}
@@ -3898,6 +3902,73 @@ function _sparse_mass_block!(W, J, M::SparseMatrixCSC, shift, n)
     return nothing
 end
 
+function _is_seqdense(pl, A)
+    flag = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscObjectTypeCompare), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Cstring, Ptr{LibPETSc.PetscBool}), A.ptr, "seqdense", flag,
+        ),
+    )
+    return flag[] == LibPETSc.PETSC_TRUE
+end
+
+# PETSc's dense storage is column-major with leading dimension `lda`, as Julia's is.
+function _set_dense_block!(pl, B, J::Matrix{S}, M, dae, shift, n) where {S}
+    data, lda = Ref{Ptr{S}}(C_NULL), Ref{PETSc.inttype(pl)}(0)
+    _check_code(
+        ccall(
+            _symbol(pl, :MatDenseGetLDA), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
+            B.ptr, lda,
+        ),
+    )
+    _check_code(
+        ccall(
+            _symbol(pl, :MatDenseGetArray), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Ptr{S}}),
+            B.ptr, data,
+        ),
+    )
+    try
+        W = view(unsafe_wrap(Array, data[], (Int(lda[]), n)), 1:n, 1:n)
+        dae ? copyto!(W, J) : _shifted!(W, J, M, S(shift))
+    finally
+        _check_code(
+            ccall(
+                _symbol(pl, :MatDenseRestoreArray), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{Ptr{S}}), B.ptr, data,
+            ),
+        )
+    end
+    return nothing
+end
+
+function _shifted!(W, J, M, shift)
+    W .= .-J
+    _add_mass!(W, M, shift)
+    return nothing
+end
+
+function _add_mass!(W, ::Nothing, shift)
+    @inbounds for i in axes(W, 1)
+        W[i, i] += shift
+    end
+    return nothing
+end
+function _add_mass!(W, M::LinearAlgebra.Diagonal, shift)
+    @inbounds for i in axes(W, 1)
+        W[i, i] += shift * M.diag[i]
+    end
+    return nothing
+end
+_add_mass!(W, M::Matrix, shift) = (W .+= shift .* M; nothing)
+function _add_mass!(W, M::SparseMatrixCSC, shift)
+    rows, vals = rowvals(M), nonzeros(M)
+    @inbounds for j in axes(M, 2), k in nzrange(M, j)
+        W[rows[k], j] += shift * vals[k]
+    end
+    return nothing
+end
+
 function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
@@ -3909,15 +3980,19 @@ function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         ctx.njacs += 1
         n = length(ctx.u)
         M = ctx.M
-        if M isa SparseMatrixCSC
-            _sparse_mass_block!(ctx.W, ctx.J, M, shift, n)
+        if _is_seqdense(ctx.petsclib, B)
+            _set_dense_block!(ctx.petsclib, B, ctx.J, M, ctx.dae, shift, n)
         else
-            # MatSetValues reads the block row-major, hence W[j, i].
-            @inbounds for j in 1:n, i in 1:n
-                ctx.W[j, i] = ctx.dae ? ctx.J[i, j] : shift * _mass(ctx, i, j) - ctx.J[i, j]
+            if M isa SparseMatrixCSC
+                _sparse_mass_block!(ctx.W, ctx.J, M, shift, n)
+            else
+                # MatSetValues reads the block row-major, hence W[j, i].
+                @inbounds for j in 1:n, i in 1:n
+                    ctx.W[j, i] = ctx.dae ? ctx.J[i, j] : shift * _mass(ctx, i, j) - ctx.J[i, j]
+                end
             end
+            _setblock!(ctx, B, n)
         end
-        _setblock!(ctx, B, n)
         PETSc.assemble!(B)
         # Under -snes_mf_operator A is matrix-free and assembled only to pick up the state.
         B.ptr == A.ptr || PETSc.assemble!(A)
@@ -4020,8 +4095,14 @@ function _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_pt
             _call_jac!(ctx, xdot_ptr, shift, t)
             ctx.njacs += 1
             n = length(ctx.u)
-            _fill_rows!(ctx, shift, n)
-            _setrows!(ctx, B, n)
+            vals = LibPETSc.MatSeqAIJGetArray(ctx.petsclib, B)
+            try
+                _shifted_rows!(
+                    vals, ctx.row_cols0, ctx.row_src, ctx.J.nzval, ctx.M, ctx.dae, shift, n,
+                )
+            finally
+                LibPETSc.MatSeqAIJRestoreArray(ctx.petsclib, B, vals)
+            end
         else
             vals = _coo_values!(ctx, xdot_ptr, shift, t)
             ctx.njacs += 1
