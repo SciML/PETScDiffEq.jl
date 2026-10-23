@@ -161,7 +161,7 @@ function _consistent!(
         u0::Vector{S}, du0, prob, init, f, jac, pl, comm, t0, tf, abstol, dt, dtmax,
     ) where {S}
     is_dae = prob isa SciMLBase.AbstractDAEProblem
-    mass = is_dae ? nothing : prob.f.mass_matrix
+    mass = is_dae ? nothing : _mass_of(prob)
     eqs = vars = nothing
     if !is_dae
         plain = mass === nothing || mass == LinearAlgebra.I
@@ -292,7 +292,7 @@ end
 function _shampine!(u0::Vector{S}, du0, prob, f, jac, pl, t0, atol, pattern, h) where {S}
     p, n = prob.p, length(u0)
     is_dae = prob isa SciMLBase.AbstractDAEProblem
-    M = is_dae ? nothing : _serial_mass(S, prob.f.mass_matrix)
+    M = is_dae ? nothing : _serial_mass(S, _mass_of(prob))
     start, slope, fx = copy(u0), similar(u0), similar(u0)
     function residual!(out, x)
         @. slope = (x - start) / h
@@ -356,7 +356,7 @@ function _consistent_on!(
     end
     N, rstart = MPI.Allreduce(n, +, comm), MPI.Scan(n, +, comm) - n
     collocation = !(is_dae || brown)
-    mass = collocation ? prob.f.mass_matrix : nothing
+    mass = collocation ? _mass_of(prob) : nothing
     own = !(mass === nothing || mass == LinearAlgebra.I)
     sparse_mass = collocation && dm === nothing &&
         _anywhere(comm, own && mass isa SparseArrays.AbstractSparseMatrix)
