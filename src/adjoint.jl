@@ -1673,3 +1673,14 @@ SciMLBase._concrete_solve_adjoint(
     prob::SupportedProblem, alg::AnyPETScTS, sensealg::PETScAdjoint, u0, p,
     originator::SciMLBase.ADOriginator, args...; kwargs...,
 ) = _solve_and_pullback(prob, alg, sensealg, u0, p, originator, args...; kwargs...)
+
+_not_petsc_alg(alg) = ArgumentError(
+    "PETScAdjoint runs PETSc's own adjoint, so it needs one of PETScDiffEq's algorithms " *
+        "such as TSRK, but got $(nameof(typeof(alg))); for other solvers use an adjoint " *
+        "from SciMLSensitivity such as GaussAdjoint",
+)
+
+SciMLBase._concrete_solve_adjoint(
+    ::SupportedProblem, alg, ::PETScAdjoint, u0, p, ::SciMLBase.ADOriginator, args...;
+    kwargs...,
+) = throw(_not_petsc_alg(alg))
