@@ -2358,25 +2358,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.retcode == SciMLBase.ReturnCode.Success
             @test sol.u[end][1] ≈ exp(span[1] - span[2]) rtol = 1.0e-2
         end
-        # A first step past the span is cut only by TSSolve's MATCHSTEP.
-        for (tf, kw) in ((1.0f0, (; saveat = 0.25f0)), (0.05f0, (;)))
-            single = SciMLBase.solve(
-                SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, tf)), glle;
-                dt = 0.1f0, adaptive = false, kw...,
-            )
-            double = SciMLBase.solve(
-                SciMLBase.ODEProblem(decay!, [1.0], (0.0, Float64(tf))), glle;
-                dt = Float64(0.1f0), adaptive = false, kw...,
-            )
-            @test single.retcode == SciMLBase.ReturnCode.Success
-            @test single.t[end] == tf
-            @test single.t == double.t
-            @test single.u[end][1] ≈ double.u[end][1] rtol = 1.0e-6
-        end
-        @test_throws why SciMLBase.solve(
-            SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0)),
-            PETScDiffEq.TSGeneric("bdf", ["-ts_type", "glle"]); dt = 0.1f0, adaptive = false,
-        )
+        single = SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0))
+        @test_throws why SciMLBase.solve(single, glle; dt = 0.1f0, adaptive = false)
     end
 
     @testset "the same types are refused when an option selects them" begin
