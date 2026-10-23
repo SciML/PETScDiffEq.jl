@@ -7636,9 +7636,9 @@ end
 
 function _take_discontinuity!(integ::PETScIntegrator)
     h = integ.h
-    integ.derivative_discontinuity = false
     # `set_u!` leaves `end_u` behind, so only a state nothing touched passes as consistent.
     _reinitialize!(integ, nothing, copy(h.ctx.end_u))
+    integ.derivative_discontinuity = false
     integ.finished && return nothing
     _write_state!(h, integ.u)
     LibPETSc.TSRestartStep(h.petsclib, h.ts)

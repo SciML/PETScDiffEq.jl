@@ -10575,7 +10575,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             integ.u[2] = 5.0
             SciMLBase.derivative_discontinuity!(integ, true)
             @test_throws SciMLBase.CheckInitFailureError SciMLBase.step!(integ)
-            SciMLBase.terminate!(integ)
+            flagged_at = integ.t
+            @test_throws SciMLBase.CheckInitFailureError SciMLBase.step!(integ)
+            @test integ.t == flagged_at
+            integ.u[2] = 2integ.u[1]
+            SciMLBase.step!(integ)
+            @test integ.t > flagged_at
+            @test balanced(integ.u)
+            @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
         end
     end
 
