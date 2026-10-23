@@ -55,8 +55,8 @@ The adjoint runs in PETSc's double real build. A `Float32` problem is solved the
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
 `du0` and `dp` come back as `Float32` where `u0` and `p` are. Its cost times are matched to
 the steps at single precision, so the times its own `solve` saved are accepted with `dt`
-repeated as that `solve` was given it, and with `tstops` it takes that `solve`'s steps to
-single precision. A complex state is refused.
+repeated as that `solve` was given it, and at fixed steps or with `tstops` it takes that
+`solve`'s steps to single precision. A complex state is refused.
 
 Costs are discrete, integral or both. At each `t[i]`, `dgdu_discrete(out, u, p, t, i)`
 writes the cost's derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`,
@@ -461,8 +461,10 @@ function _land_on!(adj, ts, step, s, c)
     return nothing
 end
 
-# `_step_unlocked`'s choice of the stop to end the next step on, and its cut of a step past it.
+# `_step_unlocked`'s cap on the next step, its choice of the stop to end it on, and its cut
+# of a step past it.
 function _next_stop!(q::StopQueue{R}, pl, ts, s) where {R}
+    _cap_step!(pl, ts, q.fixed)
     while !isempty(q.stops) && q.stops[1] <= s + _near(R(s), q.tbound)
         popfirst!(q.stops)
     end
@@ -502,6 +504,7 @@ function _end_step!(q::StopQueue{R}, pl, ts) where {R}
     if q.stop === nothing
         tol = _near(R(q.tf), q.tbound)
         s != q.tf && s >= q.tf - tol && LibPETSc.TSSetTime(pl, ts, q.tf)
+        _cap_step!(pl, ts, q.fixed)
         # Under `matches` PETSc's MATCHSTEP is off, so each step to tf is matched here.
         q.matches && s < q.tf - tol && _next_stop!(q, pl, ts, s)
         return nothing
@@ -850,6 +853,19 @@ function _check_adjoint_problem(
     )
     prob isa SciMLBase.AbstractODEProblem ||
         throw(ArgumentError("PETScAdjoint supports an ODEProblem, not a DAEProblem"))
+    prob.f isa Union{
+        SciMLBase.ODEFunction, SciMLBase.SplitFunction, SciMLBase.DynamicalODEFunction,
+    } || throw(
+        ArgumentError(
+            "PETScAdjoint takes the right-hand side and its `jac` and `paramjac` from an " *
+                "ODEFunction, a SplitFunction or a DynamicalODEFunction, but `prob.f` here is " *
+                "of type $(nameof(typeof(prob.f))), whose fields need not describe the system " *
+                "it solves (an ODEForwardSensitivityFunction's are the original problem's); " *
+                "differentiate the original problem instead, with " *
+                "`sensealg = ForwardSensitivity()` or an adjoint from SciMLSensitivity such " *
+                "as `InterpolatingAdjoint()`",
+        ),
+    )
     prob.u0 isa AbstractVector || throw(
         ArgumentError(
             "PETScAdjoint supports a vector `u0`, not an array-shaped one; pass `vec(u0)` " *
@@ -888,7 +904,7 @@ function _check_adjoint_problem(
                 "before PETScAdjoint has set up the cost; remove it from petsc_options",
         ),
     )
-    mm = prob.f.mass_matrix
+    mm = _mass_of(prob)
     mm === nothing || mm == LinearAlgebra.I || throw(
         ArgumentError(
             "PETScAdjoint does not support a mass matrix; PETSc's ARKIMEX adjoint assumes " *
@@ -1373,12 +1389,14 @@ function _discrete_adjoint_unlocked(
         adaptive && !stopping && _set_time_span!(h, cost_s)
         # The rules `_match_steps_here!` gives `solve` in place of PETSc's MATCHSTEP.
         matches, own = R === Float32, R !== Float32 && _bad_hmax()
-        queue = stopping ? StopQueue{R}(
+        # A fixed-step Float32 `solve` keeps that rule without stops too.
+        queued = stopping || matches && !adaptive
+        queue = queued ? StopQueue{R}(
                 _tstops(adaptive ? vcat(tstops, jumps, cost_t) : vcat(tstops, jumps), h),
                 h.tdir .* Float64.(jumps), h.tf, !adaptive, LibPETSc.TSGetTimeStep(pl, ts),
                 nothing, false, Float64(h.ctx.tbound), matches, own,
             ) : nothing
-        stopping && (matches || own) &&
+        queued && (matches || own) &&
             LibPETSc.TSSetExactFinalTime(pl, ts, LibPETSc.TS_EXACTFINALTIME_STEPOVER)
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
@@ -1673,3 +1691,14 @@ SciMLBase._concrete_solve_adjoint(
     prob::SupportedProblem, alg::AnyPETScTS, sensealg::PETScAdjoint, u0, p,
     originator::SciMLBase.ADOriginator, args...; kwargs...,
 ) = _solve_and_pullback(prob, alg, sensealg, u0, p, originator, args...; kwargs...)
+
+_not_petsc_alg(alg) = ArgumentError(
+    "PETScAdjoint runs PETSc's own adjoint, so it needs one of PETScDiffEq's algorithms " *
+        "such as TSRK, but got $(nameof(typeof(alg))); for other solvers use an adjoint " *
+        "from SciMLSensitivity such as GaussAdjoint",
+)
+
+SciMLBase._concrete_solve_adjoint(
+    ::SupportedProblem, alg, ::PETScAdjoint, u0, p, ::SciMLBase.ADOriginator, args...;
+    kwargs...,
+) = throw(_not_petsc_alg(alg))

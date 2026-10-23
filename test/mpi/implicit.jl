@@ -1,6 +1,6 @@
 using MPI, PETScDiffEq, SciMLBase, SparseArrays, Test
-using LinearAlgebra: Diagonal
-using PETScDiffEq: PETSc, AutoFiniteDiff, AutoForwardDiff, DiffEqBase
+using LinearAlgebra: Diagonal, UniformScaling
+using PETScDiffEq: PETSc, AutoFiniteDiff, AutoForwardDiff, DiffEqBase, SciMLOperators
 using SciMLBase: ODEProblem, ODEFunction, DAEProblem, DAEFunction, SplitODEProblem, ReturnCode,
     solve
 
@@ -388,6 +388,32 @@ const METHODS = (
         e = caught(() -> solve(prob, TSImplicit("bdf"; comm)))
         @test rank == thrower ? e isa ArgumentError && occursin("must be $n x $N", e.msg) :
             remote(e)
+    end
+
+    @testset "a multiple of I or an operator as this rank's mass matrix" begin
+        n = length(rows)
+        heat(mass) = ODEProblem(
+            heat_function(heat!, rows; jac = true, mass_matrix = mass), heat0(rows), SPAN,
+        )
+        bdf = TSImplicit("bdf"; comm)
+        twos = Diagonal(fill(2.0, n))
+        ref = solve(heat(twos), bdf; TOL...)
+        for mass in (
+                UniformScaling(2.0), SciMLOperators.ScalarOperator(2.0),
+                SciMLOperators.MatrixOperator(twos),
+            )
+            @test solve(heat(mass), bdf; TOL...).u == ref.u
+        end
+        changing = SciMLOperators.MatrixOperator(
+            Matrix(twos); update_func! = (A, u, p, t) -> (A[1, 1] = 2 + t; nothing),
+        )
+        free = SciMLOperators.FunctionOperator(
+            (w, v, u, p, t) -> (w .= 2 .* v; w), zeros(n), zeros(n),
+        )
+        for (given, why) in ((changing, "isconstant` is false"), (free, "matrix-free"))
+            e = caught(() -> solve(heat(rank == thrower ? given : twos), bdf))
+            @test rank == thrower ? e isa ArgumentError && occursin(why, e.msg) : remote(e)
+        end
     end
 
     @testset "algebraic rows with a zero on the diagonal" begin

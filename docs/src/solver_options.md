@@ -23,8 +23,13 @@ callbacks' `initialize` and `finalize` run, the state at `t0` is saved when `sav
 smaller step, the solve ends there with `ReturnCode.DtLessThanMin`. A step shortened to
 land on a stop or the final time does not count, and a fixed-step solve has no floor, as in
 OrdinaryDiffEq. With `force_dtmin = true` the solve goes on at `dtmin` instead, and the floor
-wins over a smaller `dtmax`. A NaN `dt`, `dtmin` or `dtmax`, an infinite `dt` and a zero
-`dtmax` throw an `ArgumentError`, where OrdinaryDiffEq ends the solve with `DtNaN` or
+wins over a smaller `dtmax`. `dtmax` bounds every step of an adaptive solve, a first step
+from `dt` and one from `set_proposed_dt!` included, as in OrdinaryDiffEq, while a fixed-step
+solve steps at `dt`. PETSc's rule for landing on a stop or the final time is kept: a step
+that would leave less than 1% of itself before one is stretched onto it, where
+OrdinaryDiffEq takes the short step after it. `TSGeneric("glle")` picks its steps with its
+own controller, which ignores `dtmax`. A NaN `dt`, `dtmin` or `dtmax`, an infinite `dt` and
+a zero `dtmax` throw an `ArgumentError`, where OrdinaryDiffEq ends the solve with `DtNaN` or
 `Unstable`, or takes an infinite `dt` as the whole span. `d_discontinuities` are stepped onto, and, as SciML defines them,
 the step after each starts one ULP past it, so the right-hand side there sees the new regime
 when written as `if t > t_d`. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
@@ -83,7 +88,15 @@ its own from the step's start. The points cost from 6 calls of `f` for `"5f"` to
 `"8vr"`, once in each step a state is taken from, and dense output stays the cubic Hermite,
 so for these `sol(t)` between saved points is less accurate than `saveat`.
 With a mass matrix or a `DAEProblem` only PETSc's is available, and a type that has none
-raises an `ArgumentError` when such a state is needed. `integrator(t, Val{1})` is the slope
+raises an `ArgumentError` when such a state is needed. A `ContinuousCallback` looks for a sign
+change at `interp_points` times across every step, so with such a type it raises at the first
+step even when it would never fire; with `interp_points = 0` it raises only once it fires, and
+with `rootfind = NoRootFind` it fires at the step's end and never raises. PETSc's interpolant for
+`TSARKIMEX`'s `"1bee"`, `"l2"` and the DIRK tableaux whose first stage is implicit, such as
+`"8614a"`, starts from that stage rather than from the step's start, so those count as having
+none, whether a subtype, `-ts_arkimex_type` or `-ts_dirk_type` picks them. With these,
+`-ts_exact_final_time interpolate`, which takes the final state from that interpolant, raises an
+`ArgumentError` on any problem. `integrator(t, Val{1})` is the slope
 of the cubic Hermite interpolant through the step's ends, the interpolant's own derivative
 where the package interpolates itself, and it raises with a mass matrix or a `DAEProblem`.
 Past the step's end, where DiffEqCallbacks' `PositiveDomain` and `GeneralDomain` look,
@@ -103,8 +116,12 @@ OrdinaryDiffEq's integrator does.
 `ODEProblem`, `SplitODEProblem`, `DAEProblem`, `DynamicalODEProblem` and
 `SecondOrderODEProblem` are supported, in place or out of place except for a `DAEProblem`,
 whose residual has to be in place, along with `ODEFunction`'s `jac`, `jac_prototype` and
-`mass_matrix`. Supply a `jac_prototype` for anything sparse: without one the Jacobian is
-dense and forces a dense factorization.
+`mass_matrix`. A `mass_matrix` that is a multiple of `I`, as a `UniformScaling` or a
+`ScalarOperator`, or a constant SciMLOperator such as a `MatrixOperator`, is taken as its
+matrix. An operator that `SciMLOperators.isconstant` calls not constant, such as one with an
+update function, is refused, and so is a matrix-free `FunctionOperator`. Supply a
+`jac_prototype` for anything sparse: without one the Jacobian is dense and forces a dense
+factorization.
 
 `TSARKIMEX` integrates the `f1` of a `SplitODEProblem` implicitly and its `f2` explicitly.
 Every other algorithm solves it as the `ODEProblem` of `f1 + f2` and returns that problem's
@@ -151,7 +168,9 @@ fixed-step backward Euler solve fail. A `-snes_lag_jacobian` in `petsc_options` 
 
 `DiscreteCallback`, `ContinuousCallback`, `VectorContinuousCallback` and `CallbackSet`
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`,
-`terminate!` and `initialize_dae!`. After a step the running solution's retcode is `Success`, as
+`terminate!` and `initialize_dae!`. The exception is PETSc's `"glle"`, which PETSc runs only
+as a whole solve, so `init` refuses it and so does a solve with a callback or `tstops`; see
+[`TSGeneric`](@ref). After a step the running solution's retcode is `Success`, as
 OrdinaryDiffEq's is. `check_error` gives `Success` while the integrator can go on and the
 retcode it stopped with after that. In a callback's `finalize` it gives the retcode passed to
 `terminate!`, and `Success` for a solve that ended any other way, where OrdinaryDiffEq's
