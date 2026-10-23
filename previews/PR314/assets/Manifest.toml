@@ -2,7 +2,7 @@
 
 julia_version = "1.13.2"
 manifest_format = "2.1"
-project_hash = "bbc629a72ee954a57b83002d07ae84390f4fd99d"
+project_hash = "bee5e3a359ada12c152c9a5ee7441a0beaf4c603"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -531,10 +531,10 @@ version = "1.5.0"
 
 [[deps.Git_LFS_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "246c7a13f927d780f3f77a029664cda98c5f0f22"
+git-tree-sha1 = "d310b22511a51569401e975194cc76077bcd3786"
 registries = "General"
 uuid = "020c3dae-16b3-5ae5-87b3-4cb189e250b2"
-version = "3.8.0+0"
+version = "3.8.1+0"
 
 [[deps.Git_jll]]
 deps = ["Artifacts", "Expat_jll", "JLLWrappers", "LibCURL_jll", "Libdl", "Libiconv_jll", "OpenSSL_jll", "PCRE2_jll", "Zlib_jll"]
@@ -615,10 +615,10 @@ version = "1.8.0"
 
 [[deps.JSON]]
 deps = ["Dates", "Logging", "Parsers", "PrecompileTools", "StructUtils", "UUIDs", "Unicode"]
-git-tree-sha1 = "9d8bead1c9ed9f2dc4eb5b51947262163b38ffce"
+git-tree-sha1 = "ef46833ad806dc03d95dbe86db3d113965c461cd"
 registries = "General"
 uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-version = "1.12.1"
+version = "1.12.2"
 
     [deps.JSON.extensions]
     JSONArrowExt = ["ArrowTypes"]
@@ -960,9 +960,9 @@ version = "0.5.3"
 
 [[deps.PETScDiffEq]]
 deps = ["ADTypes", "ConstructionBase", "DiffEqBase", "DifferentiationInterface", "ForwardDiff", "Libdl", "LinearAlgebra", "MPI", "PETSc", "PETSc_jll", "PrecompileTools", "SciMLBase", "SciMLLogging", "SciMLOperators", "SparseArrays", "SparseMatrixColorings", "SymbolicIndexingInterface"]
-path = "/home/runner/work/PETScDiffEq.jl/PETScDiffEq.jl"
+path = "/home/runner/_work/PETScDiffEq.jl/PETScDiffEq.jl"
 uuid = "0a65194f-a16f-47d0-900e-080c22068669"
-version = "0.10.3"
+version = "0.11.0"
 
     [deps.PETScDiffEq.extensions]
     PETScDiffEqSciMLSensitivityExt = ["SciMLSensitivity", "ChainRulesCore"]
@@ -1345,10 +1345,10 @@ version = "0.6.1"
 
 [[deps.StructUtils]]
 deps = ["Dates", "UUIDs"]
-git-tree-sha1 = "9372decd34a91c0e1183fcb0e826182b89699150"
+git-tree-sha1 = "044ed182312a8ad0f28437f048f3e1eae9093a80"
 registries = "General"
 uuid = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
-version = "2.11.0"
+version = "2.11.1"
 
     [deps.StructUtils.extensions]
     StructUtilsDataFramesExt = ["DataFrames"]
