@@ -2438,14 +2438,16 @@ function _jacobian_lag(pl, snes)
     return lag[]
 end
 
+_set_jacobian_lag!(pl, snes, lag) = _check_code(
+    ccall(
+        _symbol(pl, :SNESSetLagJacobian), LibPETSc.PetscErrorCode,
+        (LibPETSc.CSNES, LibPETSc.PetscInt), snes, LibPETSc.PetscInt(lag),
+    ),
+)
+
 # TSStep_RosW lifts its Jacobian lag only after its last stage, so a failed stage leaves it frozen.
 function _unfreeze_jacobian!(pl, snes)
-    _jacobian_lag(pl, snes) < 0 && _check_code(
-        ccall(
-            _symbol(pl, :SNESSetLagJacobian), LibPETSc.PetscErrorCode,
-            (LibPETSc.CSNES, LibPETSc.PetscInt), snes, LibPETSc.PetscInt(1),
-        ),
-    )
+    _jacobian_lag(pl, snes) < 0 && _set_jacobian_lag!(pl, snes, 1)
     return nothing
 end
 
@@ -2700,6 +2702,33 @@ function _set_pc_type!(pl, ts, type)
     code == 0 || throw(LibPETSc.PetscError(code))
     return nothing
 end
+
+function _set_ksp_type!(pl, ts, type)
+    ksp = Ref{LibPETSc.CKSP}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :SNESGetKSP), LibPETSc.PetscErrorCode,
+            (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}), _snes(pl, ts), ksp,
+        ),
+    )
+    _check_code(
+        ccall(_symbol(pl, :KSPSetType), LibPETSc.PetscErrorCode, (LibPETSc.CKSP, Cstring), ksp[], type),
+    )
+    return nothing
+end
+
+# The SNES's matrix is dense when it is the package's own n-by-n block or PETSc's
+# differencing matrix, which PETSc makes dense. Rosenbrock-W keeps GMRES, as any ksponly
+# solve does below, without setting LU first only to undo it.
+_dense_jacobian(h, alg, comm, clone, sparse_jac, dm_jac) =
+    comm === nothing && clone === nothing && _uses_ifunction(alg) &&
+    !(_ts_type(alg) in ("irk", "alpha2", "rosw")) &&
+    (h.jac_mat === nothing ? h.fd_mat === nothing : !sparse_jac && !dm_jac)
+
+_names_linear_solver(opts) = any(
+    o -> any(n -> _names_option(o, n), ("ksp_type", "pc_type", "snes_mf", "snes_mf_operator")),
+    opts,
+)
 
 # PETSc's DMDA colouring refuses a periodic axis whose size its colour count does not divide.
 _dm_colours(pl, dm) = _dm_colours(Returns(nothing), pl, dm)
@@ -5898,6 +5927,11 @@ function _setup(
                 comm === nothing ||
                     append!(effective_options, ["-sub_pc_factor_nonzeros_along_diagonal"])
             end
+            # ILU(0) of a dense matrix is already its full LU, which GMRES then wraps in a
+            # Krylov iteration it does not need.
+            dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
+                !_names_linear_solver([alg.petsc_options; extra_options])
+            dense_lu && append!(effective_options, ["-ksp_type", "preonly", "-pc_type", "lu"])
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
             forced = force_dtmin && dtmin !== nothing && dtmin != 0
             forced &&
@@ -6005,8 +6039,15 @@ function _setup(
                 )
             end
             # PETSc's default LU cannot factor IRK's Kronecker-product stage matrix.
-            chosen == "irk" && !any(o -> _names_option(o, "pc_type"), effective_options) &&
+            if chosen == "irk" && (dense_lu || !any(o -> _names_option(o, "pc_type"), effective_options))
                 _set_pc_type!(petsclib, ts, "pbjacobi")
+                dense_lu && _set_ksp_type!(petsclib, ts, "gmres")
+            elseif dense_lu && _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly")
+                # Without a Newton norm to see it, only GMRES's residual norm catches a NaN
+                # right-hand side, so that a smaller step is tried.
+                _set_pc_type!(petsclib, ts, "ilu")
+                _set_ksp_type!(petsclib, ts, "gmres")
+            end
             # Only valid once TSSetFromOptions has reached the linear solve.
             h.pivot_raises = _pivot_raises(petsclib, ts) ||
                 _option_flag(effective_options, "ts_error_if_step_fails")
@@ -6051,6 +6092,12 @@ function _setup(
             end
             fixed || !_uses_ifunction(alg) ||
                 _retry_failed_solves!(petsclib, ts, ctx, ptrs.stage_check, effective_options)
+            # PETSc's Newton forms a Jacobian at every iteration. From BDF's extrapolated guess
+            # one per solve, formed again after five iterations, takes about the same steps; a
+            # fixed step cannot retry a solve that fails, so it keeps one per iteration.
+            !fixed && running == "bdf" &&
+                !any(o -> _names_option(o, "snes_lag_jacobian"), effective_options) &&
+                _set_jacobian_lag!(petsclib, _snes(petsclib, ts.ptr), 5)
             fixed || _uses_ifunction(alg) ||
                 _set_stage_check!(petsclib, ts, ctx, ptrs.attempt_check)
             ctx.linear = _uses_ifunction(alg) &&
