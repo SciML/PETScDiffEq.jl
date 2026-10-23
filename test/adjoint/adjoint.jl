@@ -449,3 +449,14 @@ end
         end
     end
 end
+
+@testset "interpolating adjoints of the high-order TSRK subtypes" begin
+    loss(alg, sensealg) = p -> sum(
+        abs2, Array(solve(prob, alg; p, saveat = TS, sensealg, abstol = 1.0e-10, reltol = 1.0e-10)),
+    )
+    reference = Zygote.gradient(loss(Tsit5(), InterpolatingAdjoint()), P0)[1]
+    # sol(t) is the cubic Hermite here, measured 2.1e-6 off for 7vr.
+    for alg in (TSRK("5bs"), TSRK("7vr")), sensealg in (InterpolatingAdjoint(), QuadratureAdjoint())
+        @test relerr(Zygote.gradient(loss(alg, sensealg), P0)[1], reference) < 1.0e-5
+    end
+end

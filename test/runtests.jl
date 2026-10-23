@@ -1377,6 +1377,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         )
     end
 
+    @testset "f is called only at times inside tspan" begin
+        times = Float64[]
+        forced!(du, u, p, t) = (push!(times, t); du .= sin(t) .- u; nothing)
+        for (T, subtypes) in ((Float64, ("5bs", "7vr", "8vr")), (Float32, ("5dp", "7vr"))),
+                span in ((0, 1), (1, 0), (0.1, 1.3), (1.3, 0.1), (2, 0.3)), subtype in subtypes
+            empty!(times)
+            tspan = T.(span)
+            sol = SciMLBase.solve(
+                SciMLBase.ODEProblem(forced!, T[1, 2], tspan), PETScDiffEq.TSRK(subtype);
+                abstol = 1.0e-6, reltol = 1.0e-6,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test all(t -> minimum(tspan) <= t <= maximum(tspan), times)
+        end
+    end
+
     @testset "unstable_check sees what OrdinaryDiffEq's does" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         grow = SciMLBase.ODEProblem(
