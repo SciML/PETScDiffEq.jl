@@ -6261,7 +6261,7 @@ function _setup(
                     !any(o -> any(k -> _names_option(o, k), _NO_REUSE_OPTIONS), effective_options)
                 h.again = (;
                     alg, initializealg, dt = dt_given ? dt : nothing, dtmin, dtmax, force_dtmin,
-                    save_args, dt_args, estimates, est_calls, step_limit,
+                    save_args, dt_args, estimates, est_calls, step_limit, hook = Ref{Any}(nothing),
                     dt0 = LibPETSc.TSGetTimeStep(petsclib, ts),
                 )
             end
@@ -6434,9 +6434,8 @@ function _solve_unlocked(
         )
         try
             return _solve_integrator_unlocked(integ)
-        catch
+        finally
             _destroy!(integ.h)
-            rethrow()
         end
     end
     h = _setup(prob, alg; kwargs..., transient = true)
@@ -7887,6 +7886,8 @@ function _reuse!(h::TSHandles{<:Any, <:Any, R, S}, prob, tstops) where {R, S}
     LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_CONVERGED_ITERATING)
     LibPETSc.TSAdaptReset(pl, LibPETSc.TSGetAdapt(pl, ts))
     LibPETSc.TSRestartStep(pl, ts)
+    a.hook[] === nothing || (POST_STEP_CTX[ts.ptr] = a.hook[])
+    a.hook[] = nothing
     return true
 end
 
@@ -7938,8 +7939,8 @@ function _reinit_unlocked(
         !old.destroyed && isempty(getfield(integ.opts, :written)) ? _ts_state(old) : nothing
     reused = before !== nothing && _reuse!(old, prob, stops)
     h = reused ? old : _setup(
-        prob, integ.alg; tstops = stops, setup_kwargs..., direction = integ.tdir,
-    )
+            prob, integ.alg; tstops = stops, setup_kwargs..., direction = integ.tdir,
+        )
     try
         if !reused
             _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
@@ -8062,8 +8063,13 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
         _discretes(sol) !== nothing &&
         SciMLBase.save_final_discretes!(integ, integ.opts.callback)
     integ.finished = true
-    # A serial TS outlives the solve, for `reinit!` to start again on it.
-    h.again === nothing && _destroy!(h)
+    # A serial TS that ended well outlives the solve, for `reinit!` to start again on it.
+    if h.again === nothing || h.stopped != 0 || h.ctx.err !== nothing ||
+            !SciMLBase.successful_retcode(integ.sol.retcode)
+        _destroy!(h)
+    else
+        h.again.hook[] = pop!(POST_STEP_CTX, h.ts.ptr, nothing)
+    end
     h.ctx.comm === nothing || _throw_if_threw!(h.ctx)
     return nothing
 end
