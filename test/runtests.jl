@@ -1853,8 +1853,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         lin = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, dense = false)
         @test sol.dense
         @test !lin.dense
-        @test sol.interp isa SciMLBase.HermiteInterpolation
-        @test lin.interp isa SciMLBase.LinearInterpolation
+        @test sol.interp isa SciMLBase.BasicInterpolation && sol.interp.dense
+        @test lin.interp isa SciMLBase.BasicInterpolation && !lin.interp.dense
+        @test typeof(lin) === typeof(sol)
         @test length(sol.interp.du) == length(sol.u)
         @test sol.stats.nf == lin.stats.nf + length(sol.u)
         @test abs(sol(0.55)[1] - exp(-0.55)) < 1.0e-6
@@ -1866,6 +1867,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             isol = SciMLBase.solve!(SciMLBase.init(prob, alg; dt = 0.1, adaptive = false))
             @test isol.dense
             @test isol(0.55) == sol(0.55)
+        end
+
+        @testset "one solution type whatever is saved" begin
+            back = SciMLBase.remake(prob; tspan = (1.0, 0.0))
+            for problem in (prob, back), save_idxs in (nothing, [1], 1)
+                saved(; kw...) = SciMLBase.solve(problem, alg; dt = 0.1, save_idxs, kw...)
+                sols = (
+                    saved(), saved(; dense = false), saved(; saveat = 0.25),
+                    saved(; save_everystep = false),
+                )
+                @test allequal(map(typeof, sols))
+            end
+            integ = SciMLBase.init(back, alg; dt = 0.1, dense = false)
+            running = typeof(integ.sol)
+            @test typeof(SciMLBase.solve!(integ)) === running
+            @test running === typeof(SciMLBase.solve(back, alg; dt = 0.1))
         end
 
         @testset "off by default with saveat, on by request" begin

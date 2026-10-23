@@ -430,3 +430,22 @@ end
     ambiguous = Test.detect_ambiguities(PETScDiffEq, ext, SciMLSensitivity, SciMLBase)
     @test !any(pair -> any(m -> occursin("PETScDiffEq.", string(m.sig)), pair), ambiguous)
 end
+
+@testset "GaussAdjoint and GaussKronrodAdjoint checkpoint a solution that is not dense" begin
+    final(alg, sensealg; kw...) =
+        (u0, p) -> sum(abs2, solve(prob, alg; u0, p, sensealg, save_everystep = false, kw...).u[end])
+    fit(alg, sensealg; kw...) =
+        (u0, p) -> sum(abs2, Array(solve(prob, alg; u0, p, sensealg, saveat = TS, kw...)))
+    tight = (abstol = 1.0e-12, reltol = 1.0e-12)
+    tol = (abstol = 1.0e-10, reltol = 1.0e-10)
+    for (loss, sensealgs) in (
+            (final, (GaussAdjoint(), GaussKronrodAdjoint())),
+            (fit, (GaussAdjoint(checkpointing = true), GaussKronrodAdjoint(checkpointing = true))),
+        )
+        reference = flat(Zygote.gradient(loss(Tsit5(), GaussAdjoint(); tight...), U0, P0))
+        for alg in (TSRK("5dp"), TSRosW()), sensealg in sensealgs
+            gradient = Zygote.gradient(loss(alg, sensealg; tol...), U0, P0)
+            @test relerr(flat(gradient), reference) < 2.0e-7
+        end
+    end
+end

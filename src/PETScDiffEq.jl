@@ -2130,8 +2130,7 @@ _saved(ctx::TSContext{R, S, A}, u) where {R, S, A} = ctx.save_idxs === nothing ?
 _given_idxs(ctx::TSContext{R, S, A}) where {R, S, A} =
     A <: Number ? only(ctx.save_idxs) : ctx.save_idxs
 
-_interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, dus) :
-    SciMLBase.LinearInterpolation(ts, ctx.us)
+_interp(ctx, ts, dus) = SciMLBase.BasicInterpolation(ts, ctx.us, dus, ctx.dense)
 
 function _hermite!(out, ctx, s, s0, u0, s1, u1, ::Type{Val{N}} = Val{0}) where {N}
     ctx.fstart === nothing && (ctx.fstart = _derivative(ctx, s0, u0))
@@ -7706,8 +7705,9 @@ function _initial_save!(h::TSHandles)
     return nothing
 end
 
+# An empty `dus` keeps its type, so a solution's type does not depend on `dense`.
 _user_time(h::TSHandles) = h.tdir > 0 ? (h.ctx.ts, h.ctx.dus) :
-    (_user_t.(h.tdir, h.ctx.ts), [-d for d in h.ctx.dus])
+    (_user_t.(h.tdir, h.ctx.ts), eltype(h.ctx.dus)[-d for d in h.ctx.dus])
 
 _nf(h::TSHandles) = h.ctx.nf + (h.ad_calls === nothing ? 0 : h.ad_calls[])
 
