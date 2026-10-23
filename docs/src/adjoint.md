@@ -49,9 +49,9 @@ in place of the `ArrayPartition`.
 
 It runs in PETSc's double real build. A `Float32` problem is differentiated there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and the
-gradients come back as `Float32` where `u0` and `p` are. With `tstops` its steps are those of
-the `Float32` `solve` to single precision: every stage time of the two agreed to 1.6e-7 in
-the tests. A complex state is refused.
+gradients come back as `Float32` where `u0` and `p` are. At fixed steps or with `tstops` its
+steps are those of the `Float32` `solve` to single precision: every stage time of the two
+agreed to 1.6e-7 in the tests. A complex state is refused.
 
 The gradient is that of the solution PETSc computes at these steps. It agrees with finite
 differences of the same fixed-step `solve`, and it differs from a continuous adjoint such as
@@ -258,3 +258,8 @@ saved states carry a derivative. A `Float32` problem, a `DynamicalODEProblem` or
 though `adjoint_sensitivities` takes them, and so are Enzyme, ReverseDiff, Tracker and
 Mooncake, none of which this has been verified with. Everything `adjoint_sensitivities`
 refuses is refused as well.
+
+Without a `sensealg`, an `ODEProblem` is differentiated with SciMLSensitivity's
+`InterpolatingAdjoint()`, the default of `adjoint_sensitivities`, since the choice
+SciMLSensitivity makes for a small problem, `ForwardDiffSensitivity`, steps dual numbers,
+which PETSc cannot hold.
