@@ -55,7 +55,8 @@ The adjoint runs in PETSc's double real build. A `Float32` problem is solved the
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and
 `du0` and `dp` come back as `Float32` where `u0` and `p` are. Its cost times are matched to
 the steps at single precision, so the times its own `solve` saved are accepted with `dt`
-repeated as that `solve` was given it. A complex state is refused.
+repeated as that `solve` was given it, and with `tstops` it takes that `solve`'s steps to
+single precision. A complex state is refused.
 
 Costs are discrete, integral or both. At each `t[i]`, `dgdu_discrete(out, u, p, t, i)`
 writes the cost's derivative with respect to the state and `dgdp_discrete(out, u, p, t, i)`,
@@ -100,9 +101,9 @@ starting, 8 MB at the default and 8 GB at `maxiters = 10^9`. Without a limit, at
 `maxiters = Inf` or `typemax(Int)`, it reserves them for 10000 steps and doubles that as
 they fill. PETSc's time span holds one more copy of the state for each cost time inside
 `tspan`. `TSImplicit` and `TSARKIMEX`
-solve transposed linear systems with the same Krylov solver and tolerances as their Newton
-steps, so with default options the gradient can be off by up to about their relative
-tolerance of 1e-5 while the forward states are far closer; pass
+solve transposed linear systems with the same linear solver as their Newton steps. A dense
+Jacobian is factored directly; with a sparse one the default GMRES leaves the gradient off by
+up to about its relative tolerance of 1e-5 while the forward states are far closer; pass
 `-ksp_type preonly -pc_type lu`, or a tighter `-ksp_rtol`, when that matters. The options
 stay in force while the adjoint runs, so those PETSc reads only then, such as
 `-ts_trajectory_view` and `-ts_adjoint_view_solution`, take effect; options set globally,
@@ -186,8 +187,9 @@ PETScAdjoint(; petsc_options::AbstractVector{<:AbstractString} = String[]) =
     PETScAdjoint(String[String(o) for o in petsc_options])
 
 # The stops of `solve`'s own loop, as `tdir * t`, which the adjoint's TSSolve steps to as that
-# loop does; `stop` is the one the step in progress ends on, if any.
-mutable struct StopQueue
+# loop does; `stop` is the one the step in progress ends on, if any. `R`, `matches` and
+# `own_matchstep` are those of `solve`'s handles.
+mutable struct StopQueue{R}
     stops::Vector{Float64}
     jumps::Vector{Float64}
     tf::Float64
@@ -196,6 +198,8 @@ mutable struct StopQueue
     stop::Union{Nothing, Float64}
     started::Bool
     tbound::Float64
+    matches::Bool
+    own_matchstep::Bool
 end
 
 mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
@@ -458,15 +462,21 @@ function _land_on!(adj, ts, step, s, c)
 end
 
 # `_step_unlocked`'s choice of the stop to end the next step on, and its cut of a step past it.
-function _next_stop!(q::StopQueue, pl, ts, s)
-    while !isempty(q.stops) && q.stops[1] <= s + _near(s, q.tbound)
+function _next_stop!(q::StopQueue{R}, pl, ts, s) where {R}
+    while !isempty(q.stops) && q.stops[1] <= s + _near(R(s), q.tbound)
         popfirst!(q.stops)
     end
-    q.stop = !isempty(q.stops) && q.stops[1] < q.tf - _near(q.tf, q.tbound) ? q.stops[1] : nothing
+    q.stop = !isempty(q.stops) && q.stops[1] < q.tf - _near(R(q.tf), q.tbound) ? q.stops[1] :
+        nothing
     target = something(q.stop, q.tf)
     smax = target == -1 ? nextfloat(target) : _max_time(target)
     LibPETSc.TSSetMaxTime(pl, ts, smax)
-    LibPETSc.TSGetTimeStep(pl, ts) > smax - s && LibPETSc.TSSetTimeStep(pl, ts, smax - s)
+    if q.matches
+        p = _match_step!(pl, ts, target - s, R(s), q.fixed)
+        q.fixed || (q.dtcache = p)
+    elseif LibPETSc.TSGetTimeStep(pl, ts) > smax - s
+        LibPETSc.TSSetTimeStep(pl, ts, smax - s)
+    end
     return nothing
 end
 
@@ -485,19 +495,22 @@ end
 
 # `_step_unlocked` after its TSStep: the landing on a stop and the step it resumes with. It runs
 # before TSSolve compares the time with the max time, which `_next_stop!` has moved on.
-function _end_step!(q::StopQueue, pl, ts)
+function _end_step!(q::StopQueue{R}, pl, ts) where {R}
     Int(LibPETSc.TSGetConvergedReason(pl, ts)) < 0 && return nothing
+    q.own_matchstep && _matchstep!(pl, ts)
     s = LibPETSc.TSGetTime(pl, ts)
     if q.stop === nothing
-        s != q.tf && s >= q.tf - _near(q.tf, q.tbound) && LibPETSc.TSSetTime(pl, ts, q.tf)
+        tol = _near(R(q.tf), q.tbound)
+        s != q.tf && s >= q.tf - tol && LibPETSc.TSSetTime(pl, ts, q.tf)
+        # Under `matches` PETSc's MATCHSTEP is off, so each step to tf is matched here.
+        q.matches && s < q.tf - tol && _next_stop!(q, pl, ts, s)
         return nothing
-    elseif s >= q.stop - _near(q.stop, q.tbound)
-        resumed = q.fixed || s < LibPETSc.TSGetMaxTime(pl, ts) ? q.dtcache :
-            max(q.dtcache, LibPETSc.TSGetTimeStep(pl, ts))
+    elseif s >= q.stop - _near(R(q.stop), q.tbound)
+        resumed = _resumed_step(pl, ts, q.dtcache, R(q.stop), q.matches, q.fixed)
         s = q.stop
         LibPETSc.TSSetTime(pl, ts, s)
         LibPETSc.TSSetTimeStep(pl, ts, resumed)
-    elseif !q.fixed
+    elseif !q.matches && !q.fixed
         q.dtcache = LibPETSc.TSGetTimeStep(pl, ts)
     end
     if s in q.jumps
@@ -1358,11 +1371,15 @@ function _discrete_adjoint_unlocked(
         end
         # PETSc 3.22 allocates the span's states in TSSetUp, which the solve below is first to call.
         adaptive && !stopping && _set_time_span!(h, cost_s)
-        queue = stopping ? StopQueue(
+        # The rules `_match_steps_here!` gives `solve` in place of PETSc's MATCHSTEP.
+        matches, own = R === Float32, R !== Float32 && _bad_hmax()
+        queue = stopping ? StopQueue{R}(
                 _tstops(adaptive ? vcat(tstops, jumps, cost_t) : vcat(tstops, jumps), h),
                 h.tdir .* Float64.(jumps), h.tf, !adaptive, LibPETSc.TSGetTimeStep(pl, ts),
-                nothing, false, Float64(h.ctx.tbound),
+                nothing, false, Float64(h.ctx.tbound), matches, own,
             ) : nothing
+        stopping && (matches || own) &&
+            LibPETSc.TSSetExactFinalTime(pl, ts, LibPETSc.TS_EXACTFINALTIME_STEPOVER)
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
         inplace(fun) = _shaped(
