@@ -25,8 +25,11 @@ land on a stop or the final time does not count, and a fixed-step solve has no f
 OrdinaryDiffEq. With `force_dtmin = true` the solve goes on at `dtmin` instead, and the floor
 wins over a smaller `dtmax`. `dtmax` bounds every step of an adaptive solve, a first step
 from `dt` and one from `set_proposed_dt!` included, as in OrdinaryDiffEq, while a fixed-step
-solve steps at `dt`. A NaN `dt`, `dtmin` or `dtmax`, an infinite `dt` and a zero
-`dtmax` throw an `ArgumentError`, where OrdinaryDiffEq ends the solve with `DtNaN` or
+solve steps at `dt`. PETSc's rule for landing on a stop or the final time is kept: a step
+that would leave less than 1% of itself before one is stretched onto it, where
+OrdinaryDiffEq takes the short step after it. `TSGeneric("glle")` picks its steps with its
+own controller, which ignores `dtmax`. A NaN `dt`, `dtmin` or `dtmax`, an infinite `dt` and
+a zero `dtmax` throw an `ArgumentError`, where OrdinaryDiffEq ends the solve with `DtNaN` or
 `Unstable`, or takes an infinite `dt` as the whole span. `d_discontinuities` are stepped onto, and, as SciML defines them,
 the step after each starts one ULP past it, so the right-hand side there sees the new regime
 when written as `if t > t_d`. `isoutofdomain(u, p, t)` is asked after each step of an adaptive solve, and a
