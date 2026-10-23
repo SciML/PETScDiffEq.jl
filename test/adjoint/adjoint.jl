@@ -243,6 +243,17 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
             sol, TSRK("4"); sensealg = PETScAdjoint(), dt = 0.01, adaptive = false,
             t = TS, dgdu_discrete = dg!, dgdp_continuous = gp!,
         )
+        fsp = ODEForwardSensitivityProblem(prob.f, U0, (0.0, 1.0), P0)
+        fixed = (dt = 0.01, adaptive = false)
+        sensitivities = solve(fsp, Tsit5(); saveat = TS)
+        refused = "ArgumentError: PETScAdjoint takes the right-hand side and its `jac` and `paramjac` from an ODEFunction"
+        @test_throws refused adjoint_sensitivities(
+            sensitivities, TSRK("4"); sensealg = PETScAdjoint(), t = TS, dgdu_discrete = dg!,
+            fixed...,
+        )
+        @test_throws refused Zygote.gradient(P0) do p
+            sum(solve(fsp, TSRK("4"); p, saveat = TS, sensealg = PETScAdjoint(), fixed...)[end])
+        end
     end
 
     @testset "maxiters that the solve reaches tspan's end within" begin

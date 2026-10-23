@@ -850,6 +850,19 @@ function _check_adjoint_problem(
     )
     prob isa SciMLBase.AbstractODEProblem ||
         throw(ArgumentError("PETScAdjoint supports an ODEProblem, not a DAEProblem"))
+    prob.f isa Union{
+        SciMLBase.ODEFunction, SciMLBase.SplitFunction, SciMLBase.DynamicalODEFunction,
+    } || throw(
+        ArgumentError(
+            "PETScAdjoint takes the right-hand side and its `jac` and `paramjac` from an " *
+                "ODEFunction, a SplitFunction or a DynamicalODEFunction, but `prob.f` here is " *
+                "of type $(nameof(typeof(prob.f))), whose fields need not describe the system " *
+                "it solves (an ODEForwardSensitivityFunction's are the original problem's); " *
+                "differentiate the original problem instead, with " *
+                "`sensealg = ForwardSensitivity()` or an adjoint from SciMLSensitivity such " *
+                "as `InterpolatingAdjoint()`",
+        ),
+    )
     prob.u0 isa AbstractVector || throw(
         ArgumentError(
             "PETScAdjoint supports a vector `u0`, not an array-shaped one; pass `vec(u0)` " *
