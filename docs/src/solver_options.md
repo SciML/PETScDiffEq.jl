@@ -101,8 +101,12 @@ OrdinaryDiffEq's integrator does.
 `ODEProblem`, `SplitODEProblem`, `DAEProblem`, `DynamicalODEProblem` and
 `SecondOrderODEProblem` are supported, in place or out of place except for a `DAEProblem`,
 whose residual has to be in place, along with `ODEFunction`'s `jac`, `jac_prototype` and
-`mass_matrix`. Supply a `jac_prototype` for anything sparse: without one the Jacobian is
-dense and forces a dense factorization.
+`mass_matrix`. A `mass_matrix` that is a multiple of `I`, as a `UniformScaling` or a
+`ScalarOperator`, or a constant SciMLOperator such as a `MatrixOperator`, is taken as its
+matrix. An operator that `SciMLOperators.isconstant` calls not constant, such as one with an
+update function, is refused, and so is a matrix-free `FunctionOperator`. Supply a
+`jac_prototype` for anything sparse: without one the Jacobian is dense and forces a dense
+factorization.
 
 `TSARKIMEX` integrates the `f1` of a `SplitODEProblem` implicitly and its `f2` explicitly.
 Every other algorithm solves it as the `ODEProblem` of `f1 + f2` and returns that problem's

@@ -901,7 +901,7 @@ function _check_adjoint_problem(
                 "before PETScAdjoint has set up the cost; remove it from petsc_options",
         ),
     )
-    mm = prob.f.mass_matrix
+    mm = _mass_of(prob)
     mm === nothing || mm == LinearAlgebra.I || throw(
         ArgumentError(
             "PETScAdjoint does not support a mass matrix; PETSc's ARKIMEX adjoint assumes " *
