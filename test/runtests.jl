@@ -13799,12 +13799,34 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             rest!(ddu, du, u, p, t) = (ddu .= 1 .- u .- 0.3; nothing)
             for T in (Float32, Float64)
-                rest = SciMLBase.SecondOrderODEProblem(rest!, T[0], T[0.7], (T(0), T(5)))
-                sol = @test_logs min_level = Logging.Warn SciMLBase.solve(
-                    rest, PETScDiffEq.TSAlpha2(),
+                T === Float32 && !single_build && continue
+                rest = SciMLBase.SecondOrderODEProblem(rest!, T[0], T[0.7], (T(0), T(100)))
+                for kw in ((;), (; abstol = 0.0, reltol = 1.0e-6))
+                    sol = @test_logs min_level = Logging.Warn SciMLBase.solve(
+                        rest, PETScDiffEq.TSAlpha2(); kw...,
+                    )
+                    @test sol.retcode == SciMLBase.ReturnCode.Success
+                    @test sol.t[end] == 100
+                    @test collect(sol.u[end]) ≈ [0, 0.7] atol = 1.0e-6
+                end
+            end
+            # Round-off residual at rest, from u - 1 cancelling.
+            grav!(ddu, du, u, p, t) = (ddu .= -9.81 .- 1.0e9 .* (u .- 1); nothing)
+            hung = SciMLBase.SecondOrderODEProblem(
+                grav!, [0.0], [1 - 9.81 / 1.0e9], (0.0, 100.0),
+            )
+            sol = @test_logs min_level = Logging.Warn SciMLBase.solve(hung, PETScDiffEq.TSAlpha2())
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.t[end] == 100
+            if single_build
+                part!(ddu, du, u, p, t) = (ddu[1] = -u[1]; ddu[2] = -0.1f0; nothing)
+                part = SciMLBase.SecondOrderODEProblem(
+                    part!, Float32[1, 0], Float32[0, 1000], (0.0f0, 10.0f0),
                 )
-                @test sol.retcode == SciMLBase.ReturnCode.Success
-                @test collect(sol.u[end]) ≈ [0, 0.7] atol = 1.0e-6
+                sol = @test_logs (:warn, spacing) SciMLBase.solve(
+                    part, PETScDiffEq.TSAlpha2(); abstol = 1.0e-5, reltol = 1.0e-5,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Unstable
             end
             forced = SciMLBase.SecondOrderODEProblem(
                 forced!, Float32[0], Float32[1], (0.0f0, 10.0f0),

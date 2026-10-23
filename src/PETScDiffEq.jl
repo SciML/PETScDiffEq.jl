@@ -532,11 +532,13 @@ Adapts on PETSc's error estimate for the method, which PETSc leaves off unless a
 `reltol` and `abstol` apply. PETSc weighs the velocity and the position with one tolerance
 per component of the position, so a vector tolerance on the state `[v; u]` takes the smaller
 of each velocity and position pair. `adaptive = false` steps at the `dt` you give. PETSc
-forms the velocity and the acceleration from the step's change in position, so a tolerance
-that asks for steps whose change is below the position's floating point spacing, as `1e-9`
-does in `Float32`, ends an adaptive solve with `Unstable`.
+forms the velocity and the acceleration from the step's change in position, so an adaptive
+solve ends with `Unstable` when a component's change falls below the position's floating
+point spacing while the velocity it would carry exceeds the tolerance. A tight tolerance
+such as `1e-9` in `Float32` does this, and so can the automatic first step of a `Float32`
+body starting from rest at default tolerances; pass `dt` there.
 
-Each step solves for the acceleration, with the Jacobian of `f` in `u` and `u'`. That comes
+Each step solves for the position, with the Jacobian of `f` in `u` and `u'`. That comes
 from a `jac`, which is the Jacobian of the first-order system `[v; u]' = [f(v, u, p, t); v]`,
 `2n` by `2n` in the order of the state, as OrdinaryDiffEq's implicit methods take it, or
 without one from `autodiff`, as for [`TSImplicit`](@ref). A sparse `jac_prototype` of that
@@ -2501,8 +2503,31 @@ function _adapt_real(pl, ts_ptr, name, ::Type{R}) where {R}
     return lo[]
 end
 
-# alpha2 takes the velocity from the change in position, which an SNORM stop leaves zero.
-function _lost_update(pl, ts, ::Type{R}) where {R}
+function _array_read(pl, v, ::Type{S}) where {S}
+    v == C_NULL && return Ptr{S}(C_NULL)
+    a = Ref{Ptr{S}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :VecGetArrayRead), LibPETSc.PetscErrorCode,
+            (LibPETSc.CVec, Ptr{Ptr{S}}), v, a,
+        ),
+    )
+    return a[]
+end
+
+function _array_restore(pl, v, a::Ptr{S}) where {S}
+    v == C_NULL && return nothing
+    _check_code(
+        ccall(
+            _symbol(pl, :VecRestoreArrayRead), LibPETSc.PetscErrorCode,
+            (LibPETSc.CVec, Ptr{Ptr{S}}), v, Ref(a),
+        ),
+    )
+    return nothing
+end
+
+# A component an SNORM stop left unmoved loses gamma / (beta dt) times its update in velocity.
+function _lost_update(ctx, pl, ts, ::Type{R}) where {R}
     snes, reason = _snes(pl, ts.ptr), Ref{Cint}(0)
     _check_code(
         ccall(
@@ -2511,63 +2536,65 @@ function _lost_update(pl, ts, ::Type{R}) where {R}
         ),
     )
     reason[] == Cint(LibPETSc.SNES_CONVERGED_SNORM_RELATIVE) || return false
-    x, x0 = Ref{LibPETSc.CVec}(C_NULL), Ref{LibPETSc.CVec}(C_NULL)
+    x, dx = Ref{LibPETSc.CVec}(C_NULL), Ref{LibPETSc.CVec}(C_NULL)
+    for (getter, vec) in ((:SNESGetSolution, x), (:SNESGetSolutionUpdate, dx))
+        _check_code(
+            ccall(
+                _symbol(pl, getter), LibPETSc.PetscErrorCode,
+                (LibPETSc.CSNES, Ptr{LibPETSc.CVec}), snes, vec,
+            ),
+        )
+    end
+    x0, v0 = Ref{LibPETSc.CVec}(C_NULL), Ref{LibPETSc.CVec}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :SNESGetSolution), LibPETSc.PetscErrorCode,
-            (LibPETSc.CSNES, Ptr{LibPETSc.CVec}), snes, x,
+            _symbol(pl, :TS2GetSolution), LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, Ptr{LibPETSc.CVec}, Ptr{LibPETSc.CVec}), ts.ptr, x0, v0,
         ),
     )
+    alpha_m, alpha_f, gamma, beta = Ref{R}(0), Ref{R}(0), Ref{R}(0), Ref{R}(0)
     _check_code(
         ccall(
-            _symbol(pl, :TSGetSolution), LibPETSc.PetscErrorCode,
-            (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts.ptr, x0,
+            _symbol(pl, :TSAlpha2GetParams), LibPETSc.PetscErrorCode,
+            (LibPETSc.CTS, Ptr{R}, Ptr{R}, Ptr{R}, Ptr{R}), ts.ptr, alpha_m, alpha_f, gamma,
+            beta,
         ),
     )
-    same = Ref(LibPETSc.PETSC_FALSE)
-    _check_code(
-        ccall(
-            _symbol(pl, :VecEqual), LibPETSc.PetscErrorCode,
-            (LibPETSc.CVec, LibPETSc.CVec, Ptr{LibPETSc.PetscBool}), x[], x0[], same,
-        ),
-    )
-    same[] == LibPETSc.PETSC_TRUE || return false
-    atol, vatol = Ref{R}(0), Ref{LibPETSc.CVec}(C_NULL)
+    atol, rtol = Ref{R}(0), Ref{R}(0)
+    vatol, vrtol = Ref{LibPETSc.CVec}(C_NULL), Ref{LibPETSc.CVec}(C_NULL)
     _check_code(
         ccall(
             _symbol(pl, :TSGetTolerances), LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, Ptr{R}, Ptr{LibPETSc.CVec}, Ptr{R}, Ptr{LibPETSc.CVec}),
-            ts.ptr, atol, vatol, C_NULL, C_NULL,
+            ts.ptr, atol, vatol, rtol, vrtol,
         ),
     )
-    tol = if vatol[] == C_NULL
-        n = Ref{PETSc.inttype(pl)}(0)
-        _check_code(
-            ccall(
-                _symbol(pl, :VecGetSize), LibPETSc.PetscErrorCode,
-                (LibPETSc.CVec, Ptr{Cvoid}), x[], n,
-            ),
-        )
-        atol[] * sqrt(R(n[]))
-    else
-        norm2 = Ref{R}(0)
-        _check_code(
-            ccall(
-                _symbol(pl, :VecNorm), LibPETSc.PetscErrorCode,
-                (LibPETSc.CVec, Cint, Ptr{R}), vatol[], Cint(LibPETSc.NORM_2), norm2,
-            ),
-        )
-        norm2[]
-    end
-    fnorm = Ref{R}(0)
+    n = Ref{PETSc.inttype(pl)}(0)
     _check_code(
         ccall(
-            _symbol(pl, :SNESGetFunctionNorm), LibPETSc.PetscErrorCode,
-            (LibPETSc.CSNES, Ptr{R}), snes, fnorm,
+            _symbol(pl, :VecGetLocalSize), LibPETSc.PetscErrorCode,
+            (LibPETSc.CVec, Ptr{Cvoid}), x[], n,
         ),
     )
-    # dt times the residual is the velocity change left out; at rest it is below abstol.
-    return LibPETSc.TSGetTimeStep(pl, ts) * fnorm[] > tol
+    shift = gamma[] / (beta[] * LibPETSc.TSGetTimeStep(pl, ts))
+    S = PETSc.scalartype(pl)
+    vecs = (x[], x0[], dx[], v0[], vatol[], vrtol[])
+    ptrs = map(v -> _array_read(pl, v, S), vecs)
+    lost = false
+    try
+        px, px0, pdx, pv0, patol, prtol = ptrs
+        for i in 1:n[]
+            unsafe_load(px, i) == unsafe_load(px0, i) || continue
+            ai = patol == C_NULL ? atol[] : real(unsafe_load(patol, i))
+            ri = prtol == C_NULL ? rtol[] : real(unsafe_load(prtol, i))
+            tol = ai + ri * abs(unsafe_load(pv0, i))
+            # PETSc's error norm skips a component with no tolerance.
+            lost |= tol > 0 && shift * abs(unsafe_load(pdx, i)) > tol
+        end
+    finally
+        foreach((v, a) -> _array_restore(pl, v, a), vecs, ptrs)
+    end
+    return ctx.comm === nothing ? lost : MPI.Allreduce(lost, |, ctx.comm)
 end
 
 function _lost_update_message(R, t)
@@ -2598,7 +2625,7 @@ function _check_stage_body!(ctx, ts, t::R, y, accept) where {R}
         snes = _snes_failed(pl, ts_ptr)
         snes === nothing || _stale_failure!(pl, snes, y) && (snes = nothing)
         if snes === nothing
-            lost = ctx.alg_name == "alpha2" && _lost_update(pl, ts, R)
+            lost = ctx.alg_name == "alpha2" && _lost_update(ctx, pl, ts, R)
             lost || s + h == s || return LibPETSc.PetscErrorCode(0)
             # PetscBool is 4 bytes before PETSc 3.24 and 1 after, and PETSc set it true.
             unsafe_store!(Ptr{UInt8}(accept), 0x00)
