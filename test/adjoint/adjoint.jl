@@ -243,6 +243,17 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
             sol, TSRK("4"); sensealg = PETScAdjoint(), dt = 0.01, adaptive = false,
             t = TS, dgdu_discrete = dg!, dgdp_continuous = gp!,
         )
+        fsp = ODEForwardSensitivityProblem(prob.f, U0, (0.0, 1.0), P0)
+        fixed = (dt = 0.01, adaptive = false)
+        sensitivities = solve(fsp, Tsit5(); saveat = TS)
+        refused = "ArgumentError: PETScAdjoint takes the right-hand side and its `jac` and `paramjac` from an ODEFunction"
+        @test_throws refused adjoint_sensitivities(
+            sensitivities, TSRK("4"); sensealg = PETScAdjoint(), t = TS, dgdu_discrete = dg!,
+            fixed...,
+        )
+        @test_throws refused Zygote.gradient(P0) do p
+            sum(solve(fsp, TSRK("4"); p, saveat = TS, sensealg = PETScAdjoint(), fixed...)[end])
+        end
     end
 
     @testset "maxiters that the solve reaches tspan's end within" begin
@@ -368,6 +379,9 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
         @test_throws "ArgumentError: PETSc has no adjoint for TSRosW" Zygote.gradient(
             summed(prob, TSRosW()), P0,
         )
+        @test_throws "ArgumentError: PETScAdjoint runs PETSc's own adjoint, so it needs one of PETScDiffEq's algorithms such as TSRK, but got Tsit5" Zygote.gradient(
+            summed(prob, Tsit5()), P0,
+        )
         @test_throws "ArgumentError: PETScAdjoint differentiates `solve` of a Float64 problem only" Zygote.gradient(
             summed(single, TSRK("4"); dt = 0.01f0, adaptive = false), Float32.(P0),
         )
@@ -384,6 +398,55 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
         ambiguous = Test.detect_ambiguities(PETScDiffEq, ext, SciMLSensitivity, SciMLBase)
         mine = filter(pair -> any(m -> occursin("PETScAdjoint", string(m.sig)), pair), ambiguous)
         @test isempty(mine)
+    end
+end
+
+@testset "ODEForwardSensitivityProblem and ForwardSensitivity" begin
+    fsp = ODEForwardSensitivityProblem(prob.f, U0, (0.0, 1.0), P0)
+    tol = (abstol = 1.0e-10, reltol = 1.0e-10)
+    ref = Array(solve(fsp, Tsit5(); saveat = TS, tol...))
+    for alg in (TSRK("5dp"), TSImplicit("bdf"; autodiff = PETScDiffEq.AutoFiniteDiff()))
+        sol = Array(solve(fsp, alg; saveat = TS, tol...))
+        @test size(sol) == size(ref) && relerr(sol, ref) < 1.0e-6
+    end
+    grad(alg) = Zygote.gradient(P0) do p
+        sum(abs2, Array(solve(prob, alg; p, saveat = TS, sensealg = ForwardSensitivity(), tol...)))
+    end
+    @test relerr(grad(TSRK("5dp"))[1], grad(Tsit5())[1]) < 1.0e-8
+end
+
+@testset "Zygote differentiates solve without a sensealg" begin
+    fit(alg; kw...) = (u0, p) -> sum(abs2, Array(solve(prob, alg; u0, p, saveat = TS, kw...)))
+    final(alg; kw...) =
+        (u0, p) -> sum(abs2, solve(prob, alg; u0, p, save_everystep = false, kw...).u[end])
+    for loss in (fit, final)
+        reference = flat(Zygote.gradient(loss(Tsit5(); abstol = 1.0e-12, reltol = 1.0e-12), U0, P0))
+        for alg in (TSRK("5dp"), TSRosW())
+            gradient = Zygote.gradient(loss(alg; abstol = 1.0e-10, reltol = 1.0e-10), U0, P0)
+            @test relerr(flat(gradient), reference) < 2.0e-7
+        end
+    end
+    ext = Base.get_extension(PETScDiffEq, :PETScDiffEqSciMLSensitivityExt)
+    ambiguous = Test.detect_ambiguities(PETScDiffEq, ext, SciMLSensitivity, SciMLBase)
+    @test !any(pair -> any(m -> occursin("PETScDiffEq.", string(m.sig)), pair), ambiguous)
+end
+
+@testset "GaussAdjoint and GaussKronrodAdjoint checkpoint a solution that is not dense" begin
+    final(alg, sensealg; kw...) =
+        (u0, p) -> sum(abs2, solve(prob, alg; u0, p, sensealg, save_everystep = false, kw...).u[end])
+    fit(alg, sensealg; kw...) =
+        (u0, p) -> sum(abs2, Array(solve(prob, alg; u0, p, sensealg, saveat = TS, kw...)))
+    tight = (abstol = 1.0e-12, reltol = 1.0e-12)
+    tol = (abstol = 1.0e-10, reltol = 1.0e-10)
+    for (loss, sensealgs) in (
+            (final, (GaussAdjoint(), GaussKronrodAdjoint())),
+            (fit, (GaussAdjoint(checkpointing = true), GaussKronrodAdjoint(checkpointing = true))),
+        )
+        reference = flat(Zygote.gradient(loss(Tsit5(), GaussAdjoint(); tight...), U0, P0))
+        for alg in (TSRK("5dp"), TSRosW()), sensealg in sensealgs
+            gradient = Zygote.gradient(loss(alg, sensealg; tol...), U0, P0)
+            @test relerr(flat(gradient), reference) < 2.0e-7
+        end
     end
 end
 

@@ -49,7 +49,9 @@ in place of the `ArrayPartition`.
 
 It runs in PETSc's double real build. A `Float32` problem is differentiated there in
 `Float64`, so `jac`, `paramjac` and the cost functions are handed `Float64` states, and the
-gradients come back as `Float32` where `u0` and `p` are. A complex state is refused.
+gradients come back as `Float32` where `u0` and `p` are. At fixed steps or with `tstops` its
+steps are those of the `Float32` `solve` to single precision: every stage time of the two
+agreed to 1.6e-7 in the tests. A complex state is refused.
 
 The gradient is that of the solution PETSc computes at these steps. It agrees with finite
 differences of the same fixed-step `solve`, and it differs from a continuous adjoint such as
@@ -137,10 +139,10 @@ du0, dp = adjoint_sensitivities(
 )
 ```
 
-`TSImplicit` and `TSARKIMEX` solve transposed linear systems with the Krylov solver their
-Newton steps use, by default GMRES with ILU(0) stopping at a relative residual of 1e-5, so
-the gradient can be off by up to about that tolerance while the forward states are far more
-accurate. With Crank-Nicolson and default options, the gradient's relative error was 4e-8
+`TSImplicit` and `TSARKIMEX` solve transposed linear systems with the linear solver their
+Newton steps use. A dense Jacobian is factored directly. A sparse one is solved by default
+with GMRES and ILU(0) stopping at a relative residual of 1e-5, so the gradient can be off by
+up to about that tolerance while the forward states are far more accurate. With Crank-Nicolson and default options, the gradient's relative error was 4e-8
 for a 2-D heat equation on a 7 by 7 grid, 2.5e-6 on a 24 by 24 grid and 1.1e-5 for
 advection-diffusion on a 16 by 16 grid, while the forward states were within 8e-12, 5e-10
 and 1e-9 of a direct solve. A 1-D heat equation with 50 unknowns gave the same gradient as a
@@ -256,3 +258,8 @@ saved states carry a derivative. A `Float32` problem, a `DynamicalODEProblem` or
 though `adjoint_sensitivities` takes them, and so are Enzyme, ReverseDiff, Tracker and
 Mooncake, none of which this has been verified with. Everything `adjoint_sensitivities`
 refuses is refused as well.
+
+Without a `sensealg`, an `ODEProblem` is differentiated with SciMLSensitivity's
+`InterpolatingAdjoint()`, the default of `adjoint_sensitivities`, since the choice
+SciMLSensitivity makes for a small problem, `ForwardDiffSensitivity`, steps dual numbers,
+which PETSc cannot hold.
