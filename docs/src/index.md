@@ -56,7 +56,8 @@ prob = SciMLBase.ODEProblem(lorenz, u0, tspan)
 sol = SciMLBase.solve(prob, TSRK("5dp"); dt = 0.01, abstol = 1e-8, reltol = 1e-8)
 ```
 
-`dt` sets the first step. An adaptive solve can leave it out, and the first step is then
+`dt` sets the first step, which an adaptive solve holds to `dtmax`. An adaptive solve can
+leave it out, and the first step is then
 Hairer and Wanner's estimate as OrdinaryDiffEq uses it, taken with the `abstol` and `reltol`
 keywords (SciML's defaults, `abstol = 1e-6` and `reltol = 1e-3`, when not given). DAE and mass-matrix
 problems start from a small step instead. A solve PETSc steps at a fixed size needs `dt`:
