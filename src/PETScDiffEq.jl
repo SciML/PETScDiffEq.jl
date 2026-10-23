@@ -7884,6 +7884,7 @@ function _reuse!(h::TSHandles{<:Any, <:Any, R, S}, prob, tstops) where {R, S}
     ctx.end_s = t0
     ctx.fend = du0 === nothing ? nothing : h.tdir .* du0
     ctx.tbound = plan[6]
+    ctx.tend = tf
     h.t0, h.tf, h.u0 = t0, tf, u0
     h.save_start, h.save_end, h.end_saveat = plan[3], plan[4], plan[5]
     h.stopped = 0
