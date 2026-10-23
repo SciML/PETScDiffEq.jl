@@ -4840,6 +4840,8 @@ mutable struct TSHandles{CTX, L, R, S}
     jac_init::Any
     abstol::Any
     reltol::Any
+    again::Any
+    fresh::Any
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -5019,9 +5021,11 @@ function _global_norm(comm, u, t)
 end
 
 # PETSc's floor clamps only the steps its adaptor chooses, not one handed to it.
+_first_step(dt, dtmin, force_dtmin, R) =
+    force_dtmin && dtmin !== nothing ? max(abs(R(dt)), abs(R(dtmin))) : abs(R(dt))
+
 function _hand_step!(h::TSHandles{<:Any, <:Any, R}, dt, dtmin, force_dtmin) where {R}
-    step = force_dtmin && dtmin !== nothing ? max(abs(R(dt)), abs(R(dtmin))) : abs(R(dt))
-    LibPETSc.TSSetTimeStep(h.petsclib, h.ts, step)
+    LibPETSc.TSSetTimeStep(h.petsclib, h.ts, _first_step(dt, dtmin, force_dtmin, R))
     return nothing
 end
 
@@ -5660,6 +5664,76 @@ function _summed(prob::_SplitProblem, alg)
     return SciMLBase.ODEProblem{iip}(g, prob.u0, prob.tspan, prob.p; prob.kwargs...)
 end
 
+# Types whose state between solves `_reuse!` is known to clear. ARKIMEX's implicit-only path
+# seeds a restart's slope solve from the last solve's stages and keeps the algebraic rows it
+# found, which only TSReset clears, so it is reused only with an additive tableau and an RHS.
+_reusable(running, is_split) = first(split(running)) in _REUSED_TYPES ||
+    startswith(running, "arkimex ") && is_split && haskey(_ARKIMEX_ORDER, last(split(running)))
+const _REUSED_TYPES = ("rk", "rosw", "bdf", "beuler", "cn", "theta", "euler", "ssp")
+
+const _NO_REUSE_OPTIONS = (
+    "ts_init_time", "ts_max_time", "ts_max_snes_failures", "ts_max_reject", "ts_monitor",
+    "ts_trajectory", "ts_save_trajectory", "ts_view", "ts_adjoint",
+)
+
+# The first step `_setup` gives a solve that names no `dt`; `h.ctx.f!` may be reversed.
+function _first_dt(
+        h, is_dae, has_mass, dtmin, abstol, reltol, dtmax, user_f1, user_f2, running,
+        user_t0::R, t0, tf, tstops, u0, p, calls,
+    ) where {R}
+    petsclib, ts, comm, tdir = h.petsclib, h.ts, h.ctx.comm, h.tdir
+    est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
+    calls .= 0
+    is_dae && return max(R(1.0e-6) * _span(t0, tf), _min_step(user_t0))
+    has_mass &&
+        return max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
+    est_abstol = something(abstol, 1.0e-6)
+    est_reltol = something(reltol, 1.0e-3)
+    user_dtmax = dtmax === nothing || isinf(dtmax) ? R(Inf) : abs(R(dtmax))
+    first_stop = minimum(
+        (abs(R(s) - user_t0) for s in tstops if tdir * (R(s) - user_t0) > 0);
+        init = R(Inf),
+    )
+    threw = Ref{Any}(nothing)
+    estimate = _initial_dt(
+        _counted(_guard_f(user_f1, comm, threw), calls, 1),
+        user_f2 === nothing ? nothing :
+            _counted(_guard_f(user_f2, comm, threw), calls, 2), u0,
+        p, user_t0, tdir, _running_order(petsclib, ts, running),
+        est_abstol, est_reltol, est_dtmin,
+        min(user_dtmax, first_stop, abs(tf - t0)), comm,
+    )
+    _throw_anywhere(comm, threw[])
+    return estimate
+end
+
+function _save_plan(R, t0, tf, tdir, saveat, save_everystep, save_start, save_end, save_on)
+    saveat_times = saveat isa Number ?
+        collect(R, t0:abs(R(saveat)):tf) :
+        sort!(tdir .* Vector{R}(collect(saveat)))
+    slack = eps(isinf(tf) ? t0 : tf)
+    filter!(t -> t0 - slack <= t <= tf + slack, saveat_times)
+    bound = max(abs(t0), abs(tf))
+    at_start(t) = abs(t - t0) <= _near(t0, bound)
+    at_end(t) = abs(t - tf) <= _near(tf, bound)
+    no_saveat = !(saveat isa Number) && isempty(saveat)
+    save_everystep = save_on && something(save_everystep, no_saveat)
+    save_start = something(
+        save_start, save_everystep || no_saveat || saveat isa Number ||
+            any(at_start, saveat_times),
+    )
+    # OrdinaryDiffEq tests `t in saveat` on the argument as given, so a number is one time.
+    end_saveat = save_end === true || no_saveat ? nothing :
+        saveat isa Number ? [tdir * R(saveat)] : copy(saveat_times)
+    save_end = something(
+        save_end, save_everystep || no_saveat || saveat isa Number || any(at_end, saveat_times),
+    )
+    save_on || empty!(saveat_times)
+    save_start || filter!(!at_start, saveat_times)
+    save_end || filter!(!at_end, saveat_times)
+    return saveat_times, save_everystep, save_start, save_end, end_saveat, bound
+end
+
 function _setup(
         problem::SupportedProblem,
         alg::AnyPETScTS;
@@ -5912,29 +5986,10 @@ function _setup(
     else
         zeros(S, n, n)
     end
-    saveat_times = saveat isa Number ?
-        collect(R, t0:abs(R(saveat)):tf) :
-        sort!(tdir .* Vector{R}(collect(saveat)))
-    slack = eps(isinf(tf) ? t0 : tf)
-    filter!(t -> t0 - slack <= t <= tf + slack, saveat_times)
-    bound = max(abs(t0), abs(tf))
-    at_start(t) = abs(t - t0) <= _near(t0, bound)
-    at_end(t) = abs(t - tf) <= _near(tf, bound)
+    save_args = (saveat, save_everystep, save_start, save_end, save_on)
+    saveat_times, save_everystep, save_start, save_end, end_saveat, bound =
+        _save_plan(R, t0, tf, tdir, save_args...)
     no_saveat = !(saveat isa Number) && isempty(saveat)
-    save_everystep = save_on && something(save_everystep, no_saveat)
-    save_start = something(
-        save_start, save_everystep || no_saveat || saveat isa Number ||
-            any(at_start, saveat_times),
-    )
-    # OrdinaryDiffEq tests `t in saveat` on the argument as given, so a number is one time.
-    end_saveat = save_end === true || no_saveat ? nothing :
-        saveat isa Number ? [tdir * R(saveat)] : copy(saveat_times)
-    save_end = something(
-        save_end, save_everystep || no_saveat || saveat isa Number || any(at_end, saveat_times),
-    )
-    save_on || empty!(saveat_times)
-    save_start || filter!(!at_start, saveat_times)
-    save_end || filter!(!at_end, saveat_times)
     sparse_mass = has_mass && dm === nothing && comm !== nothing &&
         _anywhere(comm, own_mass && mass_matrix isa SparseArrays.AbstractSparseMatrix)
     M = if !has_mass
@@ -6033,6 +6088,7 @@ function _setup(
         false,
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
+        nothing, nothing,
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -6382,38 +6438,28 @@ function _setup(
                 )
             end
             ctx.hermite && (ctx.restep = _restep_tableau(petsclib, ts, running))
-            if !dt_given && !dt_option
-                user_t0 = R(prob.tspan[1])
-                est_dtmin = dtmin === nothing ? zero(R) : abs(R(dtmin))
-                dt = if is_dae
-                    max(R(1.0e-6) * _span(t0, tf), _min_step(user_t0))
-                elseif has_mass
-                    max(nextfloat(max(est_dtmin, eps(user_t0))), R(1.0e-6), _min_step(user_t0))
-                else
-                    est_abstol = something(abstol, 1.0e-6)
-                    est_reltol = something(reltol, 1.0e-3)
-                    user_dtmax = dtmax === nothing || isinf(dtmax) ? R(Inf) : abs(R(dtmax))
-                    first_stop = minimum(
-                        (abs(R(s) - user_t0) for s in tstops if tdir * (R(s) - user_t0) > 0);
-                        init = R(Inf),
-                    )
-                    threw, calls = Ref{Any}(nothing), [0, 0]
-                    estimate = _initial_dt(
-                        _counted(_guard_f(user_f1, comm, threw), calls, 1),
-                        user_f2 === nothing ? nothing :
-                            _counted(_guard_f(user_f2, comm, threw), calls, 2), u0,
-                        p, user_t0, tdir, _running_order(petsclib, ts, running),
-                        est_abstol, est_reltol, est_dtmin,
-                        min(user_dtmax, first_stop, abs(tf - t0)), comm,
-                    )
-                    ctx.nf += calls[1]
-                    ctx.nf2 += calls[2]
-                    _throw_anywhere(comm, threw[])
-                    estimate
-                end
+            estimates = !dt_given && !dt_option
+            dt_args = (
+                is_dae, has_mass, dtmin, abstol, reltol, dtmax, user_f1, user_f2, running,
+            )
+            est_calls = [0, 0]
+            if estimates
+                dt = _first_dt(
+                    h, dt_args..., R(prob.tspan[1]), t0, tf, tstops, u0, p, est_calls,
+                )
+                ctx.nf += est_calls[1]
+                ctx.nf2 += est_calls[2]
                 _hand_step!(h, dt, dtmin, force_dtmin)
             end
             _cap_step!(petsclib, ts, fixed)
+            if comm === nothing && dm === nothing && tf != -1 && _reusable(running, is_split) &&
+                    !any(o -> any(k -> _names_option(o, k), _NO_REUSE_OPTIONS), effective_options)
+                h.again = (;
+                    alg, initializealg, dt = dt_given ? dt : nothing, dtmin, dtmax, force_dtmin,
+                    save_args, dt_args, estimates, est_calls, step_limit, hook = Ref{Any}(nothing),
+                    dt0 = LibPETSc.TSGetTimeStep(petsclib, ts),
+                )
+            end
         end
     catch
         _destroy!(h)
@@ -6583,9 +6629,8 @@ function _solve_unlocked(
         )
         try
             return _solve_integrator_unlocked(integ)
-        catch
+        finally
             _destroy!(integ.h)
-            rethrow()
         end
     end
     h = _setup(prob, alg; kwargs..., transient = true)
@@ -7745,6 +7790,7 @@ function _init_unlocked(
     end
     _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
     _match_steps_here!(h)
+    _mark_fresh!(h)
     _initial_save!(h)
     stops = _tstops(stops_given, h)
     dt0 = h.tdir * LibPETSc.TSGetTimeStep(h.petsclib, h.ts)
@@ -7963,6 +8009,122 @@ function _live_stats!(integ::PETScIntegrator)
     return nothing
 end
 
+# What a reused TS starts from: the context as `_setup` left it, before any save or step.
+function _mark_fresh!(h::TSHandles)
+    h.again === nothing && return nothing
+    ctx = h.ctx
+    h.fresh = Any[getfield(ctx, i) for i in 1:fieldcount(typeof(ctx))]
+    for name in (:ts, :us, :dus)
+        h.fresh[Base.fieldindex(typeof(ctx), name)] = empty(getfield(ctx, name))
+    end
+    return nothing
+end
+
+function _ts_state(h::TSHandles)
+    pl, ts, ctx = h.petsclib, h.ts, h.ctx
+    return (
+        Any[getfield(ctx, i) for i in 1:fieldcount(typeof(ctx))], copy(ctx.u), copy(ctx.end_u),
+        (h.t0, h.tf, h.u0, h.save_start, h.save_end, h.end_saveat, h.stopped, h.init_failed),
+        h.ad_calls === nothing ? 0 : h.ad_calls[],
+        LibPETSc.TSGetTime(pl, ts), LibPETSc.TSGetStepNumber(pl, ts),
+        LibPETSc.TSGetTimeStep(pl, ts), LibPETSc.TSGetMaxTime(pl, ts),
+        LibPETSc.TSGetConvergedReason(pl, ts),
+        PETScCompat.with_local_array!(copy, h.u; read = true, write = false),
+    )
+end
+
+function _restore_ts_state!(h::TSHandles, st)
+    pl, ts, ctx = h.petsclib, h.ts, h.ctx
+    fields, u, end_u, hs, ad, t, n, dt, tmax, reason, sol = st
+    _return_work_vec!(ctx, ts)
+    _release_work_vec!(ctx)
+    for i in eachindex(fields)
+        setfield!(ctx, i, fields[i])
+    end
+    ctx.workvec = C_NULL
+    copyto!(ctx.u, u)
+    copyto!(ctx.end_u, end_u)
+    h.t0, h.tf, h.u0, h.save_start, h.save_end, h.end_saveat, h.stopped, h.init_failed = hs
+    h.ad_calls === nothing || (h.ad_calls[] = ad)
+    PETScCompat.with_local_array!(a -> copyto!(a, sol), h.u; read = false, write = true)
+    LibPETSc.TSSetTime(pl, ts, t)
+    LibPETSc.TSSetStepNumber(pl, ts, n)
+    LibPETSc.TSSetTimeStep(pl, ts, dt)
+    LibPETSc.TSSetMaxTime(pl, ts, tmax)
+    LibPETSc.TSSetConvergedReason(pl, ts, reason)
+    return nothing
+end
+
+# Puts `h` back where `_setup` would leave a new one for `prob`, keeping its PETSc objects.
+# Returns false, touching nothing, when only a new `_setup` can do that.
+function _reuse!(h::TSHandles{<:Any, <:Any, R, S}, prob, tstops) where {R, S}
+    a = h.again
+    (a === nothing || h.destroyed || h.fresh === nothing) && return false
+    pl, ts, ctx = h.petsclib, h.ts, h.ctx
+    ps = _summed(prob, a.alg)
+    t0u, tfu = R(ps.tspan[1]), R(ps.tspan[2])
+    isfinite(t0u) && !isnan(tfu) && tfu != -h.tdir || return false
+    t0, tf = h.tdir * t0u, h.tdir * tfu
+    u0 = Vector{S}(vec(ps.u0))
+    length(u0) == length(h.u0) || return false
+    du0 = _start_du(ps, u0)
+    ad = h.ad_calls === nothing ? 0 : h.ad_calls[]
+    p, initialized = try
+        _initialize!(
+            u0, ps, ps, a.initializealg, h.f_init, h.jac_init, pl, nothing, t0u, tfu,
+            real.(h.abstol), real.(h.reltol), a.dt, a.dtmax, du0,
+        )
+    finally
+        h.ad_calls === nothing || (h.ad_calls[] = ad)
+    end
+    plan = _save_plan(R, t0, tf, h.tdir, a.save_args...)
+    calls = [0, 0]
+    dt = a.estimates ? _first_dt(h, a.dt_args..., t0u, t0, tf, tstops, u0, p, calls) : a.dt0
+    p isa fieldtype(typeof(ctx), :p) || return false
+    fresh = h.fresh
+    _return_work_vec!(ctx, ts)
+    _release_work_vec!(ctx)
+    for i in eachindex(fresh)
+        setfield!(ctx, i, fresh[i])
+    end
+    # PETSc's counts run on over the solves of one TS; these offsets take back the earlier ones.
+    fails = Int(LibPETSc.TSGetSNESFailures(pl, ts))
+    ctx.nreject = fails - Int(LibPETSc.TSGetStepRejections(pl, ts))
+    ctx.nfail = -fails
+    ctx.nits = -Int(LibPETSc.TSGetSNESIterations(pl, ts))
+    ctx.nf += calls[1] - a.est_calls[1]
+    ctx.nf2 += calls[2] - a.est_calls[2]
+    a.est_calls .= calls
+    ctx.p = p
+    copyto!(ctx.u, u0)
+    copyto!(ctx.end_u, u0)
+    ctx.ts, ctx.us, ctx.dus = empty(ctx.ts), empty(ctx.us), empty(ctx.dus)
+    ctx.saveat = plan[1]
+    ctx.save_start = plan[3]
+    ctx.end_s = t0
+    ctx.fend = du0 === nothing ? nothing : h.tdir .* du0
+    ctx.tbound = plan[6]
+    ctx.tend = tf
+    h.t0, h.tf, h.u0 = t0, tf, u0
+    h.save_start, h.save_end, h.end_saveat = plan[3], plan[4], plan[5]
+    h.stopped = 0
+    h.init_failed = !initialized
+    h.ad_calls === nothing || (h.ad_calls[] = 0)
+    _write_state!(h, u0)
+    LibPETSc.TSSetTime(pl, ts, t0)
+    LibPETSc.TSSetStepNumber(pl, ts, LibPETSc.PetscInt(0))
+    LibPETSc.TSSetTimeStep(pl, ts, a.estimates ? _first_step(dt, a.dtmin, a.force_dtmin, R) : dt)
+    LibPETSc.TSSetMaxTime(pl, ts, _max_time(tf))
+    _cap_step!(pl, ts, h.fixed)
+    LibPETSc.TSSetMaxSteps(pl, ts, _maxsteps(a.step_limit))
+    LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_CONVERGED_ITERATING)
+    LibPETSc.TSAdaptReset(pl, LibPETSc.TSGetAdapt(pl, ts))
+    LibPETSc.TSRestartStep(pl, ts)
+    a.hook[] === nothing || (POST_STEP_CTX[ts.ptr] = a.hook[])
+    a.hook[] = nothing
+    return true
+end
+
 function _reinit_unlocked(
         integ::PETScIntegrator, u0 = integ.prob.u0;
         reset_dt = nothing, reinit_cache = true,
@@ -8006,13 +8168,20 @@ function _reinit_unlocked(
     if !erase_sol && !old.ctx.dense && old.ctx.save_idxs !== nothing && !isempty(old.ctx.ts)
         setup_kwargs = merge(setup_kwargs, (dense = false,))
     end
-    h = _setup(
-        prob, integ.alg; tstops = vcat(tstops, d_discontinuities), setup_kwargs...,
-        direction = integ.tdir,
-    )
+    stops = vcat(tstops, d_discontinuities)
+    before = erase_sol && saveat === nothing && reinit_dae && old.fresh !== nothing &&
+        !old.destroyed && isempty(getfield(integ.opts, :written)) ? _ts_state(old) : nothing
+    reused = before !== nothing && _reuse!(old, prob, stops)
+    h = reused ? old : _setup(
+            prob, integ.alg; tstops = stops, setup_kwargs..., direction = integ.tdir,
+        )
     try
-        _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
-        _match_steps_here!(h)
+        if !reused
+            _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
+            _match_steps_here!(h)
+            # Built for this call's own saveat, init or dense, which a later reinit! drops.
+            saveat === nothing && reinit_dae && erase_sol ? _mark_fresh!(h) : (h.again = nothing)
+        end
         if !erase_sol
             append!(h.ctx.ts, old.ctx.ts)
             append!(h.ctx.us, old.ctx.us)
@@ -8034,10 +8203,10 @@ function _reinit_unlocked(
             )
         end
     catch
-        _destroy!(h)
+        reused ? _restore_ts_state!(h, before) : _destroy!(h)
         rethrow()
     end
-    _destroy!(old)
+    reused || _destroy!(old)
     integ.h = h
     if _overrides(get(setup_kwargs, :initializealg, DiffEqBase.DefaultInit()), prob.f)
         setfield!(integ, :p, convert(fieldtype(typeof(integ), :p), h.ctx.p))
@@ -8128,7 +8297,13 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
         _discretes(sol) !== nothing &&
         SciMLBase.save_final_discretes!(integ, integ.opts.callback)
     integ.finished = true
-    _destroy!(h)
+    # A serial TS that ended well outlives the solve, for `reinit!` to start again on it.
+    if h.again === nothing || h.stopped != 0 || h.ctx.err !== nothing ||
+            !SciMLBase.successful_retcode(integ.sol.retcode)
+        _destroy!(h)
+    else
+        h.again.hook[] = pop!(POST_STEP_CTX, h.ts.ptr, nothing)
+    end
     h.ctx.comm === nothing || _throw_if_threw!(h.ctx)
     return nothing
 end
@@ -8139,6 +8314,7 @@ function _terminate_unlocked(
     empty!(integ.tstops)
     if integ.stop === nothing
         _finish!(integ, retcode)
+        _destroy!(integ.h)
     else
         integ.stop = retcode
         integ.sol = SciMLBase.solution_new_retcode(integ.sol, retcode)

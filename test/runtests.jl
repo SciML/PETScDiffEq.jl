@@ -1961,6 +1961,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
     end
 
     @testset "reinit!" begin
+        @testset "a reused TS keeps f inside the new span" begin
+            seen = Float64[]
+            forced!(du, u, p, t) = (push!(seen, t); du .= sin(t) .- u; nothing)
+            prob = SciMLBase.ODEProblem(forced!, [1.0, 2.0], (0.0, 1.0))
+            integ = SciMLBase.init(prob, PETScDiffEq.TSRK("7vr"); abstol = 1.0e-6, reltol = 1.0e-6)
+            SciMLBase.solve!(integ)
+            for tf in (0.7, 1.3)
+                SciMLBase.reinit!(integ, [1.0, 2.0]; tf)
+                empty!(seen)
+                SciMLBase.solve!(integ)
+                @test all(<=(tf), seen)
+            end
+        end
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"))
             fresh = SciMLBase.solve(prob, alg; dt = 0.1)

@@ -80,6 +80,8 @@ end
             # A PETSc that cannot run here must leave the package loadable.
         end
     end
+    # A finished integrator keeps its TS, whose finalizer would look up symbols after this.
+    foreach(_destroy!, collect(keys(LIVE_HANDLES)))
     # The workload's pointers and handles belong to the precompiling process.
     empty!(CALLBACKS)
     empty!(PETSC_SYMBOLS)
