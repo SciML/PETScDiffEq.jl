@@ -566,9 +566,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         found = [PETScDiffEq._symbol(pl, :TSGetSolution) for pl in builds]
         @test allunique(found)
         @test [PETScDiffEq._symbol(pl, :TSGetSolution) for pl in builds] == found
-        ptrs = [PETScDiffEq._callbacks(pl) for pl in builds]
-        @test ptrs[1].rhs != ptrs[2].rhs
-        @test PETScDiffEq._callbacks(builds[1]) === ptrs[1]
+        ctxs = map((Float64, Float32)) do S
+            integ = SciMLBase.init(
+                SciMLBase.ODEProblem(decay!, S[1], (zero(S), one(S))), PETScDiffEq.TSRK("5dp");
+                dt = S(0.1),
+            )
+            SciMLBase.solve!(integ)
+            integ.h.ctx
+        end
+        ptrs = [PETScDiffEq._callbacks(ctx).rhs for ctx in ctxs]
+        @test ptrs[1] != ptrs[2]
+        @test PETScDiffEq._callbacks(ctxs[1]).rhs == ptrs[1]
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8)
         SciMLBase.solve!(SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
