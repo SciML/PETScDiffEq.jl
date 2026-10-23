@@ -2359,7 +2359,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.u[end][1] ≈ exp(span[1] - span[2]) rtol = 1.0e-2
         end
         single = SciMLBase.ODEProblem(decay!, Float32[1], (0.0f0, 1.0f0))
-        @test_throws why SciMLBase.solve(single, glle; dt = 0.1f0, adaptive = false)
+        PETScDiffEq._SINGLE_BUILDS &&
+            @test_throws why SciMLBase.solve(single, glle; dt = 0.1f0, adaptive = false)
     end
 
     @testset "the same types are refused when an option selects them" begin
