@@ -601,7 +601,10 @@ package's own convergence tests. `"alpha"` refuses `-snes_type ksponly`, as
 PETSc setup call this package does not make, and without it they crash or integrate to
 zero rather than saying anything. `"alpha2"` and `"basicsymplectic"` are refused too, since
 they need a second-order or partitioned problem; use [`TSAlpha2`](@ref) or
-[`TSBasicSymplectic`](@ref).
+[`TSBasicSymplectic`](@ref). PETSc runs `"glle"` only as a whole solve, with no single step
+and no stop between steps. So `init` refuses it, and so does a solve with a callback, `tstops`,
+`d_discontinuities`, `isoutofdomain`, `unstable_check`, an adaptive `dtmin` or a Float32
+clock.
 
 A `comm` other than `MPI.COMM_SELF` runs an explicit type as [`TSRK`](@ref) runs, and an
 implicit `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`, `"arkimex"`, `"irk"`, `"alpha"` or
@@ -890,6 +893,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     restep::Union{Nothing, Restep{R}}
     inner::Any
     mass_slope::Bool
+    tend::R
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -931,6 +935,9 @@ function _call!(f, ctx::TSContext, out, args...)
 end
 
 _call_f!(ctx::TSContext, du, u, t) = _call!(ctx.f!, ctx, du, u, ctx.p, t)
+
+# PETSc sums some tableaus' stage fractions to just over 1, putting a stage past the span.
+_in_span(ctx::TSContext, t) = ctx.tend < t <= ctx.tend + 64 * eps(ctx.tbound) ? ctx.tend : t
 
 _guard_f(f, ::Nothing, _) = f
 _guard_f(f, ::MPI.Comm, box) = function (du, args...)
@@ -2125,6 +2132,7 @@ _select(u, idxs::Vector{Int}) = u[idxs]
 function _derivative(ctx::TSContext{R, S}, t, u) where {R, S}
     u = convert(Vector{S}, vec(u))
     du = similar(u)
+    t = _in_span(ctx, t)
     _call_f!(ctx, du, u, t)
     if ctx.f2! !== nothing
         _call!(ctx.f2!, ctx, ctx.du, u, ctx.p, t)
@@ -2141,8 +2149,7 @@ _saved(ctx::TSContext{R, S, A}, u) where {R, S, A} = ctx.save_idxs === nothing ?
 _given_idxs(ctx::TSContext{R, S, A}) where {R, S, A} =
     A <: Number ? only(ctx.save_idxs) : ctx.save_idxs
 
-_interp(ctx, ts, dus) = ctx.dense ? SciMLBase.HermiteInterpolation(ts, ctx.us, dus) :
-    SciMLBase.LinearInterpolation(ts, ctx.us)
+_interp(ctx, ts, dus) = SciMLBase.BasicInterpolation(ts, ctx.us, dus, ctx.dense)
 
 function _hermite!(out, ctx, s, s0, u0, s1, u1, ::Type{Val{N}} = Val{0}) where {N}
     ctx.fstart === nothing && (ctx.fstart = _derivative(ctx, s0, u0))
@@ -2533,7 +2540,9 @@ function _check_stage_body!(ctx, ts, t::R, y, accept) where {R}
         _out_of_attempts!(ctx, pl, ts, accept) && return LibPETSc.PetscErrorCode(0)
         h, s = LibPETSc.TSGetTimeStep(pl, ts), LibPETSc.TSGetTime(pl, ts)
         snes = _snes_failed(pl, ts_ptr)
-        snes === nothing || _stale_failure!(pl, snes, y) && (snes = nothing)
+        # TSAlpha and TSAlpha2 solve for X1 but check Xa, and solve before every check.
+        snes === nothing || ctx.alg_name in ("alpha", "alpha2") ||
+            _stale_failure!(pl, snes, y) && (snes = nothing)
         if snes === nothing
             s + h == s || return LibPETSc.PetscErrorCode(0)
             # PetscBool is 4 bytes before PETSc 3.24 and 1 after, and PETSc set it true.
@@ -2966,6 +2975,31 @@ function _distributed_mass(::Type{S}, mass, n, N, comm) where {S}
     mass isa SparseArrays.AbstractSparseMatrix && return SparseMatrixCSC{S, Int}(mass)
     d = mass === nothing ? ones(S, n) : Vector{S}(mass.diag)
     return sparse(1:n, rstart .+ (1:n), d, n, N)
+end
+
+# Takes a multiple of I (a ScalarOperator too) or a constant SciMLOperator as its matrix.
+function _mass_of(prob)
+    M = prob.f.mass_matrix
+    if M isa SciMLOperators.AbstractSciMLOperator
+        M isa SciMLOperators.FunctionOperator && !SciMLOperators.isconvertible(M) && throw(
+            ArgumentError(
+                "PETScDiffEq needs the entries of the mass matrix, which this matrix-free " *
+                    "`FunctionOperator` does not give; pass the matrix itself",
+            ),
+        )
+        SciMLOperators.isconstant(M) || throw(
+            ArgumentError(
+                "PETScDiffEq takes a mass matrix that does not change with u, p or t, and " *
+                    "`SciMLOperators.isconstant` is false for this `$(nameof(typeof(M)))`; " *
+                    "pass its matrix if that does not change",
+            ),
+        )
+        M = M isa SciMLOperators.AbstractSciMLScalarOperator ?
+            convert(Number, M) * LinearAlgebra.I : convert(AbstractMatrix, M)
+    end
+    M isa LinearAlgebra.UniformScaling && M != LinearAlgebra.I &&
+        return LinearAlgebra.Diagonal(fill(M.λ, length(prob.u0)))
+    return M
 end
 
 # A serial solve keeps a copy of a Diagonal or sparse M as that; any other kind is made dense.
@@ -3626,7 +3660,7 @@ function _rhs_body!(ctx, t, x_ptr, f_ptr)
     pl = ctx.petsclib
     try
         _readvec!(ctx.u, pl, _lent(pl, x_ptr))
-        _call_f!(ctx, ctx.du, ctx.u, t)
+        _call_f!(ctx, ctx.du, ctx.u, _in_span(ctx, t))
         _writevec!(pl, _lent(pl, f_ptr), ctx.du)
         ctx.nf += 1
     catch e
@@ -3650,7 +3684,7 @@ function _split_rhs_body!(ctx, t, x_ptr, f_ptr)
     pl = ctx.petsclib
     try
         _readvec!(ctx.u, pl, _lent(pl, x_ptr))
-        _call!(ctx.f2!, ctx, ctx.du, ctx.u, ctx.p, t)
+        _call!(ctx.f2!, ctx, ctx.du, ctx.u, ctx.p, _in_span(ctx, t))
         _writevec!(pl, _lent(pl, f_ptr), ctx.du)
         ctx.nf2 += 1
     catch e
@@ -3699,7 +3733,7 @@ end
 function _ifunction_body!(ctx, ts, t, x_ptr, xdot_ptr, f_ptr)
     pl = ctx.petsclib
     try
-        t = _stage_time(ctx, ts, t)
+        t = _in_span(ctx, _stage_time(ctx, ts, t))
         _read_block!(ctx.u, ctx, _lent(pl, x_ptr))
         udot = _read_block!(ctx.mudot, ctx, _lent(pl, xdot_ptr))
         if ctx.dae
@@ -4056,7 +4090,7 @@ function _ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
-        t = _stage_time(ctx, ts, t)
+        t = _in_span(ctx, _stage_time(ctx, ts, t))
         _readvec!(ctx.u, ctx.petsclib, x)
         _call_jac!(ctx, xdot_ptr, shift, t)
         ctx.njacs += 1
@@ -4104,7 +4138,7 @@ function _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
     moved = ctx.relayout === nothing ? nothing : ctx.relayout.mat
     J = something(moved, B)
     try
-        t = _stage_time(ctx, ts, t)
+        t = _in_span(ctx, _stage_time(ctx, ts, t))
         _read_block!(ctx.u, ctx, _lent(pl, x_ptr))
         _mat_zero!(pl, J)
         err = nothing
@@ -4166,7 +4200,7 @@ function _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_pt
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
-        t = _stage_time(ctx, ts, t)
+        t = _in_span(ctx, _stage_time(ctx, ts, t))
         _read_block!(ctx.u, ctx, x)
         if ctx.coo === nothing
             _call_jac!(ctx, xdot_ptr, shift, t)
@@ -4650,7 +4684,7 @@ _default_options(alg::TSARKIMEX) =
 _default_options(::TSAlpha2) = ["-ts_adapt_type", "basic"]
 
 const UNSUPPORTED_KWARGS = (
-    :internalnorm, :calck, :alias_u0, :sensealg,
+    :internalnorm, :calck, :alias_u0,
     :controller, :qmax, :qmin, :gamma, :beta1, :beta2, :failfactor,
     :step_limiter, :stage_limiter,
 )
@@ -5131,12 +5165,14 @@ const _WITH_DM = "with a `dm`"
 
 function _check_diagonal_mass(prob, is_dae, where, or = "")
     n = length(prob.u0)
-    mass = is_dae ? nothing : prob.f.mass_matrix
+    mass = is_dae ? nothing : _mass_of(prob)
     (mass === nothing || mass == LinearAlgebra.I) && return nothing
+    given = prob.f.mass_matrix
+    op = given isa SciMLOperators.AbstractSciMLOperator ? "$(nameof(typeof(given))) of a " : ""
     mass isa LinearAlgebra.Diagonal || throw(
         ArgumentError(
             "PETScDiffEq takes only a `Diagonal` mass matrix$or $where, not a " *
-                "$(nameof(typeof(mass)))",
+                "$op$(nameof(typeof(mass)))",
         ),
     )
     size(mass) == (n, n) || throw(
@@ -5151,7 +5187,7 @@ end
 # Like the `jac_prototype`, a sparse mass matrix holds this rank's rows, with global columns.
 function _check_local_mass(prob, is_dae, N)
     n = length(prob.u0)
-    mass = is_dae ? nothing : prob.f.mass_matrix
+    mass = is_dae ? nothing : _mass_of(prob)
     (mass === nothing || mass == LinearAlgebra.I) && return nothing
     mass isa SparseArrays.AbstractSparseMatrix ||
         return _check_diagonal_mass(prob, is_dae, _NOT_SELF, " or a sparse one")
@@ -5557,7 +5593,8 @@ function _setup(
     is_dae = prob isa SciMLBase.AbstractDAEProblem
     comm = _distributed(alg) ? alg.comm : nothing
     shape === nothing || _refuse_shaped(is_dae, comm, _alg_dm(alg))
-    mass_matrix = is_dae ? nothing : prob.f.mass_matrix
+    # Each rank has its own mass matrix, so one rank alone can refuse it.
+    mass_matrix = is_dae ? nothing : _checked_everywhere(() -> _mass_of(prob), comm)
     own_mass = !(mass_matrix === nothing || mass_matrix == LinearAlgebra.I)
     has_mass = _anywhere(comm, own_mass)
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
@@ -5866,7 +5903,7 @@ function _setup(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
-        nothing, mass_slope,
+        nothing, mass_slope, tf,
     )::TSContext
     h = Base.inferencebarrier(TSHandles)(
         ctx, petsclib, LibPETSc.TS(petsclib), uvec, nothing, nothing, ad_calls, nothing,
@@ -6078,6 +6115,12 @@ function _setup(
                 ArgumentError(
                     "$(nameof(typeof(alg))) runs PETSc's `$(_ts_type(alg))`, so an option " *
                         "cannot change it to `$chosen`",
+                ),
+            )
+            alg isa TSMPRK && chosen == "glle" && throw(
+                ArgumentError(
+                    "TSMPRK takes its steps one at a time, and PETSc runs `glle` only as a " *
+                        "whole solve, so an option cannot change it to `glle`",
                 ),
             )
             alg isa TSBasicSymplectic && _set_kicks!(ctx.f!, _symplectic_type(petsclib, ts))
@@ -6422,6 +6465,11 @@ function _solve_unlocked(
         end
     end
     h = _setup(prob, alg; kwargs..., transient = true)
+    (h.ctx.unstable !== nothing || h.ctx.dtmin > 0) && _refuse_glle(
+        h, prob,
+        "which does not stop between steps, so it cannot take `unstable_check` or an " *
+            "adaptive `dtmin`",
+    )
     ctx, pl = h.ctx, h.petsclib
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
@@ -6432,7 +6480,8 @@ function _solve_unlocked(
         verbose = get(kwargs, :verbose, true)
         fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
         _match_steps_here!(h)
-        ctx.halt_stalled = ctx.comm === nothing
+        # glle never moves PETSc's previous time, and its loop reads no stop.
+        ctx.halt_stalled = ctx.comm === nothing && LibPETSc.TSGetType(pl, h.ts) != "glle"
         if fixed || ctx.halt_stalled
             ctx.halt_nonfinite = fixed
             _set_post_step!(pl, h.ts, ctx)
@@ -6455,6 +6504,11 @@ function _solve_unlocked(
         # raises leaves its rejected trial in the solution vector.
         tend, uend = raised || ctx.stalled ? (ctx.end_s, copy(ctx.end_u)) :
             (LibPETSc.TSGetSolveTime(pl, h.ts), _read_state!(similar(h.u0), ctx, h.u))
+        # PETSc's last step can end an ulp off tf, where the integrator lands.
+        if tend != h.tf && abs(tend - h.tf) <= _near(h.tf, ctx.tbound)
+            isempty(ctx.ts) || ctx.ts[end] != tend || (ctx.ts[end] = h.tf)
+            tend = h.tf
+        end
         st = _read_stats(h)
     finally
         _destroy!(h)
@@ -7515,6 +7569,19 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     return nothing
 end
 
+# PETSc's GLLE has a whole solve, with no single step and no stop between steps.
+function _refuse_glle(h, prob, cannot)
+    LibPETSc.TSGetType(h.petsclib, h.ts) == "glle" || return nothing
+    _destroy!(h)
+    other = prob isa SciMLBase.AbstractDAEProblem ? "TSDAE(\"bdf\")" : "TSImplicit(\"bdf\")"
+    throw(
+        ArgumentError(
+            "PETSc runs `glle` only as a whole solve, $cannot; solve without them, or use " *
+                "another type such as `$other`",
+        ),
+    )
+end
+
 function _init_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
@@ -7528,6 +7595,12 @@ function _init_unlocked(
     stops_given = vcat(tstops, d_discontinuities)
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = stops_given, kwargs...)
+    _refuse_glle(
+        h, prob,
+        "with no single step, so it cannot take `init` and `step!`, nor what a solve needs " *
+            "them for: a callback, `tstops`, `d_discontinuities`, `isoutofdomain` or a " *
+            "Float32 clock",
+    )
     prob = _with_p(prob, h.ctx.p)
     if late !== nothing
         tstops = try
@@ -7657,9 +7730,9 @@ end
 
 function _take_discontinuity!(integ::PETScIntegrator)
     h = integ.h
-    integ.derivative_discontinuity = false
     # `set_u!` leaves `end_u` behind, so only a state nothing touched passes as consistent.
     _reinitialize!(integ, nothing, copy(h.ctx.end_u))
+    integ.derivative_discontinuity = false
     integ.finished && return nothing
     _write_state!(h, integ.u)
     LibPETSc.TSRestartStep(h.petsclib, h.ts)
@@ -7727,8 +7800,9 @@ function _initial_save!(h::TSHandles)
     return nothing
 end
 
+# An empty `dus` keeps its type, so a solution's type does not depend on `dense`.
 _user_time(h::TSHandles) = h.tdir > 0 ? (h.ctx.ts, h.ctx.dus) :
-    (_user_t.(h.tdir, h.ctx.ts), [-d for d in h.ctx.dus])
+    (_user_t.(h.tdir, h.ctx.ts), eltype(h.ctx.dus)[-d for d in h.ctx.dus])
 
 _nf(h::TSHandles) = h.ctx.nf + (h.ad_calls === nothing ? 0 : h.ad_calls[])
 
