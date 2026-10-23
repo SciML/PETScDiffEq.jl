@@ -6427,6 +6427,11 @@ function _solve_unlocked(
         # raises leaves its rejected trial in the solution vector.
         tend, uend = raised || ctx.stalled ? (ctx.end_s, copy(ctx.end_u)) :
             (LibPETSc.TSGetSolveTime(pl, h.ts), _read_state!(similar(h.u0), ctx, h.u))
+        # PETSc's last step can end an ulp off tf, where the integrator lands.
+        if tend != h.tf && abs(tend - h.tf) <= _near(h.tf, ctx.tbound)
+            isempty(ctx.ts) || ctx.ts[end] != tend || (ctx.ts[end] = h.tf)
+            tend = h.tf
+        end
         st = _read_stats(h)
     finally
         _destroy!(h)

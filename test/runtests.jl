@@ -10976,6 +10976,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             sol = SciMLBase.solve(mprk, PETScDiffEq.TSMPRK([1], "p2"); dt = 0.001)
             @test isapprox(sol.u[end], [exp(1.0), exp(3.0)]; rtol = 1.0e-4)
         end
+
+        @testset "a solve ends on tspan[2] as the integrator does" begin
+            forced!(du, u, p, t) = (du .= sin(t) .- u; nothing)
+            for (span, subtype) in (((2.52, 0.057), "5dp"), ((1.238, 0.103), "7vr")),
+                    kw in ((;), (save_everystep = false,))
+                prob = SciMLBase.ODEProblem(forced!, [1.0, 2.0], span)
+                alg = PETScDiffEq.TSRK(subtype)
+                sol = SciMLBase.solve(prob, alg; abstol = 1.0e-6, reltol = 1.0e-6, kw...)
+                integ = SciMLBase.init(prob, alg; abstol = 1.0e-6, reltol = 1.0e-6, kw...)
+                @test sol.t[end] == span[2]
+                @test SciMLBase.solve!(integ).t == sol.t
+            end
+        end
     end
 
     @testset "An infinite time span runs until a callback ends it" begin
