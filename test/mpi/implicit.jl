@@ -1,6 +1,6 @@
 using MPI, PETScDiffEq, SciMLBase, SparseArrays, Test
 using LinearAlgebra: Diagonal, UniformScaling
-using PETScDiffEq: PETSc, AutoFiniteDiff, AutoForwardDiff, DiffEqBase
+using PETScDiffEq: PETSc, AutoFiniteDiff, AutoForwardDiff, DiffEqBase, SciMLOperators
 using SciMLBase: ODEProblem, ODEFunction, DAEProblem, DAEFunction, SplitODEProblem, ReturnCode,
     solve
 
