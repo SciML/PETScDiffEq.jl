@@ -566,9 +566,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         found = [PETScDiffEq._symbol(pl, :TSGetSolution) for pl in builds]
         @test allunique(found)
         @test [PETScDiffEq._symbol(pl, :TSGetSolution) for pl in builds] == found
-        ptrs = [PETScDiffEq._callbacks(pl) for pl in builds]
-        @test ptrs[1].rhs != ptrs[2].rhs
-        @test PETScDiffEq._callbacks(builds[1]) === ptrs[1]
+        ctxs = map((Float64, Float32)) do S
+            integ = SciMLBase.init(
+                SciMLBase.ODEProblem(decay!, S[1], (zero(S), one(S))), PETScDiffEq.TSRK("5dp");
+                dt = S(0.1),
+            )
+            SciMLBase.solve!(integ)
+            integ.h.ctx
+        end
+        ptrs = [PETScDiffEq._callbacks(ctx).rhs for ctx in ctxs]
+        @test ptrs[1] != ptrs[2]
+        @test PETScDiffEq._callbacks(ctxs[1]).rhs == ptrs[1]
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8)
         SciMLBase.solve!(SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-8))
@@ -4153,6 +4161,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.stats.nreject > 1
             @test sol.stats.nnonlinconvfail == 0
             @test maximum(abs(u[1] - exp(-1000t)) for (t, u) in zip(sol.t, sol.u)) < 1.0e-3
+        end
+
+        @testset "a generalized-alpha step whose Newton solve failed" begin
+            first_order(g) = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = g(u[1], t); nothing), [1.0], (0.0, 1.0),
+            )
+            second_order(g) = SciMLBase.SecondOrderODEProblem(
+                (ddu, du, u, p, t) -> (ddu[1] = g(u[1], t); nothing), [0.0], [1.0], (0.0, 1.0),
+            )
+            alpha(o) = PETScDiffEq.TSGeneric("alpha", ["-ts_adapt_type"; "basic"; o])
+            for (problem, alg) in ((first_order, alpha), (second_order, PETScDiffEq.TSAlpha2))
+                sol = @test_logs (:warn, r"nonlinear solve failed at every step size") SciMLBase.solve(
+                    problem((u, t) -> t > 0.5 ? NaN : -u), alg(String[]); dt = 0.05,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Unstable
+                @test 0.5 < sol.t[end] < 0.52
+                @test sol.stats.nnonlinconvfail > 10
+                sol = SciMLBase.solve(
+                    problem((u, t) -> t < 0.5 ? -u : -u - 5u^3), alg(["-snes_max_it", "1"]);
+                    dt = 0.05,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.stats.nnonlinconvfail > 100
+            end
         end
 
         @testset "a Newton solve that diverges at the first step" begin
@@ -9060,6 +9092,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             all(in(PETScDiffEq.DiffEqBase.allowedkeywords), keys(kw)) || continue
             @test_logs min_level = Logging.Warn SciMLBase.solve(prob, alg; dt = 0.1, kw...)
         end
+        differentiated = SciMLBase.remake(prob; sensealg = PETScDiffEq.PETScAdjoint())
+        @test_logs min_level = Logging.Warn SciMLBase.solve(differentiated, alg; dt = 0.1)
+        @test_logs min_level = Logging.Warn SciMLBase.solve!(
+            SciMLBase.init(differentiated, alg; dt = 0.1),
+        )
     end
 
     @testset "error norms follow OrdinaryDiffEq's defaults and switches" begin
@@ -10974,6 +11011,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             mprk = SciMLBase.ODEProblem(two_rate!, [1.0, 1.0], (1.0, 0.0))
             sol = SciMLBase.solve(mprk, PETScDiffEq.TSMPRK([1], "p2"); dt = 0.001)
             @test isapprox(sol.u[end], [exp(1.0), exp(3.0)]; rtol = 1.0e-4)
+        end
+
+        @testset "a solve ends on tspan[2] as the integrator does" begin
+            forced!(du, u, p, t) = (du .= sin(t) .- u; nothing)
+            for (span, subtype) in (((2.52, 0.057), "5dp"), ((1.238, 0.103), "7vr")),
+                    kw in ((;), (save_everystep = false,))
+                prob = SciMLBase.ODEProblem(forced!, [1.0, 2.0], span)
+                alg = PETScDiffEq.TSRK(subtype)
+                sol = SciMLBase.solve(prob, alg; abstol = 1.0e-6, reltol = 1.0e-6, kw...)
+                integ = SciMLBase.init(prob, alg; abstol = 1.0e-6, reltol = 1.0e-6, kw...)
+                @test sol.t[end] == span[2]
+                @test SciMLBase.solve!(integ).t == sol.t
+            end
         end
     end
 
