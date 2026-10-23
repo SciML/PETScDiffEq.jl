@@ -18,15 +18,8 @@ function SciMLSensitivity._adjoint_sensitivities(
     )
 end
 
-function SciMLSensitivity._adjoint_sensitivities(sol, ::PETScAdjoint, alg; kwargs...)
-    throw(
-        ArgumentError(
-            "PETScAdjoint runs PETSc's own adjoint, so it needs one of PETScDiffEq's " *
-                "algorithms such as TSRK, but got $(nameof(typeof(alg))); for other " *
-                "solvers use an adjoint from SciMLSensitivity such as GaussAdjoint",
-        ),
-    )
-end
+SciMLSensitivity._adjoint_sensitivities(sol, ::PETScAdjoint, alg; kwargs...) =
+    throw(PETScDiffEq._not_petsc_alg(alg))
 
 # Building an algorithm copies its option strings in a loop, which Zygote cannot trace.
 function ChainRulesCore.rrule(

@@ -101,9 +101,9 @@ starting, 8 MB at the default and 8 GB at `maxiters = 10^9`. Without a limit, at
 `maxiters = Inf` or `typemax(Int)`, it reserves them for 10000 steps and doubles that as
 they fill. PETSc's time span holds one more copy of the state for each cost time inside
 `tspan`. `TSImplicit` and `TSARKIMEX`
-solve transposed linear systems with the same Krylov solver and tolerances as their Newton
-steps, so with default options the gradient can be off by up to about their relative
-tolerance of 1e-5 while the forward states are far closer; pass
+solve transposed linear systems with the same linear solver as their Newton steps. A dense
+Jacobian is factored directly; with a sparse one the default GMRES leaves the gradient off by
+up to about its relative tolerance of 1e-5 while the forward states are far closer; pass
 `-ksp_type preonly -pc_type lu`, or a tighter `-ksp_rtol`, when that matters. The options
 stay in force while the adjoint runs, so those PETSc reads only then, such as
 `-ts_trajectory_view` and `-ts_adjoint_view_solution`, take effect; options set globally,
@@ -850,6 +850,19 @@ function _check_adjoint_problem(
     )
     prob isa SciMLBase.AbstractODEProblem ||
         throw(ArgumentError("PETScAdjoint supports an ODEProblem, not a DAEProblem"))
+    prob.f isa Union{
+        SciMLBase.ODEFunction, SciMLBase.SplitFunction, SciMLBase.DynamicalODEFunction,
+    } || throw(
+        ArgumentError(
+            "PETScAdjoint takes the right-hand side and its `jac` and `paramjac` from an " *
+                "ODEFunction, a SplitFunction or a DynamicalODEFunction, but `prob.f` here is " *
+                "of type $(nameof(typeof(prob.f))), whose fields need not describe the system " *
+                "it solves (an ODEForwardSensitivityFunction's are the original problem's); " *
+                "differentiate the original problem instead, with " *
+                "`sensealg = ForwardSensitivity()` or an adjoint from SciMLSensitivity such " *
+                "as `InterpolatingAdjoint()`",
+        ),
+    )
     prob.u0 isa AbstractVector || throw(
         ArgumentError(
             "PETScAdjoint supports a vector `u0`, not an array-shaped one; pass `vec(u0)` " *
@@ -1675,3 +1688,14 @@ SciMLBase._concrete_solve_adjoint(
     prob::SupportedProblem, alg::AnyPETScTS, sensealg::PETScAdjoint, u0, p,
     originator::SciMLBase.ADOriginator, args...; kwargs...,
 ) = _solve_and_pullback(prob, alg, sensealg, u0, p, originator, args...; kwargs...)
+
+_not_petsc_alg(alg) = ArgumentError(
+    "PETScAdjoint runs PETSc's own adjoint, so it needs one of PETScDiffEq's algorithms " *
+        "such as TSRK, but got $(nameof(typeof(alg))); for other solvers use an adjoint " *
+        "from SciMLSensitivity such as GaussAdjoint",
+)
+
+SciMLBase._concrete_solve_adjoint(
+    ::SupportedProblem, alg, ::PETScAdjoint, u0, p, ::SciMLBase.ADOriginator, args...;
+    kwargs...,
+) = throw(_not_petsc_alg(alg))
