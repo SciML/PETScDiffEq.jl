@@ -386,3 +386,17 @@ parts = SplitODEProblem(stiff!, rest!, U0, (0.0, 1.0), P0)
         @test isempty(mine)
     end
 end
+
+@testset "ODEForwardSensitivityProblem and ForwardSensitivity" begin
+    fsp = ODEForwardSensitivityProblem(prob.f, U0, (0.0, 1.0), P0)
+    tol = (abstol = 1.0e-10, reltol = 1.0e-10)
+    ref = Array(solve(fsp, Tsit5(); saveat = TS, tol...))
+    for alg in (TSRK("5dp"), TSImplicit("bdf"; autodiff = PETScDiffEq.AutoFiniteDiff()))
+        sol = Array(solve(fsp, alg; saveat = TS, tol...))
+        @test size(sol) == size(ref) && relerr(sol, ref) < 1.0e-6
+    end
+    grad(alg) = Zygote.gradient(P0) do p
+        sum(abs2, Array(solve(prob, alg; p, saveat = TS, sensealg = ForwardSensitivity(), tol...)))
+    end
+    @test relerr(grad(TSRK("5dp"))[1], grad(Tsit5())[1]) < 1.0e-8
+end
