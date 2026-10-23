@@ -56,8 +56,9 @@ fails the solve returns at `t0` with `ReturnCode.InitialFailure`.
 
 The parameters the initialization gives are the ones the solve uses, and the ones in
 `sol.prob.p` and `integrator.p`. It runs where OrdinaryDiffEq runs it: at `init` and `solve`,
-on an `ODEProblem` without a mass matrix too, in `reinit!`, in `initialize_dae!`, and after
-a callback on a `DAEProblem` or a mass-matrix problem. The problem's hooks are given the
+on an `ODEProblem` without a mass matrix too, in `reinit!`, in `initialize_dae!`, after a
+callback on a `DAEProblem` or a mass-matrix problem, and before the step after `set_u!` or
+`derivative_discontinuity!(integrator, true)` on one. The problem's hooks are given the
 problem at `init`, `solve` and `reinit!` and the integrator afterwards. No check follows it,
 as none does in OrdinaryDiffEq. It does not run on a communicator other than
 `MPI.COMM_SELF`, and `PETScAdjoint` does not differentiate it; `initializealg = CheckInit()`
@@ -75,6 +76,8 @@ singular mass matrix only `OverrideInit()` does anything. After a callback's `af
 without calling `derivative_discontinuity!(integrator, false)`, or its `initialize` calls
 `derivative_discontinuity!(integrator, true)`, the integrator is initialized again with the
 callback's `initializealg`, or the solve's when the callback has none, as OrdinaryDiffEq does.
+`set_u!` and `derivative_discontinuity!(integrator, true)` between steps have the next step
+do the same with the solve's `initializealg`, and restart PETSc's step as a callback does.
 So with the default a callback has to leave the algebraic equations satisfied or the solve
 throws `CheckInitFailureError`, and under `BrownFullBasicInit()` the algebraic variables are
 solved for again. On a `DAEProblem` the derivative is again the one the integrator holds,
