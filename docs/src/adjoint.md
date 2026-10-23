@@ -258,3 +258,8 @@ saved states carry a derivative. A `Float32` problem, a `DynamicalODEProblem` or
 though `adjoint_sensitivities` takes them, and so are Enzyme, ReverseDiff, Tracker and
 Mooncake, none of which this has been verified with. Everything `adjoint_sensitivities`
 refuses is refused as well.
+
+Without a `sensealg`, an `ODEProblem` is differentiated with SciMLSensitivity's
+`InterpolatingAdjoint()`, the default of `adjoint_sensitivities`, since the choice
+SciMLSensitivity makes for a small problem, `ForwardDiffSensitivity`, steps dual numbers,
+which PETSc cannot hold.

@@ -21,6 +21,14 @@ end
 SciMLSensitivity._adjoint_sensitivities(sol, ::PETScAdjoint, alg; kwargs...) =
     throw(PETScDiffEq._not_petsc_alg(alg))
 
+# SciMLSensitivity's default for a small problem steps dual numbers, which PETSc cannot hold.
+SciMLBase._concrete_solve_adjoint(
+    prob::SciMLBase.ODEProblem, alg::PETScDiffEq.AnyPETScTS, ::Nothing, u0, p,
+    originator::SciMLBase.ADOriginator, args...; kwargs...,
+) = SciMLBase._concrete_solve_adjoint(
+    prob, alg, SciMLSensitivity.InterpolatingAdjoint(), u0, p, originator, args...; kwargs...,
+)
+
 # Building an algorithm copies its option strings in a loop, which Zygote cannot trace.
 function ChainRulesCore.rrule(
         T::Type{<:Union{PETScAdjoint, PETScDiffEq.AnyPETScTS}}, args...; kwargs...,

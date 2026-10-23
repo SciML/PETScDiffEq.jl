@@ -414,3 +414,19 @@ end
     end
     @test relerr(grad(TSRK("5dp"))[1], grad(Tsit5())[1]) < 1.0e-8
 end
+
+@testset "Zygote differentiates solve without a sensealg" begin
+    fit(alg; kw...) = (u0, p) -> sum(abs2, Array(solve(prob, alg; u0, p, saveat = TS, kw...)))
+    final(alg; kw...) =
+        (u0, p) -> sum(abs2, solve(prob, alg; u0, p, save_everystep = false, kw...).u[end])
+    for loss in (fit, final)
+        reference = flat(Zygote.gradient(loss(Tsit5(); abstol = 1.0e-12, reltol = 1.0e-12), U0, P0))
+        for alg in (TSRK("5dp"), TSRosW())
+            gradient = Zygote.gradient(loss(alg; abstol = 1.0e-10, reltol = 1.0e-10), U0, P0)
+            @test relerr(flat(gradient), reference) < 2.0e-7
+        end
+    end
+    ext = Base.get_extension(PETScDiffEq, :PETScDiffEqSciMLSensitivityExt)
+    ambiguous = Test.detect_ambiguities(PETScDiffEq, ext, SciMLSensitivity, SciMLBase)
+    @test !any(pair -> any(m -> occursin("PETScDiffEq.", string(m.sig)), pair), ambiguous)
+end
