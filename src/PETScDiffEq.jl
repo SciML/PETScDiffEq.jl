@@ -601,7 +601,10 @@ package's own convergence tests. `"alpha"` refuses `-snes_type ksponly`, as
 PETSc setup call this package does not make, and without it they crash or integrate to
 zero rather than saying anything. `"alpha2"` and `"basicsymplectic"` are refused too, since
 they need a second-order or partitioned problem; use [`TSAlpha2`](@ref) or
-[`TSBasicSymplectic`](@ref).
+[`TSBasicSymplectic`](@ref). PETSc runs `"glle"` only as a whole solve, with no single step
+and no stop between steps. So `init` refuses it, and so does a solve with a callback, `tstops`,
+`d_discontinuities`, `isoutofdomain`, `unstable_check`, an adaptive `dtmin` or a Float32
+clock.
 
 A `comm` other than `MPI.COMM_SELF` runs an explicit type as [`TSRK`](@ref) runs, and an
 implicit `"beuler"`, `"cn"`, `"theta"`, `"bdf"`, `"rosw"`, `"arkimex"`, `"irk"`, `"alpha"` or
@@ -6069,6 +6072,12 @@ function _setup(
                         "cannot change it to `$chosen`",
                 ),
             )
+            alg isa TSMPRK && chosen == "glle" && throw(
+                ArgumentError(
+                    "TSMPRK takes its steps one at a time, and PETSc runs `glle` only as a " *
+                        "whole solve, so an option cannot change it to `glle`",
+                ),
+            )
             alg isa TSBasicSymplectic && _set_kicks!(ctx.f!, _symplectic_type(petsclib, ts))
             chosen != _ts_type(alg) && haskey(_NEEDS_OTHER_SETUP, chosen) && throw(
                 ArgumentError(
@@ -6400,6 +6409,11 @@ function _solve_unlocked(
         end
     end
     h = _setup(prob, alg; kwargs..., transient = true)
+    (h.ctx.unstable !== nothing || h.ctx.dtmin > 0) && _refuse_glle(
+        h, prob,
+        "which does not stop between steps, so it cannot take `unstable_check` or an " *
+            "adaptive `dtmin`",
+    )
     ctx, pl = h.ctx, h.petsclib
     tend, uend, st = h.t0, copy(h.u0), nothing
     try
@@ -6410,7 +6424,8 @@ function _solve_unlocked(
         verbose = get(kwargs, :verbose, true)
         fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
         _match_steps_here!(h)
-        ctx.halt_stalled = ctx.comm === nothing
+        # glle never moves PETSc's previous time, and its loop reads no stop.
+        ctx.halt_stalled = ctx.comm === nothing && LibPETSc.TSGetType(pl, h.ts) != "glle"
         if fixed || ctx.halt_stalled
             ctx.halt_nonfinite = fixed
             _set_post_step!(pl, h.ts, ctx)
@@ -7498,6 +7513,19 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     return nothing
 end
 
+# PETSc's GLLE has a whole solve, with no single step and no stop between steps.
+function _refuse_glle(h, prob, cannot)
+    LibPETSc.TSGetType(h.petsclib, h.ts) == "glle" || return nothing
+    _destroy!(h)
+    other = prob isa SciMLBase.AbstractDAEProblem ? "TSDAE(\"bdf\")" : "TSImplicit(\"bdf\")"
+    throw(
+        ArgumentError(
+            "PETSc runs `glle` only as a whole solve, $cannot; solve without them, or use " *
+                "another type such as `$other`",
+        ),
+    )
+end
+
 function _init_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
@@ -7511,6 +7539,12 @@ function _init_unlocked(
     stops_given = vcat(tstops, d_discontinuities)
     callbacks, continuous = _split_callbacks(callback)
     h = _setup(prob, alg; tstops = stops_given, kwargs...)
+    _refuse_glle(
+        h, prob,
+        "with no single step, so it cannot take `init` and `step!`, nor what a solve needs " *
+            "them for: a callback, `tstops`, `d_discontinuities`, `isoutofdomain` or a " *
+            "Float32 clock",
+    )
     prob = _with_p(prob, h.ctx.p)
     if late !== nothing
         tstops = try

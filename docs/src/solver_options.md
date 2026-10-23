@@ -149,7 +149,9 @@ fixed-step backward Euler solve fail. A `-snes_lag_jacobian` in `petsc_options` 
 
 `DiscreteCallback`, `ContinuousCallback`, `VectorContinuousCallback` and `CallbackSet`
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`,
-`terminate!` and `initialize_dae!`. After a step the running solution's retcode is `Success`, as
+`terminate!` and `initialize_dae!`. The exception is PETSc's `"glle"`, which PETSc runs only
+as a whole solve, so `init` refuses it and so does a solve with a callback or `tstops`; see
+[`TSGeneric`](@ref). After a step the running solution's retcode is `Success`, as
 OrdinaryDiffEq's is. `check_error` gives `Success` while the integrator can go on and the
 retcode it stopped with after that. In a callback's `finalize` it gives the retcode passed to
 `terminate!`, and `Success` for a solve that ended any other way, where OrdinaryDiffEq's
