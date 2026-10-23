@@ -9633,6 +9633,82 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test capped.stats.naccept > free.stats.naccept
     end
 
+    @testset "dtmax bounds a step PETSc is handed, as OrdinaryDiffEq's does" begin
+        loose = (abstol = 0.1, reltol = 0.1)
+        rk, rosw = PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW()
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(decay!; mass_matrix = fill(2.0, 1, 1)), [1.0], (0.0, 1.0),
+        )
+        res!(r, du, u, p, t) = (r .= du .+ u; nothing)
+        dae = SciMLBase.DAEProblem(res!, [-1.0], [1.0], (0.0, 100.0))
+        for (pr, alg) in (
+                (prob, rk), (prob, rosw), (mass, rosw), (mass, PETScDiffEq.TSImplicit("bdf")),
+                (dae, PETScDiffEq.TSDAE()),
+            )
+            sol = SciMLBase.solve(pr, alg; dt = 0.5, dtmax = 0.01, loose..., maxiters = 10)
+            @test sol.t[2] <= 0.01
+        end
+        for (pr, alg, top) in ((mass, rosw, 1.0e-7), (dae, PETScDiffEq.TSDAE(), 1.0e-5))
+            integ = SciMLBase.init(pr, alg; dtmax = top)
+            @test integ.dt <= top
+            SciMLBase.step!(integ)
+            @test integ.t <= top
+            SciMLBase.auto_dt_reset!(integ)
+            @test integ.dt <= top
+            SciMLBase.terminate!(integ)
+        end
+        integ = SciMLBase.init(prob, rk; dtmax = 0.01, loose...)
+        SciMLBase.step!(integ)
+        SciMLBase.set_proposed_dt!(integ, 0.5)
+        SciMLBase.step!(integ)
+        @test integ.dt <= 0.01 + 1.0e-12
+        integ.opts.dtmax = 0.001
+        SciMLBase.step!(integ)
+        @test integ.dt <= 0.001 + 1.0e-12
+        SciMLBase.terminate!(integ)
+        fixed = SciMLBase.solve(prob, rk; dt = 0.5, dtmax = 0.01, adaptive = false)
+        @test fixed.t == [0.0, 0.5, 1.0]
+        # A last step within 1% of dtmax is stretched onto tf on every path.
+        for T in (Float64, Float32)
+            T === Float32 && !(Float32 in PETScDiffEq._loaded_builds()) && continue
+            odd = SciMLBase.ODEProblem(decay!, T[1], (T(0), T(1.00005)))
+            kw = (; abstol = T(0.1), reltol = T(0.1), dtmax = T(0.01))
+            ts = SciMLBase.solve(odd, rk; kw...).t
+            @test SciMLBase.solve!(SciMLBase.init(odd, rk; kw...)).t == ts
+            @test SciMLBase.solve(odd, rk; kw..., tstops = [T(5)]).t == ts
+        end
+        integ = SciMLBase.init(
+            dae, PETScDiffEq.TSDAE(); dtmin = 1.0e-5, dtmax = 1.0e-7, force_dtmin = true,
+        )
+        first = integ.dt
+        @test first >= 1.0e-5
+        SciMLBase.step!(integ)
+        SciMLBase.auto_dt_reset!(integ)
+        @test integ.dt == first
+        t0 = integ.t
+        SciMLBase.step!(integ)
+        @test integ.t - t0 >= 1.0e-5
+        SciMLBase.reinit!(integ; reset_dt = true)
+        SciMLBase.step!(integ)
+        @test integ.t >= 1.0e-5
+        @test_throws ArgumentError integ.opts.dtmax = NaN
+        @test_throws ArgumentError integ.opts.dtmax = 0.0
+        SciMLBase.terminate!(integ)
+        integ = SciMLBase.init(prob, rk; dtmin = 0.05, force_dtmin = true, loose...)
+        SciMLBase.step!(integ)
+        SciMLBase.set_proposed_dt!(integ, 0.001)
+        t0 = integ.t
+        SciMLBase.step!(integ)
+        @test integ.t - t0 ≈ 0.05
+        SciMLBase.terminate!(integ)
+        integ = SciMLBase.init(mass, PETScDiffEq.TSRosW("ra34pw2", ["-ts_adapt_dt_max", "1e-7"]))
+        SciMLBase.step!(integ)
+        SciMLBase.auto_dt_reset!(integ)
+        @test SciMLBase.get_proposed_dt(integ) == 1.0e-7
+        SciMLBase.terminate!(integ)
+    end
+
     @testset "Subtype setters take effect" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         exact = exp(-1.0)
@@ -12207,6 +12283,15 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 (
                     "adaptive ARKIMEX 3 with a discontinuity", TSARKIMEX("3", exact), (0.0, 1.0),
                     [0.3, 1.0], (abstol = 1.0e-6, reltol = 1.0e-6, d_discontinuities = [0.3]), [],
+                ),
+                (
+                    "adaptive, dtmax and a stop", TSRK("3bs"), (0.0, 1.0), [0.5005, 1.0],
+                    (abstol = 0.1, reltol = 0.1, dtmax = 0.1, tstops = [0.5005]), [],
+                ),
+                (
+                    "adaptive, dtmax and a discontinuity", TSRK("3bs"), (0.0, 1.0), [1.0],
+                    (abstol = 0.1, reltol = 0.1, dtmax = 0.1, d_discontinuities = [0.5005]),
+                    [],
                 ),
                 # `solve` runs these in PETSc's single build where it has one.
                 (

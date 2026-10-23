@@ -4909,10 +4909,23 @@ function _global_norm(comm, u, t)
     return real(eltype(u))(sqrt(sums[1] / max(sums[2], 1)))
 end
 
-# PETSc's floor clamps only the steps its adaptor chooses, not the one given.
-function _set_first_step!(h::TSHandles{<:Any, <:Any, R}, dt, dtmin, force_dtmin) where {R}
+# PETSc's floor clamps only the steps its adaptor chooses, not one handed to it.
+function _hand_step!(h::TSHandles{<:Any, <:Any, R}, dt, dtmin, force_dtmin) where {R}
     step = force_dtmin && dtmin !== nothing ? max(abs(R(dt)), abs(R(dtmin))) : abs(R(dt))
     LibPETSc.TSSetTimeStep(h.petsclib, h.ts, step)
+    return nothing
+end
+
+# PETSc's ceiling, like its floor, bounds only the steps its adaptor picks. A pick MATCHSTEP
+# stretched by under 1% onto the max time is kept, as TSSolve keeps it.
+function _cap_step!(pl, ts, fixed)
+    fixed && return nothing
+    _, hi = LibPETSc.TSAdaptGetStepLimits(pl, LibPETSc.TSGetAdapt(pl, ts))
+    p = LibPETSc.TSGetTimeStep(pl, ts)
+    p > hi || return nothing
+    p < hi * oftype(hi, 1.01) &&
+        p == LibPETSc.TSGetMaxTime(pl, ts) - LibPETSc.TSGetTime(pl, ts) && return nothing
+    LibPETSc.TSSetTimeStep(pl, ts, hi)
     return nothing
 end
 
@@ -6044,7 +6057,7 @@ function _setup(
             end
             LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
-            dt_given && _set_first_step!(h, dt, dtmin, force_dtmin)
+            dt_given && _hand_step!(h, dt, dtmin, force_dtmin)
             LibPETSc.TSSetMaxTime(petsclib, ts, _max_time(tf))
             LibPETSc.TSSetMaxSteps(petsclib, ts, _maxsteps(step_limit))
             LibPETSc.TSSetExactFinalTime(
@@ -6200,6 +6213,7 @@ function _setup(
                 ),
             )
             fixed = adapt_type == "none"
+            h.fixed = fixed
             adapts = _adapts(running)
             dt_option = any(o -> _names_option(o, "ts_dt"), effective_options)
             if !dt_given && !dt_option && !(adaptive && adapts === true)
@@ -6288,8 +6302,9 @@ function _setup(
                     _throw_anywhere(comm, threw[])
                     estimate
                 end
-                _set_first_step!(h, dt, dtmin, force_dtmin)
+                _hand_step!(h, dt, dtmin, force_dtmin)
             end
+            _cap_step!(petsclib, ts, fixed)
         end
     catch
         _destroy!(h)
@@ -6666,6 +6681,8 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
     name in (:abstol, :reltol) && (v = _flat_tol(v, _state_size(h), name))
     name in (:abstol, :reltol) &&
         _checked_everywhere(() -> _check_tol(v, length(h.u0), name), h.ctx.comm)
+    name === :dtmax && isnan(v) && throw(ArgumentError("`dtmax` is NaN"))
+    name === :dtmax && iszero(v) && throw(ArgumentError("`dtmax` is zero"))
     setfield!(
         o, name, name in (:dtmin, :dtmax) ? R(v) : name === :maxiters ? _step_limit(v) : v,
     )
@@ -6839,9 +6856,13 @@ function _set_proposed_dt_unlocked(integ::PETScIntegrator, dt)
     _checked_everywhere(integ.h.ctx.comm) do
         isnan(dt) && throw(ArgumentError("`set_proposed_dt!` was given a NaN step"))
     end
-    integ.finished || LibPETSc.TSSetTimeStep(
-        integ.h.petsclib, integ.h.ts, _smallest(integ.h.ctx.comm, abs(oftype(integ.t, dt))),
+    integ.finished && return nothing
+    h, opts = integ.h, integ.opts
+    _hand_step!(
+        h, _smallest(h.ctx.comm, abs(oftype(integ.t, dt))), getfield(opts, :dtmin),
+        getfield(opts, :force_dtmin),
     )
+    _cap_step!(h.petsclib, h.ts, h.fixed)
     return nothing
 end
 
@@ -8192,6 +8213,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     outer === nothing && _take_written_time!(integ)
     outer === nothing && _take_written_state!(integ)
     outer === nothing && _take_written_tolerances!(integ)
+    _cap_step!(pl, h.ts, h.fixed)
     dtprev = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     before = (
         Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty,
@@ -8373,7 +8395,14 @@ function _use_dt!(integ::PETScIntegrator, dt, estimated = false)
     dt = abs(oftype(integ.t, dt))
     integ.dt = integ.tdir * dt
     estimated && !SciMLBase.isadaptive(integ) && return nothing
-    LibPETSc.TSSetTimeStep(integ.h.petsclib, integ.h.ts, dt)
+    h = integ.h
+    if estimated
+        _hand_step!(h, dt, getfield(integ.opts, :dtmin), getfield(integ.opts, :force_dtmin))
+        _cap_step!(h.petsclib, h.ts, h.fixed)
+        integ.dt = integ.tdir * LibPETSc.TSGetTimeStep(h.petsclib, h.ts)
+    else
+        LibPETSc.TSSetTimeStep(h.petsclib, h.ts, dt)
+    end
     integ.dtcache = integ.dt
     return nothing
 end

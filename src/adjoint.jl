@@ -461,8 +461,10 @@ function _land_on!(adj, ts, step, s, c)
     return nothing
 end
 
-# `_step_unlocked`'s choice of the stop to end the next step on, and its cut of a step past it.
+# `_step_unlocked`'s cap on the next step, its choice of the stop to end it on, and its cut
+# of a step past it.
 function _next_stop!(q::StopQueue{R}, pl, ts, s) where {R}
+    _cap_step!(pl, ts, q.fixed)
     while !isempty(q.stops) && q.stops[1] <= s + _near(R(s), q.tbound)
         popfirst!(q.stops)
     end
@@ -502,6 +504,7 @@ function _end_step!(q::StopQueue{R}, pl, ts) where {R}
     if q.stop === nothing
         tol = _near(R(q.tf), q.tbound)
         s != q.tf && s >= q.tf - tol && LibPETSc.TSSetTime(pl, ts, q.tf)
+        _cap_step!(pl, ts, q.fixed)
         # Under `matches` PETSc's MATCHSTEP is off, so each step to tf is matched here.
         q.matches && s < q.tf - tol && _next_stop!(q, pl, ts, s)
         return nothing
