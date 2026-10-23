@@ -81,7 +81,15 @@ its own from the step's start. The points cost from 6 calls of `f` for `"5f"` to
 `"8vr"`, once in each step a state is taken from, and dense output stays the cubic Hermite,
 so for these `sol(t)` between saved points is less accurate than `saveat`.
 With a mass matrix or a `DAEProblem` only PETSc's is available, and a type that has none
-raises an `ArgumentError` when such a state is needed. `integrator(t, Val{1})` is the slope
+raises an `ArgumentError` when such a state is needed. A `ContinuousCallback` looks for a sign
+change at `interp_points` times across every step, so with such a type it raises at the first
+step even when it would never fire; with `interp_points = 0` it raises only once it fires, and
+with `rootfind = NoRootFind` it fires at the step's end and never raises. PETSc's interpolant for
+`TSARKIMEX`'s `"1bee"`, `"l2"` and the DIRK tableaux whose first stage is implicit, such as
+`"8614a"`, starts from that stage rather than from the step's start, so those count as having
+none, whether a subtype, `-ts_arkimex_type` or `-ts_dirk_type` picks them. With these,
+`-ts_exact_final_time interpolate`, which takes the final state from that interpolant, raises an
+`ArgumentError` on any problem. `integrator(t, Val{1})` is the slope
 of the cubic Hermite interpolant through the step's ends, the interpolant's own derivative
 where the package interpolates itself, and it raises with a mass matrix or a `DAEProblem`.
 Past the step's end, where DiffEqCallbacks' `PositiveDomain` and `GeneralDomain` look,

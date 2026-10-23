@@ -9062,7 +9062,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
 
             none = (
                 "r34prw", "r3prl2", "rodas3", "rodaspr", "rodaspr2", "grk4t", "shamp4",
-                "veldd4", "4l", "prssp2", "ars443", "bpr3",
+                "veldd4", "4l", "prssp2", "ars443", "bpr3", "1bee", "l2",
             )
             refused = ("lassp3p4s2c", "llssp3p4s2c", "ark3", "assp3p3s1c", "ars122")
             families = (
@@ -9073,6 +9073,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 st in refused && continue
                 st in none ? refuses_between_steps(family(st)) :
                     @test matches_petsc(mass, family(st))
+            end
+            for st in PETScDiffEq._ARKIMEX_DIRK
+                st in PETScDiffEq._IMPLICIT_FIRST_STAGE ?
+                    refuses_between_steps(PETScDiffEq.TSARKIMEX(st)) :
+                    @test matches_petsc(mass, PETScDiffEq.TSARKIMEX(st))
             end
             for st in ("beuler", "cn", "theta", "bdf")
                 @test matches_petsc(mass, PETScDiffEq.TSImplicit(st))
@@ -9402,6 +9407,76 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             for M in (lumped(2000), band(2000, 1 / 6, 2 / 3))
                 @test (@allocated run(M)) < 16_000_000
             end
+        end
+    end
+
+    @testset "an ARKIMEX tableau whose interpolant misses the step's start counts as none" begin
+        twice!(du, u, p, t) = (du[1] = -2u[1]; du[2] = -2u[2]; nothing)
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(twice!; mass_matrix = [2.0 0.0; 0.0 1.0]), [1.0, 1.0],
+            (0.0, 1.0),
+        )
+        exact(t) = [exp(-t), exp(-2t)]
+        fixed = (dt = 0.05, adaptive = false)
+        crossing = SciMLBase.ContinuousCallback(
+            (u, t, integ) -> u[1] - 0.6, integ -> SciMLBase.terminate!(integ),
+        )
+        for alg in (
+                PETScDiffEq.TSARKIMEX("1bee"), PETScDiffEq.TSARKIMEX("l2"),
+                PETScDiffEq.TSARKIMEX("8614a"),
+                PETScDiffEq.TSARKIMEX("3", ["-ts_arkimex_type", "1bee"]),
+                PETScDiffEq.TSGeneric("dirk", ["-ts_dirk_type", "657a"]),
+            )
+            @test_throws "no interpolant" SciMLBase.solve(mass, alg; fixed..., saveat = [0.525])
+            @test_throws "no interpolant" SciMLBase.solve(mass, alg; fixed..., callback = crossing)
+            sol = SciMLBase.solve(mass, alg; fixed...)
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.u[end] ≈ exact(1.0) rtol = 0.05
+        end
+        residual!(r, du, u, p, t) = (r[1] = du[1] + u[1]; r[2] = u[2] - 2u[1]; nothing)
+        dae = SciMLBase.DAEProblem(
+            residual!, [-1.0, 0.0], [1.0, 2.0], (0.0, 1.0); differential_vars = [true, false],
+        )
+        named = "`dirk 8614a` has no interpolant in PETSc that starts at the step's start"
+        @test_throws named SciMLBase.solve(
+            dae, PETScDiffEq.TSDAE("dirk", ["-ts_dirk_type", "8614a"]); fixed..., saveat = [0.525],
+        )
+        # Measured 2.9e-4.
+        sol = SciMLBase.solve(mass, PETScDiffEq.TSARKIMEX("es213sal"); fixed..., saveat = [0.525])
+        @test maximum(abs.(sol.u[1] .- exact(0.525))) < 1.0e-3
+        plain = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        sol = SciMLBase.solve(plain, PETScDiffEq.TSARKIMEX("8614a"); fixed..., saveat = [0.525])
+        @test sol.u[1][1] ≈ exp(-0.525) rtol = 1.0e-6
+
+        interp = ["-ts_exact_final_time", "interpolate"]
+        long = (dt = 0.3, adaptive = false)
+        refusal = "takes the final state from PETSc's interpolant"
+        for alg in (
+                    PETScDiffEq.TSARKIMEX("8614a", interp),
+                    PETScDiffEq.TSARKIMEX("3", [interp; "-ts_arkimex_type"; "1bee"]),
+                    PETScDiffEq.TSGeneric("dirk", [interp; "-ts_dirk_type"; "657a"]),
+                ), prob in (plain, mass)
+            @test_throws refusal SciMLBase.solve(prob, alg; long...)
+        end
+        @test_throws refusal SciMLBase.init(plain, PETScDiffEq.TSARKIMEX("8614a", interp); long...)
+        @test_throws "`dirk 8614a` starts from its implicit first stage" SciMLBase.solve(
+            dae, PETScDiffEq.TSDAE("dirk", [interp; "-ts_dirk_type"; "8614a"]); long...,
+        )
+        sol = SciMLBase.solve(plain, PETScDiffEq.TSARKIMEX("3", interp); long...)
+        @test sol.u[end][1] ≈ exp(-1.0) atol = 1.0e-3
+
+        function start_miss(st)
+            integ = SciMLBase.init(mass, PETScDiffEq.TSARKIMEX(st); fixed...)
+            SciMLBase.step!(integ)
+            h = integ.h
+            PETScDiffEq.LibPETSc.TSInterpolate(h.petsclib, h.ts, integ.tprev, h.ctx.work)
+            at_start = PETScDiffEq._readvec!(similar(integ.u), h.petsclib, h.ctx.work)
+            SciMLBase.terminate!(integ)
+            return maximum(abs.(at_start .- integ.uprev))
+        end
+        for st in [sort(collect(keys(PETScDiffEq._ARKIMEX_ORDER))); PETScDiffEq._ARKIMEX_DIRK...]
+            st in (PETScDiffEq._ARKIMEX_NO_INTERP..., "ars122") && continue
+            @test (start_miss(st) > 1.0e-8) == (st in PETScDiffEq._IMPLICIT_FIRST_STAGE)
         end
     end
 
