@@ -3933,8 +3933,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         ) == 1
         beuler = PETScDiffEq.TSImplicit("beuler")
         fixed = (dt = 0.01, reltol = 1.0e-6)
-        warns(f) = (l = Test.TestLogger(); Logging.with_logger(f, l);
-            count(r -> r.level == Logging.Warn, l.logs))
+        warns(f) = (
+            l = Test.TestLogger(); Logging.with_logger(f, l);
+            count(r -> r.level == Logging.Warn, l.logs)
+        )
         eprob = SciMLBase.EnsembleProblem(lv; prob_func = vary)
         kept = Ref(0)
         @test warns(() -> (kept[] = check(eprob, beuler, 4; fixed...))) == 8
