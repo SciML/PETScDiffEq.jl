@@ -1666,6 +1666,24 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test counts(integ.sol) == counts(sol)
             @test integ.sol.t == sol.t && integ.sol.u == sol.u
         end
+        # A raised reject limit lets one step make more attempts than maxiters has left.
+        stiff = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = -2.0e3 * (u[1] - cos(t)); du[2] = u[1] - u[2]),
+            [0.0, 1.0], (0.0, 2.0),
+        )
+        # PETSc 3.25 renames -ts_max_reject; 3.22 knows only the old name.
+        for name in ("-ts_max_reject", "-ts_max_step_rejections")
+            opts = ["-ts_adapt_clip", "0.95,10", name, "50"]
+            push!(opts, "-options_suppress_deprecated_warnings")
+            alg = PETScDiffEq.TSRK("5dp", opts)
+            sol = SciMLBase.solve(stiff, alg; dt = 1.0, maxiters = 20)
+            @test sum(counts(sol)) <= 20
+            name == "-ts_max_reject" && @test sol.retcode == SciMLBase.ReturnCode.MaxIters
+            integ = SciMLBase.init(stiff, alg; dt = 1.0, maxiters = 20)
+            SciMLBase.solve!(integ)
+            @test counts(integ.sol) == counts(sol)
+            @test integ.sol.retcode == sol.retcode
+        end
     end
 
     @testset "the nonlinear counters come from the solver, not the stepper" begin
