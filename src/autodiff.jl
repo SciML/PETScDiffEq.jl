@@ -26,12 +26,46 @@ function _coloring_algorithm(backend)
     return SparseMatrixColorings.GreedyColoringAlgorithm()
 end
 
+# The default colouring depends only on the pattern, so solves on one pattern share it.
+# DI's preparation keeps its own buffers; the colouring result is only read.
+struct SharedColoring <: ADTypes.AbstractColoringAlgorithm end
+
+const COLORINGS = Tuple{Any, SparseMatrixCSC, Any}[]
+const COLORINGS_LOCK = ReentrantLock()
+
+function SparseMatrixColorings.coloring(
+        A::AbstractMatrix, problem::SparseMatrixColorings.ColoringProblem, ::SharedColoring;
+        decompression_eltype::Type = Float64, symmetric_pattern::Bool = false,
+    )
+    greedy = SparseMatrixColorings.GreedyColoringAlgorithm()
+    A isa SparseMatrixCSC || return SparseMatrixColorings.coloring(
+        A, problem, greedy; decompression_eltype, symmetric_pattern,
+    )
+    key = (problem, decompression_eltype, symmetric_pattern)
+    return lock(COLORINGS_LOCK) do
+        for (k, P, result) in COLORINGS
+            k == key && size(P) == size(A) && P.colptr == A.colptr && P.rowval == A.rowval &&
+                return result
+        end
+        # The graph keeps the matrix's index arrays, so it gets a copy the caller cannot change.
+        P = copy(A)
+        result = SparseMatrixColorings.coloring(
+            P, problem, greedy; decompression_eltype, symmetric_pattern,
+        )
+        length(COLORINGS) >= 8 && popfirst!(COLORINGS)
+        push!(COLORINGS, (key, P, result))
+        return result
+    end
+end
+
 function _with_pattern(backend, proto)
     if proto isa SparseArrays.AbstractSparseMatrix
+        coloring = _coloring_algorithm(backend)
         return ADTypes.AutoSparse(
             ADTypes.dense_ad(backend);
             sparsity_detector = ADTypes.KnownJacobianSparsityDetector(proto),
-            coloring_algorithm = _coloring_algorithm(backend),
+            coloring_algorithm = coloring == SparseMatrixColorings.GreedyColoringAlgorithm() ?
+                SharedColoring() : coloring,
         )
     end
     backend isa ADTypes.AutoSparse &&

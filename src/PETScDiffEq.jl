@@ -829,10 +829,11 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     missing_diag::Vector{Int}
     W::Matrix{S}
     idx0::Vector{LibPETSc.PetscInt}
-    row_cols0::Vector{Vector{LibPETSc.PetscInt}}
-    row_src::Vector{Vector{Int}}
-    row_src2::Vector{Vector{Int}}
-    row_buf::Vector{Vector{S}}
+    row_ptr::Vector{LibPETSc.PetscInt}
+    row_cols0::Vector{LibPETSc.PetscInt}
+    row_src::Vector{Int}
+    row_src2::Vector{Int}
+    row_buf::Vector{S}
     J::JBUF
     ts::Vector{R}
     us::Vector{A}
@@ -3070,15 +3071,10 @@ function _call_jac!(ctx, xdot_ptr, shift, t)
 end
 
 # Writes `shift * M - J` straight into SeqAIJ's values, rows by ascending column.
-function _shifted_rows!(vals, cols0, srcs, J::Vector{S}, M, dae, shift, n) where {S}
-    k = 1
-    @inbounds for i in 1:n
-        cols, src = cols0[i], srcs[i]
-        for m in eachindex(src)
-            jv = src[m] == 0 ? zero(S) : J[src[m]]
-            vals[k] = dae ? jv : shift * _mass_at(S, M, i, Int(cols[m]) + 1) - jv
-            k += 1
-        end
+function _shifted_rows!(vals, ptr, cols0, src, J::Vector{S}, M, dae, shift, n) where {S}
+    @inbounds for i in 1:n, k in (ptr[i] + 1):ptr[i + 1]
+        jv = src[k] == 0 ? zero(S) : J[src[k]]
+        vals[k] = dae ? jv : shift * _mass_at(S, M, i, Int(cols0[k]) + 1) - jv
     end
     return nothing
 end
@@ -3134,65 +3130,73 @@ _mass_nonzeros(M::LinearAlgebra.Diagonal) =
 _mass_nonzeros(M) = findall(!iszero, M)
 
 # Relies on SeqAIJ storing rows by ascending column, the order `_row_structure` builds.
-function _setrows!(ctx, A, n)
+function _setrows!(ctx, A)
     vals = LibPETSc.MatSeqAIJGetArray(ctx.petsclib, A)
     try
-        k = 1
-        @inbounds for i in 1:n
-            buf = ctx.row_buf[i]
-            for v in buf
-                vals[k] = v
-                k += 1
-            end
-        end
+        copyto!(vals, ctx.row_buf)
     finally
         LibPETSc.MatSeqAIJRestoreArray(ctx.petsclib, A, vals)
     end
     return nothing
 end
 
-# The shift lands on the diagonal and M's nonzeros, so those always get a slot (src 0).
+# 0-based CSR rows, as SeqAIJ stores them. The shift lands on the diagonal and M's
+# nonzeros, so those always get a slot (src 0).
 function _row_structure(J::SparseMatrixCSC, n, M = nothing, rstart = 0, colmap = nothing)
-    start = zeros(Int, n + 1)
-    for k in 1:(J.colptr[end] - 1)
-        start[J.rowval[k] + 1] += 1
+    rowval = J.rowval
+    mass = M === nothing ? CartesianIndex{2}[] : sort!(_mass_nonzeros(M); by = ij -> ij[1])
+    # Room for each row's entries of J, its diagonal and its entries of M.
+    start = ones(Int, n + 1)
+    @inbounds for k in 1:(J.colptr[end] - 1)
+        start[rowval[k] + 1] += 1
+    end
+    @inbounds for ij in mass
+        start[ij[1] + 1] += 1
     end
     start[1] = 1
     cumsum!(start, start)
     next = start[1:n]
-    jcol, jsrc = Vector{Int}(undef, start[end] - 1), Vector{Int}(undef, start[end] - 1)
-    for j in axes(J, 2), k in nzrange(J, j)
-        i = J.rowval[k]
-        jcol[next[i]], jsrc[next[i]] = colmap === nothing ? j : colmap[j], k
+    cols0 = Vector{_PetscInt}(undef, start[end] - 1)
+    src = Vector{Int}(undef, length(cols0))
+    @inbounds for j in axes(J, 2), k in nzrange(J, j)
+        i = rowval[k]
+        cols0[next[i]], src[next[i]] = (colmap === nothing ? j : colmap[j]) - 1, k
         next[i] += 1
     end
-    mass = M === nothing ? CartesianIndex{2}[] : sort!(_mass_nonzeros(M); by = ij -> ij[1])
-    cols0 = Vector{Vector{_PetscInt}}(undef, n)
-    src = Vector{Vector{Int}}(undef, n)
-    buf = Vector{Vector{eltype(J)}}(undef, n)
-    c, s, m = Int[], Int[], 1
-    for i in 1:n
-        r = start[i]:(start[i + 1] - 1)
-        append!(empty!(c), view(jcol, r))
-        append!(empty!(s), view(jsrc, r))
-        _slot!(c, s, rstart + i)
+    ptr = Vector{_PetscInt}(undef, n + 1)
+    ptr[1] = 0
+    q, m = 0, 1
+    @inbounds for i in 1:n
+        lo, hi = start[i], next[i] - 1
+        hi = _slot!(cols0, src, lo, hi, rstart + i - 1)
         while m <= length(mass) && mass[m][1] == i
-            _slot!(c, s, mass[m][2])
+            hi = _slot!(cols0, src, lo, hi, mass[m][2] - 1)
             m += 1
         end
-        if !issorted(c)
-            perm = sortperm(c)
-            copyto!(c, c[perm])
-            copyto!(s, s[perm])
+        r = lo:hi
+        if !issorted(view(cols0, r))
+            perm = sortperm(view(cols0, r))
+            cols0[r] = cols0[r][perm]
+            src[r] = src[r][perm]
         end
-        cols0[i] = _PetscInt[j - 1 for j in c]
-        src[i] = copy(s)
-        buf[i] = zeros(eltype(J), length(c))
+        for k in r
+            q += 1
+            cols0[q], src[q] = cols0[k], src[k]
+        end
+        ptr[i + 1] = q
     end
-    return cols0, src, buf
+    resize!(cols0, q)
+    resize!(src, q)
+    return ptr, cols0, src, zeros(eltype(J), q)
 end
 
-_slot!(c, s, j) = j in c || (push!(c, j); push!(s, 0))
+function _slot!(cols0, src, lo, hi, c)
+    @inbounds for k in lo:hi
+        cols0[k] == c && return hi
+    end
+    @inbounds cols0[hi + 1], src[hi + 1] = c, 0
+    return hi + 1
+end
 
 # (i, j) of df/dv and (i, NV + j) of df/du share a slot, as does the diagonal for shift_a.
 function _second_order_rows(J::SparseMatrixCSC, nv, NV = nv, rstart = 0)
@@ -3204,18 +3208,16 @@ function _second_order_rows(J::SparseMatrixCSC, nv, NV = nv, rstart = 0)
     end
     at(cs, ks, j) = (s = searchsortedfirst(cs, j); s <= length(cs) && cs[s] == j ? ks[s] : 0)
     cols = [sort!(unique!(vcat(cv[i], cu[i], rstart + i))) for i in 1:nv]
-    cols0 = [_PetscInt[j - 1 for j in cols[i]] for i in 1:nv]
-    src_v = [[at(cv[i], kv[i], j) for j in cols[i]] for i in 1:nv]
-    src_u = [[at(cu[i], ku[i], j) for j in cols[i]] for i in 1:nv]
-    buf = [zeros(eltype(J), length(cols[i])) for i in 1:nv]
-    return cols0, src_v, src_u, buf
+    ptr = _PetscInt[0; cumsum(length.(cols))]
+    cols0 = _PetscInt[j - 1 for i in 1:nv for j in cols[i]]
+    src_v = [at(cv[i], kv[i], j) for i in 1:nv for j in cols[i]]
+    src_u = [at(cu[i], ku[i], j) for i in 1:nv for j in cols[i]]
+    return ptr, cols0, src_v, src_u, zeros(eltype(J), length(cols0))
 end
 
-function _rows_pattern(cols0, n)
-    rows = [i for i in 1:n for _ in cols0[i]]
-    cols = [Int(c) + 1 for i in 1:n for c in cols0[i]]
-    return sparse(rows, cols, ones(length(rows)), n, n)
-end
+# The entries of row i in flat CSR arrays whose 0-based row offsets are `ptr`.
+_row(ptr, i) = (ptr[i] + 1):ptr[i + 1]
+_row_ids(ptr) = [i for i in 1:(length(ptr) - 1) for _ in _row(ptr, i)]
 
 # A sparse M holds this rank's rows with global columns, as J does; `c` is 0-based.
 _mass_entry(::Type{S}, M::SparseMatrixCSC, i, c, rstart) where {S} = S(M[i, c + 1])
@@ -3224,11 +3226,11 @@ _mass_entry(::Type{S}, M, i, c, rstart) where {S} =
 
 function _coo_structure(J::SparseMatrixCSC{S}, rstart, M, colmap = nothing) where {S}
     n = size(J, 1)
-    cols0, src, _ = _row_structure(J, n, M isa SparseMatrixCSC ? M : nothing, rstart, colmap)
-    rows = _PetscInt[rstart + i - 1 for i in 1:n for _ in cols0[i]]
-    cols = _PetscInt[c for i in 1:n for c in cols0[i]]
-    mass = S[_mass_entry(S, M, i, c, rstart) for i in 1:n for c in cols0[i]]
-    coo = COOJacobian(Int[k for i in 1:n for k in src[i]], mass, zeros(S, length(rows)))
+    ptr, cols, src, _ = _row_structure(J, n, M isa SparseMatrixCSC ? M : nothing, rstart, colmap)
+    ids = _row_ids(ptr)
+    rows = _PetscInt[rstart + i - 1 for i in ids]
+    mass = S[_mass_entry(S, M, ids[k], cols[k], rstart) for k in eachindex(cols)]
+    coo = COOJacobian(src, mass, zeros(S, length(rows)))
     return rows, cols, coo
 end
 
@@ -4062,19 +4064,14 @@ function _set_i2block!(ctx, J::SparseMatrixCSC, B, shift_v, shift_a, nv)
     vals = J.nzval
     z = zero(eltype(vals))
     r0 = ctx.coo === nothing ? 0 : Int(first(LibPETSc.MatGetOwnershipRange(ctx.petsclib, B)))
-    @inbounds for i in 1:nv
-        cols, sv, su, buf = ctx.row_cols0[i], ctx.row_src[i], ctx.row_src2[i], ctx.row_buf[i]
-        for k in eachindex(cols)
-            jv = sv[k] == 0 ? z : vals[sv[k]]
-            ju = su[k] == 0 ? z : vals[su[k]]
-            buf[k] = shift_a * (Int(cols[k]) + 1 == r0 + i) - shift_v * jv - ju
-        end
+    cols, sv, su, buf = ctx.row_cols0, ctx.row_src, ctx.row_src2, ctx.row_buf
+    @inbounds for i in 1:nv, k in _row(ctx.row_ptr, i)
+        jv = sv[k] == 0 ? z : vals[sv[k]]
+        ju = su[k] == 0 ? z : vals[su[k]]
+        buf[k] = shift_a * (Int(cols[k]) + 1 == r0 + i) - shift_v * jv - ju
     end
-    ctx.coo === nothing && return _setrows!(ctx, B, nv)
-    k = 0
-    @inbounds for buf in ctx.row_buf, x in buf
-        ctx.coo.vals[k += 1] = x
-    end
+    ctx.coo === nothing && return _setrows!(ctx, B)
+    copyto!(ctx.coo.vals, buf)
     return LibPETSc.MatSetValuesCOO(ctx.petsclib, B, ctx.coo.vals, LibPETSc.INSERT_VALUES)
 end
 
@@ -4328,7 +4325,8 @@ function _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_pt
             vals = LibPETSc.MatSeqAIJGetArray(ctx.petsclib, B)
             try
                 _shifted_rows!(
-                    vals, ctx.row_cols0, ctx.row_src, ctx.J.nzval, ctx.M, ctx.dae, shift, n,
+                    vals, ctx.row_ptr, ctx.row_cols0, ctx.row_src, ctx.J.nzval, ctx.M, ctx.dae,
+                    shift, n,
                 )
             finally
                 LibPETSc.MatSeqAIJRestoreArray(ctx.petsclib, B, vals)
@@ -5588,9 +5586,7 @@ end
 function _second_order_jacobian!(h::TSHandles{<:Any, <:Any, <:Any, S}, nv, ptrs, ctxptr) where {S}
     pl = h.petsclib
     h.jac_mat = h.ctx.J isa SparseMatrixCSC ?
-        PETScCompat.PetscMat(
-            pl, MPI.COMM_SELF, _rows_pattern(h.ctx.row_cols0, nv); with_arrays = true,
-        ) :
+        PETScCompat.aij(pl, h.ctx.row_ptr, h.ctx.row_cols0, nv) :
         PETScCompat.PetscMat(pl, zeros(S, nv, nv))
     _check_code(
         ccall(
@@ -5609,9 +5605,8 @@ function _distributed_second_order!(
     pl, ctx = h.petsclib, h.ctx
     rstart = Int(first(LibPETSc.VecGetOwnershipRange(pl, h.solution)))
     NV = size(P, 2) ÷ 2
-    cols0, src_v, src_u, buf = _second_order_rows(P, nv, NV, rstart)
-    rows = LibPETSc.PetscInt[rstart + i - 1 for i in 1:nv for _ in cols0[i]]
-    cols = LibPETSc.PetscInt[c for i in 1:nv for c in cols0[i]]
+    ptr, cols, src_v, src_u, buf = _second_order_rows(P, nv, NV, rstart)
+    rows = LibPETSc.PetscInt[rstart + i - 1 for i in _row_ids(ptr)]
     mat = LibPETSc.MatCreate(pl, ctx.comm)
     has_jac ? (h.jac_mat = mat) : (h.fd_mat = mat)
     _coo_matrix!(mat, pl, nv, NV, rows, cols)
@@ -5620,7 +5615,8 @@ function _distributed_second_order!(
         PETSc.assemble!(mat)
         return _difference_jacobian!(pl, h.ts, mat, ctxptr)
     end
-    ctx.row_cols0, ctx.row_src, ctx.row_src2, ctx.row_buf = cols0, src_v, src_u, buf
+    ctx.row_ptr, ctx.row_cols0, ctx.row_src, ctx.row_src2, ctx.row_buf =
+        ptr, cols, src_v, src_u, buf
     ctx.coo = COOJacobian(Int[], S[], zeros(S, length(rows)))
     _check_code(
         ccall(
@@ -6020,13 +6016,13 @@ function _setup(
     W0 = has_jac && !uses_sparse_jac && !dm_jac ? zeros(S, m, m) : zeros(S, 0, 0)
     idx0 = has_jac && !uses_sparse_jac && !dm_jac ?
         _PetscInt[i - 1 for i in 1:m] : _PetscInt[]
-    row_cols0, row_src, row_src2, row_buf = if !(uses_sparse_jac && comm === nothing)
-        (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Int}[], Vector{S}[])
+    row_ptr, row_cols0, row_src, row_src2, row_buf = if !(uses_sparse_jac && comm === nothing)
+        (_PetscInt[], _PetscInt[], Int[], Int[], S[])
     elseif alg isa TSAlpha2
         _second_order_rows(J0, nv)
     else
-        cols0, src, buf = _row_structure(J0, n, M)
-        (cols0, src, Vector{Int}[], buf)
+        ptr, cols0, src, buf = _row_structure(J0, n, M)
+        (ptr, cols0, src, Int[], buf)
     end
     kept = if save_idxs === nothing
         nothing
@@ -6072,7 +6068,7 @@ function _setup(
         petsclib, f1, f2, jac_fn, p,
         similar(u0), copy(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0,
         idx0,
-        row_cols0, row_src, row_src2, row_buf, J0,
+        row_ptr, row_cols0, row_src, row_src2, row_buf, J0,
         R[], A[], A[], nothing, nothing,
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
         clone === nothing || pair ? _work_vec(petsclib, comm, uvec, n) :
@@ -6170,10 +6166,8 @@ function _setup(
                 elseif has_jac
                     _second_order_jacobian!(h, nv, ptrs, ctxptr)
                 elseif prob.f.jac_prototype isa SparseArrays.AbstractSparseMatrix
-                    cols0, _, _, _ = _second_order_rows(SparseMatrixCSC(prob.f.jac_prototype), nv)
-                    h.fd_mat = PETScCompat.PetscMat(
-                        petsclib, MPI.COMM_SELF, _rows_pattern(cols0, nv); with_arrays = true,
-                    )
+                    ptr, cols0 = _second_order_rows(SparseMatrixCSC(prob.f.jac_prototype), nv)
+                    h.fd_mat = PETScCompat.aij(petsclib, ptr, cols0, nv)
                     _difference_jacobian!(petsclib, ts, h.fd_mat, ctxptr)
                 else
                     _difference_jacobian!(petsclib, ts, nothing, ctxptr)
@@ -6209,10 +6203,7 @@ function _setup(
                     _difference_jacobian!(petsclib, ts, mat, ctxptr)
                 end
             elseif has_jac && uses_sparse_jac
-                pattern = _jacobian_pattern(J0, n, M)
-                h.jac_mat = PETScCompat.PetscMat(
-                    petsclib, MPI.COMM_SELF, pattern; with_arrays = true,
-                )
+                h.jac_mat = PETScCompat.aij(petsclib, ctx.row_ptr, ctx.row_cols0, n)
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.sparse_ijacobian, ctxptr,
                 )
