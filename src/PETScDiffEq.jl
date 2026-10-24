@@ -337,6 +337,9 @@ one. Without one, `f1`'s Jacobian comes from `autodiff`, as for
 left at zero, which is PETSc's own default. Adapts on its embedded error
 estimate, except for `"prssp2"`, `"ars443"` and `"bpr3"`, which PETSc gives
 none, so they step at the `dt` you give and warn if you pass a tolerance.
+PETSc's basic controller picks the steps here with a safety factor of 0.8, where PETSc's
+default is 0.9: fewer steps are rejected, which on stiff problems saves Newton iterations at
+the same error. `-ts_adapt_safety` sets another, and `-ts_adapt_type dsp` keeps PETSc's.
 
 `"ars122"` needs a `SplitODEProblem`: it has an explicit first stage and is not stiffly
 accurate, so PETSc cannot evaluate its first-stage slope when the whole problem is
@@ -2483,6 +2486,13 @@ _set_jacobian_lag!(pl, snes, lag) = _check_code(
         (LibPETSc.CSNES, LibPETSc.PetscInt), snes, LibPETSc.PetscInt(lag),
     ),
 )
+
+function _set_adapt_safety!(pl, ts, safety)
+    adapt = LibPETSc.TSGetAdapt(pl, ts)
+    _, reject = LibPETSc.TSAdaptGetSafety(pl, adapt)
+    LibPETSc.TSAdaptSetSafety(pl, adapt, safety, reject)
+    return nothing
+end
 
 # TSStep_RosW lifts its Jacobian lag only after its last stage, so a failed stage leaves it frozen.
 function _unfreeze_jacobian!(pl, snes)
@@ -6417,6 +6427,9 @@ function _setup(
             !fixed && running == "bdf" &&
                 !any(o -> _names_option(o, "snes_lag_jacobian"), effective_options) &&
                 _set_jacobian_lag!(petsclib, _snes(petsclib, ts.ptr), 5)
+            chosen == "arkimex" && adapt_type == "basic" &&
+                !any(o -> _names_option(o, "ts_adapt_safety"), effective_options) &&
+                _set_adapt_safety!(petsclib, ts, R(0.8))
             fixed || _uses_ifunction(alg) ||
                 _set_stage_check!(petsclib, ts, ctx, ptrs.attempt_check)
             ctx.linear = _uses_ifunction(alg) &&

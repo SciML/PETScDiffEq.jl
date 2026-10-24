@@ -334,6 +334,35 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "TSARKIMEX adapts at a safety factor of 0.8" begin
+        prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+        kw = (abstol = 1.0e-6, reltol = 1.0e-4)
+        function safety(alg)
+            integ = SciMLBase.init(prob, alg; kw...)
+            pl = integ.h.petsclib
+            adapt = PETScDiffEq.LibPETSc.TSGetAdapt(pl, integ.h.ts)
+            return first(PETScDiffEq.LibPETSc.TSAdaptGetSafety(pl, adapt))
+        end
+        @test safety(PETScDiffEq.TSARKIMEX("4")) == 0.8
+        @test safety(PETScDiffEq.TSGeneric("arkimex")) == 0.8
+        @test safety(PETScDiffEq.TSARKIMEX("4", ["-ts_adapt_safety", "0.85"])) == 0.85
+        @test safety(PETScDiffEq.TSARKIMEX("4", ["-ts_adapt_type", "dsp"])) == 0.9
+        @test safety(PETScDiffEq.TSRosW()) == 0.9
+
+        sol = SciMLBase.solve(prob, PETScDiffEq.TSARKIMEX("4"); kw...)
+        @test sol.t == SciMLBase.solve(
+            prob, PETScDiffEq.TSARKIMEX("4", ["-ts_adapt_safety", "0.8"]); kw...,
+        ).t
+        @test sol.t != SciMLBase.solve(
+            prob, PETScDiffEq.TSARKIMEX("4", ["-ts_adapt_safety", "0.9"]); kw...,
+        ).t
+        integ = SciMLBase.init(prob, PETScDiffEq.TSARKIMEX("4"); kw...)
+        SciMLBase.solve!(integ)
+        SciMLBase.reinit!(integ)
+        SciMLBase.solve!(integ)
+        @test integ.sol.t == sol.t
+    end
+
     @testset "an IMEX split whose explicit part reads u" begin
         halves(a, b) = SciMLBase.SplitODEProblem(
             (du, u, p, t) -> (du[1] = a * u[1]; nothing),
