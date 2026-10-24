@@ -152,10 +152,16 @@ factored directly, with `-ksp_type preonly -pc_type lu`. PETSc's own default, GM
 ILU(0), does the same factorization, since ILU(0) of a dense matrix is its full LU, and runs
 a Krylov iteration on top. `TSRosW`, and any solve whose SNES is `ksponly`, keeps GMRES,
 whose residual norm is what notices a NaN right-hand side so that a smaller step is tried.
-A sparse, DM or distributed Jacobian keeps GMRES with ILU(0), block Jacobi in parallel,
-since a direct factorization can fill in: on a 2-D Brusselator with 2048 states PETSc's LU
-took 5 to 9 times as long. A `-ksp_type`, `-pc_type`, `-snes_mf` or `-snes_mf_operator` in
-`petsc_options` replaces this choice.
+A sparse `jac_prototype` in a serial solve without a `dm` is factored with LU in its natural
+ordering when no entry lies more than 4 places from the diagonal, since the fill then stays
+inside the band: on a 1-D Brusselator with u and v interleaved this is 1.4 to 2.7 times as
+fast as GMRES with ILU(0). `TSRosW` and a `ksponly` solve wrap that LU in a Richardson
+iteration, whose residual norm catches a NaN as GMRES's does. A wider sparse pattern keeps
+GMRES with ILU(0), ordered by reverse Cuthill-McKee, since a direct factorization of a 2-D
+grid fills in: on a 2-D Brusselator with 2048 states PETSc's LU took 5 to 9 times as long.
+DM and distributed Jacobians keep GMRES with ILU(0), block Jacobi in parallel. A `-ksp_type`,
+`-pc_type`, `-snes_mf` or `-snes_mf_operator`, or any other `-ksp_` or `-pc_` option but a
+viewer, monitor or converged reason, in `petsc_options` replaces this choice.
 
 PETSc's Newton solver forms a new Jacobian at every iteration. An adaptive BDF solve, through
 `TSImplicit("bdf")` or `TSDAE`, sets `-snes_lag_jacobian 5`: one Jacobian per nonlinear
