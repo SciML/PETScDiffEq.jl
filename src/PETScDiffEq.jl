@@ -829,10 +829,11 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     missing_diag::Vector{Int}
     W::Matrix{S}
     idx0::Vector{LibPETSc.PetscInt}
-    row_cols0::Vector{Vector{LibPETSc.PetscInt}}
-    row_src::Vector{Vector{Int}}
-    row_src2::Vector{Vector{Int}}
-    row_buf::Vector{Vector{S}}
+    row_ptr::Vector{LibPETSc.PetscInt}
+    row_cols0::Vector{LibPETSc.PetscInt}
+    row_src::Vector{Int}
+    row_src2::Vector{Int}
+    row_buf::Vector{S}
     J::JBUF
     ts::Vector{R}
     us::Vector{A}
@@ -899,6 +900,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     inner::Any
     mass_slope::Bool
     tend::R
+    attempt_margin::Int
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -2127,6 +2129,29 @@ const _STEP_SYMBOLS = (
 
 _symbol(petsclib, ::Val{name}) where {name} = _symbol(petsclib, name)
 
+const PETSC_VERSIONS = Dict{String, VersionNumber}()
+
+_petsc_version(petsclib) = get!(PETSC_VERSIONS, petsclib.petsc_library) do
+    I = PETSc.inttype(petsclib)
+    major, minor, sub = Ref{I}(0), Ref{I}(0), Ref{I}(0)
+    _check_code(
+        ccall(
+            _symbol(petsclib, :PetscGetVersionNumber), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), major, minor, sub, C_NULL,
+        ),
+    )
+    VersionNumber(major[], minor[], sub[])
+end
+
+# PETSc 3.25 renames these options and still reads the old names, the only ones 3.22 reads.
+const _RENAMED_OPTIONS = (ts_dt = "ts_time_step", ts_max_reject = "ts_max_step_rejections")
+
+function _names_petsc_option(petsclib, opt, name)
+    _names_option(opt, name) && return true
+    new = get(_RENAMED_OPTIONS, Symbol(name), nothing)
+    return new !== nothing && _petsc_version(petsclib) >= v"3.25" && _names_option(opt, new)
+end
+
 # OrdinaryDiffEq applies dtmin only when adaptive. `force_dtmin` hands it to PETSc.
 _floor(R, dtmin, force_dtmin, adaptive) =
     force_dtmin || !adaptive || dtmin === nothing ? zero(R) : abs(R(dtmin))
@@ -2335,6 +2360,33 @@ function _ts_dm(pl, ts)
     )
     code == 0 || throw(LibPETSc.PetscError(code))
     return dm[]
+end
+
+# SNESSolve hands its vector to the TS's DMShell, which empties the DM's work-vector cache
+# unless that vector already carries the DM. The TS duplicates its stage vectors from the
+# state, so the state carries the DM and a separate template stays the DMShell's vector.
+function _share_dm!(pl, ts, u)
+    dm, template = _ts_dm(pl, ts), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :VecDuplicate), LibPETSc.PetscErrorCode,
+            (LibPETSc.CVec, Ptr{Ptr{Cvoid}}), u, template,
+        ),
+    )
+    code = ccall(
+        _symbol(pl, :DMShellSetGlobalVector), LibPETSc.PetscErrorCode,
+        (Ptr{Cvoid}, Ptr{Cvoid}), dm, template[],
+    )
+    _check_code(
+        ccall(_symbol(pl, :VecDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},), template),
+    )
+    _check_code(code)
+    _check_code(
+        ccall(
+            _symbol(pl, :VecSetDM), LibPETSc.PetscErrorCode, (LibPETSc.CVec, Ptr{Cvoid}), u, dm,
+        ),
+    )
+    return nothing
 end
 
 # TSAdapt raises PETSC_ERR_FP with its DM work vector still out, which pins the DM and fails
@@ -2743,6 +2795,19 @@ function _check_attempts!(
     return LibPETSc.PetscErrorCode(0)
 end
 
+const _MAX_REJECT_OPTIONS = ("ts_max_reject", "ts_max_step_rejections")
+
+function _arm_attempts!(ctx, ts_ptr)
+    ctx.attempt_margin < 0 && return nothing
+    pl = ctx.petsclib
+    code, taken = _taken(pl, ts_ptr)
+    _check_code(code)
+    ctx.maxiters - (taken + ctx.nreject + ctx.nfail) > ctx.attempt_margin && return nothing
+    ctx.attempt_margin = -1
+    _set_stage_check!(pl, LibPETSc.TS(ts_ptr, pl), ctx, _callbacks(ctx).attempt_check)
+    return nothing
+end
+
 function _set_stage_check!(pl, ts, ctx, ptr)
     POST_STEP_CTX[ts.ptr] = (ctx, ts)
     _check_code(
@@ -2757,7 +2822,7 @@ end
 function _retry_failed_solves!(pl, ts, ctx, ptr, opts)
     for (name, setter) in
         (("ts_max_snes_failures", :TSSetMaxSNESFailures), ("ts_max_reject", :TSSetMaxStepRejections))
-        any(o -> _names_option(o, name), opts) && continue
+        any(o -> _names_petsc_option(pl, o, name), opts) && continue
         _check_code(
             ccall(
                 _symbol(pl, setter), LibPETSc.PetscErrorCode, (LibPETSc.CTS, LibPETSc.PetscInt),
@@ -3097,6 +3162,51 @@ _dense_jacobian(h, alg, comm, clone, sparse_jac, dm_jac) =
     !(_ts_type(alg) in ("irk", "alpha2", "rosw")) &&
     (h.jac_mat === nothing ? h.fd_mat === nothing : !sparse_jac && !dm_jac)
 
+# In the natural order a narrow band factors with no fill outside it, faster than GMRES with
+# ILU(0) takes to converge; the band of a 2-D grid is already too wide.
+const _BANDED_LU_WIDTH = 4
+
+# The bandwidth of a serial solve's sparse Jacobian, when the package picks its linear solver.
+function _sparse_bandwidth(h, alg, comm, clone, prob, M)
+    comm === nothing && clone === nothing && _uses_ifunction(alg) || return nothing
+    _ts_type(alg) in ("irk", "alpha2") && return nothing
+    P = prob.f.jac_prototype
+    P isa SparseArrays.AbstractSparseMatrix || return nothing
+    h.jac_mat !== nothing || h.fd_mat !== nothing || return nothing
+    return _bandwidth(SparseMatrixCSC(P), M)
+end
+
+function _bandwidth(P::SparseMatrixCSC, M)
+    w = 0
+    for j in axes(P, 2), k in nzrange(P, j)
+        w = max(w, abs(rowvals(P)[k] - j))
+    end
+    M === nothing || for ij in _mass_nonzeros(M)
+        w = max(w, abs(ij[1] - ij[2]))
+    end
+    return w
+end
+
+# A KSP or PC option in the user's list tunes the default solver, which then stays. Viewers,
+# monitors and reasons only observe, so they leave the default as it is.
+_tunes_linear_solver(opts) = _names_linear_solver(opts) || any(_tunes_ksp_or_pc, opts)
+
+function _tunes_ksp_or_pc(opt)
+    startswith(opt, "-") || return false
+    name = lowercase(first(split(opt[2:end], "=")))
+    startswith(name, "ksp_") || startswith(name, "pc_") || return false
+    return !any(w -> occursin(w, name), ("view", "monitor", "converged_reason"))
+end
+
+# Whether the user's options make the SNES a single linear solve.
+function _linear_snes(opts)
+    i = findlast(o -> _names_option(o, "snes_type"), opts)
+    i === nothing && return false
+    value = occursin("=", opts[i]) ? last(split(opts[i], "="; limit = 2)) :
+        i < length(opts) ? opts[i + 1] : ""
+    return lowercase(value) in ("ksponly", "ksptransposeonly")
+end
+
 _names_linear_solver(opts) = any(
     o -> any(n -> _names_option(o, n), ("ksp_type", "pc_type", "snes_mf", "snes_mf_operator")),
     opts,
@@ -3189,6 +3299,16 @@ function _option_flag(opts, name)
         value = lowercase(setting) in ("1", "true", "yes", "on")
     end
     return value
+end
+
+# PETSc 3.22 reorders for a nonzero diagonal even when the factorization orders itself, as
+# MUMPS, UMFPACK and KLU do, and crashes on the ordering it never made. They pivot anyway.
+function _own_factor(opts, name)
+    i = findlast(o -> _names_option(o, name), opts)
+    i === nothing && return true
+    value = occursin("=", opts[i]) ? last(split(opts[i], "="; limit = 2)) :
+        i < length(opts) && !startswith(opts[i + 1], "-") ? opts[i + 1] : ""
+    return lowercase(value) in ("", "petsc")
 end
 
 # PETSc refuses a negative, infinite or NaN value itself, so `tol` stays for those.
@@ -3286,15 +3406,10 @@ function _call_jac!(ctx, xdot_ptr, shift, t)
 end
 
 # Writes `shift * M - J` straight into SeqAIJ's values, rows by ascending column.
-function _shifted_rows!(vals, cols0, srcs, J::Vector{S}, M, dae, shift, n) where {S}
-    k = 1
-    @inbounds for i in 1:n
-        cols, src = cols0[i], srcs[i]
-        for m in eachindex(src)
-            jv = src[m] == 0 ? zero(S) : J[src[m]]
-            vals[k] = dae ? jv : shift * _mass_at(S, M, i, Int(cols[m]) + 1) - jv
-            k += 1
-        end
+function _shifted_rows!(vals, ptr, cols0, src, J::Vector{S}, M, dae, shift, n) where {S}
+    @inbounds for i in 1:n, k in (ptr[i] + 1):ptr[i + 1]
+        jv = src[k] == 0 ? zero(S) : J[src[k]]
+        vals[k] = dae ? jv : shift * _mass_at(S, M, i, Int(cols0[k]) + 1) - jv
     end
     return nothing
 end
@@ -3350,65 +3465,73 @@ _mass_nonzeros(M::LinearAlgebra.Diagonal) =
 _mass_nonzeros(M) = findall(!iszero, M)
 
 # Relies on SeqAIJ storing rows by ascending column, the order `_row_structure` builds.
-function _setrows!(ctx, A, n)
+function _setrows!(ctx, A)
     vals = LibPETSc.MatSeqAIJGetArray(ctx.petsclib, A)
     try
-        k = 1
-        @inbounds for i in 1:n
-            buf = ctx.row_buf[i]
-            for v in buf
-                vals[k] = v
-                k += 1
-            end
-        end
+        copyto!(vals, ctx.row_buf)
     finally
         LibPETSc.MatSeqAIJRestoreArray(ctx.petsclib, A, vals)
     end
     return nothing
 end
 
-# The shift lands on the diagonal and M's nonzeros, so those always get a slot (src 0).
+# 0-based CSR rows, as SeqAIJ stores them. The shift lands on the diagonal and M's
+# nonzeros, so those always get a slot (src 0).
 function _row_structure(J::SparseMatrixCSC, n, M = nothing, rstart = 0, colmap = nothing)
-    start = zeros(Int, n + 1)
-    for k in 1:(J.colptr[end] - 1)
-        start[J.rowval[k] + 1] += 1
+    rowval = J.rowval
+    mass = M === nothing ? CartesianIndex{2}[] : sort!(_mass_nonzeros(M); by = ij -> ij[1])
+    # Room for each row's entries of J, its diagonal and its entries of M.
+    start = ones(Int, n + 1)
+    @inbounds for k in 1:(J.colptr[end] - 1)
+        start[rowval[k] + 1] += 1
+    end
+    @inbounds for ij in mass
+        start[ij[1] + 1] += 1
     end
     start[1] = 1
     cumsum!(start, start)
     next = start[1:n]
-    jcol, jsrc = Vector{Int}(undef, start[end] - 1), Vector{Int}(undef, start[end] - 1)
-    for j in axes(J, 2), k in nzrange(J, j)
-        i = J.rowval[k]
-        jcol[next[i]], jsrc[next[i]] = colmap === nothing ? j : colmap[j], k
+    cols0 = Vector{_PetscInt}(undef, start[end] - 1)
+    src = Vector{Int}(undef, length(cols0))
+    @inbounds for j in axes(J, 2), k in nzrange(J, j)
+        i = rowval[k]
+        cols0[next[i]], src[next[i]] = (colmap === nothing ? j : colmap[j]) - 1, k
         next[i] += 1
     end
-    mass = M === nothing ? CartesianIndex{2}[] : sort!(_mass_nonzeros(M); by = ij -> ij[1])
-    cols0 = Vector{Vector{_PetscInt}}(undef, n)
-    src = Vector{Vector{Int}}(undef, n)
-    buf = Vector{Vector{eltype(J)}}(undef, n)
-    c, s, m = Int[], Int[], 1
-    for i in 1:n
-        r = start[i]:(start[i + 1] - 1)
-        append!(empty!(c), view(jcol, r))
-        append!(empty!(s), view(jsrc, r))
-        _slot!(c, s, rstart + i)
+    ptr = Vector{_PetscInt}(undef, n + 1)
+    ptr[1] = 0
+    q, m = 0, 1
+    @inbounds for i in 1:n
+        lo, hi = start[i], next[i] - 1
+        hi = _slot!(cols0, src, lo, hi, rstart + i - 1)
         while m <= length(mass) && mass[m][1] == i
-            _slot!(c, s, mass[m][2])
+            hi = _slot!(cols0, src, lo, hi, mass[m][2] - 1)
             m += 1
         end
-        if !issorted(c)
-            perm = sortperm(c)
-            copyto!(c, c[perm])
-            copyto!(s, s[perm])
+        r = lo:hi
+        if !issorted(view(cols0, r))
+            perm = sortperm(view(cols0, r))
+            cols0[r] = cols0[r][perm]
+            src[r] = src[r][perm]
         end
-        cols0[i] = _PetscInt[j - 1 for j in c]
-        src[i] = copy(s)
-        buf[i] = zeros(eltype(J), length(c))
+        for k in r
+            q += 1
+            cols0[q], src[q] = cols0[k], src[k]
+        end
+        ptr[i + 1] = q
     end
-    return cols0, src, buf
+    resize!(cols0, q)
+    resize!(src, q)
+    return ptr, cols0, src, zeros(eltype(J), q)
 end
 
-_slot!(c, s, j) = j in c || (push!(c, j); push!(s, 0))
+function _slot!(cols0, src, lo, hi, c)
+    @inbounds for k in lo:hi
+        cols0[k] == c && return hi
+    end
+    @inbounds cols0[hi + 1], src[hi + 1] = c, 0
+    return hi + 1
+end
 
 # (i, j) of df/dv and (i, NV + j) of df/du share a slot, as does the diagonal for shift_a.
 function _second_order_rows(J::SparseMatrixCSC, nv, NV = nv, rstart = 0)
@@ -3420,18 +3543,16 @@ function _second_order_rows(J::SparseMatrixCSC, nv, NV = nv, rstart = 0)
     end
     at(cs, ks, j) = (s = searchsortedfirst(cs, j); s <= length(cs) && cs[s] == j ? ks[s] : 0)
     cols = [sort!(unique!(vcat(cv[i], cu[i], rstart + i))) for i in 1:nv]
-    cols0 = [_PetscInt[j - 1 for j in cols[i]] for i in 1:nv]
-    src_v = [[at(cv[i], kv[i], j) for j in cols[i]] for i in 1:nv]
-    src_u = [[at(cu[i], ku[i], j) for j in cols[i]] for i in 1:nv]
-    buf = [zeros(eltype(J), length(cols[i])) for i in 1:nv]
-    return cols0, src_v, src_u, buf
+    ptr = _PetscInt[0; cumsum(length.(cols))]
+    cols0 = _PetscInt[j - 1 for i in 1:nv for j in cols[i]]
+    src_v = [at(cv[i], kv[i], j) for i in 1:nv for j in cols[i]]
+    src_u = [at(cu[i], ku[i], j) for i in 1:nv for j in cols[i]]
+    return ptr, cols0, src_v, src_u, zeros(eltype(J), length(cols0))
 end
 
-function _rows_pattern(cols0, n)
-    rows = [i for i in 1:n for _ in cols0[i]]
-    cols = [Int(c) + 1 for i in 1:n for c in cols0[i]]
-    return sparse(rows, cols, ones(length(rows)), n, n)
-end
+# The entries of row i in flat CSR arrays whose 0-based row offsets are `ptr`.
+_row(ptr, i) = (ptr[i] + 1):ptr[i + 1]
+_row_ids(ptr) = [i for i in 1:(length(ptr) - 1) for _ in _row(ptr, i)]
 
 # A sparse M holds this rank's rows with global columns, as J does; `c` is 0-based.
 _mass_entry(::Type{S}, M::SparseMatrixCSC, i, c, rstart) where {S} = S(M[i, c + 1])
@@ -3440,11 +3561,11 @@ _mass_entry(::Type{S}, M, i, c, rstart) where {S} =
 
 function _coo_structure(J::SparseMatrixCSC{S}, rstart, M, colmap = nothing) where {S}
     n = size(J, 1)
-    cols0, src, _ = _row_structure(J, n, M isa SparseMatrixCSC ? M : nothing, rstart, colmap)
-    rows = _PetscInt[rstart + i - 1 for i in 1:n for _ in cols0[i]]
-    cols = _PetscInt[c for i in 1:n for c in cols0[i]]
-    mass = S[_mass_entry(S, M, i, c, rstart) for i in 1:n for c in cols0[i]]
-    coo = COOJacobian(Int[k for i in 1:n for k in src[i]], mass, zeros(S, length(rows)))
+    ptr, cols, src, _ = _row_structure(J, n, M isa SparseMatrixCSC ? M : nothing, rstart, colmap)
+    ids = _row_ids(ptr)
+    rows = _PetscInt[rstart + i - 1 for i in ids]
+    mass = S[_mass_entry(S, M, ids[k], cols[k], rstart) for k in eachindex(cols)]
+    coo = COOJacobian(src, mass, zeros(S, length(rows)))
     return rows, cols, coo
 end
 
@@ -4281,19 +4402,14 @@ function _set_i2block!(ctx, J::SparseMatrixCSC, B, shift_v, shift_a, nv)
     vals = J.nzval
     z = zero(eltype(vals))
     r0 = ctx.coo === nothing ? 0 : Int(first(LibPETSc.MatGetOwnershipRange(ctx.petsclib, B)))
-    @inbounds for i in 1:nv
-        cols, sv, su, buf = ctx.row_cols0[i], ctx.row_src[i], ctx.row_src2[i], ctx.row_buf[i]
-        for k in eachindex(cols)
-            jv = sv[k] == 0 ? z : vals[sv[k]]
-            ju = su[k] == 0 ? z : vals[su[k]]
-            buf[k] = shift_a * (Int(cols[k]) + 1 == r0 + i) - shift_v * jv - ju
-        end
+    cols, sv, su, buf = ctx.row_cols0, ctx.row_src, ctx.row_src2, ctx.row_buf
+    @inbounds for i in 1:nv, k in _row(ctx.row_ptr, i)
+        jv = sv[k] == 0 ? z : vals[sv[k]]
+        ju = su[k] == 0 ? z : vals[su[k]]
+        buf[k] = shift_a * (Int(cols[k]) + 1 == r0 + i) - shift_v * jv - ju
     end
-    ctx.coo === nothing && return _setrows!(ctx, B, nv)
-    k = 0
-    @inbounds for buf in ctx.row_buf, x in buf
-        ctx.coo.vals[k += 1] = x
-    end
+    ctx.coo === nothing && return _setrows!(ctx, B)
+    copyto!(ctx.coo.vals, buf)
     return LibPETSc.MatSetValuesCOO(ctx.petsclib, B, ctx.coo.vals, LibPETSc.INSERT_VALUES)
 end
 
@@ -4547,7 +4663,8 @@ function _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_pt
             vals = LibPETSc.MatSeqAIJGetArray(ctx.petsclib, B)
             try
                 _shifted_rows!(
-                    vals, ctx.row_cols0, ctx.row_src, ctx.J.nzval, ctx.M, ctx.dae, shift, n,
+                    vals, ctx.row_ptr, ctx.row_cols0, ctx.row_src, ctx.J.nzval, ctx.M, ctx.dae,
+                    shift, n,
                 )
             finally
                 LibPETSc.MatSeqAIJRestoreArray(ctx.petsclib, B, vals)
@@ -4585,6 +4702,7 @@ end
 
 function _monitor_at!(ctx, ts_ptr, step, t, x)
     try
+        _arm_attempts!(ctx, ts_ptr)
         (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
             _hold_work_vec!(ctx, ts_ptr)
         tol = _near(t, ctx.tbound)
@@ -5072,6 +5190,7 @@ mutable struct TSHandles{CTX, L, R, S}
     again::Any
     fresh::Any
     lu::Any
+    quiet::Bool
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -5808,9 +5927,7 @@ end
 function _second_order_jacobian!(h::TSHandles{<:Any, <:Any, <:Any, S}, nv, ptrs, ctxptr) where {S}
     pl = h.petsclib
     h.jac_mat = h.ctx.J isa SparseMatrixCSC ?
-        PETScCompat.PetscMat(
-            pl, MPI.COMM_SELF, _rows_pattern(h.ctx.row_cols0, nv); with_arrays = true,
-        ) :
+        PETScCompat.aij(pl, h.ctx.row_ptr, h.ctx.row_cols0, nv) :
         PETScCompat.PetscMat(pl, zeros(S, nv, nv))
     _check_code(
         ccall(
@@ -5829,9 +5946,8 @@ function _distributed_second_order!(
     pl, ctx = h.petsclib, h.ctx
     rstart = Int(first(LibPETSc.VecGetOwnershipRange(pl, h.solution)))
     NV = size(P, 2) ÷ 2
-    cols0, src_v, src_u, buf = _second_order_rows(P, nv, NV, rstart)
-    rows = LibPETSc.PetscInt[rstart + i - 1 for i in 1:nv for _ in cols0[i]]
-    cols = LibPETSc.PetscInt[c for i in 1:nv for c in cols0[i]]
+    ptr, cols, src_v, src_u, buf = _second_order_rows(P, nv, NV, rstart)
+    rows = LibPETSc.PetscInt[rstart + i - 1 for i in _row_ids(ptr)]
     mat = LibPETSc.MatCreate(pl, ctx.comm)
     has_jac ? (h.jac_mat = mat) : (h.fd_mat = mat)
     _coo_matrix!(mat, pl, nv, NV, rows, cols)
@@ -5840,7 +5956,8 @@ function _distributed_second_order!(
         PETSc.assemble!(mat)
         return _difference_jacobian!(pl, h.ts, mat, ctxptr)
     end
-    ctx.row_cols0, ctx.row_src, ctx.row_src2, ctx.row_buf = cols0, src_v, src_u, buf
+    ctx.row_ptr, ctx.row_cols0, ctx.row_src, ctx.row_src2, ctx.row_buf =
+        ptr, cols, src_v, src_u, buf
     ctx.coo = COOJacobian(Int[], S[], zeros(S, length(rows)))
     _check_code(
         ccall(
@@ -5902,8 +6019,9 @@ _reusable(running, is_split) = first(split(running)) in _REUSED_TYPES ||
 const _REUSED_TYPES = ("rk", "rosw", "bdf", "beuler", "cn", "theta", "euler", "ssp")
 
 const _NO_REUSE_OPTIONS = (
-    "ts_init_time", "ts_max_time", "ts_max_snes_failures", "ts_max_reject", "ts_monitor",
-    "ts_trajectory", "ts_save_trajectory", "ts_view", "ts_adjoint",
+    "ts_init_time", "ts_max_time", "ts_max_snes_failures", "ts_max_reject",
+    "ts_max_step_rejections", "ts_monitor", "ts_trajectory", "ts_save_trajectory",
+    "ts_view", "ts_adjoint",
 )
 
 # The first step `_setup` gives a solve that names no `dt`; `h.ctx.f!` may be reversed.
@@ -6240,13 +6358,13 @@ function _setup(
     W0 = has_jac && !uses_sparse_jac && !dm_jac ? zeros(S, m, m) : zeros(S, 0, 0)
     idx0 = has_jac && !uses_sparse_jac && !dm_jac ?
         _PetscInt[i - 1 for i in 1:m] : _PetscInt[]
-    row_cols0, row_src, row_src2, row_buf = if !(uses_sparse_jac && comm === nothing)
-        (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Int}[], Vector{S}[])
+    row_ptr, row_cols0, row_src, row_src2, row_buf = if !(uses_sparse_jac && comm === nothing)
+        (_PetscInt[], _PetscInt[], Int[], Int[], S[])
     elseif alg isa TSAlpha2
         _second_order_rows(J0, nv)
     else
-        cols0, src, buf = _row_structure(J0, n, M)
-        (cols0, src, Vector{Int}[], buf)
+        ptr, cols0, src, buf = _row_structure(J0, n, M)
+        (ptr, cols0, src, Int[], buf)
     end
     kept = if save_idxs === nothing
         nothing
@@ -6292,7 +6410,7 @@ function _setup(
         petsclib, f1, f2, jac_fn, p,
         similar(u0), copy(u0), similar(u0), similar(u0), M, is_dae, missing_diag, W0,
         idx0,
-        row_cols0, row_src, row_src2, row_buf, J0,
+        row_ptr, row_cols0, row_src, row_src2, row_buf, J0,
         R[], A[], A[], nothing, nothing,
         saveat_times, 1, save_everystep, save_start, dense_out, kept,
         clone === nothing || pair ? _work_vec(petsclib, comm, uvec, n) :
@@ -6310,7 +6428,7 @@ function _setup(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
-        nothing, mass_slope, tf,
+        nothing, mass_slope, tf, -1,
     )::TSContext
     h = Base.inferencebarrier(TSHandles)(
         ctx, petsclib, LibPETSc.TS(petsclib), uvec, nothing, nothing, ad_calls, nothing,
@@ -6318,7 +6436,7 @@ function _setup(
         false,
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
-        nothing, nothing, nothing,
+        nothing, nothing, nothing, false,
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -6345,6 +6463,7 @@ function _setup(
         end
         alg isa TSAlpha2 ? _set_second_order_solution!(h, nv) :
             LibPETSc.TSSetSolution(petsclib, ts, u)
+        clone === nothing && !(alg isa TSAlpha2) && _share_dm!(petsclib, ts, u)
 
         ctxptr = pointer_from_objref(ctx)
         ptrs = _callbacks(ctx)
@@ -6390,10 +6509,8 @@ function _setup(
                 elseif has_jac
                     _second_order_jacobian!(h, nv, ptrs, ctxptr)
                 elseif prob.f.jac_prototype isa SparseArrays.AbstractSparseMatrix
-                    cols0, _, _, _ = _second_order_rows(SparseMatrixCSC(prob.f.jac_prototype), nv)
-                    h.fd_mat = PETScCompat.PetscMat(
-                        petsclib, MPI.COMM_SELF, _rows_pattern(cols0, nv); with_arrays = true,
-                    )
+                    ptr, cols0 = _second_order_rows(SparseMatrixCSC(prob.f.jac_prototype), nv)
+                    h.fd_mat = PETScCompat.aij(petsclib, ptr, cols0, nv)
                     _difference_jacobian!(petsclib, ts, h.fd_mat, ctxptr)
                 else
                     _difference_jacobian!(petsclib, ts, nothing, ctxptr)
@@ -6429,10 +6546,7 @@ function _setup(
                     _difference_jacobian!(petsclib, ts, mat, ctxptr)
                 end
             elseif has_jac && uses_sparse_jac
-                pattern = _jacobian_pattern(J0, n, M)
-                h.jac_mat = PETScCompat.PetscMat(
-                    petsclib, MPI.COMM_SELF, pattern; with_arrays = true,
-                )
+                h.jac_mat = PETScCompat.aij(petsclib, ctx.row_ptr, ctx.row_cols0, n)
                 LibPETSc.TSSetIJacobian(
                     petsclib, ts, h.jac_mat, h.jac_mat, ptrs.sparse_ijacobian, ctxptr,
                 )
@@ -6464,14 +6578,16 @@ function _setup(
             tf == -1 && push!(effective_options, "-ts_max_time=-1")
             append!(effective_options, _default_options(alg))
             # PETSc's sparse LU does not pivot, and an algebraic row has a zero diagonal.
+            user_options = [alg.petsc_options; extra_options]
             if h.jac_mat !== nothing && (uses_sparse_jac || dm_jac) || h.fd_mat !== nothing
-                append!(effective_options, ["-pc_factor_nonzeros_along_diagonal"])
+                _own_factor(user_options, "pc_factor_mat_solver_type") &&
+                    append!(effective_options, ["-pc_factor_nonzeros_along_diagonal"])
                 comm === nothing ||
+                    !_own_factor(user_options, "sub_pc_factor_mat_solver_type") ||
                     append!(effective_options, ["-sub_pc_factor_nonzeros_along_diagonal"])
             end
             # ILU(0) of a dense matrix is already its full LU, which GMRES then wraps in a
             # Krylov iteration it does not need.
-            user_options = [alg.petsc_options; extra_options]
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
                 !_names_linear_solver(user_options)
             small_lu = _small_lu(h, alg, comm, clone, uses_sparse_jac, dm_jac, n) &&
@@ -6479,6 +6595,23 @@ function _setup(
                 !any(o -> startswith(lowercase(o), "-pc_"), user_options)
             dense_lu && !small_lu &&
                 append!(effective_options, ["-ksp_type", "preonly", "-pc_type", "lu"])
+            width = dense_lu || _tunes_linear_solver(user_options) ?
+                nothing : _sparse_bandwidth(h, alg, comm, clone, prob, M)
+            banded_lu = width !== nothing && width <= _BANDED_LU_WIDTH
+            # Without a Newton norm only a residual norm catches a NaN right-hand side, so a linear
+            # solve wraps the LU in Richardson, which checks one and needs one step to converge.
+            banded_linear = banded_lu &&
+                (_ts_type(alg) == "rosw" || _linear_snes(user_options))
+            banded_lu && append!(
+                effective_options,
+                banded_linear ?
+                    ["-ksp_type", "richardson"] :
+                    ["-ksp_type", "preonly"],
+                ["-pc_type", "lu", "-pc_factor_mat_ordering_type", "natural"],
+            )
+            # ILU(0) preconditions better in the reverse Cuthill-McKee order on wider patterns.
+            width === nothing || banded_lu ||
+                append!(effective_options, ["-pc_factor_mat_ordering_type", "rcm"])
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
             forced = force_dtmin && dtmin !== nothing && dtmin != 0
             forced &&
@@ -6496,12 +6629,13 @@ function _setup(
                 append!(effective_options, ["-snes_fd_color_use_mat"])
             append!(effective_options, alg.petsc_options)
             append!(effective_options, extra_options)
+            h.quiet = !any(_viewer_option, effective_options)
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
                 h.opts = PETScCompat.PetscOptions(petsclib; parsed...)
-                push!(h.opts)
                 try
-                    LibPETSc.TSSetFromOptions(petsclib, ts)
+                    # Monitors and viewers are made here, so they follow the solve's own options.
+                    _with_options(() -> LibPETSc.TSSetFromOptions(petsclib, ts), h)
                 catch e
                     e isa LibPETSc.PetscError || rethrow()
                     throw(
@@ -6511,8 +6645,6 @@ function _setup(
                                 "PETSc knows, and PETSc's message is printed above",
                         ),
                     )
-                finally
-                    pop!(h.opts)
                 end
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
@@ -6592,9 +6724,10 @@ function _setup(
                 )
             end
             # PETSc's default LU cannot factor IRK's Kronecker-product stage matrix.
-            if chosen == "irk" && (dense_lu || !any(o -> _names_option(o, "pc_type"), effective_options))
+            if chosen == "irk" &&
+                    (dense_lu || banded_lu || !any(o -> _names_option(o, "pc_type"), effective_options))
                 _set_pc_type!(petsclib, ts, "pbjacobi")
-                dense_lu && _set_ksp_type!(petsclib, ts, "gmres")
+                (dense_lu || banded_lu) && _set_ksp_type!(petsclib, ts, "gmres")
             elseif small_lu
                 _use_small_lu!(
                     h, n, _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly"),
@@ -6618,8 +6751,17 @@ function _setup(
             )
             fixed = adapt_type == "none"
             h.fixed = fixed
+            # An option that picked a linear solve the setup above did not foresee keeps the
+            # default solver.
+            if banded_lu && !banded_linear && chosen != "irk" &&
+                    (running == "rosw" || _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly"))
+                _set_pc_type!(petsclib, ts, "ilu")
+                _set_ksp_type!(petsclib, ts, "gmres")
+            end
             adapts = _adapts(running)
-            dt_option = any(o -> _names_option(o, "ts_dt"), effective_options)
+            dt_option = any(effective_options) do o
+                _names_petsc_option(petsclib, o, "ts_dt")
+            end
             if !dt_given && !dt_option && !(adaptive && adapts === true)
                 throw(
                     ArgumentError(
@@ -6656,8 +6798,19 @@ function _setup(
             !fixed && running == "bdf" &&
                 !any(o -> _names_option(o, "snes_lag_jacobian"), effective_options) &&
                 _set_jacobian_lag!(petsclib, _snes(petsclib, ts.ptr), 5)
-            fixed || _uses_ifunction(alg) ||
-                _set_stage_check!(petsclib, ts, ctx, ptrs.attempt_check)
+            if !fixed && !_uses_ifunction(alg)
+                # PETSc 3.25 renames -ts_max_reject; the pushed options are the only source.
+                raised = any(effective_options) do o
+                    any(n -> _names_option(o, n), _MAX_REJECT_OPTIONS)
+                end
+                if raised
+                    _set_stage_check!(petsclib, ts, ctx, ptrs.attempt_check)
+                else
+                    # A TSStep makes at most PETSc's default 11 attempts, so the check, which
+                    # runs at every stage, is installed only once maxiters is that close.
+                    ctx.attempt_margin = 13
+                end
+            end
             ctx.linear = _uses_ifunction(alg) &&
                 _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly")
             if running != ctx.alg_name
@@ -6822,15 +6975,47 @@ function _assemble(
     )
 end
 
+# Every option PETSc 3.22 and 3.25 read as a viewer or monitor contains one of these.
+const _VIEWER_WORDS = (
+    "view", "monitor", "converged_reason", "converged_rate", "test", "compare", "estimate",
+    "eigenvalues", "singularvalues", "residual", "draw", "saws", "display", "plot", "help",
+    "adapt_error", "extrude", "forest",
+)
+_viewer_option(opt) = startswith(opt, "-") &&
+    any(w -> occursin(w, lowercase(first(split(opt[2:end], "=")))), _VIEWER_WORDS)
+
 # Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
 function _with_options(f, h::TSHandles)
     push!(h.opts)
     try
-        return f()
+        return _with_viewers(f, h)
     finally
         pop!(h.opts)
     end
 end
+
+# Solves in progress that turned PETSc's viewers off while the caller had them on.
+const VIEWERS_HIDDEN = Ref(0)
+
+# Without a viewer option set, every viewer lookup PETSc makes in a solve finds nothing, so
+# a quiet solve skips them; a solve nested in one turns them back on for its own options.
+function _with_viewers(f, h::TSHandles)
+    pl = h.petsclib
+    hide = h.quiet && !_viewers_off(pl)
+    hide || !h.quiet && VIEWERS_HIDDEN[] > 0 || return f()
+    LibPETSc.PetscOptionsPushCreateViewerOff(
+        pl, hide ? LibPETSc.PETSC_TRUE : LibPETSc.PETSC_FALSE,
+    )
+    VIEWERS_HIDDEN[] += hide
+    try
+        return f()
+    finally
+        VIEWERS_HIDDEN[] -= hide
+        LibPETSc.PetscOptionsPopCreateViewerOff(pl)
+    end
+end
+
+_viewers_off(pl) = LibPETSc.PetscOptionsGetCreateViewerOff(pl) != LibPETSc.PETSC_FALSE
 
 # Under a distributed comm the error is returned, to raise once the ranks agree on who threw.
 function _run!(f, h::TSHandles)
@@ -8326,6 +8511,7 @@ function _reuse!(h::TSHandles{<:Any, <:Any, R, S}, prob, tstops) where {R, S}
     for i in eachindex(fresh)
         setfield!(ctx, i, fresh[i])
     end
+    ctx.attempt_margin < 0 || _set_stage_check!(pl, ts, ctx, C_NULL)
     # PETSc's counts run on over the solves of one TS; these offsets take back the earlier ones.
     fails = Int(LibPETSc.TSGetSNESFailures(pl, ts))
     ctx.nreject = fails - Int(LibPETSc.TSGetStepRejections(pl, ts))
@@ -8768,6 +8954,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     h.stopped = 0
     (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
         _hold_work_vec!(ctx, h.ts)
+    _arm_attempts!(ctx, h.ts.ptr)
     failure = _run!(h) do
         LibPETSc.TSStep(pl, h.ts)
         _linear_bdf_slope!(h)
