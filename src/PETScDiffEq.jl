@@ -2876,13 +2876,14 @@ _dense_jacobian(h, alg, comm, clone, sparse_jac, dm_jac) =
 # ILU(0) takes to converge; the band of a 2-D grid is already too wide.
 const _BANDED_LU_WIDTH = 4
 
-function _banded_jacobian(h, alg, comm, clone, prob, M)
-    comm === nothing && clone === nothing && _uses_ifunction(alg) || return false
-    _ts_type(alg) in ("irk", "alpha2") && return false
+# The bandwidth of a serial solve's sparse Jacobian, when the package picks its linear solver.
+function _sparse_bandwidth(h, alg, comm, clone, prob, M)
+    comm === nothing && clone === nothing && _uses_ifunction(alg) || return nothing
+    _ts_type(alg) in ("irk", "alpha2") && return nothing
     P = prob.f.jac_prototype
-    P isa SparseArrays.AbstractSparseMatrix || return false
-    h.jac_mat !== nothing || h.fd_mat !== nothing || return false
-    return _bandwidth(SparseMatrixCSC(P), M) <= _BANDED_LU_WIDTH
+    P isa SparseArrays.AbstractSparseMatrix || return nothing
+    h.jac_mat !== nothing || h.fd_mat !== nothing || return nothing
+    return _bandwidth(SparseMatrixCSC(P), M)
 end
 
 function _bandwidth(P::SparseMatrixCSC, M)
@@ -6263,12 +6264,16 @@ function _setup(
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
                 !_names_linear_solver([alg.petsc_options; extra_options])
             dense_lu && append!(effective_options, ["-ksp_type", "preonly", "-pc_type", "lu"])
-            banded_lu = !dense_lu && _banded_jacobian(h, alg, comm, clone, prob, M) &&
-                !_tunes_linear_solver([alg.petsc_options; extra_options])
+            width = dense_lu || _tunes_linear_solver([alg.petsc_options; extra_options]) ?
+                nothing : _sparse_bandwidth(h, alg, comm, clone, prob, M)
+            banded_lu = width !== nothing && width <= _BANDED_LU_WIDTH
             banded_lu && append!(
                 effective_options,
                 ["-ksp_type", "preonly", "-pc_type", "lu", "-pc_factor_mat_ordering_type", "natural"],
             )
+            # ILU(0) preconditions better in the reverse Cuthill-McKee order on wider patterns.
+            width === nothing || banded_lu ||
+                append!(effective_options, ["-pc_factor_mat_ordering_type", "rcm"])
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
             forced = force_dtmin && dtmin !== nothing && dtmin != 0
             forced &&
