@@ -3746,6 +3746,121 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "an ensemble solves on one kept TS as independent solves do" begin
+        P = PETScDiffEq
+        fields(s) = map(k -> getfield(s, k), fieldnames(typeof(s)))
+        same(a, b) = a.t == b.t && a.u == b.u && a.retcode == b.retcode &&
+            fields(a.stats) == fields(b.stats)
+        ctx(i) = SciMLBase.EnsembleContext(i, 1, 0, nothing, nothing, nothing)
+        open_handles() = count(h -> !h.destroyed, keys(P.LIVE_HANDLES))
+        lv = SciMLBase.ODEProblem(lotka_volterra!, [1.0, 1.0], (0.0, 2.0), [1.5, 1.0, 3.0, 1.0])
+        # Each trajectory solved alone after the ensemble; returns how many TSs it kept.
+        function check(eprob, alg, n, refs = nothing; kw...)
+            made, open = P.HANDLES_MADE[], open_handles()
+            sim = SciMLBase.solve(eprob, alg, SciMLBase.EnsembleSerial(); trajectories = n, kw...)
+            made = P.HANDLES_MADE[] - made
+            @test open_handles() == open
+            @test isempty(P.KEPT_HANDLES) && P.REUSERS[] == 0 && isempty(P.POST_STEP_CTX)
+            for i in 1:n
+                ref = refs === nothing ? SciMLBase.solve(
+                        eprob.prob_func(deepcopy(eprob.prob), ctx(i)), alg; kw...,
+                    ) : refs[i]
+                @test same(sim.u[i], ref)
+            end
+            return made
+        end
+        vary(pr, c) = SciMLBase.remake(
+            pr; p = pr.p .* (1 + c.sim_id / 40), u0 = pr.u0 .* (1 + c.sim_id / 80),
+            tspan = (0.0, 1.0 + c.sim_id / 10),
+        )
+        for alg in (
+                PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
+                PETScDiffEq.TSImplicit("bdf"),
+            )
+            @test check(SciMLBase.EnsembleProblem(lv; prob_func = vary), alg, 8) == 1
+            @test check(
+                SciMLBase.EnsembleProblem(lv; prob_func = vary), alg, 4; saveat = 0.1,
+                abstol = [1.0e-8, 1.0e-7],
+            ) == 1
+        end
+        rk = PETScDiffEq.TSRK("5dp")
+        p0 = copy(lv.p)
+        shared = deepcopy(lv)
+        in_place(pr, c) = (pr.p .= p0 .* (1 + c.sim_id / 40); pr)
+        refs = [SciMLBase.solve(in_place(shared, ctx(i)), rk) for i in 1:4]
+        @test check(
+            SciMLBase.EnsembleProblem(shared; prob_func = in_place, safetycopy = false), rk, 4,
+            refs,
+        ) == 1
+        # A reversed span, another f or sparsity, a callback and a failed solve start anew.
+        back(pr, c) = SciMLBase.remake(pr; tspan = isodd(c.sim_id) ? (0.0, 1.0) : (1.0, 0.0))
+        @test check(SciMLBase.EnsembleProblem(lv; prob_func = back), rk, 6) == 2
+        with_jac = SciMLBase.remake(
+            lv; f = SciMLBase.ODEFunction(lotka_volterra!; jac = lotka_volterra_jac!),
+        )
+        @test check(
+            SciMLBase.EnsembleProblem(lv; prob_func = (pr, c) -> isodd(c.sim_id) ? pr : with_jac),
+            PETScDiffEq.TSRosW(), 6,
+        ) == 2
+        chain(proto) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(chain!; jac_prototype = proto), [1.0, 0.5, 0.25], (0.0, 1.0),
+        )
+        full = chain(sparse(ones(3, 3)))
+        @test check(
+            SciMLBase.EnsembleProblem(
+                chain(CHAIN_PROTOTYPE); prob_func = (pr, c) -> isodd(c.sim_id) ? pr : full,
+            ), PETScDiffEq.TSImplicit("bdf"), 6,
+        ) == 2
+        never = SciMLBase.DiscreteCallback((u, t, i) -> false, i -> nothing)
+        @test check(SciMLBase.EnsembleProblem(lv; prob_func = vary), rk, 3; callback = never) == 3
+        long(pr, c) = SciMLBase.remake(pr; tspan = (0.0, isodd(c.sim_id) ? 1.0 : 500.0))
+        @test check(SciMLBase.EnsembleProblem(lv; prob_func = long), rk, 6; maxiters = 100) == 3
+        # The setup copies the mass matrix, so one changed in place is not reused.
+        mass = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(chain!; mass_matrix = Matrix(1.0I, 3, 3)), [1.0, 0.5, 0.25],
+            (0.0, 1.0),
+        )
+        scale!(pr, c) = (pr.f.mass_matrix[1, 1] = 1.0 + isodd(c.sim_id); pr)
+        refs = [SciMLBase.solve(scale!(mass, ctx(i)), PETScDiffEq.TSRosW()) for i in 1:4]
+        @test check(
+            SciMLBase.EnsembleProblem(mass; prob_func = scale!, safetycopy = false),
+            PETScDiffEq.TSRosW(), 4, refs,
+        ) == 2
+
+        ps = [[1.5, 1.0, 3.0, 1.0 + k / 10] for k in 1:4]
+        sols = P.reusing() do
+            P.reusing(() -> [SciMLBase.solve(SciMLBase.remake(lv; p = p), rk) for p in ps])
+        end
+        @test all(same(s, SciMLBase.solve(SciMLBase.remake(lv; p = p), rk)) for (s, p) in zip(sols, ps))
+        @test isempty(P.KEPT_HANDLES) && P.REUSERS[] == 0
+        @test_throws ErrorException P.reusing() do
+            SciMLBase.solve(lv, rk)
+            @test length(P.KEPT_HANDLES) == 1
+            error("stop")
+        end
+        @test isempty(P.KEPT_HANDLES) && P.REUSERS[] == 0
+
+        script = """
+        using PETScDiffEq, SciMLBase
+        f!(du, u, p, t) = (du[1] = -p[1] * u[1] + u[2]; du[2] = -u[2]; nothing)
+        prob = SciMLBase.ODEProblem(f!, [1.0, 1.0], (0.0, 1.0), [1.0])
+        vary(pr, c) = SciMLBase.remake(pr; p = [1.0 + c.sim_id / 10])
+        ens = SciMLBase.EnsembleProblem(prob; prob_func = vary)
+        alg = PETScDiffEq.TSRosW()
+        sim = SciMLBase.solve(ens, alg, SciMLBase.EnsembleThreads(); trajectories = 64)
+        ctx(i) = SciMLBase.EnsembleContext(i, 1, 0, nothing, nothing, nothing)
+        fields(s) = map(k -> getfield(s, k), fieldnames(typeof(s)))
+        all(1:64) do i
+            r = SciMLBase.solve(vary(prob, ctx(i)), alg)
+            s = sim.u[i]
+            s.t == r.t && s.u == r.u && fields(s.stats) == fields(r.stats)
+        end || exit(2)
+        isempty(PETScDiffEq.KEPT_HANDLES) || exit(3)
+        """
+        cmd = `$(Base.julia_cmd()) -t 4 --project=$(Base.active_project()) -e $script`
+        @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
+    end
+
     @testset "nf2 counts the explicit part of a split problem" begin
         function stiff!(du, u, p, t)
             return du[1] = -1000.0 * (u[1] - cos(t))
