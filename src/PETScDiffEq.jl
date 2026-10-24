@@ -2872,6 +2872,51 @@ _dense_jacobian(h, alg, comm, clone, sparse_jac, dm_jac) =
     !(_ts_type(alg) in ("irk", "alpha2", "rosw")) &&
     (h.jac_mat === nothing ? h.fd_mat === nothing : !sparse_jac && !dm_jac)
 
+# In the natural order a narrow band factors with no fill outside it, faster than GMRES with
+# ILU(0) takes to converge; the band of a 2-D grid is already too wide.
+const _BANDED_LU_WIDTH = 4
+
+# The bandwidth of a serial solve's sparse Jacobian, when the package picks its linear solver.
+function _sparse_bandwidth(h, alg, comm, clone, prob, M)
+    comm === nothing && clone === nothing && _uses_ifunction(alg) || return nothing
+    _ts_type(alg) in ("irk", "alpha2") && return nothing
+    P = prob.f.jac_prototype
+    P isa SparseArrays.AbstractSparseMatrix || return nothing
+    h.jac_mat !== nothing || h.fd_mat !== nothing || return nothing
+    return _bandwidth(SparseMatrixCSC(P), M)
+end
+
+function _bandwidth(P::SparseMatrixCSC, M)
+    w = 0
+    for j in axes(P, 2), k in nzrange(P, j)
+        w = max(w, abs(rowvals(P)[k] - j))
+    end
+    M === nothing || for ij in _mass_nonzeros(M)
+        w = max(w, abs(ij[1] - ij[2]))
+    end
+    return w
+end
+
+# A KSP or PC option in the user's list tunes the default solver, which then stays. Viewers,
+# monitors and reasons only observe, so they leave the default as it is.
+_tunes_linear_solver(opts) = _names_linear_solver(opts) || any(_tunes_ksp_or_pc, opts)
+
+function _tunes_ksp_or_pc(opt)
+    startswith(opt, "-") || return false
+    name = lowercase(first(split(opt[2:end], "=")))
+    startswith(name, "ksp_") || startswith(name, "pc_") || return false
+    return !any(w -> occursin(w, name), ("view", "monitor", "converged_reason"))
+end
+
+# Whether the user's options make the SNES a single linear solve.
+function _linear_snes(opts)
+    i = findlast(o -> _names_option(o, "snes_type"), opts)
+    i === nothing && return false
+    value = occursin("=", opts[i]) ? last(split(opts[i], "="; limit = 2)) :
+        i < length(opts) ? opts[i + 1] : ""
+    return lowercase(value) in ("ksponly", "ksptransposeonly")
+end
+
 _names_linear_solver(opts) = any(
     o -> any(n -> _names_option(o, n), ("ksp_type", "pc_type", "snes_mf", "snes_mf_operator")),
     opts,
@@ -6248,6 +6293,23 @@ function _setup(
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
                 !_names_linear_solver([alg.petsc_options; extra_options])
             dense_lu && append!(effective_options, ["-ksp_type", "preonly", "-pc_type", "lu"])
+            width = dense_lu || _tunes_linear_solver([alg.petsc_options; extra_options]) ?
+                nothing : _sparse_bandwidth(h, alg, comm, clone, prob, M)
+            banded_lu = width !== nothing && width <= _BANDED_LU_WIDTH
+            # Without a Newton norm only a residual norm catches a NaN right-hand side, so a linear
+            # solve wraps the LU in Richardson, which checks one and needs one step to converge.
+            banded_linear = banded_lu &&
+                (_ts_type(alg) == "rosw" || _linear_snes([alg.petsc_options; extra_options]))
+            banded_lu && append!(
+                effective_options,
+                banded_linear ?
+                    ["-ksp_type", "richardson"] :
+                    ["-ksp_type", "preonly"],
+                ["-pc_type", "lu", "-pc_factor_mat_ordering_type", "natural"],
+            )
+            # ILU(0) preconditions better in the reverse Cuthill-McKee order on wider patterns.
+            width === nothing || banded_lu ||
+                append!(effective_options, ["-pc_factor_mat_ordering_type", "rcm"])
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
             forced = force_dtmin && dtmin !== nothing && dtmin != 0
             forced &&
@@ -6361,9 +6423,10 @@ function _setup(
                 )
             end
             # PETSc's default LU cannot factor IRK's Kronecker-product stage matrix.
-            if chosen == "irk" && (dense_lu || !any(o -> _names_option(o, "pc_type"), effective_options))
+            if chosen == "irk" &&
+                    (dense_lu || banded_lu || !any(o -> _names_option(o, "pc_type"), effective_options))
                 _set_pc_type!(petsclib, ts, "pbjacobi")
-                dense_lu && _set_ksp_type!(petsclib, ts, "gmres")
+                (dense_lu || banded_lu) && _set_ksp_type!(petsclib, ts, "gmres")
             elseif dense_lu && _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly")
                 # Without a Newton norm to see it, only GMRES's residual norm catches a NaN
                 # right-hand side, so that a smaller step is tried.
@@ -6383,6 +6446,13 @@ function _setup(
             )
             fixed = adapt_type == "none"
             h.fixed = fixed
+            # An option that picked a linear solve the setup above did not foresee keeps the
+            # default solver.
+            if banded_lu && !banded_linear && chosen != "irk" &&
+                    (running == "rosw" || _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly"))
+                _set_pc_type!(petsclib, ts, "ilu")
+                _set_ksp_type!(petsclib, ts, "gmres")
+            end
             adapts = _adapts(running)
             dt_option = any(o -> _names_option(o, "ts_dt"), effective_options)
             if !dt_given && !dt_option && !(adaptive && adapts === true)

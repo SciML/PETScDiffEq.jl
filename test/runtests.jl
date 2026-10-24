@@ -7630,11 +7630,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.ODEFunction(heat!; jac = heat_jac!, jac_prototype = proto), u0, span,
         )
         generic = PETScDiffEq.TSGeneric
+        # Naming the KSP keeps a banded jac_prototype on the GMRES and ILU a DM's matrix gets.
+        gmres = ["-ksp_type", "gmres"]
         for (with_dm, alg, kw, gap) in (
-                (PETScDiffEq.TSImplicit("bdf"; dm = da), PETScDiffEq.TSImplicit("bdf"), tol, 1.0e-13),
-                (PETScDiffEq.TSRosW(; dm = da), PETScDiffEq.TSRosW(), tol, 1.0e-13),
-                (generic("alpha"; dm = da), generic("alpha"), (; dt = 1.0e-4), 1.0e-9),
-                (generic("dirk"; dm = da), generic("dirk"), (; dt = 1.0e-4, tol...), 1.0e-9),
+                (
+                    PETScDiffEq.TSImplicit("bdf", gmres; dm = da), PETScDiffEq.TSImplicit("bdf", gmres),
+                    tol, 1.0e-13,
+                ),
+                (
+                    PETScDiffEq.TSRosW("ra34pw2", gmres; dm = da), PETScDiffEq.TSRosW("ra34pw2", gmres),
+                    tol, 1.0e-13,
+                ),
+                (generic("alpha", gmres; dm = da), generic("alpha", gmres), (; dt = 1.0e-4), 1.0e-9),
+                (generic("dirk", gmres; dm = da), generic("dirk", gmres), (; dt = 1.0e-4, tol...), 1.0e-9),
             )
             empty!(seen)
             got = SciMLBase.solve(dm_prob((0.0, 0.1)), with_dm; kw...)
@@ -9831,6 +9839,79 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test sol.retcode == SciMLBase.ReturnCode.Success
             end
         end
+    end
+
+    @testset "a banded jac_prototype's default LU" begin
+        n = 32
+        function brusselator!(du, x, p, t)
+            for i in 1:n
+                u, v = x[2i - 1], x[2i]
+                ul, vl = i == 1 ? (1.0, 3.0) : (x[2i - 3], x[2i - 2])
+                ur, vr = i == n ? (1.0, 3.0) : (x[2i + 1], x[2i + 2])
+                du[2i - 1] = 1.0 + u^2 * v - 4.0 * u + p * (ul - 2u + ur)
+                du[2i] = 3.0 * u - u^2 * v + p * (vl - 2v + vr)
+            end
+            return nothing
+        end
+        # Bandwidth 2 with gaps, so ILU(0) is not already the LU.
+        rows = [[2i - 1, 2i - 1, 2i, 2i] for i in 1:n]
+        cols = [[2i - 1, 2i, 2i - 1, 2i] for i in 1:n]
+        proto = sparse(
+            [reduce(vcat, rows); 1:(2n - 2); 3:(2n)], [reduce(vcat, cols); 3:(2n); 1:(2n - 2)],
+            1.0, 2n, 2n,
+        )
+        x = range(0, 1; length = n + 2)[2:(end - 1)]
+        u0 = vec(permutedims([1.0 .+ sinpi.(2 .* x) fill(3.0, n)]))
+        prob = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(brusselator!; jac_prototype = proto), u0, (0.0, 10.0),
+            (n + 1)^2 / 50,
+        )
+        solve_with(o) = SciMLBase.solve(
+            prob, PETScDiffEq.TSImplicit("bdf", o); abstol = 1.0e-7, reltol = 1.0e-5,
+        )
+        plain = solve_with(String[])
+        # Watching the linear solves must not change them.
+        mktempdir() do dir
+            log = joinpath(dir, "ksp.txt")
+            for name in ("-ksp_converged_reason", "-ksp_monitor", "-ksp_view")
+                watched = solve_with([name, "ascii:$log"])
+                @test watched.u == plain.u
+                @test watched.stats.nnonliniter == plain.stats.nnonliniter
+            end
+            view = read(log, String)
+            @test occursin("type: preonly", view) && occursin("type: lu", view)
+        end
+        tuned = solve_with(["-ksp_type", "gmres"])
+        @test tuned.retcode == SciMLBase.ReturnCode.Success
+        @test maximum(abs, tuned.u[end] - plain.u[end]) < 1.0e-4
+
+        # Without a Newton norm a NaN right-hand side still fails the linear solve, as with a
+        # dense Jacobian, so the step is retried smaller rather than taken.
+        nan_below_zero!(du, u, p, t) = for i in 1:6
+            du[i] = u[i] < 0 ? NaN :
+                -1000u[i] + 0.01 * ((i > 1 ? u[i - 1] : 0.0) + (i < 6 ? u[i + 1] : 0.0))
+        end
+        band = spdiagm(-1 => ones(5), 0 => ones(6), 1 => ones(5))
+        for alg in (PETScDiffEq.TSImplicit("bdf", ["-snes_type", "ksponly"]), PETScDiffEq.TSRosW())
+            banded = SciMLBase.solve(
+                SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(nan_below_zero!; jac_prototype = band), ones(6), (0.0, 1.0),
+                ),
+                alg,
+            )
+            dense = SciMLBase.solve(SciMLBase.ODEProblem(nan_below_zero!, ones(6), (0.0, 1.0)), alg)
+            @test banded.retcode == dense.retcode
+            @test banded.t[end] ≈ dense.t[end] rtol = 1.0e-6
+        end
+        fixed = (; dt = 0.01, adaptive = false)
+        stopped = SciMLBase.solve(
+            SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(nan_below_zero!; jac_prototype = band), ones(6), (0.0, 1.0),
+            ),
+            PETScDiffEq.TSRosW(); fixed...,
+        )
+        @test stopped.retcode == SciMLBase.ReturnCode.ConvergenceFailure
+        @test !any(isnan, stopped.u[end])
     end
 
     @testset "Integrator interface" begin
@@ -14617,8 +14698,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         (; abstol = 1.0e-8, reltol = 1.0e-8),
                     ),
                     (
+                        # Naming the KSP keeps the serial solve's ILU in its natural order.
                         springs(; jac = springs_jac!, jac_prototype = springs_proto),
-                        PETScDiffEq.TSImplicit("bdf"; comm = world), PETScDiffEq.TSImplicit("bdf"),
+                        PETScDiffEq.TSImplicit("bdf", ["-ksp_type", "gmres"]; comm = world),
+                        PETScDiffEq.TSImplicit("bdf", ["-ksp_type", "gmres"]),
                         (; abstol = 1.0e-8, reltol = 1.0e-8),
                     ),
                 )
