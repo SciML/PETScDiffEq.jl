@@ -1754,6 +1754,46 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         )
     end
 
+    @testset "options PETSc 3.25 renamed count under the name PETSc reads" begin
+        new_names = PETScDiffEq._petsc_version(PETScDiffEq._petsclib(Float64)) >= v"3.25"
+        stiff = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = -2.0e3 * (u[1] - cos(t)); du[2] = u[1] - u[2]),
+            [0.0, 1.0], (0.0, 2.0),
+        )
+        quiet = ["-options_suppress_deprecated_warnings"]
+        counts(sol) = (sol.retcode, sol.stats.naccept, sol.stats.nreject)
+        # The implicit methods retry without limit unless a reject limit is given.
+        clip = [quiet; "-ts_adapt_clip"; "0.95,10"]
+        bdf(o) = PETScDiffEq.TSImplicit("bdf", o)
+        for alg in (bdf, o -> PETScDiffEq.TSARKIMEX("3", o))
+            plain = SciMLBase.solve(stiff, alg(clip); dt = 1.0)
+            old = SciMLBase.solve(stiff, alg([clip; "-ts_max_reject"; "1"]); dt = 1.0)
+            new = SciMLBase.solve(
+                stiff, alg([clip; "-ts_max_step_rejections"; "1"]); dt = 1.0,
+            )
+            @test counts(old) != counts(plain)
+            @test counts(new) == counts(new_names ? old : plain)
+        end
+        old = SciMLBase.solve(stiff, PETScDiffEq.TSRK("4", [quiet; "-ts_dt"; "0.1"]))
+        @test old.t[2] == 0.1
+        fixed = PETScDiffEq.TSRK("4", [quiet; "-ts_time_step"; "0.1"])
+        if new_names
+            new = SciMLBase.solve(stiff, fixed)
+            @test new.t == old.t && new.u == old.u
+        else
+            @test_throws "needs `dt`" SciMLBase.solve(stiff, fixed)
+        end
+        dp5(o) = SciMLBase.solve(stiff, PETScDiffEq.TSRK("5dp", [quiet; o]))
+        old, new = dp5(["-ts_dt", "0.1"]), dp5(["-ts_time_step", "0.1"])
+        plain = dp5(String[])
+        @test new.t == (new_names ? old : plain).t
+        @test SciMLBase.init(stiff, PETScDiffEq.TSRK("5dp", quiet)).h.again !== nothing
+        for name in ("-ts_max_reject", "-ts_max_step_rejections")
+            integ = SciMLBase.init(stiff, PETScDiffEq.TSRK("5dp", [quiet; name; "5"]))
+            @test integ.h.again === nothing
+        end
+    end
+
     @testset "-ts_max_steps limits the steps as maxiters does" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         fixed = (dt = 0.01, adaptive = false)
