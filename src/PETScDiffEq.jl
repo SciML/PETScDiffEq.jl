@@ -2732,6 +2732,8 @@ function _check_attempts!(
     return LibPETSc.PetscErrorCode(0)
 end
 
+const _MAX_REJECT_OPTIONS = ("ts_max_reject", "ts_max_step_rejections")
+
 function _arm_attempts!(ctx, ts_ptr)
     ctx.attempt_margin < 0 && return nothing
     pl = ctx.petsclib
@@ -6431,7 +6433,11 @@ function _setup(
                 !any(o -> _names_option(o, "snes_lag_jacobian"), effective_options) &&
                 _set_jacobian_lag!(petsclib, _snes(petsclib, ts.ptr), 5)
             if !fixed && !_uses_ifunction(alg)
-                if any(o -> _names_option(o, "ts_max_reject"), effective_options)
+                # PETSc 3.25 renames -ts_max_reject; the pushed options are the only source.
+                raised = any(effective_options) do o
+                    any(n -> _names_option(o, n), _MAX_REJECT_OPTIONS)
+                end
+                if raised
                     _set_stage_check!(petsclib, ts, ctx, ptrs.attempt_check)
                 else
                     # A TSStep makes at most PETSc's default 11 attempts, so the check, which
