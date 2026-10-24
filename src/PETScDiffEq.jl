@@ -2872,6 +2872,34 @@ _dense_jacobian(h, alg, comm, clone, sparse_jac, dm_jac) =
     !(_ts_type(alg) in ("irk", "alpha2", "rosw")) &&
     (h.jac_mat === nothing ? h.fd_mat === nothing : !sparse_jac && !dm_jac)
 
+# In the natural order a narrow band factors with no fill outside it, faster than GMRES with
+# ILU(0) takes to converge; the band of a 2-D grid is already too wide.
+const _BANDED_LU_WIDTH = 4
+
+function _banded_jacobian(h, alg, comm, clone, prob, M)
+    comm === nothing && clone === nothing && _uses_ifunction(alg) || return false
+    _ts_type(alg) in ("irk", "alpha2") && return false
+    P = prob.f.jac_prototype
+    P isa SparseArrays.AbstractSparseMatrix || return false
+    h.jac_mat !== nothing || h.fd_mat !== nothing || return false
+    return _bandwidth(SparseMatrixCSC(P), M) <= _BANDED_LU_WIDTH
+end
+
+function _bandwidth(P::SparseMatrixCSC, M)
+    w = 0
+    for j in axes(P, 2), k in nzrange(P, j)
+        w = max(w, abs(rowvals(P)[k] - j))
+    end
+    M === nothing || for ij in _mass_nonzeros(M)
+        w = max(w, abs(ij[1] - ij[2]))
+    end
+    return w
+end
+
+# A KSP or PC option in the user's list tunes the default solver, which then stays.
+_tunes_linear_solver(opts) = _names_linear_solver(opts) ||
+    any(o -> startswith(lowercase(o), "-pc_") || startswith(lowercase(o), "-ksp_"), opts)
+
 _names_linear_solver(opts) = any(
     o -> any(n -> _names_option(o, n), ("ksp_type", "pc_type", "snes_mf", "snes_mf_operator")),
     opts,
@@ -6235,6 +6263,12 @@ function _setup(
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
                 !_names_linear_solver([alg.petsc_options; extra_options])
             dense_lu && append!(effective_options, ["-ksp_type", "preonly", "-pc_type", "lu"])
+            banded_lu = !dense_lu && _banded_jacobian(h, alg, comm, clone, prob, M) &&
+                !_tunes_linear_solver([alg.petsc_options; extra_options])
+            banded_lu && append!(
+                effective_options,
+                ["-ksp_type", "preonly", "-pc_type", "lu", "-pc_factor_mat_ordering_type", "natural"],
+            )
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
             forced = force_dtmin && dtmin !== nothing && dtmin != 0
             forced &&
@@ -6348,9 +6382,10 @@ function _setup(
                 )
             end
             # PETSc's default LU cannot factor IRK's Kronecker-product stage matrix.
-            if chosen == "irk" && (dense_lu || !any(o -> _names_option(o, "pc_type"), effective_options))
+            if chosen == "irk" &&
+                    (dense_lu || banded_lu || !any(o -> _names_option(o, "pc_type"), effective_options))
                 _set_pc_type!(petsclib, ts, "pbjacobi")
-                dense_lu && _set_ksp_type!(petsclib, ts, "gmres")
+                (dense_lu || banded_lu) && _set_ksp_type!(petsclib, ts, "gmres")
             elseif dense_lu && _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly")
                 # Without a Newton norm to see it, only GMRES's residual norm catches a NaN
                 # right-hand side, so that a smaller step is tried.
@@ -6370,6 +6405,13 @@ function _setup(
             )
             fixed = adapt_type == "none"
             h.fixed = fixed
+            # A fixed step does not retry a NaN, which a linear solve fails on only through
+            # GMRES's residual norm, so it keeps the default solver.
+            if banded_lu && fixed && chosen != "irk" &&
+                    (running == "rosw" || _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly"))
+                _set_pc_type!(petsclib, ts, "ilu")
+                _set_ksp_type!(petsclib, ts, "gmres")
+            end
             adapts = _adapts(running)
             dt_option = any(o -> _names_option(o, "ts_dt"), effective_options)
             if !dt_given && !dt_option && !(adaptive && adapts === true)
