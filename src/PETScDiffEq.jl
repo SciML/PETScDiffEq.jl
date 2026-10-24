@@ -2326,6 +2326,33 @@ function _ts_dm(pl, ts)
     return dm[]
 end
 
+# SNESSolve hands its vector to the TS's DMShell, which empties the DM's work-vector cache
+# unless that vector already carries the DM. The TS duplicates its stage vectors from the
+# state, so the state carries the DM and a separate template stays the DMShell's vector.
+function _share_dm!(pl, ts, u)
+    dm, template = _ts_dm(pl, ts), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :VecDuplicate), LibPETSc.PetscErrorCode,
+            (LibPETSc.CVec, Ptr{Ptr{Cvoid}}), u, template,
+        ),
+    )
+    code = ccall(
+        _symbol(pl, :DMShellSetGlobalVector), LibPETSc.PetscErrorCode,
+        (Ptr{Cvoid}, Ptr{Cvoid}), dm, template[],
+    )
+    _check_code(
+        ccall(_symbol(pl, :VecDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},), template),
+    )
+    _check_code(code)
+    _check_code(
+        ccall(
+            _symbol(pl, :VecSetDM), LibPETSc.PetscErrorCode, (LibPETSc.CVec, Ptr{Cvoid}), u, dm,
+        ),
+    )
+    return nothing
+end
+
 # TSAdapt raises PETSC_ERR_FP with its DM work vector still out, which pins the DM and fails
 # its next DMClearGlobalVectors. Holding the vector the DM hands out first lets it go back.
 function _hold_work_vec!(ctx, ts)
@@ -4895,6 +4922,7 @@ mutable struct TSHandles{CTX, L, R, S}
     reltol::Any
     again::Any
     fresh::Any
+    quiet::Bool
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -6139,7 +6167,7 @@ function _setup(
         false,
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
-        nothing, nothing,
+        nothing, nothing, false,
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -6166,6 +6194,7 @@ function _setup(
         end
         alg isa TSAlpha2 ? _set_second_order_solution!(h, nv) :
             LibPETSc.TSSetSolution(petsclib, ts, u)
+        clone === nothing && !(alg isa TSAlpha2) && _share_dm!(petsclib, ts, u)
 
         ctxptr = pointer_from_objref(ctx)
         ptrs = _callbacks(ctx)
@@ -6327,12 +6356,13 @@ function _setup(
                 append!(effective_options, ["-snes_fd_color_use_mat"])
             append!(effective_options, alg.petsc_options)
             append!(effective_options, extra_options)
+            h.quiet = !any(_viewer_option, effective_options)
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
                 h.opts = PETScCompat.PetscOptions(petsclib; parsed...)
-                push!(h.opts)
                 try
-                    LibPETSc.TSSetFromOptions(petsclib, ts)
+                    # Monitors and viewers are made here, so they follow the solve's own options.
+                    _with_options(() -> LibPETSc.TSSetFromOptions(petsclib, ts), h)
                 catch e
                     e isa LibPETSc.PetscError || rethrow()
                     throw(
@@ -6342,8 +6372,6 @@ function _setup(
                                 "PETSc knows, and PETSc's message is printed above",
                         ),
                     )
-                finally
-                    pop!(h.opts)
                 end
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
@@ -6657,15 +6685,47 @@ function _assemble(
     )
 end
 
+# Every option PETSc 3.22 and 3.25 read as a viewer or monitor contains one of these.
+const _VIEWER_WORDS = (
+    "view", "monitor", "converged_reason", "converged_rate", "test", "compare", "estimate",
+    "eigenvalues", "singularvalues", "residual", "draw", "saws", "display", "plot", "help",
+    "adapt_error", "extrude", "forest",
+)
+_viewer_option(opt) = startswith(opt, "-") &&
+    any(w -> occursin(w, lowercase(first(split(opt[2:end], "=")))), _VIEWER_WORDS)
+
 # Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
 function _with_options(f, h::TSHandles)
     push!(h.opts)
     try
-        return f()
+        return _with_viewers(f, h)
     finally
         pop!(h.opts)
     end
 end
+
+# Solves in progress that turned PETSc's viewers off while the caller had them on.
+const VIEWERS_HIDDEN = Ref(0)
+
+# Without a viewer option set, every viewer lookup PETSc makes in a solve finds nothing, so
+# a quiet solve skips them; a solve nested in one turns them back on for its own options.
+function _with_viewers(f, h::TSHandles)
+    pl = h.petsclib
+    hide = h.quiet && !_viewers_off(pl)
+    hide || !h.quiet && VIEWERS_HIDDEN[] > 0 || return f()
+    LibPETSc.PetscOptionsPushCreateViewerOff(
+        pl, hide ? LibPETSc.PETSC_TRUE : LibPETSc.PETSC_FALSE,
+    )
+    VIEWERS_HIDDEN[] += hide
+    try
+        return f()
+    finally
+        VIEWERS_HIDDEN[] -= hide
+        LibPETSc.PetscOptionsPopCreateViewerOff(pl)
+    end
+end
+
+_viewers_off(pl) = LibPETSc.PetscOptionsGetCreateViewerOff(pl) != LibPETSc.PETSC_FALSE
 
 # Under a distributed comm the error is returned, to raise once the ranks agree on who threw.
 function _run!(f, h::TSHandles)

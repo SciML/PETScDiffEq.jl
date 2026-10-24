@@ -525,6 +525,39 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
     end
 
+    @testset "a solve nested in a quiet one prints what it would print alone" begin
+        script = """
+        using PETScDiffEq, SciMLBase
+        mark(s) = (flush(stdout); Libc.flush_cstdio(); println(s); flush(stdout))
+        rober!(du, u, p, t) = (du[1] = -0.04u[1] + 1e4 * u[2] * u[3];
+            du[2] = 0.04u[1] - 1e4 * u[2] * u[3] - 3e7 * u[2]^2; du[3] = 3e7 * u[2]^2; nothing)
+        options = ["-ts_monitor", "-snes_converged_reason", "-ksp_monitor",
+            "-snes_linesearch_monitor", "-ksp_view_final_residual"]
+        function inner()
+            prob = SciMLBase.ODEProblem(rober!, [1.0, 0.0, 0.0], (0.0, 1.0))
+            sol = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf", options))
+            mark("end")
+            return sol.u[end][1]
+        end
+        calls = Ref(0)
+        outer!(du, u, p, t) = (calls[] += 1; calls[] == 3 && inner(); du .= -u; nothing)
+        mark("alone")
+        inner()
+        for alg in (PETScDiffEq.TSImplicit("bdf"), PETScDiffEq.TSRosW("ra34pw2"))
+            calls[] = 0
+            mark("nested")
+            SciMLBase.solve(SciMLBase.ODEProblem(outer!, [1.0], (0.0, 1.0)), alg)
+        end
+        """
+        cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $script`
+        out = read(pipeline(cmd; stderr = devnull), String)
+        parts = split(out, r"^(alone|nested)\n"m; keepempty = false)
+        alone = first(split(parts[1], "end\n"))
+        @test count("TS dt", alone) > 5 && occursin("KSP final norm of residual", alone)
+        @test length(parts) == 3
+        @test all(p -> first(split(p, "end\n")) == alone, parts[2:end])
+    end
+
     @testset "a first solve runs precompiled code and loading starts nothing" begin
         script = """
         using PETScDiffEq, SciMLBase
