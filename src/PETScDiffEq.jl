@@ -2897,9 +2897,25 @@ function _bandwidth(P::SparseMatrixCSC, M)
     return w
 end
 
-# A KSP or PC option in the user's list tunes the default solver, which then stays.
-_tunes_linear_solver(opts) = _names_linear_solver(opts) ||
-    any(o -> startswith(lowercase(o), "-pc_") || startswith(lowercase(o), "-ksp_"), opts)
+# A KSP or PC option in the user's list tunes the default solver, which then stays. Viewers,
+# monitors and reasons only observe, so they leave the default as it is.
+_tunes_linear_solver(opts) = _names_linear_solver(opts) || any(_tunes_ksp_or_pc, opts)
+
+function _tunes_ksp_or_pc(opt)
+    startswith(opt, "-") || return false
+    name = lowercase(first(split(opt[2:end], "=")))
+    startswith(name, "ksp_") || startswith(name, "pc_") || return false
+    return !any(w -> occursin(w, name), ("view", "monitor", "converged_reason"))
+end
+
+# Whether the user's options make the SNES a single linear solve.
+function _linear_snes(opts)
+    i = findlast(o -> _names_option(o, "snes_type"), opts)
+    i === nothing && return false
+    value = occursin("=", opts[i]) ? last(split(opts[i], "="; limit = 2)) :
+        i < length(opts) ? opts[i + 1] : ""
+    return lowercase(value) in ("ksponly", "ksptransposeonly")
+end
 
 _names_linear_solver(opts) = any(
     o -> any(n -> _names_option(o, n), ("ksp_type", "pc_type", "snes_mf", "snes_mf_operator")),
@@ -6267,9 +6283,16 @@ function _setup(
             width = dense_lu || _tunes_linear_solver([alg.petsc_options; extra_options]) ?
                 nothing : _sparse_bandwidth(h, alg, comm, clone, prob, M)
             banded_lu = width !== nothing && width <= _BANDED_LU_WIDTH
+            # Without a Newton norm only a residual norm catches a NaN right-hand side, so a linear
+            # solve wraps the LU in Richardson, which checks one and needs one step to converge.
+            banded_linear = banded_lu &&
+                (_ts_type(alg) == "rosw" || _linear_snes([alg.petsc_options; extra_options]))
             banded_lu && append!(
                 effective_options,
-                ["-ksp_type", "preonly", "-pc_type", "lu", "-pc_factor_mat_ordering_type", "natural"],
+                banded_linear ?
+                    ["-ksp_type", "richardson"] :
+                    ["-ksp_type", "preonly"],
+                ["-pc_type", "lu", "-pc_factor_mat_ordering_type", "natural"],
             )
             # ILU(0) preconditions better in the reverse Cuthill-McKee order on wider patterns.
             width === nothing || banded_lu ||
@@ -6410,9 +6433,9 @@ function _setup(
             )
             fixed = adapt_type == "none"
             h.fixed = fixed
-            # A fixed step does not retry a NaN, which a linear solve fails on only through
-            # GMRES's residual norm, so it keeps the default solver.
-            if banded_lu && fixed && chosen != "irk" &&
+            # An option that picked a linear solve the setup above did not foresee keeps the
+            # default solver.
+            if banded_lu && !banded_linear && chosen != "irk" &&
                     (running == "rosw" || _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly"))
                 _set_pc_type!(petsclib, ts, "ilu")
                 _set_ksp_type!(petsclib, ts, "gmres")
