@@ -6294,9 +6294,9 @@ function _setup(
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
                 h.opts = PETScCompat.PetscOptions(petsclib; parsed...)
-                push!(h.opts)
                 try
-                    LibPETSc.TSSetFromOptions(petsclib, ts)
+                    # Monitors and viewers are made here, so they follow the solve's own options.
+                    _with_options(() -> LibPETSc.TSSetFromOptions(petsclib, ts), h)
                 catch e
                     e isa LibPETSc.PetscError || rethrow()
                     throw(
@@ -6306,8 +6306,6 @@ function _setup(
                                 "PETSc knows, and PETSc's message is printed above",
                         ),
                     )
-                finally
-                    pop!(h.opts)
                 end
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
