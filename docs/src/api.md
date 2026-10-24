@@ -21,6 +21,12 @@ TSGeneric
 PETScIntegrator
 ```
 
+## Repeated solves
+
+```@docs
+PETScDiffEq.reusing
+```
+
 ## Sensitivity algorithm
 
 ```@docs
