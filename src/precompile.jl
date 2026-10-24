@@ -87,4 +87,5 @@ end
     empty!(PETSC_SYMBOLS)
     empty!(EXIT_CLEANUP_ARMED)
     empty!(LIVE_HANDLES)
+    empty!(COLORINGS)
 end
