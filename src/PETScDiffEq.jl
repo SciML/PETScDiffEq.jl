@@ -2965,6 +2965,16 @@ function _option_flag(opts, name)
     return value
 end
 
+# PETSc 3.22 reorders for a nonzero diagonal even when the factorization orders itself, as
+# MUMPS, UMFPACK and KLU do, and crashes on the ordering it never made. They pivot anyway.
+function _own_factor(opts, name)
+    i = findlast(o -> _names_option(o, name), opts)
+    i === nothing && return true
+    value = occursin("=", opts[i]) ? last(split(opts[i], "="; limit = 2)) :
+        i < length(opts) && !startswith(opts[i + 1], "-") ? opts[i + 1] : ""
+    return lowercase(value) in ("", "petsc")
+end
+
 # PETSc refuses a negative, infinite or NaN value itself, so `tol` stays for those.
 function _option_tol(opts, name, tol)
     i = findlast(o -> _names_option(o, name), opts)
@@ -6234,9 +6244,12 @@ function _setup(
             tf == -1 && push!(effective_options, "-ts_max_time=-1")
             append!(effective_options, _default_options(alg))
             # PETSc's sparse LU does not pivot, and an algebraic row has a zero diagonal.
+            user_options = [alg.petsc_options; extra_options]
             if h.jac_mat !== nothing && (uses_sparse_jac || dm_jac) || h.fd_mat !== nothing
-                append!(effective_options, ["-pc_factor_nonzeros_along_diagonal"])
+                _own_factor(user_options, "pc_factor_mat_solver_type") &&
+                    append!(effective_options, ["-pc_factor_nonzeros_along_diagonal"])
                 comm === nothing ||
+                    !_own_factor(user_options, "sub_pc_factor_mat_solver_type") ||
                     append!(effective_options, ["-sub_pc_factor_nonzeros_along_diagonal"])
             end
             # ILU(0) of a dense matrix is already its full LU, which GMRES then wraps in a
