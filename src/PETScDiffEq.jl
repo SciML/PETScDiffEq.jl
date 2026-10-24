@@ -6609,6 +6609,9 @@ function _setup(
                     ["-ksp_type", "preonly"],
                 ["-pc_type", "lu", "-pc_factor_mat_ordering_type", "natural"],
             )
+            # PETSc's default -ksp_atol 1e-50 passes a solve that did nothing near underflow.
+            banded_linear && !any(o -> _names_option(o, "ksp_atol"), user_options) &&
+                append!(effective_options, ["-ksp_atol", "0"])
             # ILU(0) preconditions better in the reverse Cuthill-McKee order on wider patterns.
             width === nothing || banded_lu ||
                 append!(effective_options, ["-pc_factor_mat_ordering_type", "rcm"])
