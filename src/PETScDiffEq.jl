@@ -1224,7 +1224,7 @@ end
 function _is_stag(pl, dm, flag = Ref{Cint}(0))
     _check_code(
         ccall(
-            _symbol(pl, :PetscObjectTypeCompare), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscObjectTypeCompare)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Cstring, Ptr{Cint}), dm, "stag", flag,
         ),
     )
@@ -1450,7 +1450,7 @@ end
 function _is_plex(pl, dm, flag = Ref{Cint}(0))
     _check_code(
         ccall(
-            _symbol(pl, :PetscObjectTypeCompare), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscObjectTypeCompare)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Cstring, Ptr{Cint}), dm, "plex", flag,
         ),
     )
@@ -2115,6 +2115,15 @@ _symbol(petsclib, name::Symbol) = get!(PETSC_SYMBOLS, (petsclib.petsc_library, n
     Libdl.dlsym(Libdl.dlopen(petsclib.petsc_library), name)
 end
 
+# Looked up every stage; the per-library methods below bind each one once.
+const _STEP_SYMBOLS = (
+    :TSGetSNES, :SNESGetConvergedReason, :SNESSetConvergedReason, :SNESGetSolution,
+    :SNESGetLagJacobian, :SNESSetLagJacobian, :TSGetStages, :PetscObjectGetReference,
+    :PetscObjectTypeCompare, :MatDenseGetLDA, :MatDenseGetArray, :MatDenseRestoreArray,
+)
+
+_symbol(petsclib, ::Val{name}) where {name} = _symbol(petsclib, name)
+
 # OrdinaryDiffEq applies dtmin only when adaptive. `force_dtmin` hands it to PETSc.
 _floor(R, dtmin, force_dtmin, adaptive) =
     force_dtmin || !adaptive || dtmin === nothing ? zero(R) : abs(R(dtmin))
@@ -2354,7 +2363,7 @@ function _rehold_work_vec!(ctx, ts)
         refs = Ref{PETSc.inttype(ctx.petsclib)}(0)
         _check_code(
             ccall(
-                _symbol(ctx.petsclib, :PetscObjectGetReference), LibPETSc.PetscErrorCode,
+                _symbol(ctx.petsclib, Val(:PetscObjectGetReference)), LibPETSc.PetscErrorCode,
                 (Ptr{Cvoid}, Ptr{Cvoid}), ctx.workvec, refs,
             ),
         )
@@ -2418,7 +2427,7 @@ function _snes(pl, ts_ptr)
     snes = Ref{LibPETSc.CSNES}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :TSGetSNES), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:TSGetSNES)), LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts_ptr, snes,
         ),
     )
@@ -2440,7 +2449,7 @@ function _snes_failed(pl, ts_ptr)
     snes, reason = _snes(pl, ts_ptr), Ref{Cint}(0)
     _check_code(
         ccall(
-            _symbol(pl, :SNESGetConvergedReason), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:SNESGetConvergedReason)), LibPETSc.PetscErrorCode,
             (LibPETSc.CSNES, Ptr{Cint}), snes, reason,
         ),
     )
@@ -2452,14 +2461,14 @@ function _stale_failure!(pl, snes, y)
     x = Ref{LibPETSc.CVec}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :SNESGetSolution), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:SNESGetSolution)), LibPETSc.PetscErrorCode,
             (LibPETSc.CSNES, Ptr{LibPETSc.CVec}), snes, x,
         ),
     )
     x[] == y && return false
     _check_code(
         ccall(
-            _symbol(pl, :SNESSetConvergedReason), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:SNESSetConvergedReason)), LibPETSc.PetscErrorCode,
             (LibPETSc.CSNES, Cint), snes, 0,
         ),
     )
@@ -2470,7 +2479,7 @@ function _jacobian_lag(pl, snes)
     lag = Ref{PETSc.inttype(pl)}(0)
     _check_code(
         ccall(
-            _symbol(pl, :SNESGetLagJacobian), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:SNESGetLagJacobian)), LibPETSc.PetscErrorCode,
             (LibPETSc.CSNES, Ptr{Cvoid}), snes, lag,
         ),
     )
@@ -2479,7 +2488,7 @@ end
 
 _set_jacobian_lag!(pl, snes, lag) = _check_code(
     ccall(
-        _symbol(pl, :SNESSetLagJacobian), LibPETSc.PetscErrorCode,
+        _symbol(pl, Val(:SNESSetLagJacobian)), LibPETSc.PetscErrorCode,
         (LibPETSc.CSNES, LibPETSc.PetscInt), snes, LibPETSc.PetscInt(lag),
     ),
 )
@@ -2497,7 +2506,7 @@ function _last_stage(ctx, pl, ts_ptr, y)
     ns, stages = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{LibPETSc.CVec}}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :TSGetStages), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:TSGetStages)), LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, Ptr{Cvoid}, Ptr{Ptr{LibPETSc.CVec}}), ts_ptr, ns, stages,
         ),
     )
@@ -2555,7 +2564,7 @@ function _lost_update(ctx, pl, ts, ::Type{R}) where {R}
     snes, reason = _snes(pl, ts.ptr), Ref{Cint}(0)
     _check_code(
         ccall(
-            _symbol(pl, :SNESGetConvergedReason), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:SNESGetConvergedReason)), LibPETSc.PetscErrorCode,
             (LibPETSc.CSNES, Ptr{Cint}), snes, reason,
         ),
     )
@@ -2763,7 +2772,7 @@ function _pivot_raises(pl, ts)
     snes_raises = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE)
     _check_code(
         ccall(
-            _symbol(pl, :TSGetSNES), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:TSGetSNES)), LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
         ),
     )
@@ -2826,7 +2835,7 @@ function _set_pc_type!(pl, ts, type)
     pc = Ref{Ptr{Cvoid}}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :TSGetSNES), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:TSGetSNES)), LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
         ),
     )
@@ -2937,7 +2946,7 @@ function _difference_jacobian!(pl, ts, mat, ctxptr)
     snes = Ref{LibPETSc.CSNES}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :TSGetSNES), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:TSGetSNES)), LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, Ptr{LibPETSc.CSNES}), ts, snes,
         ),
     )
@@ -3680,6 +3689,9 @@ _lent(::L, ptr::LibPETSc.CVec) where {L} = _Lent{L}(ptr)
 
 for pl in PETSc.petsclibs
     L, lib, T, I = typeof(pl), pl.petsc_library, PETSc.scalartype(pl), PETSc.inttype(pl)
+    for name in _STEP_SYMBOLS
+        @eval _symbol(::$L, ::Val{$(QuoteNode(name))}) = cglobal(($(QuoteNode(name)), $lib))
+    end
     @eval begin
         function _taken(::$L, ts)
             n, r = Ref{$I}(0), Ref{$I}(0)
@@ -3810,7 +3822,7 @@ function _stage_time(ctx, ts, t)
     x = Ref{LibPETSc.CVec}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :SNESGetSolution), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:SNESGetSolution)), LibPETSc.PetscErrorCode,
             (LibPETSc.CSNES, Ptr{LibPETSc.CVec}), _snes(pl, ts), x,
         ),
     )
@@ -3818,7 +3830,7 @@ function _stage_time(ctx, ts, t)
     ns, stages = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{LibPETSc.CVec}}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :TSGetStages), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:TSGetStages)), LibPETSc.PetscErrorCode,
             (LibPETSc.CTS, Ptr{Cvoid}, Ptr{Ptr{LibPETSc.CVec}}), ts, ns, stages,
         ),
     )
@@ -4131,7 +4143,7 @@ function _is_seqdense(pl, A)
     flag = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE)
     _check_code(
         ccall(
-            _symbol(pl, :PetscObjectTypeCompare), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscObjectTypeCompare)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Cstring, Ptr{LibPETSc.PetscBool}), A.ptr, "seqdense", flag,
         ),
     )
@@ -4143,13 +4155,13 @@ function _set_dense_block!(pl, B, J::Matrix{S}, M, dae, shift, n) where {S}
     data, lda = Ref{Ptr{S}}(C_NULL), Ref{PETSc.inttype(pl)}(0)
     _check_code(
         ccall(
-            _symbol(pl, :MatDenseGetLDA), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
+            _symbol(pl, Val(:MatDenseGetLDA)), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Cvoid}),
             B.ptr, lda,
         ),
     )
     _check_code(
         ccall(
-            _symbol(pl, :MatDenseGetArray), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Ptr{S}}),
+            _symbol(pl, Val(:MatDenseGetArray)), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Ptr{Ptr{S}}),
             B.ptr, data,
         ),
     )
@@ -4159,7 +4171,7 @@ function _set_dense_block!(pl, B, J::Matrix{S}, M, dae, shift, n) where {S}
     finally
         _check_code(
             ccall(
-                _symbol(pl, :MatDenseRestoreArray), LibPETSc.PetscErrorCode,
+                _symbol(pl, Val(:MatDenseRestoreArray)), LibPETSc.PetscErrorCode,
                 (Ptr{Cvoid}, Ptr{Ptr{S}}), B.ptr, data,
             ),
         )
