@@ -3752,15 +3752,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         same(a, b) = a.t == b.t && a.u == b.u && a.retcode == b.retcode &&
             fields(a.stats) == fields(b.stats)
         ctx(i) = SciMLBase.EnsembleContext(i, 1, 0, nothing, nothing, nothing)
-        open_handles() = count(h -> !h.destroyed, keys(P.LIVE_HANDLES))
+        open_handles() = Set(h for h in keys(P.LIVE_HANDLES) if !h.destroyed)
         lv = SciMLBase.ODEProblem(lotka_volterra!, [1.0, 1.0], (0.0, 2.0), [1.5, 1.0, 3.0, 1.0])
         # Each trajectory solved alone after the ensemble; returns how many TSs it kept.
         function check(eprob, alg, n, refs = nothing; kw...)
-            made, open = P.HANDLES_MADE[], open_handles()
+            # Earlier testsets' integrators may hold handles and hooks, which the GC may free.
+            made, open, hooks = P.HANDLES_MADE[], open_handles(), Set(keys(P.POST_STEP_CTX))
             sim = SciMLBase.solve(eprob, alg, SciMLBase.EnsembleSerial(); trajectories = n, kw...)
             made = P.HANDLES_MADE[] - made
-            @test open_handles() == open
-            @test isempty(P.KEPT_HANDLES) && P.REUSERS[] == 0 && isempty(P.POST_STEP_CTX)
+            @test open_handles() ⊆ open
+            @test isempty(P.KEPT_HANDLES) && P.REUSERS[] == 0
+            @test keys(P.POST_STEP_CTX) ⊆ hooks
             for i in 1:n
                 ref = refs === nothing ? SciMLBase.solve(
                         eprob.prob_func(deepcopy(eprob.prob), ctx(i)), alg; kw...,

@@ -6674,6 +6674,8 @@ const _Walked = Union{SciMLBase.AbstractSciMLFunction, AnyPETScTS}
 _snap(x::AbstractArray) = deepcopy(x)
 _snap(x::Union{Tuple, NamedTuple}) = map(_snap, x)
 _snap(x::Base.Pairs) = _snap(values(x))
+_snap(x::SciMLBase.CallbackSet) = (x, map(c -> collect(Any, c), _callback_lists(x)))
+_callback_lists(x::SciMLBase.CallbackSet) = (x.continuous_callbacks, x.discrete_callbacks)
 _snap(x::_Walked) = (x, ntuple(i -> _snap_field(x, i), nfields(x)))
 _snap(x) = x
 
@@ -6685,6 +6687,11 @@ _same(s, x::AbstractArray) = typeof(s) === typeof(x) && size(s) == size(x) && is
 _same(s, x::Union{Tuple, NamedTuple}) = s isa Union{Tuple, NamedTuple} &&
     keys(s) == keys(x) && all(i -> _same(s[i], x[i]), keys(x))
 _same(s, x::Base.Pairs) = _same(s, values(x))
+# Newer SciMLBase gives each problem its own empty CallbackSet, of vectors.
+_same(s, x::SciMLBase.CallbackSet) = s isa Tuple && typeof(s[1]) === typeof(x) &&
+    all(zip(s[2], _callback_lists(x))) do (a, b)
+        length(a) == length(b) && all(splat(===), zip(a, b))
+    end
 _same(s, x::_Walked) = s isa Tuple && typeof(s[1]) === typeof(x) &&
     all(i -> _same_field(s[2][i], x, i), 1:nfields(x))
 # SciMLBase wraps f anew for each solve.
