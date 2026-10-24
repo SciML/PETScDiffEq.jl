@@ -2120,6 +2120,9 @@ const _STEP_SYMBOLS = (
     :TSGetSNES, :SNESGetConvergedReason, :SNESSetConvergedReason, :SNESGetSolution,
     :SNESGetLagJacobian, :SNESSetLagJacobian, :TSGetStages, :PetscObjectGetReference,
     :PetscObjectTypeCompare, :MatDenseGetLDA, :MatDenseGetArray, :MatDenseRestoreArray,
+    :MatDenseGetArrayRead, :MatDenseRestoreArrayRead, :PCGetOperators, :PCSetFailedReason,
+    :VecGetArrayRead, :VecRestoreArrayRead, :VecGetArrayWrite, :VecRestoreArrayWrite,
+    :PetscError,
 )
 
 _symbol(petsclib, ::Val{name}) where {name} = _symbol(petsclib, name)
@@ -2855,7 +2858,7 @@ function _set_pc_type!(pl, ts, type)
         _symbol(pl, :PCSetType), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Cstring), pc[], type,
     )
     code == 0 || throw(LibPETSc.PetscError(code))
-    return nothing
+    return pc[]
 end
 
 function _set_ksp_type!(pl, ts, type)
@@ -2869,6 +2872,220 @@ function _set_ksp_type!(pl, ts, type)
     _check_code(
         ccall(_symbol(pl, :KSPSetType), LibPETSc.PetscErrorCode, (LibPETSc.CKSP, Cstring), ksp[], type),
     )
+    return nothing
+end
+
+# At these sizes PETSc's dense LU spends longer in its own calls than in the factorization,
+# so a serial dense W is factored in Julia behind a shell preconditioner instead.
+const _SMALL_LU = 64
+
+mutable struct _SmallLU{S, L}
+    petsclib::L
+    F::Matrix{S}
+    ipiv::Vector{Int}
+    work::Vector{S}
+    nan_check::Bool
+    ctx::Any
+end
+
+# LAPACK picks a complex pivot by |re| + |im|.
+_pivot_size(x::Real) = abs(x)
+_pivot_size(x::Complex) = abs(real(x)) + abs(imag(x))
+
+# Returns the first exactly zero pivot, where PETSc's dense LU raises, or 0.
+function _lu!(F, ipiv)
+    n = size(F, 1)
+    @inbounds for k in 1:n
+        p, amax = k, _pivot_size(F[k, k])
+        for i in (k + 1):n
+            a = _pivot_size(F[i, k])
+            a > amax && ((p, amax) = (i, a))
+        end
+        ipiv[k] = p
+        if p != k
+            for j in 1:n
+                F[k, j], F[p, j] = F[p, j], F[k, j]
+            end
+        end
+        iszero(F[k, k]) && return k
+        r = inv(F[k, k])
+        for i in (k + 1):n
+            F[i, k] *= r
+        end
+        for j in (k + 1):n
+            f = F[k, j]
+            for i in (k + 1):n
+                F[i, j] = muladd(-F[i, k], f, F[i, j])
+            end
+        end
+    end
+    return 0
+end
+
+function _lu_solve!(x, F, ipiv)
+    n = length(x)
+    @inbounds for k in 1:n
+        p = ipiv[k]
+        p == k || ((x[k], x[p]) = (x[p], x[k]))
+    end
+    @inbounds for j in 1:n
+        xj = x[j]
+        for i in (j + 1):n
+            x[i] = muladd(-F[i, j], xj, x[i])
+        end
+    end
+    @inbounds for j in n:-1:1
+        xj = x[j] / F[j, j]
+        x[j] = xj
+        for i in 1:(j - 1)
+            x[i] = muladd(-F[i, j], xj, x[i])
+        end
+    end
+    return x
+end
+
+# PETSc's transposed solve is with A^T, not the conjugate transpose.
+function _lu_solve_transpose!(x, F, ipiv)
+    n = length(x)
+    @inbounds for j in 1:n
+        s = x[j]
+        for i in 1:(j - 1)
+            s = muladd(-F[i, j], x[i], s)
+        end
+        x[j] = s / F[j, j]
+    end
+    @inbounds for j in n:-1:1
+        s = x[j]
+        for i in (j + 1):n
+            s = muladd(-F[i, j], x[i], s)
+        end
+        x[j] = s
+    end
+    @inbounds for k in n:-1:1
+        p = ipiv[k]
+        p == k || ((x[k], x[p]) = (x[p], x[k]))
+    end
+    return x
+end
+
+function _lu_setup!(lu::_SmallLU{S}, pc) where {S}
+    pl = lu.petsclib
+    mat, pmat = Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    code = ccall(
+        _symbol(pl, Val(:PCGetOperators)), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}),
+        pc, mat, pmat,
+    )
+    code == 0 || return code
+    lda, a = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{S}}(C_NULL)
+    code = ccall(_symbol(pl, Val(:MatDenseGetLDA)), _Err, (Ptr{Cvoid}, Ptr{Cvoid}), pmat[], lda)
+    code == 0 || return code
+    code = ccall(
+        _symbol(pl, Val(:MatDenseGetArrayRead)), _Err, (Ptr{Cvoid}, Ptr{Ptr{S}}), pmat[], a,
+    )
+    code == 0 || return code
+    F, ld = lu.F, Int(lda[])
+    @inbounds for j in axes(F, 2), i in axes(F, 1)
+        F[i, j] = unsafe_load(a[], i + (j - 1) * ld)
+    end
+    code = ccall(
+        _symbol(pl, Val(:MatDenseRestoreArrayRead)), _Err, (Ptr{Cvoid}, Ptr{Ptr{S}}),
+        pmat[], a,
+    )
+    code == 0 || return code
+    _lu!(F, lu.ipiv) == 0 && return _Err(0)
+    return ccall(
+        _symbol(pl, Val(:PetscError)), _Err,
+        (MPI.API.MPI_Comm, Cint, Cstring, Cstring, _Err, LibPETSc.PetscErrorType, Cstring),
+        MPI.COMM_SELF, @__LINE__, "PCSetUp_Shell", @__FILE__, PETSC_ERR_MAT_LU_ZRPVT,
+        LibPETSc.PETSC_ERROR_INITIAL, "Zero pivot in LU factorization",
+    )
+end
+
+function _lu_apply!(lu::_SmallLU{S}, pc, b, x, transposed) where {S}
+    pl, w = lu.petsclib, lu.work
+    a = Ref{Ptr{S}}(C_NULL)
+    code = ccall(_symbol(pl, Val(:VecGetArrayRead)), _Err, (LibPETSc.CVec, Ptr{Ptr{S}}), b, a)
+    code == 0 || return code
+    GC.@preserve w unsafe_copyto!(pointer(w), a[], length(w))
+    code = ccall(_symbol(pl, Val(:VecRestoreArrayRead)), _Err, (LibPETSc.CVec, Ptr{Ptr{S}}), b, a)
+    code == 0 || return code
+    transposed ? _lu_solve_transpose!(w, lu.F, lu.ipiv) : _lu_solve!(w, lu.F, lu.ipiv)
+    code = ccall(_symbol(pl, Val(:VecGetArrayWrite)), _Err, (LibPETSc.CVec, Ptr{Ptr{S}}), x, a)
+    code == 0 || return code
+    GC.@preserve w unsafe_copyto!(a[], pointer(w), length(w))
+    code = ccall(_symbol(pl, Val(:VecRestoreArrayWrite)), _Err, (LibPETSc.CVec, Ptr{Ptr{S}}), x, a)
+    code == 0 || return code
+    lu.nan_check || return _Err(0)
+    # A ksponly SNES takes no residual norm, so a non-finite solve has to fail here for the
+    # step to be retried smaller.
+    return ccall(
+        _symbol(pl, Val(:PCSetFailedReason)), _Err, (Ptr{Cvoid}, LibPETSc.PCFailedReason), pc,
+        all(isfinite, w) ? LibPETSc.PC_NOERROR : LibPETSc.PC_FACTOR_OTHER,
+    )
+end
+
+function _lu_guarded(f::F, lu, args::Vararg{Any, N}) where {F, N}
+    try
+        return f(lu, args...)
+    catch e
+        lu.ctx.err = e
+        return _Err(CALLBACK_THREW)
+    end
+end
+
+# A shell preconditioner hands back only the PC, whose context holds the factors.
+for pl in PETSc.petsclibs
+    L, S, lib = typeof(pl), PETSc.scalartype(pl), pl.petsc_library
+    P = Ptr{_SmallLU{S, L}}
+    @eval begin
+        function _lu_context(pc::$P)
+            c = Ref{Ptr{Cvoid}}(C_NULL)
+            code = ccall((:PCShellGetContext, $lib), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}), pc, c)
+            return code, code == 0 ? unsafe_pointer_to_objref(c[])::_SmallLU{$S, $L} : nothing
+        end
+
+        function _lu_setup_cb(pc::$P)
+            code, lu = _lu_context(pc)
+            return lu === nothing ? code : _lu_guarded(_lu_setup!, lu, pc)
+        end
+
+        function _lu_apply_cb(pc::$P, b::LibPETSc.CVec, x::LibPETSc.CVec)
+            code, lu = _lu_context(pc)
+            return lu === nothing ? code : _lu_guarded(_lu_apply!, lu, pc, b, x, false)
+        end
+
+        function _lu_apply_transpose_cb(pc::$P, b::LibPETSc.CVec, x::LibPETSc.CVec)
+            code, lu = _lu_context(pc)
+            return lu === nothing ? code : _lu_guarded(_lu_apply!, lu, pc, b, x, true)
+        end
+
+        _lu_callbacks(::$L) = (
+            @cfunction(_lu_setup_cb, _Err, ($P,)),
+            @cfunction(_lu_apply_cb, _Err, ($P, LibPETSc.CVec, LibPETSc.CVec)),
+            @cfunction(_lu_apply_transpose_cb, _Err, ($P, LibPETSc.CVec, LibPETSc.CVec)),
+        )
+    end
+end
+
+_small_lu(h, alg, comm, clone, sparse_jac, dm_jac, n) =
+    comm === nothing && clone === nothing && _uses_ifunction(alg) && h.jac_mat !== nothing &&
+    !sparse_jac && !dm_jac && !(_ts_type(alg) in ("irk", "alpha2")) && n <= _SMALL_LU
+
+function _use_small_lu!(h, n, nan_check)
+    pl, ts = h.petsclib, h.ts
+    S = PETSc.scalartype(pl)
+    lu = _SmallLU(pl, zeros(S, n, n), zeros(Int, n), zeros(S, n), nan_check, h.ctx)
+    h.lu = lu
+    _set_ksp_type!(pl, ts, "preonly")
+    pc = _set_pc_type!(pl, ts, "shell")
+    setup, apply, apply_transpose = _lu_callbacks(pl)
+    for (name, arg) in (
+            (:PCShellSetContext, pointer_from_objref(lu)), (:PCShellSetSetUp, setup),
+            (:PCShellSetApply, apply), (:PCShellSetApplyTranspose, apply_transpose),
+        )
+        _check_code(ccall(_symbol(pl, name), _Err, (Ptr{Cvoid}, Ptr{Cvoid}), pc, arg))
+    end
+    _check_code(ccall(_symbol(pl, :PCShellSetName), _Err, (Ptr{Cvoid}, Cstring), pc, "dense LU"))
     return nothing
 end
 
@@ -4854,6 +5071,7 @@ mutable struct TSHandles{CTX, L, R, S}
     reltol::Any
     again::Any
     fresh::Any
+    lu::Any
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -6100,7 +6318,7 @@ function _setup(
         false,
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
-        nothing, nothing,
+        nothing, nothing, nothing,
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -6253,9 +6471,14 @@ function _setup(
             end
             # ILU(0) of a dense matrix is already its full LU, which GMRES then wraps in a
             # Krylov iteration it does not need.
+            user_options = [alg.petsc_options; extra_options]
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
-                !_names_linear_solver([alg.petsc_options; extra_options])
-            dense_lu && append!(effective_options, ["-ksp_type", "preonly", "-pc_type", "lu"])
+                !_names_linear_solver(user_options)
+            small_lu = _small_lu(h, alg, comm, clone, uses_sparse_jac, dm_jac, n) &&
+                !_names_linear_solver(user_options) &&
+                !any(o -> startswith(lowercase(o), "-pc_"), user_options)
+            dense_lu && !small_lu &&
+                append!(effective_options, ["-ksp_type", "preonly", "-pc_type", "lu"])
             adaptive || append!(effective_options, ["-ts_adapt_type", "none"])
             forced = force_dtmin && dtmin !== nothing && dtmin != 0
             forced &&
@@ -6372,6 +6595,10 @@ function _setup(
             if chosen == "irk" && (dense_lu || !any(o -> _names_option(o, "pc_type"), effective_options))
                 _set_pc_type!(petsclib, ts, "pbjacobi")
                 dense_lu && _set_ksp_type!(petsclib, ts, "gmres")
+            elseif small_lu
+                _use_small_lu!(
+                    h, n, _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly"),
+                )
             elseif dense_lu && _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly")
                 # Without a Newton norm to see it, only GMRES's residual norm catches a NaN
                 # right-hand side, so that a smaller step is tried.
