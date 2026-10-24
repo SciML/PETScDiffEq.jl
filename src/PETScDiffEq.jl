@@ -2325,6 +2325,33 @@ function _ts_dm(pl, ts)
     return dm[]
 end
 
+# SNESSolve hands its vector to the TS's DMShell, which empties the DM's work-vector cache
+# unless that vector already carries the DM. The TS duplicates its stage vectors from the
+# state, so the state carries the DM and a separate template stays the DMShell's vector.
+function _share_dm!(pl, ts, u)
+    dm, template = _ts_dm(pl, ts), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :VecDuplicate), LibPETSc.PetscErrorCode,
+            (LibPETSc.CVec, Ptr{Ptr{Cvoid}}), u, template,
+        ),
+    )
+    code = ccall(
+        _symbol(pl, :DMShellSetGlobalVector), LibPETSc.PetscErrorCode,
+        (Ptr{Cvoid}, Ptr{Cvoid}), dm, template[],
+    )
+    _check_code(
+        ccall(_symbol(pl, :VecDestroy), LibPETSc.PetscErrorCode, (Ptr{Ptr{Cvoid}},), template),
+    )
+    _check_code(code)
+    _check_code(
+        ccall(
+            _symbol(pl, :VecSetDM), LibPETSc.PetscErrorCode, (LibPETSc.CVec, Ptr{Cvoid}), u, dm,
+        ),
+    )
+    return nothing
+end
+
 # TSAdapt raises PETSC_ERR_FP with its DM work vector still out, which pins the DM and fails
 # its next DMClearGlobalVectors. Holding the vector the DM hands out first lets it go back.
 function _hold_work_vec!(ctx, ts)
@@ -6115,6 +6142,7 @@ function _setup(
         end
         alg isa TSAlpha2 ? _set_second_order_solution!(h, nv) :
             LibPETSc.TSSetSolution(petsclib, ts, u)
+        clone === nothing && !(alg isa TSAlpha2) && _share_dm!(petsclib, ts, u)
 
         ctxptr = pointer_from_objref(ctx)
         ptrs = _callbacks(ctx)
