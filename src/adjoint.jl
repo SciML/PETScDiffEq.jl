@@ -208,9 +208,10 @@ mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
     p::P
     jac!::JAC
     J::JBUF
-    row_cols0::Vector{Vector{LibPETSc.PetscInt}}
-    row_src::Vector{Vector{Int}}
-    row_buf::Vector{Vector{Float64}}
+    row_ptr::Vector{LibPETSc.PetscInt}
+    row_cols0::Vector{LibPETSc.PetscInt}
+    row_src::Vector{Int}
+    row_buf::Vector{Float64}
     paramjac!::PJAC
     pJ::Matrix{Float64}
     pscale::Float64
@@ -269,15 +270,11 @@ function _load_jacobian!(adj::AdjointContext{<:Any, <:Any, <:Any, <:SparseMatrix
         LibPETSc.MatSetValuesCOO(adj.petsclib, A, coo.vals, LibPETSc.INSERT_VALUES)
         return nothing
     end
-    n = length(adj.u)
-    @inbounds for i in 1:n
-        src = adj.row_src[i]
-        buf = adj.row_buf[i]
-        for k in eachindex(src)
-            buf[k] = src[k] == 0 ? 0.0 : adj.J.nzval[src[k]]
-        end
+    src, buf = adj.row_src, adj.row_buf
+    @inbounds for k in eachindex(src)
+        buf[k] = src[k] == 0 ? 0.0 : adj.J.nzval[src[k]]
     end
-    _setrows!(adj, A, n)
+    _setrows!(adj, A)
     return nothing
 end
 
@@ -1274,9 +1271,7 @@ function _set_rhs_jacobian!(adj::AdjointContext, ts, n, N, coo_rows, coo_cols)
         _coo_matrix!(adj.jac_mat, pl, n, N, coo_rows, coo_cols)
     else
         adj.jac_mat = J isa SparseMatrixCSC ?
-            PETScCompat.PetscMat(
-                pl, MPI.COMM_SELF, _jacobian_pattern(J, n); with_arrays = true,
-            ) :
+            PETScCompat.aij(pl, adj.row_ptr, adj.row_cols0, n) :
             PETScCompat.PetscMat(pl, J)
     end
     code = ccall(
@@ -1441,7 +1436,7 @@ function _discrete_adjoint_unlocked(
             proto = rhs.jac_prototype
             J = proto isa SparseMatrixCSC ? _structure(Float64, proto) : zeros(n, n)
         end
-        no_rows = (Vector{LibPETSc.PetscInt}[], Vector{Int}[], Vector{Float64}[])
+        no_rows = (LibPETSc.PetscInt[], LibPETSc.PetscInt[], Int[], Float64[])
         rows = J isa SparseMatrixCSC && comm === nothing ? _row_structure(J, n) : no_rows
         coo_rows, coo_cols, coo = if comm === nothing || (implicit && !is_split) || dm !== nothing
             nothing, nothing, nothing
