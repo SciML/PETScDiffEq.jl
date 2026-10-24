@@ -7630,11 +7630,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.ODEFunction(heat!; jac = heat_jac!, jac_prototype = proto), u0, span,
         )
         generic = PETScDiffEq.TSGeneric
+        # Naming the KSP keeps a banded jac_prototype on the GMRES and ILU a DM's matrix gets.
+        gmres = ["-ksp_type", "gmres"]
         for (with_dm, alg, kw, gap) in (
-                (PETScDiffEq.TSImplicit("bdf"; dm = da), PETScDiffEq.TSImplicit("bdf"), tol, 1.0e-13),
-                (PETScDiffEq.TSRosW(; dm = da), PETScDiffEq.TSRosW(), tol, 1.0e-13),
-                (generic("alpha"; dm = da), generic("alpha"), (; dt = 1.0e-4), 1.0e-9),
-                (generic("dirk"; dm = da), generic("dirk"), (; dt = 1.0e-4, tol...), 1.0e-9),
+                (
+                    PETScDiffEq.TSImplicit("bdf", gmres; dm = da), PETScDiffEq.TSImplicit("bdf", gmres),
+                    tol, 1.0e-13,
+                ),
+                (
+                    PETScDiffEq.TSRosW("ra34pw2", gmres; dm = da), PETScDiffEq.TSRosW("ra34pw2", gmres),
+                    tol, 1.0e-13,
+                ),
+                (generic("alpha", gmres; dm = da), generic("alpha", gmres), (; dt = 1.0e-4), 1.0e-9),
+                (generic("dirk", gmres; dm = da), generic("dirk", gmres), (; dt = 1.0e-4, tol...), 1.0e-9),
             )
             empty!(seen)
             got = SciMLBase.solve(dm_prob((0.0, 0.1)), with_dm; kw...)
@@ -14617,8 +14625,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                         (; abstol = 1.0e-8, reltol = 1.0e-8),
                     ),
                     (
+                        # Naming the KSP keeps the serial solve's ILU in its natural order.
                         springs(; jac = springs_jac!, jac_prototype = springs_proto),
-                        PETScDiffEq.TSImplicit("bdf"; comm = world), PETScDiffEq.TSImplicit("bdf"),
+                        PETScDiffEq.TSImplicit("bdf", ["-ksp_type", "gmres"]; comm = world),
+                        PETScDiffEq.TSImplicit("bdf", ["-ksp_type", "gmres"]),
                         (; abstol = 1.0e-8, reltol = 1.0e-8),
                     ),
                 )
