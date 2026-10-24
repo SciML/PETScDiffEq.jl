@@ -3827,6 +3827,27 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             PETScDiffEq.TSRosW(), 4, refs,
         ) == 2
 
+        # Problem keywords set through remake, a split problem's per-solve cache and
+        # setup warnings do not stop reuse, and each solve still warns.
+        idxs(pr, c) = SciMLBase.remake(vary(pr, c); save_idxs = [1])
+        @test check(SciMLBase.EnsembleProblem(lv; prob_func = idxs), rk, 4) == 1
+        f1!(du, u, p, t) = (du .= -p[1] .* u; nothing)
+        f2!(du, u, p, t) = (du .= 0.1 .* u; nothing)
+        split = SciMLBase.SplitODEProblem(f1!, f2!, [1.0, 2.0], (0.0, 1.0), [10.0])
+        stiffer(pr, c) = SciMLBase.remake(pr; p = [10.0 + c.sim_id])
+        @test check(
+            SciMLBase.EnsembleProblem(split; prob_func = stiffer), PETScDiffEq.TSARKIMEX("3"), 4,
+        ) == 1
+        beuler = PETScDiffEq.TSImplicit("beuler")
+        fixed = (dt = 0.01, reltol = 1.0e-6)
+        warns(f) = (l = Test.TestLogger(); Logging.with_logger(f, l);
+            count(r -> r.level == Logging.Warn, l.logs))
+        eprob = SciMLBase.EnsembleProblem(lv; prob_func = vary)
+        kept = Ref(0)
+        @test warns(() -> (kept[] = check(eprob, beuler, 4; fixed...))) == 8
+        @test kept[] == 1
+        @test warns(() -> SciMLBase.solve(lv, beuler; fixed...)) == 1
+
         ps = [[1.5, 1.0, 3.0, 1.0 + k / 10] for k in 1:4]
         sols = P.reusing() do
             P.reusing(() -> [SciMLBase.solve(SciMLBase.remake(lv; p = p), rk) for p in ps])

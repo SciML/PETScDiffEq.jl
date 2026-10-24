@@ -5764,8 +5764,11 @@ function _setup(
         kwargs...,
     )
     prob = _summed(problem, alg)
+    setup_warnings = String[]
     for (key, value) in pairs(kwargs)
-        _drops(key, value) && @warn "PETScDiffEq does not support `$key` and is ignoring it"
+        _drops(key, value) || continue
+        push!(setup_warnings, "PETScDiffEq does not support `$key` and is ignoring it")
+        @warn setup_warnings[end]
     end
     step_limit = _step_limit(maxiters)
     prob.u0 isa AbstractArray{<:Union{Real, Complex}} || throw(
@@ -6400,8 +6403,12 @@ function _setup(
                 )
             end
             if (reltol !== nothing || abstol !== nothing) && adapts === false
-                @warn "`$running` has no embedded error estimate in PETSc, so it steps at " *
-                    "the requested dt and ignores reltol/abstol"
+                push!(
+                    setup_warnings,
+                    "`$running` has no embedded error estimate in PETSc, so it steps at " *
+                        "the requested dt and ignores reltol/abstol",
+                )
+                @warn setup_warnings[end]
             end
             ctx.dtmin = _floor(R, dtmin, force_dtmin, adaptive && adapts !== false)
             ctx.retry_fp = !fixed && (comm === nothing || !_uses_ifunction(alg)) &&
@@ -6457,6 +6464,7 @@ function _setup(
                 h.again = (;
                     alg, initializealg, dt = dt_given ? dt : nothing, dtmin, dtmax, force_dtmin,
                     save_args, dt_args, estimates, est_calls, step_limit, hook = Ref{Any}(nothing),
+                    warnings = setup_warnings,
                     dt0 = LibPETSc.TSGetTimeStep(petsclib, ts),
                 )
             end
@@ -6665,6 +6673,7 @@ const _Walked = Union{SciMLBase.AbstractSciMLFunction, AnyPETScTS}
 
 _snap(x::AbstractArray) = deepcopy(x)
 _snap(x::Union{Tuple, NamedTuple}) = map(_snap, x)
+_snap(x::Base.Pairs) = _snap(values(x))
 _snap(x::_Walked) = (x, ntuple(i -> _snap_field(x, i), nfields(x)))
 _snap(x) = x
 
@@ -6675,16 +6684,20 @@ _same(s, x::SparseMatrixCSC) = s isa SparseMatrixCSC && typeof(s) === typeof(x) 
 _same(s, x::AbstractArray) = typeof(s) === typeof(x) && size(s) == size(x) && isequal(s, x)
 _same(s, x::Union{Tuple, NamedTuple}) = s isa Union{Tuple, NamedTuple} &&
     keys(s) == keys(x) && all(i -> _same(s[i], x[i]), keys(x))
+_same(s, x::Base.Pairs) = _same(s, values(x))
 _same(s, x::_Walked) = s isa Tuple && typeof(s[1]) === typeof(x) &&
     all(i -> _same_field(s[2][i], x, i), 1:nfields(x))
 # SciMLBase wraps f anew for each solve.
 _same(s, x) = s === x || SciMLBase.unwrapped_f(s) === SciMLBase.unwrapped_f(x)
 
 # Only a prototype's structure reaches the setup, and solves may write values into it.
+# A SplitFunction's `_func_cache` is scratch for calling it whole, which the setup never does.
 _snap_field(x, i) = fieldname(typeof(x), i) === :jac_prototype ?
-    _pattern(getfield(x, i)) : _snap(getfield(x, i))
+    _pattern(getfield(x, i)) : fieldname(typeof(x), i) === :_func_cache ? nothing :
+    _snap(getfield(x, i))
 _same_field(s, x, i) = fieldname(typeof(x), i) === :jac_prototype ?
-    _same_pattern(s, getfield(x, i)) : _same(s, getfield(x, i))
+    _same_pattern(s, getfield(x, i)) : fieldname(typeof(x), i) === :_func_cache ||
+    _same(s, getfield(x, i))
 
 _pattern(J::SparseMatrixCSC) = (size(J), copy(J.colptr), J.rowval[1:SparseArrays.nnz(J)])
 _pattern(J::AbstractArray) = (typeof(J), size(J))
@@ -6748,14 +6761,6 @@ function _drop_kept!()
     return nothing
 end
 
-# A reused setup still warns as a new one would.
-function _drop_warnings(kwargs)
-    for (key, value) in pairs(kwargs)
-        _drops(key, value) && @warn "PETScDiffEq does not support `$key` and is ignoring it"
-    end
-    return nothing
-end
-
 function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
@@ -6781,7 +6786,6 @@ function _solve_unlocked(
     kept = REUSERS[] > 0 ? _take_kept(prob, alg, kwargs) : nothing
     h, new_kept = nothing, false
     if kept !== nothing
-        _drop_warnings(kwargs)
         reused = try
             _reuse!(kept.h, prob, (); tssolve = true)
         catch
@@ -8319,6 +8323,8 @@ function _reuse!(
     LibPETSc.TSRestartStep(pl, ts)
     a.hook[] === nothing || (POST_STEP_CTX[ts.ptr] = a.hook[])
     a.hook[] = nothing
+    # A new setup would warn again.
+    foreach(m -> @warn(m), a.warnings)
     return true
 end
 
