@@ -4869,6 +4869,7 @@ mutable struct TSHandles{CTX, L, R, S}
     reltol::Any
     again::Any
     fresh::Any
+    quiet::Bool
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -6115,7 +6116,7 @@ function _setup(
         false,
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
-        nothing, nothing,
+        nothing, nothing, false,
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -6289,6 +6290,7 @@ function _setup(
                 append!(effective_options, ["-snes_fd_color_use_mat"])
             append!(effective_options, alg.petsc_options)
             append!(effective_options, extra_options)
+            h.quiet = !any(_viewer_option, effective_options)
             if !isempty(effective_options)
                 parsed = PETSc.parse_options(effective_options)
                 h.opts = PETScCompat.PetscOptions(petsclib; parsed...)
@@ -6611,15 +6613,47 @@ function _assemble(
     )
 end
 
+# Every option PETSc 3.22 and 3.25 read as a viewer or monitor contains one of these.
+const _VIEWER_WORDS = (
+    "view", "monitor", "converged_reason", "converged_rate", "test", "compare", "estimate",
+    "eigenvalues", "singularvalues", "residual", "draw", "saws", "display", "plot", "help",
+    "adapt_error", "extrude", "forest",
+)
+_viewer_option(opt) = startswith(opt, "-") &&
+    any(w -> occursin(w, lowercase(first(split(opt[2:end], "=")))), _VIEWER_WORDS)
+
 # Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
 function _with_options(f, h::TSHandles)
     push!(h.opts)
     try
-        return f()
+        return _with_viewers(f, h)
     finally
         pop!(h.opts)
     end
 end
+
+# Solves in progress that turned PETSc's viewers off while the caller had them on.
+const VIEWERS_HIDDEN = Ref(0)
+
+# Without a viewer option set, every viewer lookup PETSc makes in a solve finds nothing, so
+# a quiet solve skips them; a solve nested in one turns them back on for its own options.
+function _with_viewers(f, h::TSHandles)
+    pl = h.petsclib
+    hide = h.quiet && !_viewers_off(pl)
+    hide || !h.quiet && VIEWERS_HIDDEN[] > 0 || return f()
+    LibPETSc.PetscOptionsPushCreateViewerOff(
+        pl, hide ? LibPETSc.PETSC_TRUE : LibPETSc.PETSC_FALSE,
+    )
+    VIEWERS_HIDDEN[] += hide
+    try
+        return f()
+    finally
+        VIEWERS_HIDDEN[] -= hide
+        LibPETSc.PetscOptionsPopCreateViewerOff(pl)
+    end
+end
+
+_viewers_off(pl) = LibPETSc.PetscOptionsGetCreateViewerOff(pl) != LibPETSc.PETSC_FALSE
 
 # Under a distributed comm the error is returned, to raise once the ranks agree on who threw.
 function _run!(f, h::TSHandles)
