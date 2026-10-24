@@ -3,6 +3,7 @@ module PETScCompat
 
 using PETSc: PETSc
 using PETSc.LibPETSc: LibPETSc
+using MPI: MPI
 
 const V05 = pkgversion(PETSc) >= v"0.5.0-"
 
@@ -19,6 +20,8 @@ const V05 = pkgversion(PETSc) >= v"0.5.0-"
     const TSIRKSetType = LibPETSc.TSIRKSetType
     const TSARKIMEXSetType = LibPETSc.TSARKIMEXSetType
     const reshape_local_array = PETSc.reshape_local_array
+    aij(pl, ptr, cols, n) =
+        LibPETSc.PetscMat(pl, ptr, cols, zeros(PETSc.scalartype(pl), length(cols)); ncols = n)
 else
     # A development checkout can carry a version number older than its API.
     let pl = first(PETSc.petsclibs)
@@ -40,6 +43,16 @@ else
         return PETSc.MatSeqAIJWithArrays(pl, comm, S)
     end
     PetscOptions(pl; kw...) = PETSc.Options(pl; kw...)
+    # As PETSc.MatSeqAIJWithArrays, which keeps the arrays PETSc borrows until `destroy`.
+    function aij(pl, ptr, cols, n)
+        vals = zeros(PETSc.scalartype(pl), length(cols))
+        I = PETSc.inttype(pl)
+        mat = LibPETSc.MatCreateSeqAIJWithArrays(
+            pl, MPI.COMM_SELF, I(length(ptr) - 1), I(n), ptr, cols, vals,
+        )
+        PETSc._MATSEQAIJ_WITHARRAYS_STORAGE[mat.ptr] = (ptr, cols, vals)
+        return mat
+    end
 
     function _cstr(f::F, s::AbstractString) where {F}
         str = String(s)
