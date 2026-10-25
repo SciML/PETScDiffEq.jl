@@ -6112,8 +6112,11 @@ function _setup(
         kwargs...,
     )
     prob = _summed(problem, alg)
+    setup_warnings = String[]
     for (key, value) in pairs(kwargs)
-        _drops(key, value) && @warn "PETScDiffEq does not support `$key` and is ignoring it"
+        _drops(key, value) || continue
+        push!(setup_warnings, "PETScDiffEq does not support `$key` and is ignoring it")
+        @warn setup_warnings[end]
     end
     step_limit = _step_limit(maxiters)
     prob.u0 isa AbstractArray{<:Union{Real, Complex}} || throw(
@@ -6784,8 +6787,12 @@ function _setup(
                 )
             end
             if (reltol !== nothing || abstol !== nothing) && adapts === false
-                @warn "`$running` has no embedded error estimate in PETSc, so it steps at " *
-                    "the requested dt and ignores reltol/abstol"
+                push!(
+                    setup_warnings,
+                    "`$running` has no embedded error estimate in PETSc, so it steps at " *
+                        "the requested dt and ignores reltol/abstol",
+                )
+                @warn setup_warnings[end]
             end
             ctx.dtmin = _floor(R, dtmin, force_dtmin, adaptive && adapts !== false)
             ctx.retry_fp = !fixed && (comm === nothing || !_uses_ifunction(alg)) &&
@@ -6852,6 +6859,7 @@ function _setup(
                 h.again = (;
                     alg, initializealg, dt = dt_given ? dt : nothing, dtmin, dtmax, force_dtmin,
                     save_args, dt_args, estimates, est_calls, step_limit, hook = Ref{Any}(nothing),
+                    warnings = setup_warnings,
                     dt0 = LibPETSc.TSGetTimeStep(petsclib, ts),
                 )
             end
@@ -7038,6 +7046,155 @@ function _run!(f, h::TSHandles)
     return nothing
 end
 
+"""
+    PETScDiffEq.reusing(f)
+
+Call `f()`, letting each `solve` made meanwhile start again on the PETSc objects of an
+earlier solve instead of building and destroying its own, when the two differ only in
+`u0`, `p` or `tspan`. Results are the same as without it. An `EnsembleProblem` solved with
+`EnsembleSerial()` or `EnsembleThreads()` does this already; use it around a loop of solves
+such as a parameter sweep or a fit:
+
+```julia
+sols = PETScDiffEq.reusing() do
+    [solve(remake(prob; p = p), TSRosW()) for p in ps]
+end
+```
+
+The objects are freed when the outermost `reusing` returns. Solves made by other tasks
+while `f` runs may reuse them too. A solve is made as before when it has a callback,
+`tstops`, `isoutofdomain` or a Float32 clock, runs over a communicator or a DM, has a state
+that is not a real `Array`, or uses a method `reinit!` cannot reuse; one whose `f`, mass
+matrix, Jacobian sparsity, algorithm or keywords differ from every kept solve's starts anew.
+"""
+function reusing(f)
+    _locked(() -> (REUSERS[] += 1))
+    try
+        return f()
+    finally
+        _locked() do
+            (REUSERS[] -= 1) == 0 && _drop_kept!()
+        end
+    end
+end
+
+const REUSERS = Ref(0)
+# Newest first; read and changed only under PETSC_LOCK.
+const KEPT_HANDLES = Any[]
+const _MAX_KEPT = 4
+
+struct _Kept
+    h::Any
+    prob::Any
+    alg::Any
+    kwargs::Any
+    snap::Any
+end
+
+# What the setup may have copied from the problem; u0, du0, p and tspan are given again.
+_held_parts(prob) = Tuple(
+    getfield(prob, k) for k in fieldnames(typeof(prob)) if !(k in (:u0, :du0, :tspan, :p))
+)
+
+const _Walked = Union{SciMLBase.AbstractSciMLFunction, AnyPETScTS}
+
+_snap(x::AbstractArray) = deepcopy(x)
+_snap(x::Union{Tuple, NamedTuple}) = map(_snap, x)
+_snap(x::Base.Pairs) = _snap(values(x))
+_snap(x::SciMLBase.CallbackSet) = (x, map(c -> collect(Any, c), _callback_lists(x)))
+_callback_lists(x::SciMLBase.CallbackSet) = (x.continuous_callbacks, x.discrete_callbacks)
+_snap(x::_Walked) = (x, ntuple(i -> _snap_field(x, i), nfields(x)))
+_snap(x) = x
+
+# A copy of `x` taken earlier, compared by value for arrays and by identity otherwise.
+_same(s, x::SparseMatrixCSC) = s isa SparseMatrixCSC && typeof(s) === typeof(x) &&
+    size(s) == size(x) && s.colptr == x.colptr && s.rowval == x.rowval &&
+    isequal(s.nzval, x.nzval)
+_same(s, x::AbstractArray) = typeof(s) === typeof(x) && size(s) == size(x) && isequal(s, x)
+_same(s, x::Union{Tuple, NamedTuple}) = s isa Union{Tuple, NamedTuple} &&
+    keys(s) == keys(x) && all(i -> _same(s[i], x[i]), keys(x))
+_same(s, x::Base.Pairs) = _same(s, values(x))
+# Newer SciMLBase gives each problem its own empty CallbackSet, of vectors.
+_same(s, x::SciMLBase.CallbackSet) = s isa Tuple && typeof(s[1]) === typeof(x) &&
+    all(zip(s[2], _callback_lists(x))) do (a, b)
+    length(a) == length(b) && all(splat(===), zip(a, b))
+end
+_same(s, x::_Walked) = s isa Tuple && typeof(s[1]) === typeof(x) &&
+    all(i -> _same_field(s[2][i], x, i), 1:nfields(x))
+# SciMLBase wraps f anew for each solve.
+_same(s, x) = s === x || SciMLBase.unwrapped_f(s) === SciMLBase.unwrapped_f(x)
+
+# Only a prototype's structure reaches the setup, and solves may write values into it.
+# A SplitFunction's `_func_cache` is scratch for calling it whole, which the setup never does.
+_snap_field(x, i) = fieldname(typeof(x), i) === :jac_prototype ?
+    _pattern(getfield(x, i)) : fieldname(typeof(x), i) === :_func_cache ? nothing :
+    _snap(getfield(x, i))
+_same_field(s, x, i) = fieldname(typeof(x), i) === :jac_prototype ?
+    _same_pattern(s, getfield(x, i)) : fieldname(typeof(x), i) === :_func_cache ||
+    _same(s, getfield(x, i))
+
+_pattern(J::SparseMatrixCSC) = (size(J), copy(J.colptr), J.rowval[1:SparseArrays.nnz(J)])
+_pattern(J::AbstractArray) = (typeof(J), size(J))
+_pattern(J) = _snap(J)
+_same_pattern(s, J::SparseMatrixCSC) = s isa Tuple{Tuple, Vector, Vector} &&
+    s[1] == size(J) && s[2] == J.colptr && s[3] == view(J.rowval, 1:SparseArrays.nnz(J))
+_same_pattern(s, J::AbstractArray) = s == (typeof(J), size(J))
+_same_pattern(s, J) = _same(s, J)
+
+# An operator mass matrix or prototype can change in place behind an identical object.
+_plain_function(f::SciMLBase.AbstractSciMLFunction) =
+    all(i -> _plain_function(getfield(f, i)), 1:nfields(f))
+_plain_function(::SciMLOperators.AbstractSciMLOperator) = false
+_plain_function(_) = true
+
+function _fits(k::_Kept, prob, alg, kwargs)
+    typeof(prob) === typeof(k.prob) && typeof(alg) === typeof(k.alg) &&
+        typeof(kwargs) === typeof(k.kwargs) || return false
+    size(k.prob.u0) == size(prob.u0) || return false
+    sign(prob.tspan[2] - prob.tspan[1]) == k.h.tdir || return false
+    return _same(k.snap, (_held_parts(prob), alg, values(kwargs)))
+end
+
+function _take_kept(prob, alg, kwargs)
+    i = findfirst(k -> _fits(k, prob, alg, kwargs), KEPT_HANDLES)
+    i === nothing && return nothing
+    return popat!(KEPT_HANDLES, i)
+end
+
+function _keepable(h, prob, alg, kwargs)
+    h.again === nothing && return nothing
+    prob.u0 isa Array && _scalar(h) <: Real || return nothing
+    prob isa SciMLBase.AbstractDAEProblem && !(prob.du0 isa Union{Nothing, Array}) &&
+        return nothing
+    prob.f isa SciMLBase.DynamicalODEFunction && return nothing
+    _plain_function(prob.f) || return nothing
+    return _Kept(h, prob, alg, kwargs, _snap((_held_parts(prob), alg, values(kwargs))))
+end
+
+_scalar(::TSHandles{<:Any, <:Any, <:Any, S}) where {S} = S
+
+function _keep!(k::_Kept)
+    h = k.h
+    h.again.hook[] = pop!(POST_STEP_CTX, h.ts.ptr, nothing)
+    haskey(LIVE_HANDLES, h) || (LIVE_HANDLES[h] = (HANDLES_MADE[] += 1))
+    pushfirst!(KEPT_HANDLES, k)
+    length(KEPT_HANDLES) > _MAX_KEPT && _destroy_kept!(pop!(KEPT_HANDLES))
+    return nothing
+end
+
+function _destroy_kept!(k::_Kept)
+    _destroy!(k.h)
+    delete!(LIVE_HANDLES, k.h)
+    return nothing
+end
+
+function _drop_kept!()
+    while !isempty(KEPT_HANDLES)
+        _destroy_kept!(pop!(KEPT_HANDLES))
+    end
+    return nothing
+end
+
 function _solve_unlocked(
         prob::SupportedProblem, alg::AnyPETScTS;
         callback = nothing, tstops = (), d_discontinuities = (), kwargs...,
@@ -7060,14 +7217,29 @@ function _solve_unlocked(
             _destroy!(integ.h)
         end
     end
-    h = _setup(prob, alg; kwargs..., transient = true)
+    kept = REUSERS[] > 0 ? _take_kept(prob, alg, kwargs) : nothing
+    h, new_kept = nothing, false
+    if kept !== nothing
+        reused = try
+            _reuse!(kept.h, prob, (); tssolve = true)
+        catch
+            _destroy_kept!(kept)
+            rethrow()
+        end
+        reused ? (h = kept.h) : (_destroy_kept!(kept); kept = nothing)
+    end
+    if h === nothing
+        h = _setup(prob, alg; kwargs..., transient = true)
+        kept = REUSERS[] > 0 ? _keepable(h, prob, alg, kwargs) : nothing
+        new_kept = kept !== nothing
+    end
     (h.ctx.unstable !== nothing || h.ctx.dtmin > 0) && _refuse_glle(
         h, prob,
         "which does not stop between steps, so it cannot take `unstable_check` or an " *
             "adaptive `dtmin`",
     )
     ctx, pl = h.ctx, h.petsclib
-    tend, uend, st = h.t0, copy(h.u0), nothing
+    tend, uend, st, retried = h.t0, copy(h.u0), nothing, false
     try
         prob = _with_p(prob, h.ctx.p)
         h.init_failed && return _initial_failure(prob, alg, h, kwargs)
@@ -7076,6 +7248,10 @@ function _solve_unlocked(
         verbose = get(kwargs, :verbose, true)
         fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
         _match_steps_here!(h)
+        if new_kept
+            _with_options(() -> LibPETSc.TSSetUp(pl, h.ts), h)
+            _mark_fresh!(h)
+        end
         # glle never moves PETSc's previous time, and its loop reads no stop.
         ctx.halt_stalled = ctx.comm === nothing && LibPETSc.TSGetType(pl, h.ts) != "glle"
         if fixed || ctx.halt_stalled
@@ -7090,6 +7266,7 @@ function _solve_unlocked(
                 LibPETSc.TSSolve(pl, h.ts, _solution_vec(h))
             end
             raised = h.stopped != 0
+            retried |= raised
             raised && _retry_solve!(h, alg, floor, forced, verbose) || break
         end
         _throw_if_threw!(ctx)
@@ -7107,10 +7284,21 @@ function _solve_unlocked(
         end
         st = _read_stats(h)
     finally
-        _destroy!(h)
+        # A retry can change the TS for later solves, as rosw's unfrozen Jacobian does.
+        kept !== nothing && st !== nothing && !retried && ctx.err === nothing || _destroy!(h)
     end
-    sol = _assemble(prob, alg, h, tend, uend, st, kwargs)
-    ctx.comm === nothing || _throw_if_threw!(ctx)
+    if h.destroyed
+        sol = _assemble(prob, alg, h, tend, uend, st, kwargs)
+        ctx.comm === nothing || _throw_if_threw!(ctx)
+        return sol
+    end
+    sol = try
+        _assemble(prob, alg, h, tend, uend, st, kwargs)
+    catch
+        _destroy!(h)
+        rethrow()
+    end
+    SciMLBase.successful_retcode(sol.retcode) ? _keep!(kept) : _destroy!(h)
     return sol
 end
 
@@ -7220,6 +7408,21 @@ SciMLBase.__solve(
     prob::SupportedProblem, alg::AnyPETScTS, ::AbstractVector, ::AbstractVector, ks = nothing;
     kwargs...,
 ) = SciMLBase.__solve(prob, alg; kwargs...)
+
+# Other ensemble algorithms solve on other processes, which `reusing` does not reach.
+SciMLBase.__solve(
+    prob::SciMLBase.EnsembleProblem{<:SupportedProblem}, alg::AnyPETScTS,
+    ensemblealg::Union{SciMLBase.EnsembleSerial, SciMLBase.EnsembleThreads}; kwargs...,
+) = reusing() do
+    invoke(
+        SciMLBase.__solve,
+        Tuple{
+            SciMLBase.AbstractEnsembleProblem, SciMLBase.AbstractDEAlgorithm,
+            SciMLBase.BasicEnsembleAlgorithm,
+        },
+        prob, alg, ensemblealg; kwargs...,
+    )
+end
 
 mutable struct PETScIntegratorOpts{H, R}
     h::H
@@ -8484,7 +8687,9 @@ end
 
 # Puts `h` back where `_setup` would leave a new one for `prob`, keeping its PETSc objects.
 # Returns false, touching nothing, when only a new `_setup` can do that.
-function _reuse!(h::TSHandles{<:Any, <:Any, R, S}, prob, tstops) where {R, S}
+function _reuse!(
+        h::TSHandles{<:Any, <:Any, R, S}, prob, tstops; tssolve = false,
+    ) where {R, S}
     a = h.again
     (a === nothing || h.destroyed || h.fresh === nothing) && return false
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
@@ -8516,10 +8721,13 @@ function _reuse!(h::TSHandles{<:Any, <:Any, R, S}, prob, tstops) where {R, S}
     end
     ctx.attempt_margin < 0 || _set_stage_check!(pl, ts, ctx, C_NULL)
     # PETSc's counts run on over the solves of one TS; these offsets take back the earlier ones.
-    fails = Int(LibPETSc.TSGetSNESFailures(pl, ts))
-    ctx.nreject = fails - Int(LibPETSc.TSGetStepRejections(pl, ts))
-    ctx.nfail = -fails
-    ctx.nits = -Int(LibPETSc.TSGetSNESIterations(pl, ts))
+    # TSSolve zeroes them itself when it starts on step 0.
+    if !tssolve
+        fails = Int(LibPETSc.TSGetSNESFailures(pl, ts))
+        ctx.nreject = fails - Int(LibPETSc.TSGetStepRejections(pl, ts))
+        ctx.nfail = -fails
+        ctx.nits = -Int(LibPETSc.TSGetSNESIterations(pl, ts))
+    end
     ctx.nf += calls[1] - a.est_calls[1]
     ctx.nf2 += calls[2] - a.est_calls[2]
     a.est_calls .= calls
@@ -8550,6 +8758,8 @@ function _reuse!(h::TSHandles{<:Any, <:Any, R, S}, prob, tstops) where {R, S}
     LibPETSc.TSRestartStep(pl, ts)
     a.hook[] === nothing || (POST_STEP_CTX[ts.ptr] = a.hook[])
     a.hook[] = nothing
+    # A new setup would warn again.
+    foreach(m -> @warn(m), a.warnings)
     return true
 end
 
