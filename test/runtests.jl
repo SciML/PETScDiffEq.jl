@@ -4500,6 +4500,29 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test b - a < per_step * (m - n)
             end
         end
+
+        @testset "a small dense LU fails a ksponly solve on NaN as an exact Krylov solve does" begin
+            nan_below_zero!(du, u, p, t) = for i in 1:6
+                du[i] = u[i] < 0 ? NaN :
+                    -1000u[i] + 0.01 * ((i > 1 ? u[i - 1] : 0.0) + (i < 6 ? u[i + 1] : 0.0))
+            end
+            A = SymTridiagonal(fill(-1000.0, 6), fill(0.01, 5))
+            prob = SciMLBase.ODEProblem(nan_below_zero!, ones(6), (0.0, 1.0))
+            # KSP's default atol of 1e-50 would stop GMRES once u underflows towards 0.
+            krylov = ["-ksp_type", "gmres", "-pc_type", "ilu", "-ksp_atol", "0"]
+            ksponly = ["-snes_type", "ksponly"]
+            sol = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf", ksponly))
+            ref = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf", [ksponly; krylov]))
+            @test sol.retcode == ref.retcode == SciMLBase.ReturnCode.Success
+            @test (sol.stats.naccept, sol.stats.nreject) == (ref.stats.naccept, ref.stats.nreject)
+            @test sol.u[end] ≈ ref.u[end] rtol = 1.0e-10
+            for s in (sol, SciMLBase.solve(prob, PETScDiffEq.TSRosW()))
+                @test s.retcode == SciMLBase.ReturnCode.Success
+                @test !any(u -> any(isnan, u), s.u)
+                exact = [exp(Matrix(A) * t) * ones(6) for t in s.t]
+                @test maximum(maximum(abs, u - e) for (u, e) in zip(s.u, exact)) < 5.0e-3
+            end
+        end
     end
 
     @testset "the standard DiffEqCallbacks work" begin

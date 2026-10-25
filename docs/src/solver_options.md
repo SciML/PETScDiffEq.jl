@@ -148,10 +148,14 @@ asks for the exact Jacobian: with a DMDA as the `dm` it is seeded by the DM's co
 on a communicator by the colouring of a sparse `jac_prototype`.
 
 A dense Jacobian, which a serial solve without a sparse `jac_prototype` or a `dm` has, is
-factored directly, with `-ksp_type preonly -pc_type lu`. PETSc's own default, GMRES with
-ILU(0), does the same factorization, since ILU(0) of a dense matrix is its full LU, and runs
-a Krylov iteration on top. `TSRosW`, and any solve whose SNES is `ksponly`, keeps GMRES,
-whose residual norm is what notices a NaN right-hand side so that a smaller step is tried.
+factored directly. Up to 64 states the package factors it itself, with partial pivoting as
+LAPACK does, behind a shell preconditioner and `-ksp_type preonly`, since at these sizes
+PETSc's LU spends longer in its own calls than in the factorization. Larger ones use
+`-ksp_type preonly -pc_type lu`. PETSc's own default, GMRES with ILU(0), does the same
+factorization, since ILU(0) of a dense matrix is its full LU, and runs a Krylov iteration on
+top. Above 64 states `TSRosW`, and any solve whose SNES is `ksponly`, keeps GMRES, whose
+residual norm is what notices a NaN right-hand side so that a smaller step is tried; below,
+the package's solve fails on a NaN itself.
 A sparse `jac_prototype` in a serial solve without a `dm` is factored with LU in its natural
 ordering when no entry lies more than 4 places from the diagonal, since the fill then stays
 inside the band: on a 1-D Brusselator with u and v interleaved this is 1.4 to 2.7 times as
@@ -161,7 +165,9 @@ GMRES with ILU(0), ordered by reverse Cuthill-McKee, since a direct factorizatio
 grid fills in: on a 2-D Brusselator with 2048 states PETSc's LU took 5 to 9 times as long.
 DM and distributed Jacobians keep GMRES with ILU(0), block Jacobi in parallel. A `-ksp_type`,
 `-pc_type`, `-snes_mf` or `-snes_mf_operator`, or any other `-ksp_` or `-pc_` option but a
-viewer, monitor or converged reason, in `petsc_options` replaces this choice.
+viewer, monitor or converged reason, in `petsc_options` replaces this choice; for a dense
+Jacobian only the first four do, and any other `-pc_` option keeps PETSc's own factorization
+for a small one.
 
 PETSc's Newton solver forms a new Jacobian at every iteration. An adaptive BDF solve, through
 `TSImplicit("bdf")` or `TSDAE`, sets `-snes_lag_jacobian 5`: one Jacobian per nonlinear
