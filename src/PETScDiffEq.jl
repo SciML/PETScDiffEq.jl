@@ -5177,6 +5177,9 @@ _drops(key, value) = key in UNSUPPORTED_KWARGS ||
     key in UNSUPPORTED_UNLESS_NOTHING && value !== nothing ||
     key === :alias && _asks_alias(value)
 
+# `h.u` is untyped; a serial solve holds a PetscVec, which this hands on concretely typed.
+_with_u(f::F, h) where {F} = (u = h.u; u isa LibPETSc.PetscVec{typeof(h.petsclib)} ? f(u) : f(u))
+
 mutable struct TSHandles{CTX, L, R, S}
     ctx::CTX
     petsclib::L
@@ -8551,6 +8554,7 @@ _above(hi, lo) = hi > lo ? hi : nextfloat(lo)
 function _take_written_tolerances!(integ::PETScIntegrator)
     h = integ.h
     abstol, reltol = getfield(integ.opts, :abstol), getfield(integ.opts, :reltol)
+    abstol isa Float64 && reltol isa Float64 && return nothing
     abstol isa AbstractVector || reltol isa AbstractVector || return nothing
     _checked_everywhere(h.ctx.comm) do
         _check_tol(abstol, length(h.u0), :abstol)
@@ -8569,8 +8573,8 @@ end
 
 function _take_written_state!(integ::PETScIntegrator, restart::Bool = true)
     h = integ.h
-    _everywhere(h.ctx.comm, _read_state!(integ.ucache, h.ctx, h.u) == integ.u) &&
-        return nothing
+    held = _with_u(u -> _read_state!(integ.ucache, h.ctx, u), h)
+    _everywhere(h.ctx.comm, held == integ.u) && return nothing
     _write_state!(h, integ.u)
     restart && LibPETSc.TSRestartStep(h.petsclib, h.ts)
     _dirty!(h.ctx)
@@ -8670,13 +8674,12 @@ function _initial_solution(prob, alg, h::TSHandles, kwargs)
     )
 end
 
-_live_stats!(integ::PETScIntegrator) = _live_stats!(integ, getfield(integ, :sol))
-
-function _live_stats!(integ::PETScIntegrator, sol)
+# `sol` is untyped, and the builtin `getfield` reads it without a dynamic dispatch.
+function _live_stats!(integ::PETScIntegrator)
     h = integ.h
     st = _read_stats(h)
     integ.iter = st.iter
-    ctx, stats = h.ctx, sol.stats
+    ctx, stats = h.ctx, getfield(getfield(integ, :sol), :stats)
     stats isa SciMLBase.DEStats || return nothing
     stats.nf, stats.nf2, stats.njacs = _nf(h), ctx.nf2, ctx.njacs
     stats.nsolve, stats.ncondition = ctx.nsolve, ctx.ncondition
@@ -9159,10 +9162,12 @@ end
 _fixed_step(h::TSHandles) =
     LibPETSc.TSAdaptGetType(h.petsclib, LibPETSc.TSGetAdapt(h.petsclib, h.ts)) == "none"
 
-_init_failed(sol) = sol.retcode == SciMLBase.ReturnCode.InitialFailure
+_retcode(integ::PETScIntegrator) =
+    getfield(getfield(integ, :sol), :retcode)::SciMLBase.ReturnCode.T
 
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
-    _init_failed(getfield(integ, :sol)) && return nothing
+    integ.finished && _retcode(integ) == SciMLBase.ReturnCode.InitialFailure &&
+        return nothing
     integ.finished && throw(
         ArgumentError(
             "this integrator has finished at t = $(integ.t) and cannot step further; " *
@@ -9257,14 +9262,15 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     end
     integ.dt = integ.t - integ.tprev
-    _read_state!(integ.u, ctx, h.u)
+    _with_u(u -> _read_state!(integ.u, ctx, u), h)
     if ctx.domain !== nothing && SciMLBase.isadaptive(integ) &&
             _predicate(() -> ctx.domain(integ.u, ctx.p, integ.t), ctx)
         return _reject_step!(integ, before, prev, abs(integ.t - integ.tprev))
     end
     _end_step_here!(integ)
     (ctx.dae || ctx.mass_slope) && _keep_dae_slope!(integ)
-    _live_stats!(integ)
+    # Only callbacks see the stats before the step's end updates them again.
+    isempty(integ.callbacks) && isempty(integ.continuous) || _live_stats!(integ)
     fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing
     saved = !fired && _save_step!(integ, integ.t, true)
@@ -9292,14 +9298,11 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     else
         _past_discontinuity!(integ)
         _live_stats!(integ)
-        _mark_success!(integ, getfield(integ, :sol))
+        _retcode(integ) == SciMLBase.ReturnCode.Default && (
+            integ.sol =
+                SciMLBase.solution_new_retcode(integ.sol, SciMLBase.ReturnCode.Success)
+        )
     end
-    return nothing
-end
-
-function _mark_success!(integ, sol)
-    sol.retcode == SciMLBase.ReturnCode.Default &&
-        (integ.sol = SciMLBase.solution_new_retcode(sol, SciMLBase.ReturnCode.Success))
     return nothing
 end
 
