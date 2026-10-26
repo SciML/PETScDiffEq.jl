@@ -2209,8 +2209,15 @@ function _restepped!(out, ctx, s, s0, u0, s1, u1, ::Type{Val{N}}) where {N}
     us, fs = _inner_points!(ctx, s0, u0, s1)
     h = s1 - s0
     θ = (s - s0) / h
-    xs = [zero(θ); ctx.restep.nodes; one(θ)]
-    vs, ds = [[u0]; us; [u1]], [[ctx.fstart]; fs; [ctx.fend]]
+    return _restepped_sum!(
+        out, ctx.tdir, θ, h, ctx.restep.nodes, u0, us, u1, ctx.fstart, fs, ctx.fend, Val{N},
+    )
+end
+
+function _restepped_sum!(
+        out, tdir, θ, h, nodes, u0, us, u1, f0, fs, f1, ::Type{Val{N}},
+    ) where {N}
+    xs, vs, ds = _ends(zero(θ), nodes, one(θ)), _ends(u0, us, u1), _ends(f0, fs, f1)
     fill!(out, 0)
     for j in eachindex(xs)
         l, dl, w = _lagrange(xs, j, θ)
@@ -2219,8 +2226,15 @@ function _restepped!(out, ctx, s, s0, u0, s1, u1, ::Type{Val{N}}) where {N}
             ((2l * dl * (1 - 2w * x) - 2w * l^2) / h, l^2 + 2x * l * dl)
         out .+= a .* vs[j] .+ b .* ds[j]
     end
-    N == 0 || (out .*= ctx.tdir)
+    N == 0 || (out .*= tdir)
     return out
+end
+
+function _ends(a, mid, b)
+    v = Vector{promote_type(typeof(a), eltype(mid), typeof(b))}(undef, length(mid) + 2)
+    v[1], v[end] = a, b
+    copyto!(v, 2, mid, 1, length(mid))
+    return v
 end
 
 # `xs[j]`'s Lagrange basis polynomial and its slope at θ, and its slope at `xs[j]` itself.
@@ -2238,8 +2252,14 @@ end
 
 # States and slopes at the tableau's fractions of the step, each from the method's own step.
 function _inner_points!(ctx, s0, u0, s1)
+    inner = ctx.inner
+    if inner !== nothing
+        k = inner[1]
+        a, b = k[1], k[2]
+        a isa typeof(s0) && a === s0 && b isa typeof(s1) && b === s1 &&
+            k[3] === ctx.fstart && k[4] === ctx.fend && return inner[2], inner[3]
+    end
     key = (s0, s1, ctx.fstart, ctx.fend)
-    ctx.inner !== nothing && ctx.inner[1] === key && return ctx.inner[2], ctx.inner[3]
     rs, h = ctx.restep, s1 - s0
     us = [_restep(ctx, rs, s0, u0, θ * h) for θ in rs.nodes]
     fs = [_derivative(ctx, s0 + rs.nodes[i] * h, us[i]) for i in eachindex(us)]
@@ -7539,6 +7559,19 @@ carries the options OrdinaryDiffEq's integrator exposes where PETSc has them. As
 `isoutofdomain` are `nothing` unless given; `dense`, `save_idxs`, `calck`, `internalnorm` and
 `callback` are fixed at `init`.
 """
+struct _EventScratch{R}
+    s0::Vector{Float64}
+    sk::Vector{Float64}
+    buf::Vector{Float64}
+    nudged::Vector{Bool}
+    start::Vector{R}
+end
+
+_EventScratch{R}(m::Int) where {R} = _EventScratch{R}(
+    Vector{Float64}(undef, m), Vector{Float64}(undef, m), Vector{Float64}(undef, m),
+    Vector{Bool}(undef, m), Vector{R}(undef, m),
+)
+
 mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractArray{S}} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, UT, R}
     alg::Alg
@@ -7560,6 +7593,7 @@ mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractArray{
     tmp2::UT
     event_t::Vector{Vector{R}}
     event_residual::Vector{Vector{Float64}}
+    event_scratch::Vector{_EventScratch{R}}
     kwargs::Any
     tstops::Vector{R}
     tstops_cache::Any
@@ -8000,8 +8034,8 @@ end
 
 # PETSc's TSInterpolate refuses times past its clock, so `ahead` extrapolates the Hermite cubic.
 function _state_at_unlocked(
-        integ::PETScIntegrator, t, deriv::Type = Val{0}, ahead::Bool = false,
-    )
+        integ::PETScIntegrator, t, deriv::Type{D} = Val{0}, ahead::Bool = false,
+    ) where {D}
     # Snap only from outside the step: Float32 root-finder probes can round onto an end.
     s, s0, s1 = integ.tdir * t, integ.tdir * integ.tprev, integ.tdir * integ.t
     if s == s1 || s1 < s <= s1 + _near(integ.t, integ.h.ctx.tbound)
@@ -8015,19 +8049,21 @@ function _state_at_unlocked(
     return _hermite!(integ.ucache, ctx, s, s0, integ.uprev, ctx.end_s, ctx.end_u, deriv)
 end
 
-function _state_at(integ::PETScIntegrator, t, deriv::Type = Val{0}, ahead::Bool = false)
+function _state_at(
+        integ::PETScIntegrator, t, deriv::Type{D} = Val{0}, ahead::Bool = false,
+    ) where {D}
     deriv === Val{0} || deriv === Val{1} || throw(_unsupported_deriv(deriv))
     return _locked(() -> _state_at_unlocked(integ, oftype(integ.t, t), deriv, ahead))
 end
 
-function _checked_state(integ::PETScIntegrator, t, deriv::Type = Val{0})
+function _checked_state(integ::PETScIntegrator, t, deriv::Type{D} = Val{0}) where {D}
     u = _state_at(integ, t, deriv, true)
     _raise_threw!(integ)
     return u
 end
 
 # `s` is PETSc's time. Returns `integ.ucache`, which the next call overwrites.
-function _interpolate!(integ::PETScIntegrator, s, deriv::Type = Val{0})
+function _interpolate!(integ::PETScIntegrator, s, deriv::Type{D} = Val{0}) where {D}
     s = oftype(integ.t, s)
     h = integ.h
     ctx = h.ctx
@@ -8046,7 +8082,9 @@ function _interpolate!(integ::PETScIntegrator, s, deriv::Type = Val{0})
     )
 end
 
-function _interpolate_finished!(integ::PETScIntegrator, s, deriv::Type = Val{0})
+function _interpolate_finished!(
+        integ::PETScIntegrator, s, deriv::Type{D} = Val{0},
+    ) where {D}
     ctx = integ.h.ctx
     (ctx.M === nothing && !ctx.dae) || throw(
         ArgumentError(
@@ -8154,13 +8192,14 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
     t0, t1 = integ.tprev, integ.t
     integ.tdir * (t1 - t0) > 0 || return nothing
     m = _ncond(cb)
-    s0 = Vector{Float64}(undef, m)
-    sk = Vector{Float64}(undef, m)
-    buf = Vector{Float64}(undef, m)
+    sc = integ.event_scratch[k]
+    s0, sk, buf, nudged, start = sc.s0, sc.sk, sc.buf, sc.nudged, sc.start
     _fill_conditions!(s0, integ, cb, t0)
     ev, residual = integ.event_t[k], integ.event_residual[k]
-    nudged = [ev[i] == t0 && abs(s0[i] - residual[i]) <= cb.abstol for i in 1:m]
-    start = fill(t0, m)
+    for i in 1:m
+        nudged[i] = ev[i] == t0 && abs(s0[i] - residual[i]) <= cb.abstol
+    end
+    fill!(start, t0)
     if any(nudged)
         tn = t0 + (t1 - t0) * oftype(t0, cb.repeat_nudge)
         _fill_conditions!(buf, integ, cb, tn)
@@ -8171,8 +8210,8 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
     past(i, t) = integ.tdir * t > integ.tdir * start[i]
     if cb.rootfind === SciMLBase.NoRootFind
         _fill_conditions!(sk, integ, cb, t1)
-        hit = [i for i in 1:m if _is_event(s0[i], sk[i], cb)]
-        return isempty(hit) ? nothing : (t1, _crossing(cb, s0, hit, m))
+        crossed = [i for i in 1:m if _is_event(s0[i], sk[i], cb)]
+        return isempty(crossed) ? nothing : (t1, _crossing(cb, s0, crossed, m))
     end
     lo = t0
     n = max(cb.interp_points, 1)
@@ -8181,9 +8220,10 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
         _fill_conditions!(sk, integ, cb, tk)
         if any(i -> past(i, tk) && _is_event(s0[i], sk[i], cb), 1:m)
             hit = [i for i in 1:m if past(i, tk) && _is_event(s0[i], sk[i], cb)]
+            from = lo
             roots = [
                 sk[i] == 0 ? tk :
-                    _event_root(integ, cb, past(i, lo) ? lo : start[i], tk, i, buf)
+                    _event_root(integ, cb, past(i, from) ? from : start[i], tk, i, buf)
                     for i in hit
             ]
             first_root = roots[argmin(integ.tdir .* roots)]
@@ -8439,7 +8479,8 @@ function _init_unlocked(
         _integ_state(h.ctx, h.u0), _integ_state(h.ctx, h.u0, similar),
         _integ_state(h.ctx, h.u0, similar),
         Vector{R}[fill(R(NaN), _ncond(cb)) for cb in continuous],
-        Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
+        Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous],
+        _EventScratch{R}[_EventScratch{R}(_ncond(cb)) for cb in continuous], NamedTuple(kwargs),
         stops, something(late, tstops), d_discontinuities, d_discontinuities, dt0,
         _initial_solution(prob, alg, h, kwargs), false, false, nothing, 0,
     )
