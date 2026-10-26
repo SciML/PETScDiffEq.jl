@@ -3342,9 +3342,9 @@ end
 
 const ZERO_PIVOT_HANDLER_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
-_quiet_errors(f, h) = _quiet_errors(f, h.petsclib, h.pivot_raises)
+_quiet_errors(f::F, h) where {F} = _quiet_errors(f, h.petsclib, h.pivot_raises)
 
-function _quiet_errors(f, pl, raises::Bool)
+function _quiet_errors(f::F, pl, raises::Bool) where {F}
     QUIET_FAILED_STEPS[] = !raises
     _check_code(
         ccall(
@@ -5218,7 +5218,7 @@ function _destroy_live_handles!(lib)
 end
 
 const PETSC_LOCK = ReentrantLock()
-_locked(f) = lock(f, PETSC_LOCK)
+_locked(f::F) where {F} = lock(f, PETSC_LOCK)
 
 # A finalizer must not block on a lock, so it re-registers and retries later.
 function _finalize!(h::TSHandles)
@@ -6996,7 +6996,7 @@ _viewer_option(opt) = startswith(opt, "-") &&
     any(w -> occursin(w, lowercase(first(split(opt[2:end], "=")))), _VIEWER_WORDS)
 
 # Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
-function _with_options(f, h::TSHandles)
+function _with_options(f::F, h::TSHandles) where {F}
     push!(h.opts)
     try
         return _with_viewers(f, h)
@@ -7010,7 +7010,7 @@ const VIEWERS_HIDDEN = Ref(0)
 
 # Without a viewer option set, every viewer lookup PETSc makes in a solve finds nothing, so
 # a quiet solve skips them; a solve nested in one turns them back on for its own options.
-function _with_viewers(f, h::TSHandles)
+function _with_viewers(f::F, h::TSHandles) where {F}
     pl = h.petsclib
     hide = h.quiet && !_viewers_off(pl)
     hide || !h.quiet && VIEWERS_HIDDEN[] > 0 || return f()
@@ -7029,7 +7029,7 @@ end
 _viewers_off(pl) = LibPETSc.PetscOptionsGetCreateViewerOff(pl) != LibPETSc.PETSC_FALSE
 
 # Under a distributed comm the error is returned, to raise once the ranks agree on who threw.
-function _run!(f, h::TSHandles)
+function _run!(f::F, h::TSHandles) where {F}
     ctx = h.ctx
     GC.@preserve ctx begin
         try
@@ -8292,8 +8292,10 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     integ.derivative_discontinuity = true
     _pin_step!(integ)
     before = ctx.dae ? copy(integ.u) : nothing
-    stop = _affect!(integ) do
-        _checked_everywhere(() -> _fire!(integ, best_cb, best_crossing), ctx.comm)
+    stop = let cb = best_cb, crossing = best_crossing
+        _affect!(integ) do
+            _checked_everywhere(() -> _fire!(integ, cb, crossing), ctx.comm)
+        end
     end
     integ.finished && return true
     # OrdinaryDiffEq saves no discretes after an affect! that clears the discontinuity.
@@ -8468,11 +8470,11 @@ function _restore_prev!(integ::PETScIntegrator, outer)
     return nothing
 end
 
-function _reject_step!(integ::PETScIntegrator, before, taken)
+function _reject_step!(integ::PETScIntegrator, before, outer, taken)
     h = integ.h
     ctx, pl = h.ctx, h.petsclib
     code, h.stopped = h.stopped, 0
-    nstep, integ.dt, integ.dtcache, ctx.pdirty, outer = before
+    nstep, integ.dt, integ.dtcache, ctx.pdirty = before
     if code == 0
         integ.t = integ.tprev
         copyto!(integ.u, integ.uprev)
@@ -8628,11 +8630,16 @@ function _initial_solution(prob, alg, h::TSHandles, kwargs)
 end
 
 function _live_stats!(integ::PETScIntegrator)
-    ctx, st = integ.h.ctx, _read_stats(integ.h)
+    st = _read_stats(integ.h)
     integ.iter = st.iter
-    stats = integ.sol.stats
+    _live_stats!(getfield(integ, :sol), integ.h, st)
+    return nothing
+end
+
+function _live_stats!(sol, h, st)
+    ctx, stats = h.ctx, sol.stats
     stats isa SciMLBase.DEStats || return nothing
-    stats.nf, stats.nf2, stats.njacs = _nf(integ.h), ctx.nf2, ctx.njacs
+    stats.nf, stats.nf2, stats.njacs = _nf(h), ctx.nf2, ctx.njacs
     stats.nsolve, stats.ncondition = ctx.nsolve, ctx.ncondition
     stats.nnonliniter, stats.nnonlinconvfail = st.nnonliniter, st.nnonlinfail
     stats.naccept, stats.nreject = st.nsteps, st.nreject
@@ -9138,10 +9145,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     outer === nothing && _take_written_tolerances!(integ)
     _cap_step!(pl, h.ts, h.fixed)
     dtprev = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
-    before = (
-        Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty,
-        outer === nothing && ctx.domain !== nothing ? (integ.tprev, copy(integ.uprev)) : outer,
-    )
+    before = (Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty)
+    prev = outer === nothing && ctx.domain !== nothing ? (integ.tprev, copy(integ.uprev)) : outer
     start = integ.t
     reuse = ctx.hermite && integ.tdir * integ.t == ctx.end_s &&
         _everywhere(ctx.comm, _same_entries(integ.u, ctx.end_u) && !ctx.pdirty)
@@ -9179,7 +9184,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     end
     failure === nothing || throw(failure)
     if h.stopped != 0 && SciMLBase.isadaptive(integ) && _retryable!(h)
-        return _reject_step!(integ, before, LibPETSc.TSGetTimeStep(pl, h.ts))
+        return _reject_step!(integ, before, prev, LibPETSc.TSGetTimeStep(pl, h.ts))
     end
     h.stopped == 0 ? _undo_failed_irk!(ctx, pl, h.ts.ptr) :
         _warn_failed_step(integ.alg, h.stopped, integ.opts.verbose)
@@ -9188,7 +9193,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         if h.stopped == 0 && Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
             _stalled!(h, integ.alg, integ.t, integ.opts.verbose)
         end
-        _restore_prev!(integ, before[5])
+        _restore_prev!(integ, prev)
         _finish!(integ)
         return nothing
     end
@@ -9214,7 +9219,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     _read_state!(integ.u, ctx, h.u)
     if ctx.domain !== nothing && SciMLBase.isadaptive(integ) &&
             _predicate(() -> ctx.domain(integ.u, ctx.p, integ.t), ctx)
-        return _reject_step!(integ, before, abs(integ.t - integ.tprev))
+        return _reject_step!(integ, before, prev, abs(integ.t - integ.tprev))
     end
     _end_step_here!(integ)
     (ctx.dae || ctx.mass_slope) && _keep_dae_slope!(integ)
@@ -9246,9 +9251,14 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     else
         _past_discontinuity!(integ)
         _live_stats!(integ)
-        integ.sol.retcode == SciMLBase.ReturnCode.Default &&
-            (integ.sol = SciMLBase.solution_new_retcode(integ.sol, SciMLBase.ReturnCode.Success))
+        _mark_success!(integ, getfield(integ, :sol))
     end
+    return nothing
+end
+
+function _mark_success!(integ, sol)
+    sol.retcode == SciMLBase.ReturnCode.Default &&
+        (integ.sol = SciMLBase.solution_new_retcode(sol, SciMLBase.ReturnCode.Success))
     return nothing
 end
 
