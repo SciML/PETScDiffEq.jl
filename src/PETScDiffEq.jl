@@ -2124,7 +2124,7 @@ const _STEP_SYMBOLS = (
     :PetscObjectTypeCompare, :MatDenseGetLDA, :MatDenseGetArray, :MatDenseRestoreArray,
     :MatDenseGetArrayRead, :MatDenseRestoreArrayRead, :PCGetOperators, :PCSetFailedReason,
     :VecGetArrayRead, :VecRestoreArrayRead, :VecGetArrayWrite, :VecRestoreArrayWrite,
-    :PetscError,
+    :PetscError, :PetscPushErrorHandler, :PetscPopErrorHandler, :PetscTraceBackErrorHandler,
 )
 
 _symbol(petsclib, ::Val{name}) where {name} = _symbol(petsclib, name)
@@ -3219,7 +3219,7 @@ function _dm_colours(read, pl, dm)
     coloring = Ref{Ptr{Cvoid}}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscPushErrorHandler)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Ptr{Cvoid}), _symbol(pl, :PetscReturnErrorHandler), C_NULL,
         ),
     )
@@ -3227,7 +3227,7 @@ function _dm_colours(read, pl, dm)
         _symbol(pl, :DMCreateColoring), LibPETSc.PetscErrorCode,
         (Ptr{Cvoid}, Cint, Ptr{Ptr{Cvoid}}), dm, Cint(LibPETSc.IS_COLORING_GLOBAL), coloring,
     )
-    _check_code(ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ()))
+    _check_code(ccall(_symbol(pl, Val(:PetscPopErrorHandler)), LibPETSc.PetscErrorCode, ()))
     code == 0 || return false
     try
         read(coloring[])
@@ -3348,15 +3348,15 @@ function _quiet_errors(f::F, pl, raises::Bool) where {F}
     QUIET_FAILED_STEPS[] = !raises
     _check_code(
         ccall(
-            _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscPushErrorHandler)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Ptr{Cvoid}), ZERO_PIVOT_HANDLER_PTR[],
-            _symbol(pl, :PetscTraceBackErrorHandler),
+            _symbol(pl, Val(:PetscTraceBackErrorHandler)),
         ),
     )
     try
         return f()
     finally
-        _check_code(ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ()))
+        _check_code(ccall(_symbol(pl, Val(:PetscPopErrorHandler)), LibPETSc.PetscErrorCode, ()))
     end
 end
 
@@ -3369,7 +3369,7 @@ function _petsc_interpolate!(ctx, ts, s)
     PETScCompat.with_local_array!(w -> fill!(w, NaN), ctx.work; read = false, write = true)
     _check_code(
         ccall(
-            _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscPushErrorHandler)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Ptr{Cvoid}), _symbol(pl, :PetscReturnErrorHandler), C_NULL,
         ),
     )
@@ -3380,7 +3380,7 @@ function _petsc_interpolate!(ctx, ts, s)
         ctx.interpolates = false
         return nothing
     finally
-        _check_code(ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ()))
+        _check_code(ccall(_symbol(pl, Val(:PetscPopErrorHandler)), LibPETSc.PetscErrorCode, ()))
     end
     written = _anywhere(
         ctx.comm,
@@ -7329,7 +7329,7 @@ end
 function _dm_clear(pl, ts)
     _check_code(
         ccall(
-            _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscPushErrorHandler)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Ptr{Cvoid}), _symbol(pl, :PetscReturnErrorHandler), C_NULL,
         ),
     )
@@ -7339,7 +7339,7 @@ function _dm_clear(pl, ts)
             _ts_dm(pl, ts),
         ) == 0
     finally
-        _check_code(ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ()))
+        _check_code(ccall(_symbol(pl, Val(:PetscPopErrorHandler)), LibPETSc.PetscErrorCode, ()))
     end
 end
 
@@ -8629,14 +8629,12 @@ function _initial_solution(prob, alg, h::TSHandles, kwargs)
     )
 end
 
-function _live_stats!(integ::PETScIntegrator)
-    st = _read_stats(integ.h)
-    integ.iter = st.iter
-    _live_stats!(getfield(integ, :sol), integ.h, st)
-    return nothing
-end
+_live_stats!(integ::PETScIntegrator) = _live_stats!(integ, getfield(integ, :sol))
 
-function _live_stats!(sol, h, st)
+function _live_stats!(integ::PETScIntegrator, sol)
+    h = integ.h
+    st = _read_stats(h)
+    integ.iter = st.iter
     ctx, stats = h.ctx, sol.stats
     stats isa SciMLBase.DEStats || return nothing
     stats.nf, stats.nf2, stats.njacs = _nf(h), ctx.nf2, ctx.njacs
@@ -9120,8 +9118,10 @@ end
 _fixed_step(h::TSHandles) =
     LibPETSc.TSAdaptGetType(h.petsclib, LibPETSc.TSGetAdapt(h.petsclib, h.ts)) == "none"
 
+_init_failed(sol) = sol.retcode == SciMLBase.ReturnCode.InitialFailure
+
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
-    integ.sol.retcode == SciMLBase.ReturnCode.InitialFailure && return nothing
+    _init_failed(getfield(integ, :sol)) && return nothing
     integ.finished && throw(
         ArgumentError(
             "this integrator has finished at t = $(integ.t) and cannot step further; " *
