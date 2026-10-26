@@ -7533,6 +7533,19 @@ end
 Base.setproperty!(o::PETScIntegratorOpts, name::Symbol, v) =
     _locked(() -> _setopt_unlocked(o, name, v))
 
+struct _EventScratch{R}
+    s0::Vector{Float64}
+    sk::Vector{Float64}
+    buf::Vector{Float64}
+    nudged::Vector{Bool}
+    start::Vector{R}
+end
+
+_EventScratch{R}(m::Int) where {R} = _EventScratch{R}(
+    Vector{Float64}(undef, m), Vector{Float64}(undef, m), Vector{Float64}(undef, m),
+    Vector{Bool}(undef, m), Vector{R}(undef, m),
+)
+
 """
     PETScIntegrator
 
@@ -7562,19 +7575,6 @@ carries the options OrdinaryDiffEq's integrator exposes where PETSc has them. As
 `isoutofdomain` are `nothing` unless given; `dense`, `save_idxs`, `calck`, `internalnorm` and
 `callback` are fixed at `init`.
 """
-struct _EventScratch{R}
-    s0::Vector{Float64}
-    sk::Vector{Float64}
-    buf::Vector{Float64}
-    nudged::Vector{Bool}
-    start::Vector{R}
-end
-
-_EventScratch{R}(m::Int) where {R} = _EventScratch{R}(
-    Vector{Float64}(undef, m), Vector{Float64}(undef, m), Vector{Float64}(undef, m),
-    Vector{Bool}(undef, m), Vector{R}(undef, m),
-)
-
 mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractArray{S}} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, UT, R}
     alg::Alg
