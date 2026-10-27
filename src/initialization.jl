@@ -619,9 +619,9 @@ function _init_residual!(
     s = unsafe_pointer_to_objref(ctx_ptr)::InitNewton
     pl = s.petsclib
     try
-        _readvec!(s.x, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _readvec!(s.x, pl, PETScCompat.VecPtr(pl, x_ptr))
         _init_call!(() -> s.residual!(s.r, s.x), s, s.r)
-        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), s.r)
+        _writevec!(pl, PETScCompat.VecPtr(pl, f_ptr), s.r)
     catch e
         s.err = e
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
@@ -638,7 +638,7 @@ function _init_jacobian!(
     A = LibPETSc.PetscMat(A_ptr, pl)
     B = LibPETSc.PetscMat(B_ptr, pl)
     try
-        _readvec!(s.x, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _readvec!(s.x, pl, PETScCompat.VecPtr(pl, x_ptr))
         if s.comm === nothing
             _set_matrix!(pl, B, s.jacobian(s.x), s.idx)
         elseif s.fills

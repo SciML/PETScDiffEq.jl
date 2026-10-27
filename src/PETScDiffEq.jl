@@ -1087,7 +1087,7 @@ end
 function _scatter!(pl, dm, u, loc)
     glob = _dm_vec!(pl, :DMGetGlobalVector, dm)
     try
-        _writevec!(pl, PETSc.VecPtr(pl, glob[], false), u)
+        _writevec!(pl, PETScCompat.VecPtr(pl, glob[]), u)
         _check_code(
             ccall(_symbol(pl, :VecZeroEntries), LibPETSc.PetscErrorCode, (Ptr{Cvoid},), loc),
         )
@@ -1124,7 +1124,7 @@ function _ghosted(call, g::Union{Ghosted, GhostedPart}, u)
     loc = _dm_vec!(pl, :DMGetLocalVector, dm)
     try
         _scatter!(pl, dm, u, loc[])
-        v = PETSc.VecPtr(pl, loc[], false)
+        v = PETScCompat.VecPtr(pl, loc[])
         a = LibPETSc.VecGetArrayRead(pl, v)
         try
             call(a)
@@ -1893,7 +1893,7 @@ function _mat_add_diagonal!(pl, A, d)
         ),
     )
     try
-        _writevec!(pl, PETSc.VecPtr(pl, v[], false), d)
+        _writevec!(pl, PETScCompat.VecPtr(pl, v[]), d)
         _check_code(
             ccall(
                 _symbol(pl, :MatDiagonalSet), LibPETSc.PetscErrorCode,
@@ -1918,8 +1918,8 @@ function _mat_diagonal_scale!(pl, A, l, r)
         ),
     )
     try
-        l === nothing || _writevec!(pl, PETSc.VecPtr(pl, left[], false), l)
-        r === nothing || _writevec!(pl, PETSc.VecPtr(pl, right[], false), r)
+        l === nothing || _writevec!(pl, PETScCompat.VecPtr(pl, left[]), l)
+        r === nothing || _writevec!(pl, PETScCompat.VecPtr(pl, right[]), r)
         _check_code(
             ccall(
                 _symbol(pl, :MatDiagonalScale), LibPETSc.PetscErrorCode,
@@ -2027,7 +2027,7 @@ function _post_step_serial!(ctx, ts)
                     (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts, x,
                 ),
             )
-            flat = ctx.flat_vec === nothing ? PETSc.VecPtr(pl, x[], false) : ctx.flat_vec
+            flat = ctx.flat_vec === nothing ? PETScCompat.VecPtr(pl, x[]) : ctx.flat_vec
             u = _read_state!(ctx.u, ctx, flat)
             ctx.unstable !== nothing &&
                 ctx.unstable(ctx.tdir * hnext, _as_u0(ctx, u), ctx.p, _user_t(ctx.tdir, s)) &&
@@ -2065,7 +2065,7 @@ function _post_step_collective!(ctx, ts_ptr)
                         (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts_ptr, x,
                     ),
                 )
-                flat = ctx.flat_vec === nothing ? PETSc.VecPtr(pl, x[], false) : ctx.flat_vec
+                flat = ctx.flat_vec === nothing ? PETScCompat.VecPtr(pl, x[]) : ctx.flat_vec
                 u = _read_state!(ctx.u, ctx, flat)
                 ctx.wrapped_u === nothing || (u = copyto!(ctx.wrapped_u, u))
                 if ctx.unstable !== nothing
@@ -4223,7 +4223,7 @@ end
 function _mprk_part!(ctx, t, x_ptr, f_ptr, idxs)
     pl = ctx.petsclib
     try
-        _readvec!(ctx.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _readvec!(ctx.u, pl, PETScCompat.VecPtr(pl, x_ptr))
         if !_everywhere(ctx.comm, ctx.part_valid && ctx.part_t == t && ctx.part_u == ctx.u)
             _call_f!(ctx, ctx.du, ctx.u, t)
             ctx.nf += 1
@@ -4231,7 +4231,7 @@ function _mprk_part!(ctx, t, x_ptr, f_ptr, idxs)
             copyto!(ctx.part_u, ctx.u)
             ctx.part_valid = true
         end
-        sub = PETSc.VecPtr(pl, f_ptr, false)
+        sub = PETScCompat.VecPtr(pl, f_ptr)
         vals = LibPETSc.VecGetArrayWrite(pl, sub)
         try
             @inbounds for (k, i) in enumerate(idxs)
@@ -4284,7 +4284,7 @@ function _symplectic_part!(ctx, sub_ts, t, x_ptr, f_ptr, momentum::Bool)
         d, n = ctx.f!, length(ctx.u)
         momentum && (t = _kick_time(d, sub_ts, pl, t))
         v, u = view(ctx.u, 1:d.nv), view(ctx.u, (d.nv + 1):n)
-        _readvec!(momentum ? u : v, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _readvec!(momentum ? u : v, pl, PETScCompat.VecPtr(pl, x_ptr))
         out = momentum ? view(ctx.du, 1:d.nv) : view(ctx.du, (d.nv + 1):n)
         if momentum
             _kick!(d, out, v, u, ctx, t) && (ctx.nf += 1)
@@ -4292,7 +4292,7 @@ function _symplectic_part!(ctx, sub_ts, t, x_ptr, f_ptr, momentum::Bool)
             _call!(d.f2, ctx, out, v, u, ctx.p, t)
             ctx.nf2 += 1
         end
-        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), out)
+        _writevec!(pl, PETScCompat.VecPtr(pl, f_ptr), out)
     catch e
         ctx.err = e
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
@@ -4322,8 +4322,8 @@ end
 
 function _read_second_order!(ctx, u_ptr, v_ptr)
     pl, nv = ctx.petsclib, ctx.f!.nv
-    _readvec!(view(ctx.u, 1:nv), pl, PETSc.VecPtr(pl, v_ptr, false))
-    _readvec!(view(ctx.u, (nv + 1):length(ctx.u)), pl, PETSc.VecPtr(pl, u_ptr, false))
+    _readvec!(view(ctx.u, 1:nv), pl, PETScCompat.VecPtr(pl, v_ptr))
+    _readvec!(view(ctx.u, (nv + 1):length(ctx.u)), pl, PETScCompat.VecPtr(pl, u_ptr))
     _flip_velocity!(ctx, ctx.u)
     return nv
 end
@@ -4359,14 +4359,14 @@ function _i2function_body!(ctx, t, u_ptr, v_ptr, a_ptr, f_ptr)
     pl = ctx.petsclib
     try
         nv = _read_second_order!(ctx, u_ptr, v_ptr)
-        a = _readvec!(view(ctx.mudot, 1:nv), pl, PETSc.VecPtr(pl, a_ptr, false))
+        a = _readvec!(view(ctx.mudot, 1:nv), pl, PETScCompat.VecPtr(pl, a_ptr))
         acc, r = view(ctx.du, 1:nv), view(ctx.resid, 1:nv)
         v, u = view(ctx.u, 1:nv), view(ctx.u, (nv + 1):length(ctx.u))
         _call!(ctx.f!.f1, ctx, acc, v, u, ctx.p, t)
         # Reversed, f1 returns -f, while w'' = f(-w', w, p, -s) keeps its sign.
         tdir = ctx.tdir
         @. r = a - tdir * acc
-        _writevec!(pl, PETSc.VecPtr(pl, f_ptr, false), r)
+        _writevec!(pl, PETScCompat.VecPtr(pl, f_ptr), r)
         ctx.nf += 1
     catch e
         ctx.err = e
@@ -4598,7 +4598,7 @@ function _dm_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
         err = nothing
         try
             if ctx.dae
-                _readvec!(ctx.mudot, pl, PETSc.VecPtr(pl, xdot_ptr, false))
+                _readvec!(ctx.mudot, pl, PETScCompat.VecPtr(pl, xdot_ptr))
                 ctx.jac!(J, ctx.mudot, ctx.u, ctx.p, shift, t)
             else
                 ctx.jac!(J, ctx.u, ctx.p, t)
@@ -4650,7 +4650,7 @@ function _sparse_ijacobian!(
 end
 
 function _sparse_ijacobian_body!(ctx, ts, t, x_ptr, xdot_ptr, shift, A_ptr, B_ptr)
-    x = PETSc.VecPtr(ctx.petsclib, x_ptr, false)
+    x = PETScCompat.VecPtr(ctx.petsclib, x_ptr)
     A = LibPETSc.PetscMat(A_ptr, ctx.petsclib)
     B = LibPETSc.PetscMat(B_ptr, ctx.petsclib)
     try
