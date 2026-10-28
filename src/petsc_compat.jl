@@ -7,6 +7,13 @@ using MPI: MPI
 
 const V05 = pkgversion(PETSc) >= v"0.5.0-"
 
+# PETSc.jl 0.5.4 takes `own` as a keyword and warns on the positional form.
+@static if pkgversion(PETSc) >= v"0.5.4-"
+    VecPtr(pl, ptr) = PETSc.VecPtr(pl, ptr; own = false)
+else
+    VecPtr(pl, ptr) = PETSc.VecPtr(pl, ptr, false)
+end
+
 @static if V05
     const with_local_array! = PETSc.with_local_array!
     const destroy! = PETSc.destroy!

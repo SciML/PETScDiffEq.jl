@@ -293,7 +293,7 @@ end
 function _adjoint_rhsjacobian_body!(adj, s, x_ptr, A_ptr)
     pl = adj.petsclib
     try
-        _readvec!(adj.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _readvec!(adj.u, pl, PETScCompat.VecPtr(pl, x_ptr))
         _adjoint_call!(() -> adj.jac!(adj.J, adj.u, adj.p, s), adj, _stored_values(adj.J))
         A = LibPETSc.PetscMat(A_ptr, pl)
         _load_jacobian!(adj, A)
@@ -323,7 +323,7 @@ end
 function _adjoint_dm_rhsjacobian_body!(adj, s, x_ptr, A_ptr)
     pl = adj.petsclib
     try
-        _readvec!(adj.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _readvec!(adj.u, pl, PETScCompat.VecPtr(pl, x_ptr))
         A = LibPETSc.PetscMat(A_ptr, pl)
         _mat_zero!(pl, A)
         err = nothing
@@ -377,7 +377,7 @@ end
 function _adjoint_paramjac_body!(adj, s, x_ptr, A_ptr)
     pl = adj.petsclib
     try
-        _readvec!(adj.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _readvec!(adj.u, pl, PETScCompat.VecPtr(pl, x_ptr))
         _adjoint_call!(adj, adj.pJ) do
             adj.paramjac!(adj.pJ, adj.u, adj.p, _user_t(adj.tdir, s))
         end
@@ -419,7 +419,7 @@ function _adjoint_record_body!(adj, step, s, x_ptr, ts_ptr)
     try
         R = adj.clock
         tol = _cost_tol(R, step, s, s - adj.s_prev, adj.tbound)
-        x = PETSc.VecPtr(pl, x_ptr, false)
+        x = PETScCompat.VecPtr(pl, x_ptr)
         order, cost_s = adj.order, adj.cost_s
         while adj.next <= length(order) && cost_s[order[adj.next]] <= s
             k = order[adj.next]
@@ -663,7 +663,7 @@ end
 function _integral_body!(q, s, x_ptr, A_ptr, dg!, out)
     pl = q.petsclib
     try
-        _readvec!(q.u, pl, PETSc.VecPtr(pl, x_ptr, false))
+        _readvec!(q.u, pl, PETScCompat.VecPtr(pl, x_ptr))
         fill!(out, 0.0)
         dg! === nothing ||
             _adjoint_call!(() -> dg!(out, q.u, q.p, _user_t(q.tdir, s)), q, out)
