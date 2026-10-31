@@ -15160,14 +15160,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             setup = "push!(LOAD_PATH, \"@stdlib\"); using Pkg; " *
                 "Pkg.develop(path = $(repr(root))); Pkg.instantiate()"
             run(`$julia --project=$dir -e $setup`)
-            # exit.jl leaves integrators alive for the exit hooks, so it runs last.
+            # Two launches keep each under the hour below on slow runners. exit.jl leaves
+            # integrators alive for the exit hooks, so it runs last in its launch.
             launches = (
-                (
-                    1, [
-                        "explicit.jl", "implicit.jl", "adjoint.jl", "dm.jl", "types.jl",
-                        "second_order.jl", "exit.jl",
-                    ],
-                ),
+                (1, ["explicit.jl", "implicit.jl", "adjoint.jl"]),
+                (1, ["dm.jl", "types.jl", "second_order.jl", "exit.jl"]),
                 (2, ["ensemble.jl"]),
             )
             for np in rank_counts, (threads, scripts) in launches
