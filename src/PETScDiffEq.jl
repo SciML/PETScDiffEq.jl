@@ -2124,7 +2124,7 @@ const _STEP_SYMBOLS = (
     :PetscObjectTypeCompare, :MatDenseGetLDA, :MatDenseGetArray, :MatDenseRestoreArray,
     :MatDenseGetArrayRead, :MatDenseRestoreArrayRead, :PCGetOperators, :PCSetFailedReason,
     :VecGetArrayRead, :VecRestoreArrayRead, :VecGetArrayWrite, :VecRestoreArrayWrite,
-    :PetscError,
+    :PetscError, :PetscPushErrorHandler, :PetscPopErrorHandler, :PetscTraceBackErrorHandler,
 )
 
 _symbol(petsclib, ::Val{name}) where {name} = _symbol(petsclib, name)
@@ -2209,8 +2209,15 @@ function _restepped!(out, ctx, s, s0, u0, s1, u1, ::Type{Val{N}}) where {N}
     us, fs = _inner_points!(ctx, s0, u0, s1)
     h = s1 - s0
     θ = (s - s0) / h
-    xs = [zero(θ); ctx.restep.nodes; one(θ)]
-    vs, ds = [[u0]; us; [u1]], [[ctx.fstart]; fs; [ctx.fend]]
+    return _restepped_sum!(
+        out, ctx.tdir, θ, h, ctx.restep.nodes, u0, us, u1, ctx.fstart, fs, ctx.fend, Val{N},
+    )
+end
+
+function _restepped_sum!(
+        out, tdir, θ, h, nodes, u0, us, u1, f0, fs, f1, ::Type{Val{N}},
+    ) where {N}
+    xs, vs, ds = _ends(zero(θ), nodes, one(θ)), _ends(u0, us, u1), _ends(f0, fs, f1)
     fill!(out, 0)
     for j in eachindex(xs)
         l, dl, w = _lagrange(xs, j, θ)
@@ -2219,8 +2226,15 @@ function _restepped!(out, ctx, s, s0, u0, s1, u1, ::Type{Val{N}}) where {N}
             ((2l * dl * (1 - 2w * x) - 2w * l^2) / h, l^2 + 2x * l * dl)
         out .+= a .* vs[j] .+ b .* ds[j]
     end
-    N == 0 || (out .*= ctx.tdir)
+    N == 0 || (out .*= tdir)
     return out
+end
+
+function _ends(a, mid, b)
+    v = Vector{promote_type(typeof(a), eltype(mid), typeof(b))}(undef, length(mid) + 2)
+    v[1], v[end] = a, b
+    copyto!(v, 2, mid, 1, length(mid))
+    return v
 end
 
 # `xs[j]`'s Lagrange basis polynomial and its slope at θ, and its slope at `xs[j]` itself.
@@ -2238,8 +2252,14 @@ end
 
 # States and slopes at the tableau's fractions of the step, each from the method's own step.
 function _inner_points!(ctx, s0, u0, s1)
+    inner = ctx.inner
+    if inner !== nothing
+        k = inner[1]
+        a, b = k[1], k[2]
+        a isa typeof(s0) && a === s0 && b isa typeof(s1) && b === s1 &&
+            k[3] === ctx.fstart && k[4] === ctx.fend && return inner[2], inner[3]
+    end
     key = (s0, s1, ctx.fstart, ctx.fend)
-    ctx.inner !== nothing && ctx.inner[1] === key && return ctx.inner[2], ctx.inner[3]
     rs, h = ctx.restep, s1 - s0
     us = [_restep(ctx, rs, s0, u0, θ * h) for θ in rs.nodes]
     fs = [_derivative(ctx, s0 + rs.nodes[i] * h, us[i]) for i in eachindex(us)]
@@ -3219,7 +3239,7 @@ function _dm_colours(read, pl, dm)
     coloring = Ref{Ptr{Cvoid}}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscPushErrorHandler)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Ptr{Cvoid}), _symbol(pl, :PetscReturnErrorHandler), C_NULL,
         ),
     )
@@ -3227,7 +3247,7 @@ function _dm_colours(read, pl, dm)
         _symbol(pl, :DMCreateColoring), LibPETSc.PetscErrorCode,
         (Ptr{Cvoid}, Cint, Ptr{Ptr{Cvoid}}), dm, Cint(LibPETSc.IS_COLORING_GLOBAL), coloring,
     )
-    _check_code(ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ()))
+    _check_code(ccall(_symbol(pl, Val(:PetscPopErrorHandler)), LibPETSc.PetscErrorCode, ()))
     code == 0 || return false
     try
         read(coloring[])
@@ -3342,21 +3362,21 @@ end
 
 const ZERO_PIVOT_HANDLER_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
-_quiet_errors(f, h) = _quiet_errors(f, h.petsclib, h.pivot_raises)
+_quiet_errors(f::F, h) where {F} = _quiet_errors(f, h.petsclib, h.pivot_raises)
 
-function _quiet_errors(f, pl, raises::Bool)
+function _quiet_errors(f::F, pl, raises::Bool) where {F}
     QUIET_FAILED_STEPS[] = !raises
     _check_code(
         ccall(
-            _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscPushErrorHandler)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Ptr{Cvoid}), ZERO_PIVOT_HANDLER_PTR[],
-            _symbol(pl, :PetscTraceBackErrorHandler),
+            _symbol(pl, Val(:PetscTraceBackErrorHandler)),
         ),
     )
     try
         return f()
     finally
-        _check_code(ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ()))
+        _check_code(ccall(_symbol(pl, Val(:PetscPopErrorHandler)), LibPETSc.PetscErrorCode, ()))
     end
 end
 
@@ -3369,7 +3389,7 @@ function _petsc_interpolate!(ctx, ts, s)
     PETScCompat.with_local_array!(w -> fill!(w, NaN), ctx.work; read = false, write = true)
     _check_code(
         ccall(
-            _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscPushErrorHandler)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Ptr{Cvoid}), _symbol(pl, :PetscReturnErrorHandler), C_NULL,
         ),
     )
@@ -3380,7 +3400,7 @@ function _petsc_interpolate!(ctx, ts, s)
         ctx.interpolates = false
         return nothing
     finally
-        _check_code(ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ()))
+        _check_code(ccall(_symbol(pl, Val(:PetscPopErrorHandler)), LibPETSc.PetscErrorCode, ()))
     end
     written = _anywhere(
         ctx.comm,
@@ -5157,6 +5177,9 @@ _drops(key, value) = key in UNSUPPORTED_KWARGS ||
     key in UNSUPPORTED_UNLESS_NOTHING && value !== nothing ||
     key === :alias && _asks_alias(value)
 
+# `h.u` is untyped; a serial solve holds a PetscVec, which this hands on concretely typed.
+_with_u(f::F, h) where {F} = (u = h.u; u isa LibPETSc.PetscVec{typeof(h.petsclib)} ? f(u) : f(u))
+
 mutable struct TSHandles{CTX, L, R, S}
     ctx::CTX
     petsclib::L
@@ -5218,7 +5241,7 @@ function _destroy_live_handles!(lib)
 end
 
 const PETSC_LOCK = ReentrantLock()
-_locked(f) = lock(f, PETSC_LOCK)
+_locked(f::F) where {F} = lock(f, PETSC_LOCK)
 
 # A finalizer must not block on a lock, so it re-registers and retries later.
 function _finalize!(h::TSHandles)
@@ -6996,7 +7019,7 @@ _viewer_option(opt) = startswith(opt, "-") &&
     any(w -> occursin(w, lowercase(first(split(opt[2:end], "=")))), _VIEWER_WORDS)
 
 # Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
-function _with_options(f, h::TSHandles)
+function _with_options(f::F, h::TSHandles) where {F}
     push!(h.opts)
     try
         return _with_viewers(f, h)
@@ -7010,7 +7033,7 @@ const VIEWERS_HIDDEN = Ref(0)
 
 # Without a viewer option set, every viewer lookup PETSc makes in a solve finds nothing, so
 # a quiet solve skips them; a solve nested in one turns them back on for its own options.
-function _with_viewers(f, h::TSHandles)
+function _with_viewers(f::F, h::TSHandles) where {F}
     pl = h.petsclib
     hide = h.quiet && !_viewers_off(pl)
     hide || !h.quiet && VIEWERS_HIDDEN[] > 0 || return f()
@@ -7029,7 +7052,7 @@ end
 _viewers_off(pl) = LibPETSc.PetscOptionsGetCreateViewerOff(pl) != LibPETSc.PETSC_FALSE
 
 # Under a distributed comm the error is returned, to raise once the ranks agree on who threw.
-function _run!(f, h::TSHandles)
+function _run!(f::F, h::TSHandles) where {F}
     ctx = h.ctx
     GC.@preserve ctx begin
         try
@@ -7329,7 +7352,7 @@ end
 function _dm_clear(pl, ts)
     _check_code(
         ccall(
-            _symbol(pl, :PetscPushErrorHandler), LibPETSc.PetscErrorCode,
+            _symbol(pl, Val(:PetscPushErrorHandler)), LibPETSc.PetscErrorCode,
             (Ptr{Cvoid}, Ptr{Cvoid}), _symbol(pl, :PetscReturnErrorHandler), C_NULL,
         ),
     )
@@ -7339,7 +7362,7 @@ function _dm_clear(pl, ts)
             _ts_dm(pl, ts),
         ) == 0
     finally
-        _check_code(ccall(_symbol(pl, :PetscPopErrorHandler), LibPETSc.PetscErrorCode, ()))
+        _check_code(ccall(_symbol(pl, Val(:PetscPopErrorHandler)), LibPETSc.PetscErrorCode, ()))
     end
 end
 
@@ -7510,6 +7533,19 @@ end
 Base.setproperty!(o::PETScIntegratorOpts, name::Symbol, v) =
     _locked(() -> _setopt_unlocked(o, name, v))
 
+struct _EventScratch{R}
+    s0::Vector{Float64}
+    sk::Vector{Float64}
+    buf::Vector{Float64}
+    nudged::Vector{Bool}
+    start::Vector{R}
+end
+
+_EventScratch{R}(m::Int) where {R} = _EventScratch{R}(
+    Vector{Float64}(undef, m), Vector{Float64}(undef, m), Vector{Float64}(undef, m),
+    Vector{Bool}(undef, m), Vector{R}(undef, m),
+)
+
 """
     PETScIntegrator
 
@@ -7560,6 +7596,7 @@ mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractArray{
     tmp2::UT
     event_t::Vector{Vector{R}}
     event_residual::Vector{Vector{Float64}}
+    event_scratch::Vector{_EventScratch{R}}
     kwargs::Any
     tstops::Vector{R}
     tstops_cache::Any
@@ -8000,8 +8037,8 @@ end
 
 # PETSc's TSInterpolate refuses times past its clock, so `ahead` extrapolates the Hermite cubic.
 function _state_at_unlocked(
-        integ::PETScIntegrator, t, deriv::Type = Val{0}, ahead::Bool = false,
-    )
+        integ::PETScIntegrator, t, deriv::Type{D} = Val{0}, ahead::Bool = false,
+    ) where {D}
     # Snap only from outside the step: Float32 root-finder probes can round onto an end.
     s, s0, s1 = integ.tdir * t, integ.tdir * integ.tprev, integ.tdir * integ.t
     if s == s1 || s1 < s <= s1 + _near(integ.t, integ.h.ctx.tbound)
@@ -8015,19 +8052,21 @@ function _state_at_unlocked(
     return _hermite!(integ.ucache, ctx, s, s0, integ.uprev, ctx.end_s, ctx.end_u, deriv)
 end
 
-function _state_at(integ::PETScIntegrator, t, deriv::Type = Val{0}, ahead::Bool = false)
+function _state_at(
+        integ::PETScIntegrator, t, deriv::Type{D} = Val{0}, ahead::Bool = false,
+    ) where {D}
     deriv === Val{0} || deriv === Val{1} || throw(_unsupported_deriv(deriv))
     return _locked(() -> _state_at_unlocked(integ, oftype(integ.t, t), deriv, ahead))
 end
 
-function _checked_state(integ::PETScIntegrator, t, deriv::Type = Val{0})
+function _checked_state(integ::PETScIntegrator, t, deriv::Type{D} = Val{0}) where {D}
     u = _state_at(integ, t, deriv, true)
     _raise_threw!(integ)
     return u
 end
 
 # `s` is PETSc's time. Returns `integ.ucache`, which the next call overwrites.
-function _interpolate!(integ::PETScIntegrator, s, deriv::Type = Val{0})
+function _interpolate!(integ::PETScIntegrator, s, deriv::Type{D} = Val{0}) where {D}
     s = oftype(integ.t, s)
     h = integ.h
     ctx = h.ctx
@@ -8046,7 +8085,9 @@ function _interpolate!(integ::PETScIntegrator, s, deriv::Type = Val{0})
     )
 end
 
-function _interpolate_finished!(integ::PETScIntegrator, s, deriv::Type = Val{0})
+function _interpolate_finished!(
+        integ::PETScIntegrator, s, deriv::Type{D} = Val{0},
+    ) where {D}
     ctx = integ.h.ctx
     (ctx.M === nothing && !ctx.dae) || throw(
         ArgumentError(
@@ -8154,13 +8195,14 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
     t0, t1 = integ.tprev, integ.t
     integ.tdir * (t1 - t0) > 0 || return nothing
     m = _ncond(cb)
-    s0 = Vector{Float64}(undef, m)
-    sk = Vector{Float64}(undef, m)
-    buf = Vector{Float64}(undef, m)
+    sc = integ.event_scratch[k]
+    s0, sk, buf, nudged, start = sc.s0, sc.sk, sc.buf, sc.nudged, sc.start
     _fill_conditions!(s0, integ, cb, t0)
     ev, residual = integ.event_t[k], integ.event_residual[k]
-    nudged = [ev[i] == t0 && abs(s0[i] - residual[i]) <= cb.abstol for i in 1:m]
-    start = fill(t0, m)
+    for i in 1:m
+        nudged[i] = ev[i] == t0 && abs(s0[i] - residual[i]) <= cb.abstol
+    end
+    fill!(start, t0)
     if any(nudged)
         tn = t0 + (t1 - t0) * oftype(t0, cb.repeat_nudge)
         _fill_conditions!(buf, integ, cb, tn)
@@ -8171,8 +8213,8 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
     past(i, t) = integ.tdir * t > integ.tdir * start[i]
     if cb.rootfind === SciMLBase.NoRootFind
         _fill_conditions!(sk, integ, cb, t1)
-        hit = [i for i in 1:m if _is_event(s0[i], sk[i], cb)]
-        return isempty(hit) ? nothing : (t1, _crossing(cb, s0, hit, m))
+        crossed = [i for i in 1:m if _is_event(s0[i], sk[i], cb)]
+        return isempty(crossed) ? nothing : (t1, _crossing(cb, s0, crossed, m))
     end
     lo = t0
     n = max(cb.interp_points, 1)
@@ -8181,9 +8223,10 @@ function _find_event(integ::PETScIntegrator, cb, k::Int)
         _fill_conditions!(sk, integ, cb, tk)
         if any(i -> past(i, tk) && _is_event(s0[i], sk[i], cb), 1:m)
             hit = [i for i in 1:m if past(i, tk) && _is_event(s0[i], sk[i], cb)]
+            from = lo
             roots = [
                 sk[i] == 0 ? tk :
-                    _event_root(integ, cb, past(i, lo) ? lo : start[i], tk, i, buf)
+                    _event_root(integ, cb, past(i, from) ? from : start[i], tk, i, buf)
                     for i in hit
             ]
             first_root = roots[argmin(integ.tdir .* roots)]
@@ -8292,8 +8335,10 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     integ.derivative_discontinuity = true
     _pin_step!(integ)
     before = ctx.dae ? copy(integ.u) : nothing
-    stop = _affect!(integ) do
-        _checked_everywhere(() -> _fire!(integ, best_cb, best_crossing), ctx.comm)
+    stop = let cb = best_cb, crossing = best_crossing
+        _affect!(integ) do
+            _checked_everywhere(() -> _fire!(integ, cb, crossing), ctx.comm)
+        end
     end
     integ.finished && return true
     # OrdinaryDiffEq saves no discretes after an affect! that clears the discontinuity.
@@ -8437,7 +8482,8 @@ function _init_unlocked(
         _integ_state(h.ctx, h.u0), _integ_state(h.ctx, h.u0, similar),
         _integ_state(h.ctx, h.u0, similar),
         Vector{R}[fill(R(NaN), _ncond(cb)) for cb in continuous],
-        Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous], NamedTuple(kwargs),
+        Vector{Float64}[fill(NaN, _ncond(cb)) for cb in continuous],
+        _EventScratch{R}[_EventScratch{R}(_ncond(cb)) for cb in continuous], NamedTuple(kwargs),
         stops, something(late, tstops), d_discontinuities, d_discontinuities, dt0,
         _initial_solution(prob, alg, h, kwargs), false, false, nothing, 0,
     )
@@ -8468,11 +8514,11 @@ function _restore_prev!(integ::PETScIntegrator, outer)
     return nothing
 end
 
-function _reject_step!(integ::PETScIntegrator, before, taken)
+function _reject_step!(integ::PETScIntegrator, before, outer, taken)
     h = integ.h
     ctx, pl = h.ctx, h.petsclib
     code, h.stopped = h.stopped, 0
-    nstep, integ.dt, integ.dtcache, ctx.pdirty, outer = before
+    nstep, integ.dt, integ.dtcache, ctx.pdirty = before
     if code == 0
         integ.t = integ.tprev
         copyto!(integ.u, integ.uprev)
@@ -8508,6 +8554,7 @@ _above(hi, lo) = hi > lo ? hi : nextfloat(lo)
 function _take_written_tolerances!(integ::PETScIntegrator)
     h = integ.h
     abstol, reltol = getfield(integ.opts, :abstol), getfield(integ.opts, :reltol)
+    abstol isa Float64 && reltol isa Float64 && return nothing
     abstol isa AbstractVector || reltol isa AbstractVector || return nothing
     _checked_everywhere(h.ctx.comm) do
         _check_tol(abstol, length(h.u0), :abstol)
@@ -8526,8 +8573,8 @@ end
 
 function _take_written_state!(integ::PETScIntegrator, restart::Bool = true)
     h = integ.h
-    _everywhere(h.ctx.comm, _read_state!(integ.ucache, h.ctx, h.u) == integ.u) &&
-        return nothing
+    held = _with_u(u -> _read_state!(integ.ucache, h.ctx, u), h)
+    _everywhere(h.ctx.comm, held == integ.u) && return nothing
     _write_state!(h, integ.u)
     restart && LibPETSc.TSRestartStep(h.petsclib, h.ts)
     _dirty!(h.ctx)
@@ -8627,12 +8674,14 @@ function _initial_solution(prob, alg, h::TSHandles, kwargs)
     )
 end
 
+# `sol` is untyped, and the builtin `getfield` reads it without a dynamic dispatch.
 function _live_stats!(integ::PETScIntegrator)
-    ctx, st = integ.h.ctx, _read_stats(integ.h)
+    h = integ.h
+    st = _read_stats(h)
     integ.iter = st.iter
-    stats = integ.sol.stats
+    ctx, stats = h.ctx, getfield(getfield(integ, :sol), :stats)
     stats isa SciMLBase.DEStats || return nothing
-    stats.nf, stats.nf2, stats.njacs = _nf(integ.h), ctx.nf2, ctx.njacs
+    stats.nf, stats.nf2, stats.njacs = _nf(h), ctx.nf2, ctx.njacs
     stats.nsolve, stats.ncondition = ctx.nsolve, ctx.ncondition
     stats.nnonliniter, stats.nnonlinconvfail = st.nnonliniter, st.nnonlinfail
     stats.naccept, stats.nreject = st.nsteps, st.nreject
@@ -9113,8 +9162,12 @@ end
 _fixed_step(h::TSHandles) =
     LibPETSc.TSAdaptGetType(h.petsclib, LibPETSc.TSGetAdapt(h.petsclib, h.ts)) == "none"
 
+_retcode(integ::PETScIntegrator) =
+    getfield(getfield(integ, :sol), :retcode)::SciMLBase.ReturnCode.T
+
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
-    integ.sol.retcode == SciMLBase.ReturnCode.InitialFailure && return nothing
+    integ.finished && _retcode(integ) == SciMLBase.ReturnCode.InitialFailure &&
+        return nothing
     integ.finished && throw(
         ArgumentError(
             "this integrator has finished at t = $(integ.t) and cannot step further; " *
@@ -9138,10 +9191,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     outer === nothing && _take_written_tolerances!(integ)
     _cap_step!(pl, h.ts, h.fixed)
     dtprev = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
-    before = (
-        Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty,
-        outer === nothing && ctx.domain !== nothing ? (integ.tprev, copy(integ.uprev)) : outer,
-    )
+    before = (Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty)
+    prev = outer === nothing && ctx.domain !== nothing ? (integ.tprev, copy(integ.uprev)) : outer
     start = integ.t
     reuse = ctx.hermite && integ.tdir * integ.t == ctx.end_s &&
         _everywhere(ctx.comm, _same_entries(integ.u, ctx.end_u) && !ctx.pdirty)
@@ -9179,7 +9230,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     end
     failure === nothing || throw(failure)
     if h.stopped != 0 && SciMLBase.isadaptive(integ) && _retryable!(h)
-        return _reject_step!(integ, before, LibPETSc.TSGetTimeStep(pl, h.ts))
+        return _reject_step!(integ, before, prev, LibPETSc.TSGetTimeStep(pl, h.ts))
     end
     h.stopped == 0 ? _undo_failed_irk!(ctx, pl, h.ts.ptr) :
         _warn_failed_step(integ.alg, h.stopped, integ.opts.verbose)
@@ -9188,7 +9239,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         if h.stopped == 0 && Int(LibPETSc.TSGetConvergedReason(pl, h.ts)) == 0
             _stalled!(h, integ.alg, integ.t, integ.opts.verbose)
         end
-        _restore_prev!(integ, before[5])
+        _restore_prev!(integ, prev)
         _finish!(integ)
         return nothing
     end
@@ -9211,14 +9262,15 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     end
     integ.dt = integ.t - integ.tprev
-    _read_state!(integ.u, ctx, h.u)
+    _with_u(u -> _read_state!(integ.u, ctx, u), h)
     if ctx.domain !== nothing && SciMLBase.isadaptive(integ) &&
             _predicate(() -> ctx.domain(integ.u, ctx.p, integ.t), ctx)
-        return _reject_step!(integ, before, abs(integ.t - integ.tprev))
+        return _reject_step!(integ, before, prev, abs(integ.t - integ.tprev))
     end
     _end_step_here!(integ)
     (ctx.dae || ctx.mass_slope) && _keep_dae_slope!(integ)
-    _live_stats!(integ)
+    # Only callbacks see the stats before the step's end updates them again.
+    isempty(integ.callbacks) && isempty(integ.continuous) || _live_stats!(integ)
     fired = _apply_continuous_callbacks!(integ, dtprev)
     integ.finished && return nothing
     saved = !fired && _save_step!(integ, integ.t, true)
@@ -9246,8 +9298,10 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     else
         _past_discontinuity!(integ)
         _live_stats!(integ)
-        integ.sol.retcode == SciMLBase.ReturnCode.Default &&
-            (integ.sol = SciMLBase.solution_new_retcode(integ.sol, SciMLBase.ReturnCode.Success))
+        _retcode(integ) == SciMLBase.ReturnCode.Default && (
+            integ.sol =
+                SciMLBase.solution_new_retcode(integ.sol, SciMLBase.ReturnCode.Success)
+        )
     end
     return nothing
 end
