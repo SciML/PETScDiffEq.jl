@@ -7,9 +7,9 @@ using MPI: MPI
 
 const V05 = pkgversion(PETSc) >= v"0.5.0-"
 
-# PETSc.jl 0.5.4 takes `own` as a keyword and warns on the positional form.
+# PETSc.jl 0.5.4 adds `PetscVec(pl, ptr; own)`; 0.5.5 warns on any `VecPtr` call.
 @static if pkgversion(PETSc) >= v"0.5.4-"
-    VecPtr(pl, ptr) = PETSc.VecPtr(pl, ptr; own = false)
+    VecPtr(pl, ptr) = LibPETSc.PetscVec(pl, ptr; own = false)
 else
     VecPtr(pl, ptr) = PETSc.VecPtr(pl, ptr, false)
 end
