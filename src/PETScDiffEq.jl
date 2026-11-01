@@ -2576,7 +2576,8 @@ end
 
 # TSAdaptChoose takes its DM work vector after the last stage, and BDF and theta take none.
 function _last_stage(ctx, pl, ts_ptr, y)
-    ctx.alg_name in ("bdf", "theta", "beuler", "cn") && return false
+    name = ctx.alg_name
+    (name == "bdf" || name == "theta" || name == "beuler" || name == "cn") && return false
     startswith(ctx.alg_name, "rosw") && return _jacobian_lag(pl, _snes(pl, ts_ptr)) >= 0
     ns, stages = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{LibPETSc.CVec}}(C_NULL)
     _check_code(
@@ -2732,7 +2733,7 @@ function _check_stage_body!(ctx, ts, t::R, y, accept) where {R}
         h, s = LibPETSc.TSGetTimeStep(pl, ts), LibPETSc.TSGetTime(pl, ts)
         snes = _snes_failed(pl, ts_ptr)
         # TSAlpha and TSAlpha2 solve for X1 but check Xa, and solve before every check.
-        snes === nothing || ctx.alg_name in ("alpha", "alpha2") ||
+        snes === nothing || ctx.alg_name == "alpha" || ctx.alg_name == "alpha2" ||
             _stale_failure!(pl, snes, y) && (snes = nothing)
         if snes === nothing
             lost = ctx.alg_name == "alpha2" && _lost_update(ctx, pl, ts, R)
