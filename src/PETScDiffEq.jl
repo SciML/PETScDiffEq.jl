@@ -2010,7 +2010,11 @@ function _post_step_serial!(ctx, ts)
         ctx.own_matchstep && _matchstep!(pl, ts)
         s = LibPETSc.TSGetTime(pl, ts)
         smax = LibPETSc.TSGetMaxTime(pl, ts)
-        s >= smax - _near(smax, ctx.tbound) && return LibPETSc.PetscErrorCode(0)
+        if s >= smax - _near(smax, ctx.tbound)
+            # The adjoint lands in its post-evaluate, before its trajectory records the step.
+            ctx.halt_stalled && reason == 0 && _land_on_max_time!(pl, ts, s, smax)
+            return LibPETSc.PetscErrorCode(0)
+        end
         hnext = LibPETSc.TSGetTimeStep(pl, ts)
         stop = false
         if ctx.halt_stalled && reason == 0 && s <= LibPETSc.TSGetPrevTime(pl, ts)
@@ -2040,6 +2044,15 @@ function _post_step_serial!(ctx, ts)
         return LibPETSc.PetscErrorCode(CALLBACK_THREW)
     end
     return LibPETSc.PetscErrorCode(0)
+end
+
+# A step that rounds to just short of the max time ends the solve there, as the integrator
+# does, rather than leaving PETSc a step of a few ulps.
+function _land_on_max_time!(pl, ts, s, smax)
+    s < smax || return nothing
+    LibPETSc.TSSetTime(pl, ts, smax)
+    LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_CONVERGED_TIME)
+    return nothing
 end
 
 # Reduces on every rank after every step, so no early return may skip it.
