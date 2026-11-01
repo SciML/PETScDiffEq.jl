@@ -9234,6 +9234,8 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     # PETSc keeps the step shortened onto its max time, so `dtcache` holds the uncut one.
     stop = !isempty(integ.tstops) && integ.tstops[1] < h.tf - tol ? integ.tstops[1] : nothing
     target = stop === nothing ? h.tf : stop
+    # Stages that round past a stop are evaluated at it, as at tf.
+    ctx.tend = target
     # TSSetMaxTime reads -1 as PETSC_DETERMINE.
     smax = target == -1 ? nextfloat(target) : _max_time(target)
     LibPETSc.TSSetMaxTime(pl, h.ts, smax)
