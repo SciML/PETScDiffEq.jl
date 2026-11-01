@@ -4520,8 +4520,12 @@ function _set_dense_block!(pl, B, J::Matrix{S}, M, dae, shift, n) where {S}
         ),
     )
     try
-        W = view(unsafe_wrap(Array, data[], (Int(lda[]), n)), 1:n, 1:n)
-        dae ? copyto!(W, J) : _shifted!(W, J, M, S(shift))
+        if !dae && M === nothing
+            _shifted_at!(data[], Int(lda[]), J, S(shift), n)
+        else
+            W = view(unsafe_wrap(Array, data[], (Int(lda[]), n)), 1:n, 1:n)
+            dae ? copyto!(W, J) : _shifted!(W, J, M, S(shift))
+        end
     finally
         _check_code(
             ccall(
@@ -4529,6 +4533,16 @@ function _set_dense_block!(pl, B, J::Matrix{S}, M, dae, shift, n) where {S}
                 (Ptr{Cvoid}, Ptr{Ptr{S}}), B.ptr, data,
             ),
         )
+    end
+    return nothing
+end
+
+# `_shifted!` with no mass, written through the pointer, as `unsafe_wrap` allocates.
+function _shifted_at!(p::Ptr{S}, ld, J, shift, n) where {S}
+    @inbounds for j in 1:n, i in 1:n
+        w = -J[i, j]
+        i == j && (w += shift)
+        unsafe_store!(p, w, i + (j - 1) * ld)
     end
     return nothing
 end
