@@ -621,6 +621,8 @@ crossing_last_row(idx, level) =
     end
 
     @testset "every handle is freed" begin
+        # A finished serial integrator keeps its TS for reinit! until it is collected.
+        GC.gc()
         @test isempty(PETScDiffEq.PARALLEL_HANDLES)
         @test all(h -> h.destroyed, keys(PETScDiffEq.LIVE_HANDLES))
     end
