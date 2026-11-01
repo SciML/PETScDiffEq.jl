@@ -2576,7 +2576,8 @@ end
 
 # TSAdaptChoose takes its DM work vector after the last stage, and BDF and theta take none.
 function _last_stage(ctx, pl, ts_ptr, y)
-    ctx.alg_name in ("bdf", "theta", "beuler", "cn") && return false
+    name = ctx.alg_name
+    (name == "bdf" || name == "theta" || name == "beuler" || name == "cn") && return false
     startswith(ctx.alg_name, "rosw") && return _jacobian_lag(pl, _snes(pl, ts_ptr)) >= 0
     ns, stages = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{LibPETSc.CVec}}(C_NULL)
     _check_code(
@@ -2732,7 +2733,7 @@ function _check_stage_body!(ctx, ts, t::R, y, accept) where {R}
         h, s = LibPETSc.TSGetTimeStep(pl, ts), LibPETSc.TSGetTime(pl, ts)
         snes = _snes_failed(pl, ts_ptr)
         # TSAlpha and TSAlpha2 solve for X1 but check Xa, and solve before every check.
-        snes === nothing || ctx.alg_name in ("alpha", "alpha2") ||
+        snes === nothing || ctx.alg_name == "alpha" || ctx.alg_name == "alpha2" ||
             _stale_failure!(pl, snes, y) && (snes = nothing)
         if snes === nothing
             lost = ctx.alg_name == "alpha2" && _lost_update(ctx, pl, ts, R)
@@ -4519,8 +4520,12 @@ function _set_dense_block!(pl, B, J::Matrix{S}, M, dae, shift, n) where {S}
         ),
     )
     try
-        W = view(unsafe_wrap(Array, data[], (Int(lda[]), n)), 1:n, 1:n)
-        dae ? copyto!(W, J) : _shifted!(W, J, M, S(shift))
+        if !dae && M === nothing
+            _shifted_at!(data[], Int(lda[]), J, S(shift), n)
+        else
+            W = view(unsafe_wrap(Array, data[], (Int(lda[]), n)), 1:n, 1:n)
+            dae ? copyto!(W, J) : _shifted!(W, J, M, S(shift))
+        end
     finally
         _check_code(
             ccall(
@@ -4528,6 +4533,16 @@ function _set_dense_block!(pl, B, J::Matrix{S}, M, dae, shift, n) where {S}
                 (Ptr{Cvoid}, Ptr{Ptr{S}}), B.ptr, data,
             ),
         )
+    end
+    return nothing
+end
+
+# `_shifted!` with no mass, written through the pointer, as `unsafe_wrap` allocates.
+function _shifted_at!(p::Ptr{S}, ld, J, shift, n) where {S}
+    @inbounds for j in 1:n, i in 1:n
+        w = -J[i, j]
+        i == j && (w += shift)
+        unsafe_store!(p, w, i + (j - 1) * ld)
     end
     return nothing
 end
