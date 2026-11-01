@@ -1952,18 +1952,23 @@ for S in (Float32, Float64, ComplexF32, ComplexF64)
 end
 
 function _record!(ctx::TSContext{R, S}, t, x, du = nothing) where {R, S}
-    full = Vector{S}(vec(x))
     idxs = ctx.save_idxs
     push!(ctx.ts, R(t))
     ctx.user_ts === nothing || push!(ctx.user_ts, _user_t(ctx.tdir, R(t)))
-    if ctx.dense
-        du === nothing && (du = _derivative(ctx, R(t), full))
-        push!(ctx.dus, _kept(ctx, _select(du, idxs)))
-        ctx.user_dus === nothing || push!(ctx.user_dus, -ctx.dus[end])
+    if !ctx.dense
+        push!(ctx.us, _kept(ctx, _copied(S, x, idxs)))
+        return du
     end
+    full = Vector{S}(vec(x))
+    du === nothing && (du = _derivative(ctx, R(t), full))
+    push!(ctx.dus, _kept(ctx, _select(du, idxs)))
+    ctx.user_dus === nothing || push!(ctx.user_dus, -ctx.dus[end])
     push!(ctx.us, _kept(ctx, _select(full, idxs)))
     return du
 end
+
+_copied(S, x, ::Nothing) = Vector{S}(vec(x))
+_copied(S, x, idxs::Vector{Int}) = Vector{S}(view(vec(x), idxs))
 
 _kept(ctx::TSContext{R, S, A}, x) where {R, S, A} = A <: Number ? only(x) :
     A <: Vector ? x :
