@@ -200,6 +200,7 @@ mutable struct StopQueue{R}
     tbound::Float64
     matches::Bool
     own_matchstep::Bool
+    ctx::Any
 end
 
 mutable struct AdjointContext{T, P, JAC, JBUF, PJAC, DG}
@@ -468,6 +469,7 @@ function _next_stop!(q::StopQueue{R}, pl, ts, s) where {R}
     q.stop = !isempty(q.stops) && q.stops[1] < q.tf - _near(R(q.tf), q.tbound) ? q.stops[1] :
         nothing
     target = something(q.stop, q.tf)
+    q.ctx.tend = target
     smax = target == -1 ? nextfloat(target) : _max_time(target)
     LibPETSc.TSSetMaxTime(pl, ts, smax)
     if q.matches
@@ -500,7 +502,11 @@ function _end_step!(q::StopQueue{R}, pl, ts) where {R}
     s = LibPETSc.TSGetTime(pl, ts)
     if q.stop === nothing
         tol = _near(R(q.tf), q.tbound)
-        s != q.tf && s >= q.tf - tol && LibPETSc.TSSetTime(pl, ts, q.tf)
+        if s != q.tf && s >= q.tf - tol
+            LibPETSc.TSSetTime(pl, ts, q.tf)
+            # Past a max time of nextfloat(-1), which stands for -1, TSSolve would step on.
+            LibPETSc.TSSetConvergedReason(pl, ts, LibPETSc.TS_CONVERGED_TIME)
+        end
         _cap_step!(pl, ts, q.fixed)
         # Under `matches` PETSc's MATCHSTEP is off, so each step to tf is matched here.
         q.matches && s < q.tf - tol && _next_stop!(q, pl, ts, s)
@@ -522,11 +528,44 @@ function _end_step!(q::StopQueue{R}, pl, ts) where {R}
     return nothing
 end
 
+# Without stops, the end of `solve`'s post-step: its MATCHSTEP rule under `own`, and the landing
+# on tf of a step that rounds just short of it. It runs at every step, so it reads the TS raw.
+struct AdjointEnd{L}
+    petsclib::L
+    own::Bool
+    single::Bool
+    tbound::Float64
+    adj::Any
+end
+
+function _ts_get(pl, ::Val{name}, ts_ptr, ::Type{T}) where {name, T}
+    r = Ref{T}(zero(T))
+    _check_code(
+        ccall(
+            _symbol(pl, Val(name)), LibPETSc.PetscErrorCode, (LibPETSc.CTS, Ptr{T}), ts_ptr, r,
+        ),
+    )
+    return r[]
+end
+
+function _end_step!(e::AdjointEnd, ts_ptr)
+    pl = e.petsclib
+    _ts_get(pl, Val(:TSGetConvergedReason), ts_ptr, Cint) < 0 && return nothing
+    e.own && _matchstep!(pl, LibPETSc.TS(ts_ptr, pl))
+    s = _ts_get(pl, Val(:TSGetTime), ts_ptr, Float64)
+    smax = _ts_get(pl, Val(:TSGetMaxTime), ts_ptr, Float64)
+    near = e.single ? _near(Float32(smax), e.tbound) : _near(smax, e.tbound)
+    s >= smax - near && _land_on_max_time!(pl, LibPETSc.TS(ts_ptr, pl), s, smax)
+    return nothing
+end
+
 # TSSetPostEvaluate passes no context.
 const ADJ_STOPS_CTX = Dict{LibPETSc.CTS, Any}()
 
 function _adjoint_post_evaluate!(ts_ptr::LibPETSc.CTS)::LibPETSc.PetscErrorCode
-    adj = ADJ_STOPS_CTX[ts_ptr]::AdjointContext
+    hook = ADJ_STOPS_CTX[ts_ptr]
+    hook isa AdjointEnd && return _ended(hook, ts_ptr)
+    adj = hook::AdjointContext
     pl = adj.petsclib
     try
         _end_step!(adj.stops, pl, LibPETSc.TS(ts_ptr, pl))
@@ -539,8 +578,20 @@ end
 
 const ADJ_POST_EVALUATE_PTR = Ref{Ptr{Cvoid}}(C_NULL)
 
-function _set_stops!(adj::AdjointContext, pl, ts)
-    ADJ_STOPS_CTX[ts.ptr] = adj
+function _ended(hook::AdjointEnd, ts_ptr)
+    try
+        _end_step!(hook, ts_ptr)
+    catch e
+        hook.adj.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+function _set_stops!(adj::AdjointContext, pl, ts, own = false)
+    ADJ_STOPS_CTX[ts.ptr] = adj.stops === nothing ?
+        AdjointEnd(pl, own, adj.clock <: Union{Float32, ComplexF32}, Float64(adj.tbound), adj) :
+        adj
     code = ccall(
         _symbol(pl, :TSSetPostEvaluate), LibPETSc.PetscErrorCode,
         (LibPETSc.CTS, Ptr{Cvoid}), ts, ADJ_POST_EVALUATE_PTR[],
@@ -1158,7 +1209,7 @@ function _set_time_span!(h::TSHandles{<:Any, <:Any, R}, cost_s) where {R}
     for s in sort(cost_s)
         last(span) + near(s) < s < h.tf - near(s) && push!(span, s)
     end
-    length(span) == 1 && return nothing
+    length(span) == 1 && return false
     # TSSetTimeSpan passes its last time to TSSetMaxTime, which reads -1 as PETSC_DETERMINE.
     push!(span, h.tf == -1 ? nextfloat(h.tf) : h.tf)
     code = ccall(
@@ -1167,7 +1218,7 @@ function _set_time_span!(h::TSHandles{<:Any, <:Any, R}, cost_s) where {R}
         h.ts, LibPETSc.PetscInt(length(span)), span,
     )
     _check_code(code, "TSSetTimeSpan")
-    return nothing
+    return true
 end
 
 _throw_callback_error(ctx, adj, comm = nothing, q = nothing, ex = nothing) = _throw_anywhere(
@@ -1381,7 +1432,7 @@ function _discrete_adjoint_unlocked(
             _check_explicit_prototype(prob.f.f2.jac_prototype, n, N)
         end
         # PETSc 3.22 allocates the span's states in TSSetUp, which the solve below is first to call.
-        adaptive && !stopping && _set_time_span!(h, cost_s)
+        spanned = adaptive && !stopping && _set_time_span!(h, cost_s)
         # The rules `_match_steps_here!` gives `solve` in place of PETSc's MATCHSTEP.
         matches, own = R === Float32, R !== Float32 && _bad_hmax(h, vcat(tstops, jumps, cost_t))
         # A fixed-step Float32 `solve` keeps that rule without stops too.
@@ -1389,9 +1440,11 @@ function _discrete_adjoint_unlocked(
         queue = queued ? StopQueue{R}(
                 _tstops(adaptive ? vcat(tstops, jumps, cost_t) : vcat(tstops, jumps), h),
                 h.tdir .* Float64.(jumps), h.tf, !adaptive, LibPETSc.TSGetTimeStep(pl, ts),
-                nothing, false, Float64(h.ctx.tbound), matches, own,
+                nothing, false, Float64(h.ctx.tbound), matches, own, ctx,
             ) : nothing
-        queued && (matches || own) &&
+        # PETSc's time span needs its MATCHSTEP.
+        own_here = own && !queued && !spanned && !matches
+        (queued && (matches || own) || own_here) &&
             LibPETSc.TSSetExactFinalTime(pl, ts, LibPETSc.TS_EXACTFINALTIME_STEPOVER)
         iip = SciMLBase.isinplace(prob)
         backend = something(_autodiff(alg), AutoForwardDiff())
@@ -1525,7 +1578,8 @@ function _discrete_adjoint_unlocked(
                 ts, ADJ_JUMP_PTR[], adjptr, C_NULL,
             )
             _check_code(code, "TSAdjointMonitorSet")
-            queue === nothing || _set_stops!(adj, pl, ts)
+            _set_stops!(adj, pl, ts, own_here)
+            own_here && _cut_first_step!(pl, ts)
 
             try
                 _quiet_errors(h) do
