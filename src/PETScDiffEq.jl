@@ -8492,7 +8492,7 @@ function _init_unlocked(
         stops_given = vcat(tstops, d_discontinuities)
     end
     _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
-    _match_steps_here!(h)
+    _match_steps_here!(h, stops_given)
     _mark_fresh!(h)
     _initial_save!(h)
     stops = _tstops(stops_given, h)
@@ -8893,10 +8893,11 @@ function _reinit_unlocked(
     try
         if !reused
             _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
-            _match_steps_here!(h)
+            _match_steps_here!(h, stops)
             # Built for this call's own saveat, init or dense, which a later reinit! drops.
             saveat === nothing && reinit_dae && erase_sol ? _mark_fresh!(h) : (h.again = nothing)
         end
+        reused && _match_steps_here!(h, stops)
         if !erase_sol
             append!(h.ctx.ts, old.ctx.ts)
             append!(h.ctx.us, old.ctx.us)
@@ -9089,8 +9090,13 @@ function _save_step!(
     return length(ctx.ts) > n && _last_recorded(ctx, integ.tdir * upto)
 end
 
-# PETSc 3.22's build for 32-bit x86 fails MATCHSTEP's `bad hmax` check on long spans.
-_bad_hmax() = Sys.ARCH === :i686
+# MATCHSTEP's `bad hmax` check fails on long spans in PETSc 3.22's 32-bit x86 build. Elsewhere
+# t + (tmax - t) misses tmax by up to |tmax - t| eps / 2 + |tmax| eps / 2, which fails its
+# 10 eps |tmax| only for a step at least 19 |tmax| long, as on a span that ends near 0.
+_bad_hmax(h, stops = ()) = Sys.ARCH === :i686 || _off_max_time(h.t0, h.tf) ||
+    any(s -> _off_max_time(h.t0, h.tdir * s), stops)
+
+_off_max_time(t0, tmax) = !iszero(tmax) && abs(tmax - t0) > 8 * abs(tmax)
 
 # The span is set before the options, so an option can move either end of it.
 function _refuse_span_options(pl, ts, t0, tmax)
@@ -9144,11 +9150,24 @@ function _cut_first_step!(pl, ts)
 end
 
 # MATCHSTEP refuses a step leaving under 10 eps (1.2e-6 in Float32) before a stop.
-function _match_steps_here!(h::TSHandles{<:Any, <:Any, R}) where {R}
+function _match_steps_here!(h::TSHandles{<:Any, <:Any, R}, stops = ()) where {R}
     pl, ts = h.petsclib, h.ts
-    (R === Float32 || _bad_hmax()) &&
-        _exact_final_time(pl, ts) == LibPETSc.TS_EXACTFINALTIME_MATCHSTEP || return nothing
-    R === Float32 || return _take_matchstep!(h)
+    mode = _exact_final_time(pl, ts)
+    if R !== Float32
+        # A kept TS takes the mode its new span needs, whichever an earlier span left. A
+        # user's stepover is refused, so a stepover here is this package's.
+        mode == LibPETSc.TS_EXACTFINALTIME_INTERPOLATE && return nothing
+        if _bad_hmax(h, stops)
+            mode == LibPETSc.TS_EXACTFINALTIME_STEPOVER ? (h.ctx.own_matchstep = true) :
+                _take_matchstep!(h)
+        else
+            mode == LibPETSc.TS_EXACTFINALTIME_STEPOVER &&
+                LibPETSc.TSSetExactFinalTime(pl, ts, LibPETSc.TS_EXACTFINALTIME_MATCHSTEP)
+            h.ctx.own_matchstep = false
+        end
+        return nothing
+    end
+    mode == LibPETSc.TS_EXACTFINALTIME_MATCHSTEP || return nothing
     LibPETSc.TSSetExactFinalTime(pl, ts, LibPETSc.TS_EXACTFINALTIME_STEPOVER)
     h.matches = true
     h.fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, ts)) == "none"

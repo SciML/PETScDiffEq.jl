@@ -1383,7 +1383,7 @@ function _discrete_adjoint_unlocked(
         # PETSc 3.22 allocates the span's states in TSSetUp, which the solve below is first to call.
         adaptive && !stopping && _set_time_span!(h, cost_s)
         # The rules `_match_steps_here!` gives `solve` in place of PETSc's MATCHSTEP.
-        matches, own = R === Float32, R !== Float32 && _bad_hmax()
+        matches, own = R === Float32, R !== Float32 && _bad_hmax(h, vcat(tstops, jumps, cost_t))
         # A fixed-step Float32 `solve` keeps that rule without stops too.
         queued = stopping || matches && !adaptive
         queue = queued ? StopQueue{R}(
