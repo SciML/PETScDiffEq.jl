@@ -4655,7 +4655,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             ref = SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf", [ksponly; krylov]))
             @test sol.retcode == ref.retcode == SciMLBase.ReturnCode.Success
             @test (sol.stats.naccept, sol.stats.nreject) == (ref.stats.naccept, ref.stats.nreject)
-            @test sol.u[end] ≈ ref.u[end] rtol = 1.0e-10
+            # The GMRES reference moves by up to 1.2e-10 with the CPU's OpenBLAS kernel.
+            @test sol.u[end] ≈ ref.u[end] rtol = 1.0e-9
             for s in (sol, SciMLBase.solve(prob, PETScDiffEq.TSRosW()))
                 @test s.retcode == SciMLBase.ReturnCode.Success
                 @test !any(u -> any(isnan, u), s.u)
