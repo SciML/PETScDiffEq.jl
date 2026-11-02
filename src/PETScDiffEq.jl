@@ -8673,16 +8673,17 @@ SciMLBase.has_tstop(integ::PETScIntegrator) = !isempty(integ.tstops)
 SciMLBase.first_tstop(integ::PETScIntegrator) = integ.tstops[1]
 SciMLBase.pop_tstop!(integ::PETScIntegrator) = popfirst!(integ.tstops)
 
-function _initial_save!(h::TSHandles)
+# `record = false` passes over the start's saves, as `reinit!` without `erase_sol` does.
+function _initial_save!(h::TSHandles, record = true)
     ctx = h.ctx
     tol = _near(h.t0, ctx.tbound)
     landed = false
     while ctx.saveat_idx <= length(ctx.saveat) && ctx.saveat[ctx.saveat_idx] <= h.t0 + tol
-        _record_end!(ctx, ctx.saveat[ctx.saveat_idx], h.u0)
+        record && _record_end!(ctx, ctx.saveat[ctx.saveat_idx], h.u0)
         ctx.saveat_idx += 1
         landed = true
     end
-    h.save_start && !landed && _record_end!(ctx, h.t0, h.u0)
+    record && h.save_start && !landed && _record_end!(ctx, h.t0, h.u0)
     return nothing
 end
 
@@ -8916,7 +8917,7 @@ function _reinit_unlocked(
                 end
             end
         end
-        initialize_save && _initial_save!(h)
+        initialize_save && _initial_save!(h, erase_sol)
         if reset_dt === true
             dt = _estimate_dt(
                 h, _make_opts(h, setup_kwargs), h.u0, h.t0,
