@@ -7515,7 +7515,7 @@ end
 
 const FIXED_OPTS = (
     :dense, :save_idxs, :calck, :internalnorm, :callback, :tstops, :saveat, :d_discontinuities,
-    :written,
+    :written, :force_dtmin,
 )
 
 function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {H, R}
@@ -7664,7 +7664,7 @@ step PETSc proposed last. `adaptive` raises an `ArgumentError` for `TSAlpha2`, a
 type PETScDiffEq does not know, or options that pick `-ts_adapt_type`. `tstops` and `saveat`
 are the live queues keyed by `tdir * t`, with `saveat` keeping the times already passed;
 `unstable_check` and `isoutofdomain` are `nothing` unless given; `dense`, `save_idxs`,
-`calck`, `internalnorm` and `callback` are fixed at `init`.
+`calck`, `internalnorm`, `callback` and `force_dtmin` are fixed at `init`.
 """
 mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractArray{S}} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, UT, R}
