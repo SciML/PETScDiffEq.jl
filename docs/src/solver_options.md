@@ -199,9 +199,10 @@ shows the estimate. `get_proposed_dt` is signed, negative on a reversed span, an
 and `set_reltol!` hold for the steps after, until `reinit!` goes back to the tolerances `init`
 was given, where OrdinaryDiffEq's `reinit!` keeps them. The other options assigned on
 `opts`, such as `maxiters`, `dtmax` or `save_start`, carry through `reinit!` as in
-OrdinaryDiffEq. With `erase_sol = false`, a solution
-saved under `save_idxs` without dense output stays without it when the new `saveat` would
-otherwise turn it on, since a partial state gives no derivative to interpolate with.
+OrdinaryDiffEq. With `erase_sol = false` the new start is not saved again, as in
+OrdinaryDiffEq, and a solution saved under `save_idxs` without dense output stays without it
+when the new `saveat` would otherwise turn it on, since a partial state gives no derivative to
+interpolate with.
 `change_t_via_interpolation!` with `Val{true}` drops what was saved past the new time, and
 saves the new end when `save_everystep` asks for every step. `resize!`, `deleteat!` and
 `addat!` raise an `ArgumentError`, since PETSc sizes its vectors and solvers when the
