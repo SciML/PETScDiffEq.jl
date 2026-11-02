@@ -2858,14 +2858,17 @@ function _set_stage_check!(pl, ts, ctx, ptr)
     return nothing
 end
 
-function _retry_failed_solves!(pl, ts, ctx, ptr, opts)
-    for (name, setter) in
-        (("ts_max_snes_failures", :TSSetMaxSNESFailures), ("ts_max_reject", :TSSetMaxStepRejections))
+# TSCreate allows 1 failed solve and 10 rejections, which a fixed step puts back.
+function _retry_failed_solves!(pl, ts, ctx, ptr, opts, fails = -1, rejects = -1)
+    for (name, setter, n) in (
+            ("ts_max_snes_failures", :TSSetMaxSNESFailures, fails),
+            ("ts_max_reject", :TSSetMaxStepRejections, rejects),
+        )
         any(o -> _names_petsc_option(pl, o, name), opts) && continue
         _check_code(
             ccall(
                 _symbol(pl, setter), LibPETSc.PetscErrorCode, (LibPETSc.CTS, LibPETSc.PetscInt),
-                ts, LibPETSc.PetscInt(-1),
+                ts, LibPETSc.PetscInt(n),
             ),
         )
     end
@@ -5247,6 +5250,8 @@ mutable struct TSHandles{CTX, L, R, S}
     fresh::Any
     lu::Any
     quiet::Bool
+    alg::Any
+    user_options::Vector{String}
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -6495,7 +6500,7 @@ function _setup(
         false,
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
-        nothing, nothing, nothing, false,
+        nothing, nothing, nothing, false, alg, String[alg.petsc_options; extra_options],
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -7523,6 +7528,8 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
         _checked_everywhere(() -> _check_tol(v, length(h.u0), name), h.ctx.comm)
     name === :dtmax && isnan(v) && throw(ArgumentError("`dtmax` is NaN"))
     name === :dtmax && iszero(v) && throw(ArgumentError("`dtmax` is zero"))
+    changed = name === :adaptive && v != getfield(o, :adaptive)
+    changed && h !== nothing && !h.destroyed && _check_live_adaptive(h)
     setfield!(
         o, name, name in (:dtmin, :dtmax) ? R(v) : name === :maxiters ? _step_limit(v) : v,
     )
@@ -7549,9 +7556,10 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
         _, hi = LibPETSc.TSAdaptGetStepLimits(pl, adapt)
         lo = abs(getfield(o, :dtmin))
         LibPETSc.TSAdaptSetStepLimits(pl, adapt, lo, _above(hi, lo))
-    elseif name === :dtmin
+    elseif name === :dtmin || name === :adaptive
+        changed && _set_adaptive!(h, getfield(o, :adaptive))
         h.ctx.dtmin = _floor(
-            R, getfield(o, :dtmin), false,
+            R, getfield(o, :dtmin), getfield(o, :force_dtmin),
             getfield(o, :adaptive) && _adapts(h.ctx.alg_name) !== false,
         )
     elseif name === :dtmax
@@ -7565,6 +7573,54 @@ end
 
 Base.setproperty!(o::PETScIntegratorOpts, name::Symbol, v) =
     _locked(() -> _setopt_unlocked(o, name, v))
+
+function _check_live_adaptive(h::TSHandles)
+    pl, ctx = h.petsclib, h.ctx
+    adapts = _adapts(ctx.alg_name)
+    adapts === false && return nothing
+    why = adapts === nothing ? "PETScDiffEq does not know whether `$(ctx.alg_name)` has an " *
+        "error estimate" :
+        ctx.alg_name == "alpha2" ? "`alpha2` sets up its error estimate when it starts" :
+        any(s -> _names_option(s, "ts_adapt_type"), h.user_options) ?
+        "the options pick `-ts_adapt_type`" :
+        LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) in ("basic", "none") ?
+        nothing : "PETSc runs another TSAdapt"
+    why === nothing || throw(
+        ArgumentError(
+            "`adaptive` cannot change on this live integrator, since $why; pass it to `init`",
+        ),
+    )
+    return nothing
+end
+
+# Puts in or takes out what `_setup` installs for an adaptive step.
+function _set_adaptive!(h::TSHandles, adaptive::Bool)
+    pl, ts, ctx = h.petsclib, h.ts, h.ctx
+    _adapts(ctx.alg_name) === true || return nothing
+    _check_code(
+        ccall(
+            _symbol(pl, :TSAdaptSetType), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Cstring),
+            LibPETSc.TSGetAdapt(pl, ts), adaptive ? "basic" : "none",
+        ),
+    )
+    h.fixed = !adaptive
+    implicit = _uses_ifunction(h.alg)
+    ctx.retry_fp = adaptive && (ctx.comm === nothing || !implicit)
+    ctx.retry_fp || ctx.comm !== nothing || _release_work_vec!(ctx)
+    opts = h.user_options
+    if implicit
+        adaptive ? _retry_failed_solves!(pl, ts, ctx, _callbacks(ctx).stage_check, opts) :
+            _retry_failed_solves!(pl, ts, ctx, C_NULL, opts, 1, 10)
+    elseif adaptive && any(o -> any(n -> _names_option(o, n), _MAX_REJECT_OPTIONS), opts)
+        _set_stage_check!(pl, ts, ctx, _callbacks(ctx).attempt_check)
+    else
+        ctx.attempt_margin = adaptive ? 13 : -1
+        _set_stage_check!(pl, ts, ctx, C_NULL)
+    end
+    ctx.alg_name == "bdf" && !any(o -> _names_option(o, "snes_lag_jacobian"), opts) &&
+        _set_jacobian_lag!(pl, _snes(pl, ts.ptr), adaptive ? 5 : 1)
+    return nothing
+end
 
 struct _EventScratch{R}
     s0::Vector{Float64}
@@ -7602,11 +7658,13 @@ integrator as an `Array` of its size, and a `u0` of another array type, such as 
 `iter` counts every step attempted, accepted, rejected or failed, as `maxiters` does, and
 `stats` is the running `sol.stats`. `opts`
 carries the options OrdinaryDiffEq's integrator exposes where PETSc has them. Assigning
-`maxiters`, `save_everystep`, `save_start`, `save_end`, `save_discretes`, `unstable_check` or
-`isoutofdomain` takes effect at once; `tstops` and `saveat` are the live queues keyed by
-`tdir * t`, with `saveat` keeping the times already passed; `unstable_check` and
-`isoutofdomain` are `nothing` unless given; `dense`, `save_idxs`, `calck`, `internalnorm` and
-`callback` are fixed at `init`.
+`maxiters`, `save_everystep`, `save_start`, `save_end`, `save_discretes`, `unstable_check`,
+`isoutofdomain`, `dtmin` or `adaptive` takes effect at once, a fixed step going on at the
+step PETSc proposed last. `adaptive` raises an `ArgumentError` for `TSAlpha2`, a `TSGeneric`
+type PETScDiffEq does not know, or options that pick `-ts_adapt_type`. `tstops` and `saveat`
+are the live queues keyed by `tdir * t`, with `saveat` keeping the times already passed;
+`unstable_check` and `isoutofdomain` are `nothing` unless given; `dense`, `save_idxs`,
+`calck`, `internalnorm` and `callback` are fixed at `init`.
 """
 mutable struct PETScIntegrator{Alg, S, R, P, H, Pr, CB, CC, UT <: AbstractArray{S}} <:
     SciMLBase.AbstractODEIntegrator{Alg, true, UT, R}
@@ -8879,6 +8937,9 @@ function _reinit_unlocked(
     written = filter(!in((:abstol, :reltol)), getfield(integ.opts, :written))
     kept = NamedTuple{Tuple(written)}(map(k -> getfield(integ.opts, k), Tuple(written)))
     setup_kwargs = merge(integ.kwargs, kept)
+    # As in OrdinaryDiffEq, a fixed step made live keeps the step it has.
+    get(setup_kwargs, :adaptive, true) === false && get(setup_kwargs, :dt, nothing) === nothing &&
+        (setup_kwargs = merge(setup_kwargs, (dt = abs(_proposed_dt_unlocked(integ)),)))
     # As in OrdinaryDiffEq, a new saveat keeps the save_start and save_end init worked out.
     saveat === nothing || (
         setup_kwargs = merge(
