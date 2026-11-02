@@ -5252,6 +5252,7 @@ mutable struct TSHandles{CTX, L, R, S}
     quiet::Bool
     alg::Any
     user_options::Vector{String}
+    switched::Bool
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -6501,6 +6502,7 @@ function _setup(
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
         nothing, nothing, nothing, false, alg, String[alg.petsc_options; extra_options],
+        false,
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -7604,6 +7606,7 @@ function _set_adaptive!(h::TSHandles, adaptive::Bool)
         ),
     )
     h.fixed = !adaptive
+    h.switched = true
     implicit = _uses_ifunction(h.alg)
     ctx.retry_fp = adaptive && (ctx.comm === nothing || !implicit)
     ctx.retry_fp || ctx.comm !== nothing || _release_work_vec!(ctx)
@@ -9303,6 +9306,11 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     outer === nothing && _take_written_time!(integ)
     outer === nothing && _take_written_state!(integ)
     outer === nothing && _take_written_tolerances!(integ)
+    # A live switch of `adaptive` steps on from the step PETSc has proposed.
+    if outer === nothing && h.switched
+        integ.dtcache = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
+        h.switched = false
+    end
     _cap_step!(pl, h.ts, h.fixed)
     dtprev = integ.tdir * LibPETSc.TSGetTimeStep(pl, h.ts)
     before = (Int(LibPETSc.TSGetStepNumber(pl, h.ts)), integ.dt, integ.dtcache, ctx.pdirty)
