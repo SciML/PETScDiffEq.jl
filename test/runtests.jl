@@ -2111,9 +2111,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             n = length(first.t)
             SciMLBase.reinit!(integ, first.u[end]; t0 = 1.0, tf = 2.0, erase_sol = false)
             sol = SciMLBase.solve!(integ)
-            @test length(sol.t) == 2n
+            @test length(sol.t) == 2n - 1
             @test sol.t[1:n] == first.t
-            @test sol.t[n + 1] == 1.0
+            @test sol.t[n] == 1.0 < sol.t[n + 1]
             @test length(sol.interp.du) == length(sol.u)
         end
 
@@ -2157,8 +2157,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test !sol.dense
                 @test sol.t[1:3] == kept.t
                 @test sol.u[1:3] == kept.u
-                @test sol.t[4:end] == fresh.t
-                @test sol.u[4:end] == fresh.u
+                @test sol.t[4:end] == fresh.t[2:end]
+                @test sol.u[4:end] == fresh.u[2:end]
                 @test sol(0.25) == (sol.u[1] + sol.u[2]) / 2
             end
             osc!(dv, v, u, p, t) = (dv .= -u; nothing)
@@ -2172,7 +2172,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             sol = SciMLBase.solve!(integ)
             @test sol.retcode == SciMLBase.ReturnCode.Success
             @test !sol.dense
-            @test length(sol.t) == length(kept.t) + 11
+            @test length(sol.t) == length(kept.t) + 10
             @test sol.u[1:3] == kept.u
             @test all(u -> length(u) == 1, sol.u)
         end
