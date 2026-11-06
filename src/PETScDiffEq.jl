@@ -7065,6 +7065,9 @@ const _UNREAD_OPTIONS = ("options_left", "options_suppress_deprecated_warnings")
 # global options, so once the solve has read what it reads the user's unread ones are named.
 function _warn_unread_options(h::TSHandles)
     (h.opts === nothing || h.destroyed) && return nothing
+    given = sort!(String[String(key) for key in keys(PETSc.parse_options(h.user_options))])
+    filter!(name -> !(lowercase(name) in _UNREAD_OPTIONS), given)
+    isempty(given) && return nothing
     pl, n = h.petsclib, Ref{_PetscInt}(0)
     names, values = Ref{Ptr{Ptr{Cchar}}}(C_NULL), Ref{Ptr{Ptr{Cchar}}}(C_NULL)
     # PETSc replaces a deprecated name it reads with the new one, so only held names count.
@@ -7083,9 +7086,7 @@ function _warn_unread_options(h::TSHandles)
             h.opts.ptr, n, names, values,
         ),
     )
-    given = sort!([String(key) for key in keys(PETSc.parse_options(h.user_options))])
-    filter!(name -> !(lowercase(name) in _UNREAD_OPTIONS), given)
-    here = [lowercase(name) in left for name in given]
+    here = Bool[lowercase(name) in left for name in given]
     # A rank outside a sub-communicator, as telescope's, never reads that solver's options.
     comm = h.ctx.comm
     flags = comm === nothing ? here : MPI.Allreduce(here, &, comm)
