@@ -4932,18 +4932,20 @@ function _check_inttype(petsclib)
     return nothing
 end
 
-# PETSc_jll's Windows builds before 3.25 have no MPI, so PETSc creates no object at all.
+# Only a PETSc built without MPI exports MPIUNI_Memcpy, as PETSc_jll's Windows builds before
+# 3.25 do. On Windows such a build creates no PETSc object at all.
+_without_mpi(petsclib) =
+    Libdl.dlsym_e(Libdl.dlopen(petsclib.petsc_library), :MPIUNI_Memcpy) != C_NULL
+
 function _check_windows_mpi(petsclib)
-    Sys.iswindows() || return nothing
-    version = _petsc_version(petsclib)
-    version < v"3.25" && throw(
+    Sys.iswindows() && _without_mpi(petsclib) || return nothing
+    throw(
         ArgumentError(
-            "PETSc $version, from a Windows PETSc_jll older than 3.25, is built without " *
-                "MPI, so it cannot create any PETSc object; PETSc_jll 3.25, the first " *
-                "Windows build with MPI, needs Julia 1.12 or newer",
+            "PETSc $(_petsc_version(petsclib)) is built without MPI, as Windows PETSc_jll " *
+                "is before 3.25, so it cannot create any PETSc object; PETSc_jll 3.25, " *
+                "the first Windows build with MPI, needs Julia 1.12 or newer",
         ),
     )
-    return nothing
 end
 
 # TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
