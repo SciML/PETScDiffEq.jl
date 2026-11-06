@@ -35,6 +35,23 @@ const X_END, Y_END = 0.38425119502492877, -0.9232285844371989
     end
 end
 
+@testset "a kept solve runs the new problem's initialization" begin
+    @variables a(t) b(t)
+    @parameters total k = 1.0
+    @mtkcompile sys = System(
+        [D(a) ~ -k * a, 0 ~ total^3 + total - a - b], t; guesses = [total => 1.0],
+    )
+    prob = ODEProblem(sys, [a => 1.0, b => 9.0, total => missing], (0.0, 1.0))
+    probs = [prob, remake(prob; u0 = [a => 1.0, b => 29.0])]
+    sols = PETScDiffEq.reusing() do
+        s = [solve(p, TSRosW(); TOL...) for p in probs]
+        @test length(PETScDiffEq.KEPT_HANDLES) == 1
+        s
+    end
+    @test [s.ps[total] for s in sols] ≈ [2, 3] atol = 1.0e-12
+    @test all(s.u == solve(p, TSRosW(); TOL...).u for (s, p) in zip(sols, probs))
+end
+
 @testset "a parameter the initialization solves for" begin
     @variables a(t) b(t)
     @parameters total k = 1.0
