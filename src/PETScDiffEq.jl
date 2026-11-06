@@ -4046,7 +4046,9 @@ const _Banded = Union{
     LinearAlgebra.SymTridiagonal,
 }
 
-_copy_jac!(J::SparseMatrixCSC, A::_Banded) = _copy_jac!(J, SparseMatrixCSC(A))
+# Without its stored zeros, as the dense method skips zeros, so a sparser prototype still fits.
+_copy_jac!(J::SparseMatrixCSC, A::_Banded) =
+    _copy_jac!(J, SparseArrays.dropzeros!(SparseMatrixCSC(A)))
 
 struct BandedJac{F, B}
     jac::F
@@ -7243,10 +7245,13 @@ _same_field(s, x, i) = fieldname(typeof(x), i) === :jac_prototype ?
 
 _pattern(J::SparseMatrixCSC) = (size(J), copy(J.colptr), J.rowval[1:SparseArrays.nnz(J)])
 _pattern(J::AbstractArray) = (typeof(J), size(J))
+# A Bidiagonal's type does not say which side its second band is on.
+_pattern(J::LinearAlgebra.Bidiagonal) = (typeof(J), size(J), J.uplo)
 _pattern(J) = _snap(J)
 _same_pattern(s, J::SparseMatrixCSC) = s isa Tuple{Tuple, Vector, Vector} &&
     s[1] == size(J) && s[2] == J.colptr && s[3] == view(J.rowval, 1:SparseArrays.nnz(J))
 _same_pattern(s, J::AbstractArray) = s == (typeof(J), size(J))
+_same_pattern(s, J::LinearAlgebra.Bidiagonal) = s == _pattern(J)
 _same_pattern(s, J) = _same(s, J)
 
 # An operator mass matrix or prototype can change in place behind an identical object.

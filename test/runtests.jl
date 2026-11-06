@@ -10253,6 +10253,28 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             gradient(
             SciMLBase.ODEFunction(rd!; jac = by_index(tri_jac!, T), jac_prototype = sparse(T)),
         )
+        lin!(du, u, p, t) = (mul!(du, p, u); nothing)
+        bi_jac!(J, u, p, t) = (J.dv .= p.dv; J.ev .= p.ev; nothing)
+        bi(p) = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(
+                lin!; jac = bi_jac!, jac_prototype = Bidiagonal(zeros(2), zeros(1), p.uplo),
+            ),
+            [1.0, 0.0], (0.0, 1.0), p,
+        )
+        sides = [Bidiagonal([-1.0, -1.0], [1.0], uplo) for uplo in (:L, :U)]
+        fixed(p) = SciMLBase.solve(bi(p), PETScDiffEq.TSRosW("theta1"); dt = 0.1, adaptive = false)
+        alone = [fixed(p).u for p in sides]
+        @test alone[2][end][2] == 0
+        @test PETScDiffEq.reusing(() -> [fixed(p).u for p in sides]) == alone
+        oop_band = SciMLBase.ODEFunction{false}(
+            (u, p, t) -> -u; jac = (u, p, t) -> Tridiagonal(zeros(2), -ones(3), zeros(2)),
+            jac_prototype = sparse(Diagonal(ones(3))),
+        )
+        sol = SciMLBase.solve(
+            SciMLBase.ODEProblem(oop_band, [1.0, 2.0, 3.0], (0.0, 1.0)),
+            PETScDiffEq.TSImplicit("bdf"),
+        )
+        @test sol.retcode == SciMLBase.ReturnCode.Success
     end
 
     @testset "Integrator interface" begin
