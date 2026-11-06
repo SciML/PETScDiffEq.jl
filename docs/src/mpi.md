@@ -270,9 +270,10 @@ sol = solve(prob, TSRK("5dp"; dm = da))
 sol_bdf = solve(prob, TSImplicit("bdf"; dm = da))
 ```
 
-PETSc.jl 0.4 takes the stencil width as the sixth argument instead,
-`PETSc.DMDA(petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), 1, 1)`, and so does
-its `PETSc.DMStag` below; 0.5 still takes that form, with a deprecation warning.
+PETSc.jl before 0.5.4 takes the stencil width as the sixth argument instead,
+`PETSc.DMDA(petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), 1, 1)`, and so
+does its `PETSc.DMStag` below; 0.5.4 and later still take that form, with a deprecation
+warning.
 
 With a `dm` the implicit algorithms need no `jac_prototype`. Their Jacobian is the DM's own
 matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil. Without a `jac` PETSc
