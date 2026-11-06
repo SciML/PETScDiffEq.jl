@@ -32,6 +32,11 @@ Solves from several threads, such as an `EnsembleThreads` ensemble, are safe but
 at a time: PETSc's options and MPI are shared by the whole process. Distributed ones are not,
 as the [MPI](@ref) section says.
 
-Finish or terminate every integrator you start. One dropped part way is released by a
-finalizer, and if that finalizer runs at process exit, after MPI has shut down, PETSc's
-own object finalizers print an MPI warning and the process exits non-zero.
+Finish or terminate every integrator you start. A serial one dropped part way is released
+by a finalizer, and if that finalizer runs at process exit, after MPI has shut down, PETSc's
+own object finalizers print an MPI warning and the process exits non-zero. One on a
+communicator of more than one rank has no finalizer, since freeing it is collective and the
+ranks' garbage collectors would not free it together. Dropped, it keeps its TS, vectors and
+matrices until the process exits, when every rank frees them in the order they were made, so
+run a distributed integrator to its end or call `terminate!` on it on every rank: a loop
+that drops them holds every one until exit.
