@@ -7210,11 +7210,13 @@ _same(s, x) = s === x || SciMLBase.unwrapped_f(s) === SciMLBase.unwrapped_f(x)
 
 # Only a prototype's structure reaches the setup, and solves may write values into it.
 # A SplitFunction's `_func_cache` is scratch for calling it whole, which the setup never does.
+# Initialization reads the problem it is given, at setup and on reuse alike.
+const _UNHELD_FIELDS = (:_func_cache, :initialization_data)
 _snap_field(x, i) = fieldname(typeof(x), i) === :jac_prototype ?
-    _pattern(getfield(x, i)) : fieldname(typeof(x), i) === :_func_cache ? nothing :
+    _pattern(getfield(x, i)) : fieldname(typeof(x), i) in _UNHELD_FIELDS ? nothing :
     _snap(getfield(x, i))
 _same_field(s, x, i) = fieldname(typeof(x), i) === :jac_prototype ?
-    _same_pattern(s, getfield(x, i)) : fieldname(typeof(x), i) === :_func_cache ||
+    _same_pattern(s, getfield(x, i)) : fieldname(typeof(x), i) in _UNHELD_FIELDS ||
     _same(s, getfield(x, i))
 
 _pattern(J::SparseMatrixCSC) = (size(J), copy(J.colptr), J.rowval[1:SparseArrays.nnz(J)])
