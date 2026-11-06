@@ -8357,8 +8357,18 @@ function _agreed_event(integ::PETScIntegrator, cb, k::Int)
     hits = findall(!iszero, view(seen, 2, :))
     isempty(hits) && return nothing
     j = hits[argmin([integ.tdir * seen[3, i] for i in hits])]
-    crossing = cb isa SciMLBase.VectorContinuousCallback ? Int8.(seen[4:end, j]) : seen[4, j]
-    return (oftype(integ.t, seen[3, j]), crossing)
+    t = oftype(integ.t, seen[3, j])
+    cb isa SciMLBase.VectorContinuousCallback || return (t, seen[4, j])
+    # Other ranks' roots within `_find_event`'s tolerance add their entries, earliest first.
+    crossing = zeros(Int8, m)
+    together = 10 * eps(t)
+    for i in sort(hits; by = i -> integ.tdir * seen[3, i])
+        integ.tdir * seen[3, i] <= integ.tdir * seen[3, j] + together || break
+        for r in 1:m
+            crossing[r] == 0 && (crossing[r] = seen[3 + r, i])
+        end
+    end
+    return (t, crossing)
 end
 
 _mark_fired!(ev, ::SciMLBase.ContinuousCallback, _, t) = (ev[1] = t; nothing)
