@@ -1535,6 +1535,20 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test forced.retcode == SciMLBase.ReturnCode.Success
         @test forced.t[end] == 1.0
         @test minimum(diff(forced.t)[1:(end - 1)]) >= 0.01
+        start = Ref(Inf)
+        outside = (u, p, t) -> t > start[] + 0.015
+        ramp = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 1.0; nothing), [0.0], (0.0, 1.0))
+        integ = SciMLBase.init(
+            ramp, PETScDiffEq.TSRK(); dt = 0.1, dtmin = 0.05, force_dtmin = true,
+            isoutofdomain = outside,
+        )
+        SciMLBase.step!(integ)
+        start[] = integ.t
+        integ.opts.dtmin = 0.01
+        SciMLBase.set_proposed_dt!(integ, 0.1)
+        SciMLBase.step!(integ)
+        @test integ.t - start[] ≈ 0.01
+        @test !outside(integ.u, nothing, integ.t)
 
         asked = Ref(0)
         SciMLBase.solve(
@@ -6551,6 +6565,26 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             found = downs()
             @test length(found) == 1 && abs(found[1] - 0.4) < 1.0e-12
             @test isempty(downs(abstol = 1.0e-2))
+        end
+
+        @testset "conditions whose product underflows are not a crossing" begin
+            tiny = SciMLBase.ODEProblem(decay!, [1.0e-170], (0.0, 1.0))
+            cb = SciMLBase.ContinuousCallback((u, t, integ) -> u[1], SciMLBase.terminate!)
+            sol = SciMLBase.solve(
+                tiny, PETScDiffEq.TSRK(); callback = cb, abstol = 1.0e-180, reltol = 1.0e-8,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success && sol.t[end] == 1.0
+            stop!(integ, _...) = SciMLBase.terminate!(integ)
+            flat = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> 1.0e-200, stop!; rootfind = SciMLBase.NoRootFind,
+            )
+            vcb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out .= (1.0e-200, 1.0); nothing), stop!, 2,
+            )
+            for c in (flat, vcb)
+                sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = c)
+                @test sol.retcode == SciMLBase.ReturnCode.Success && sol.t[end] == 2.0
+            end
         end
 
         @testset "an unsupported callback kind is rejected" begin
@@ -13221,6 +13255,36 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             none = SciMLBase.CallbackSet()
             @test grad(prob, TSRK("4"); callback = none) == reference
             @test grad(SciMLBase.remake(prob; callback = none), TSRK("4")) == reference
+        end
+
+        @testset "a tstops function is called as solve calls it" begin
+            prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+            t = [0.555, 1.0]
+            reference = grad(prob, TSRK("4"); t, tstops = [0.555])
+            called = []
+            stops(p, tspan) = (push!(called, (p, tspan)); [0.555])
+            @test grad(prob, TSRK("4"); t, tstops = stops) == reference
+            @test grad(SciMLBase.remake(prob; tstops = stops), TSRK("4"); t) == reference
+            @test called == [(p0, (0.0, 1.0)), (p0, (0.0, 1.0))]
+
+            stages = Float64[]
+            function logged!(du, u, p, t)
+                eltype(u) <: AbstractFloat && push!(stages, t)
+                return adj_f!(du, u, p, t)
+            end
+            logging = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(logged!; jac = adj_jac!, paramjac = adj_paramjac!),
+                u0, (0.0, 1.0), p0,
+            )
+            kw = (abstol = 1.0e-6, reltol = 1.0e-6, tstops = (p, tspan) -> [1.0e-4])
+            SciMLBase.solve(logging, TSRK("5dp"); kw..., dense = false, save_everystep = false)
+            taken = copy(stages)
+            empty!(stages)
+            PETScDiffEq._discrete_adjoint(
+                logging, TSRK("5dp"), PETScAdjoint(); t = [1.0], dgdu_discrete = half_norm_du!,
+                kw...,
+            )
+            @test stages == taken
         end
 
         @testset "cost times on the grid are found after many steps" begin
