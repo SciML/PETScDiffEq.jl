@@ -4932,18 +4932,22 @@ function _check_inttype(petsclib)
     return nothing
 end
 
+const PETSC_WITHOUT_MPI = Dict{String, Bool}()
+
 # Only a PETSc built without MPI exports MPIUNI_Memcpy, as PETSc_jll's Windows builds before
-# 3.25 do. On Windows such a build creates no PETSc object at all.
-_without_mpi(petsclib) =
+# 3.25 do. On Windows PETSc.jl fails to create any PETSc object with such a build.
+_without_mpi(petsclib) = get!(PETSC_WITHOUT_MPI, petsclib.petsc_library) do
     Libdl.dlsym_e(Libdl.dlopen(petsclib.petsc_library), :MPIUNI_Memcpy) != C_NULL
+end
 
 function _check_windows_mpi(petsclib)
     Sys.iswindows() && _without_mpi(petsclib) || return nothing
     throw(
         ArgumentError(
             "PETSc $(_petsc_version(petsclib)) is built without MPI, as Windows PETSc_jll " *
-                "is before 3.25, so it cannot create any PETSc object; PETSc_jll 3.25, " *
-                "the first Windows build with MPI, needs Julia 1.12 or newer",
+                "is before 3.25, and on Windows PETSc.jl fails to create any PETSc object " *
+                "with it; PETSc_jll 3.25, the first Windows build with MPI, needs Julia 1.12 " *
+                "or newer",
         ),
     )
 end
