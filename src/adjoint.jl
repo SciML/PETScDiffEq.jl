@@ -1385,6 +1385,8 @@ function _discrete_adjoint_unlocked(
             prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, g, dgdu_continuous,
             dgdp_continuous, comm, dm,
         )
+        stops = get(given, :tstops, ())
+        _late(stops) && (given = merge(given, (; tstops = stops(prob.p, prob.tspan))))
         for key in (:tstops, :d_discontinuities)
             _check_real(get(given, key, ()), key)
         end

@@ -13206,6 +13206,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test grad(SciMLBase.remake(prob; callback = none), TSRK("4")) == reference
         end
 
+        @testset "a tstops function is called as solve calls it" begin
+            prob = adj_prob(copy(u0), copy(p0), (0.0, 1.0))
+            t = [0.555, 1.0]
+            reference = grad(prob, TSRK("4"); t, tstops = [0.555])
+            called = []
+            stops(p, tspan) = (push!(called, (p, tspan)); [0.555])
+            @test grad(prob, TSRK("4"); t, tstops = stops) == reference
+            @test grad(SciMLBase.remake(prob; tstops = stops), TSRK("4"); t) == reference
+            @test called == [(p0, (0.0, 1.0)), (p0, (0.0, 1.0))]
+        end
+
         @testset "cost times on the grid are found after many steps" begin
             decay!(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
             prob = SciMLBase.ODEProblem(
