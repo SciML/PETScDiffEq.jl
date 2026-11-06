@@ -1535,6 +1535,20 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test forced.retcode == SciMLBase.ReturnCode.Success
         @test forced.t[end] == 1.0
         @test minimum(diff(forced.t)[1:(end - 1)]) >= 0.01
+        start = Ref(Inf)
+        outside = (u, p, t) -> t > start[] + 0.015
+        ramp = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = 1.0; nothing), [0.0], (0.0, 1.0))
+        integ = SciMLBase.init(
+            ramp, PETScDiffEq.TSRK(); dt = 0.1, dtmin = 0.05, force_dtmin = true,
+            isoutofdomain = outside,
+        )
+        SciMLBase.step!(integ)
+        start[] = integ.t
+        integ.opts.dtmin = 0.01
+        SciMLBase.set_proposed_dt!(integ, 0.1)
+        SciMLBase.step!(integ)
+        @test integ.t - start[] ≈ 0.01
+        @test !outside(integ.u, nothing, integ.t)
 
         asked = Ref(0)
         SciMLBase.solve(
