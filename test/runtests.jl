@@ -4666,6 +4666,41 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "a rejected TSRK step is tried again from the step's start" begin
+        cube = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = -u[1]^3; nothing), [1.0e3], (0.0, 1.0),
+        )
+        exact = 1 / sqrt(2 + 1.0e-6)
+        kw = (dt = 0.5, abstol = 1.0e-8, reltol = 1.0e-8)
+        for sub in ("3bs", "5dp")
+            alg = PETScDiffEq.TSRK(sub)
+            for sol in (
+                    SciMLBase.solve(cube, alg; kw...),
+                    SciMLBase.solve!(SciMLBase.init(cube, alg; kw...)),
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.stats.nreject > 0
+                @test abs(sol.u[end][1] - exact) < 1.0e-7
+            end
+        end
+        integ = SciMLBase.init(
+            cube, PETScDiffEq.TSRK("5dp"); kw..., dt = 1.0e-9, adaptive = false,
+        )
+        SciMLBase.step!(integ)
+        integ.opts.adaptive = true
+        SciMLBase.set_proposed_dt!(integ, 0.5)
+        @test abs(SciMLBase.solve!(integ).u[end][1] - exact) < 1.0e-7
+        stiffens = SciMLBase.ODEProblem(
+            (du, u, p, t) -> (du[1] = t < 0.5 ? -u[1] : -1.0e8 * u[1]^3; nothing), [1.0],
+            (0.0, 1.0),
+        )
+        sol = SciMLBase.solve(
+            stiffens, PETScDiffEq.TSRK("5f"); abstol = 1.0e-6, reltol = 1.0e-6, tstops = [0.5],
+        )
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        @test abs(sol.u[end][1] - 1.0e-4) < 5.0e-6
+    end
+
     @testset "the standard DiffEqCallbacks work" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         faster = SciMLBase.ODEProblem((du, u, p, t) -> (du[1] = -2u[1]; nothing), [1.0], (0.0, 1.0))
