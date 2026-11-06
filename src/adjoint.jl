@@ -1409,7 +1409,7 @@ function _discrete_adjoint_unlocked(
         (
             cost_t, skip_start, np, dgdp_discrete === nothing, prob.f.jac === nothing,
             prob.f.paramjac === nothing, is_split && prob.f.f2.jac === nothing,
-            is_split && prob.f.f2.paramjac === nothing, tstops, jumps, integral,
+            is_split && prob.f.f2.paramjac === nothing, tstops, late, jumps, integral,
         ),
     )
 
