@@ -393,6 +393,27 @@ crossing_last_row(idx, level) =
         end
     end
 
+    @testset "a vector callback's simultaneous crossings on different ranks" begin
+        decay(n) = ODEProblem((du, u, p, t) -> (du .= -u; nothing), ones(n), (0.0, 1.0))
+        for rootfind in (SciMLBase.LeftRootFind, SciMLBase.NoRootFind)
+            events = Tuple{Float64, Vector{Int8}}[]
+            affect!(i, mask) = push!(events, (i.t, copy(mask)))
+            own_row(out, u, t, i) = (out .= 1.0; out[rank + 1] = u[1] - 0.5; nothing)
+            cb = VectorContinuousCallback(own_row, affect!, nranks; rootfind)
+            solve(decay(1), TSRK("5dp"; comm); callback = cb, tol...)
+            got = copy(events)
+            @test same_everywhere(got)
+            if rank == 0
+                empty!(events)
+                all_rows(out, u, t, i) = (out .= u .- 0.5; nothing)
+                cb = VectorContinuousCallback(all_rows, affect!, nranks; rootfind)
+                solve(decay(nranks), TSRK("5dp"); callback = cb, tol...)
+                @test last.(got) == last.(events) == [fill(Int8(-1), nranks)]
+                @test maximum(abs, first.(got) - first.(events)) <= ROUNDOFF
+            end
+        end
+    end
+
     @testset "saveat and terminate! with callbacks" begin
         for (alg, serial_alg) in algorithm_pairs()
             sol, ref = against_serial(alg, serial_alg) do idx, a
