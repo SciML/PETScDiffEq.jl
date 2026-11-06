@@ -8266,9 +8266,9 @@ end
 function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
     return (
         (prev < 0 && cb.affect! !== nothing) || (prev > 0 && cb.affect_neg! !== nothing)
-    ) && prev * next <= 0
+    ) && sign(prev) * sign(next) <= 0
 end
-_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev * next <= 0
+_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && sign(prev) * sign(next) <= 0
 
 function _event_root(integ::PETScIntegrator, cb, lo, hi, i::Int, buf)
     condition(t, _) = _fill_conditions!(buf, integ, cb, t)[i]
