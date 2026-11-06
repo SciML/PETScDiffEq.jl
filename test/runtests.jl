@@ -10096,6 +10096,38 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
     end
 
+    @testset "an option PETSc never reads is named once the solve ends" begin
+        lv!(du, u, p, t) = (du[1] = 1.5u[1] - u[1] * u[2]; du[2] = -3u[2] + u[1] * u[2]; nothing)
+        prob = SciMLBase.ODEProblem(lv!, [1.0, 1.0], (0.0, 5.0))
+        unread(name) = (:warn, r"^PETSc never read " * name * r" from `petsc_options`")
+        quiet(f) = @test_logs min_level = Logging.Warn f()
+        rk(o) = PETScDiffEq.TSRK("5dp", o)
+        typo = ["-ts_adapt_dtmax", "0.01"]
+        sol = @test_logs unread("-ts_adapt_dtmax") SciMLBase.solve(prob, rk(typo))
+        @test sol.t == SciMLBase.solve(prob, rk(String[])).t
+        quiet(() -> SciMLBase.solve(prob, rk(["-ts_adapt_dt_max", "0.01"])))
+        quiet(() -> SciMLBase.solve(prob, rk(["-options_left"])))
+        # PETSc 3.25 reads -ts_dt by moving it to its new name, -ts_time_step.
+        renamed = ["-options_suppress_deprecated_warnings", "-ts_dt", "0.1"]
+        quiet(() -> SciMLBase.solve(prob, rk(renamed)))
+        # PETSc reads a type's options only when it runs that type.
+        @test_logs unread("-ts_rosw_type") SciMLBase.solve(prob, rk(["-ts_rosw_type", "2p"]))
+        @test_logs unread("-ts_adapt_dtmax, -ts_rk_typ") SciMLBase.solve(
+            prob, rk([typo; "-ts_rk_typ"; "3"]),
+        )
+        # Block Jacobi reads its sub-solver's options inside the solve.
+        bjacobi = ["-pc_type", "bjacobi", "-sub_pc_type", "ilu"]
+        quiet(() -> SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf", bjacobi)))
+        integ = SciMLBase.init(prob, rk(typo))
+        @test_logs unread("-ts_adapt_dtmax") SciMLBase.solve!(integ)
+        @test_logs unread("-ts_adapt_dtmax") SciMLBase.solve(prob, rk(typo); tstops = [2.5])
+        # Once per solve would be once per trajectory.
+        ensemble = SciMLBase.EnsembleProblem(prob)
+        @test_logs unread("-ts_adapt_dtmax") SciMLBase.solve(
+            ensemble, rk(typo), SciMLBase.EnsembleSerial(); trajectories = 3,
+        )
+    end
+
     @testset "a banded jac_prototype's default LU" begin
         n = 32
         function brusselator!(du, x, p, t)

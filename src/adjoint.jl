@@ -1659,6 +1659,7 @@ function _discrete_adjoint_unlocked(
                     (ex === nothing || ex.err === nothing) && rethrow()
             end
             _throw_callback_error(ctx, adj, comm, q, ex)
+            _warn_unread_options(h)
             reason = LibPETSc.TSGetConvergedReason(pl, ts)
             reason == LibPETSc.TS_CONVERGED_ITS || throw(
                 ArgumentError(

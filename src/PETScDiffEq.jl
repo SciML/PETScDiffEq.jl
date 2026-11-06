@@ -7058,6 +7058,46 @@ const _VIEWER_WORDS = (
 _viewer_option(opt) = startswith(opt, "-") &&
     any(w -> occursin(w, lowercase(first(split(opt[2:end], "=")))), _VIEWER_WORDS)
 
+# PETSc reads these from its global options alone, or only beside a deprecated name.
+const _UNREAD_OPTIONS = ("options_left", "options_suppress_deprecated_warnings")
+
+# PETSc drops a name it does not know without a word, and `-options_left` reports only on its
+# global options, so once the solve has read what it reads the user's unread ones are named.
+function _warn_unread_options(h::TSHandles)
+    (h.opts === nothing || h.destroyed) && return nothing
+    pl, n = h.petsclib, Ref{_PetscInt}(0)
+    names, values = Ref{Ptr{Ptr{Cchar}}}(C_NULL), Ref{Ptr{Ptr{Cchar}}}(C_NULL)
+    # PETSc replaces a deprecated name it reads with the new one, so only held names count.
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscOptionsLeftGet), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{_PetscInt}, Ptr{Ptr{Ptr{Cchar}}}, Ptr{Ptr{Ptr{Cchar}}}),
+            h.opts.ptr, n, names, values,
+        ),
+    )
+    left = Set(lowercase(unsafe_string(unsafe_load(names[], i))) for i in 1:n[])
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscOptionsLeftRestore), LibPETSc.PetscErrorCode,
+            (Ptr{Cvoid}, Ptr{_PetscInt}, Ptr{Ptr{Ptr{Cchar}}}, Ptr{Ptr{Ptr{Cchar}}}),
+            h.opts.ptr, n, names, values,
+        ),
+    )
+    unread = String[]
+    for key in keys(PETSc.parse_options(h.user_options))
+        name = String(key)
+        key = lowercase(name)
+        key in left && !(key in _UNREAD_OPTIONS) && push!(unread, "-" * name)
+    end
+    isempty(unread) && return nothing
+    list = join(sort!(unread), ", ")
+    it = length(unread) == 1 ? "it" : "they"
+    @warn "PETSc never read $list from `petsc_options`, so $it had no effect on this " *
+        "solve; PETSc ignores a name it does not know, and the options of a type or " *
+        "object the solve does not use" maxlog = 1 _id = Symbol(:unread, list)
+    return nothing
+end
+
 # Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
 function _with_options(f::F, h::TSHandles) where {F}
     push!(h.opts)
@@ -7334,6 +7374,7 @@ function _solve_unlocked(
         end
         _throw_if_threw!(ctx)
         failure === nothing || throw(failure)
+        _warn_unread_options(h)
         h.stopped == 0 || _warn_failed_step(alg, h.stopped, verbose)
         ctx.stalled && _stalled!(h, alg, _user_t(h.tdir, ctx.end_s), verbose)
         # PETSc sets the solve time only when TSSolve returns normally, and a step that
@@ -9069,6 +9110,7 @@ function _finish!(integ::PETScIntegrator, retcode = nothing)
             cb.finalize(cb, integ.u, integ.t, integ)
         end
     end
+    _warn_unread_options(h)
     st = _read_stats(h)
     integ.iter = st.iter
     s = integ.tdir * integ.t
