@@ -1386,14 +1386,14 @@ function _discrete_adjoint_unlocked(
             dgdp_continuous, comm, dm,
         )
         stops = get(given, :tstops, ())
-        _late(stops) && (given = merge(given, (; tstops = stops(prob.p, prob.tspan))))
-        for key in (:tstops, :d_discontinuities)
-            _check_real(get(given, key, ()), key)
-        end
+        _late(stops) || _check_real(stops, :tstops)
+        _check_real(get(given, :d_discontinuities, ()), :d_discontinuities)
         given, checked, Bool(no_start)
     end
     R = first(_eltypes(prob))
-    tstops = _times(R, get(solve_kwargs, :tstops, ()))
+    given_stops = get(solve_kwargs, :tstops, ())
+    late = _late(given_stops)
+    tstops = late ? R[] : _times(R, given_stops)
     jumps = _times(R, get(solve_kwargs, :d_discontinuities, ()))
     solve_kwargs = Base.structdiff(solve_kwargs, NamedTuple{(:tstops, :d_discontinuities)})
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
@@ -1428,6 +1428,16 @@ function _discrete_adjoint_unlocked(
     adj, q, ex = nothing, nothing, nothing
     local du0, dp
     try
+        # `solve` calls a tstops function once set up, so its first step is estimated without them.
+        if late
+            tstops = _checked_everywhere(comm) do
+                given = given_stops(ctx.p, prob.tspan)
+                _check_real(given, :tstops)
+                _times(R, given)
+            end
+            comm === nothing || _check_agreement(comm, (tstops,))
+            stopping = !isempty(tstops) || !isempty(jumps)
+        end
         cost_s = h.tdir .* cost_t
         implicit, arkimex, adaptive = _check_adjoint_ts(h, alg, integral, is_split)
         is_split && comm !== nothing && dm === nothing && _checked_everywhere(comm) do
