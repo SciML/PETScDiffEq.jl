@@ -8817,6 +8817,23 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test SciMLBase.solve!(integ).t ≈ [0.0, 0.25, 0.5, 0.6, 0.75, 1.0]
         end
 
+        @testset "add_saveat! of a time already queued saves it again, as OrdinaryDiffEq does" begin
+            ramp!(du, u, p, t) = (du[1] = 1.0; nothing)
+            for (tspan, saveat, added, want) in (
+                    ((0.0, 1.0), [0.0, 0.5, 1.0], 0.0, [0.0, 0.0, 0.5, 1.0]),
+                    ((0.0, 1.0), [0.0, 0.5, 1.0], -0.0, [0.0, -0.0, 0.5, 1.0]),
+                    ((0.0, 1.0), [0.0, 0.5, 1.0], 0.5, [0.0, 0.5, 0.5, 1.0]),
+                    ((1.0, 0.0), [1.0, 0.5, 0.0], 1.0, [1.0, 1.0, 0.5, 0.0]),
+                )
+                ramp = SciMLBase.ODEProblem(ramp!, [0.0], tspan)
+                dt = 0.1 * sign(tspan[2] - tspan[1])
+                integ = SciMLBase.init(ramp, alg; dt, saveat)
+                SciMLBase.add_saveat!(integ, added)
+                sol = SciMLBase.solve!(integ)
+                @test sol.t == want && sol.u ≈ [[t - tspan[1]] for t in want]
+            end
+        end
+
         @testset "save_on = false leaves callbacks and savevalues! nothing to save" begin
             doubled = SciMLBase.DiscreteCallback(
                 (u, t, integ) -> false, integ -> nothing;

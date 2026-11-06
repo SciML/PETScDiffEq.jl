@@ -8009,8 +8009,8 @@ function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
     s = integ.tdir * t
     s < integ.tdir * integ.t &&
         throw(ArgumentError("cannot add a saveat at $t, behind the current time $(integ.t)"))
-    i = searchsortedfirst(ctx.saveat, s)
-    (i <= length(ctx.saveat) && ctx.saveat[i] == s) || insert!(ctx.saveat, i, s)
+    i = searchsortedlast(ctx.saveat, s; lt = <) + 1
+    insert!(ctx.saveat, i, s)
     i < ctx.saveat_idx && (ctx.saveat_idx += 1)
     return nothing
 end
