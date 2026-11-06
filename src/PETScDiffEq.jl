@@ -8009,8 +8009,8 @@ function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
     s = integ.tdir * t
     s < integ.tdir * integ.t &&
         throw(ArgumentError("cannot add a saveat at $t, behind the current time $(integ.t)"))
-    i = searchsortedfirst(ctx.saveat, s)
-    (i <= length(ctx.saveat) && ctx.saveat[i] == s) || insert!(ctx.saveat, i, s)
+    i = searchsortedlast(ctx.saveat, s; lt = <) + 1
+    insert!(ctx.saveat, i, s)
     i < ctx.saveat_idx && (ctx.saveat_idx += 1)
     return nothing
 end
@@ -8266,9 +8266,9 @@ end
 function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
     return (
         (prev < 0 && cb.affect! !== nothing) || (prev > 0 && cb.affect_neg! !== nothing)
-    ) && prev * next <= 0
+    ) && sign(prev) * sign(next) <= 0
 end
-_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev * next <= 0
+_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && sign(prev) * sign(next) <= 0
 
 function _event_root(integ::PETScIntegrator, cb, lo, hi, i::Int, buf)
     condition(t, _) = _fill_conditions!(buf, integ, cb, t)[i]
@@ -8630,8 +8630,8 @@ function _reject_step!(integ::PETScIntegrator, before, outer, taken)
     _write_state!(h, integ.u)
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
-    floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
-    forced = get(integ.kwargs, :force_dtmin, false) === true
+    floor = abs(getfield(integ.opts, :dtmin))
+    forced = getfield(integ.opts, :force_dtmin)
     dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, code)
     if dt === nothing || _attempts(ctx, pl, h.ts) >= ctx.maxiters
         dt === nothing && code != 0 && _warn_failed_step(integ.alg, code, integ.opts.verbose)
