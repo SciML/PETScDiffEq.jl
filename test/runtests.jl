@@ -6553,6 +6553,26 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test isempty(downs(abstol = 1.0e-2))
         end
 
+        @testset "conditions whose product underflows are not a crossing" begin
+            tiny = SciMLBase.ODEProblem(decay!, [1.0e-170], (0.0, 1.0))
+            cb = SciMLBase.ContinuousCallback((u, t, integ) -> u[1], SciMLBase.terminate!)
+            sol = SciMLBase.solve(
+                tiny, PETScDiffEq.TSRK(); callback = cb, abstol = 1.0e-180, reltol = 1.0e-8,
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success && sol.t[end] == 1.0
+            stop!(integ, _...) = SciMLBase.terminate!(integ)
+            flat = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> 1.0e-200, stop!; rootfind = SciMLBase.NoRootFind,
+            )
+            vcb = SciMLBase.VectorContinuousCallback(
+                (out, u, t, integ) -> (out .= (1.0e-200, 1.0); nothing), stop!, 2,
+            )
+            for c in (flat, vcb)
+                sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, callback = c)
+                @test sol.retcode == SciMLBase.ReturnCode.Success && sol.t[end] == 2.0
+            end
+        end
+
         @testset "an unsupported callback kind is rejected" begin
             struct OddCallback <: SciMLBase.AbstractContinuousCallback end
             @test_throws ArgumentError SciMLBase.solve(
