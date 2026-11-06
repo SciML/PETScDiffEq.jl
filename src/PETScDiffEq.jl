@@ -4932,6 +4932,20 @@ function _check_inttype(petsclib)
     return nothing
 end
 
+# PETSc_jll's Windows builds before 3.25 have no MPI, so PETSc creates no object at all.
+function _check_windows_mpi(petsclib)
+    Sys.iswindows() || return nothing
+    version = _petsc_version(petsclib)
+    version < v"3.25" && throw(
+        ArgumentError(
+            "PETSc $version, from a Windows PETSc_jll older than 3.25, is built without " *
+                "MPI, so it cannot create any PETSc object; PETSc_jll 3.25, the first " *
+                "Windows build with MPI, needs Julia 1.12 or newer",
+        ),
+    )
+    return nothing
+end
+
 # TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
 # No limit has to be PETSc's own largest count, which is wider than `Int` on 32-bit.
 _maxsteps(maxiters) = maxiters == typemax(Int) ? typemax(LibPETSc.PetscInt) :
@@ -6269,6 +6283,7 @@ function _setup(
     comm === nothing && dm === nothing && _check_square(prob.f.jac_prototype, n)
     petsclib = _petsclib(S)
     _check_inttype(petsclib)
+    _check_windows_mpi(petsclib)
     PETScCompat.isinitialized(petsclib) || PETSc.initialize(petsclib)
     _arm_exit_cleanup!(petsclib)
     if dm !== nothing

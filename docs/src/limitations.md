@@ -17,6 +17,10 @@ vectors for its velocity and position.
 On 32-bit Julia, use Julia 1.10, or add `PETSc_jll = "~3.22"` to your own compat: PETSc_jll
 3.25 has no 32-bit builds, and newer Julia versions would otherwise resolve it.
 
+On Windows, use Julia 1.12 or newer. Julia 1.10 and 1.11 resolve PETSc_jll 3.22, whose
+Windows build has no MPI and cannot create any PETSc object, so there every solve raises an
+`ArgumentError` that says so.
+
 On 32-bit x86, PETSc 3.22 fails a consistency check of its own when it shortens the last
 steps to land on a stop or on the final time, which ended long spans in `PetscError(77)`.
 There this package has PETSc step over the final time and applies PETSc's rule for those
