@@ -300,10 +300,10 @@ version = "1.16.0"
 
 [[deps.DifferentiationInterface]]
 deps = ["ADTypes", "LinearAlgebra"]
-git-tree-sha1 = "0693d8b0a4608ff289d228ab4c598df5894845cd"
+git-tree-sha1 = "4b6690f3770daf596a0a092203a2e6130d34c53b"
 registries = "General"
 uuid = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
-version = "0.7.21"
+version = "0.7.22"
 
     [deps.DifferentiationInterface.extensions]
     DifferentiationInterfaceChainRulesCoreExt = "ChainRulesCore"
@@ -966,7 +966,7 @@ version = "0.5.6"
 deps = ["ADTypes", "ConstructionBase", "DiffEqBase", "DifferentiationInterface", "ForwardDiff", "Libdl", "LinearAlgebra", "MPI", "PETSc", "PETSc_jll", "PrecompileTools", "SciMLBase", "SciMLLogging", "SciMLOperators", "SparseArrays", "SparseMatrixColorings", "SymbolicIndexingInterface"]
 path = "/home/runner/_work/PETScDiffEq.jl/PETScDiffEq.jl"
 uuid = "0a65194f-a16f-47d0-900e-080c22068669"
-version = "0.14.10"
+version = "0.14.13"
 
     [deps.PETScDiffEq.extensions]
     PETScDiffEqSciMLSensitivityExt = ["SciMLSensitivity", "ChainRulesCore"]
@@ -977,10 +977,10 @@ version = "0.14.10"
 
 [[deps.PETSc_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "HDF5_jll", "HYPRE64_jll", "HYPRE_jll", "JLLWrappers", "Libdl", "MPIABI_jll", "MPICH_jll", "MPIPreferences", "MPItrampoline_jll", "MUMPS_jll", "MicrosoftMPI_jll", "OpenBLAS32_jll", "OpenBLAS_jll", "OpenMPI_jll", "SuiteSparse_jll", "SuperLU_DIST_jll", "TOML", "TetGen_jll", "Triangle_jll", "libblastrampoline_jll", "mpif_jll"]
-git-tree-sha1 = "c0856b11a18327f5c5f8a096a9a6ba26561c0950"
+git-tree-sha1 = "644d33d4b827f1f58abeeceeff6bfd1a1d7b05a0"
 registries = "General"
 uuid = "8fa3689e-f0b9-5420-9873-adf6ccf46f2d"
-version = "3.25.4+0"
+version = "3.25.6+0"
 
 [[deps.Parsers]]
 deps = ["Dates", "PrecompileTools"]
@@ -1387,10 +1387,10 @@ version = "7.10.1+0"
 
 [[deps.SuperLU_DIST_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LLVMOpenMP_jll", "Libdl", "METIS_jll", "MPIABI_jll", "MPICH_jll", "MPIPreferences", "MPItrampoline_jll", "MicrosoftMPI_jll", "OpenBLAS32_jll", "OpenMPI_jll", "PARMETIS_jll", "TOML", "libblastrampoline_jll"]
-git-tree-sha1 = "d6b19f58aa66f7c76dc46d9f81284f50c69386c1"
+git-tree-sha1 = "3d247f9be22ba9b1c2ca28ca139b9b9c85be7769"
 registries = "General"
 uuid = "9a1356b0-3c82-5da3-b77c-7c198e8bd7ab"
-version = "9.2.3+0"
+version = "9.3.2+0"
 
 [[deps.SymbolicIndexingInterface]]
 deps = ["Accessors", "ArrayInterface", "PrecompileTools", "RuntimeGeneratedFunctions", "StaticArraysCore"]
