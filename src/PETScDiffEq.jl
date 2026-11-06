@@ -8620,8 +8620,8 @@ function _reject_step!(integ::PETScIntegrator, before, outer, taken)
     _write_state!(h, integ.u)
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
-    floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
-    forced = get(integ.kwargs, :force_dtmin, false) === true
+    floor = abs(getfield(integ.opts, :dtmin))
+    forced = getfield(integ.opts, :force_dtmin)
     dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, code)
     if dt === nothing || _attempts(ctx, pl, h.ts) >= ctx.maxiters
         dt === nothing && code != 0 && _warn_failed_step(integ.alg, code, integ.opts.verbose)
