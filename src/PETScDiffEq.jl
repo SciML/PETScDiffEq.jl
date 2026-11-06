@@ -7083,14 +7083,15 @@ function _warn_unread_options(h::TSHandles)
             h.opts.ptr, n, names, values,
         ),
     )
-    unread = String[]
-    for key in keys(PETSc.parse_options(h.user_options))
-        name = String(key)
-        key = lowercase(name)
-        key in left && !(key in _UNREAD_OPTIONS) && push!(unread, "-" * name)
-    end
+    given = sort!([String(key) for key in keys(PETSc.parse_options(h.user_options))])
+    filter!(name -> !(lowercase(name) in _UNREAD_OPTIONS), given)
+    here = [lowercase(name) in left for name in given]
+    # A rank outside a sub-communicator, as telescope's, never reads that solver's options.
+    comm = h.ctx.comm
+    flags = comm === nothing ? here : MPI.Allreduce(here, &, comm)
+    unread = ["-" * name for (name, f) in zip(given, flags) if f]
     isempty(unread) && return nothing
-    list = join(sort!(unread), ", ")
+    list = join(unread, ", ")
     it = length(unread) == 1 ? "it" : "they"
     @warn "PETSc never read $list from `petsc_options`, so $it had no effect on this " *
         "solve; PETSc ignores a name it does not know, and the options of a type or " *
