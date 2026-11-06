@@ -7055,8 +7055,8 @@ const _VIEWER_WORDS = (
     "eigenvalues", "singularvalues", "residual", "draw", "saws", "display", "plot", "help",
     "adapt_error", "extrude", "forest",
 )
-_viewer_option(opt) = startswith(opt, "-") &&
-    any(w -> occursin(w, lowercase(first(split(opt[2:end], "=")))), _VIEWER_WORDS)
+_viewer_option(opt) =
+    startswith(opt, "-") && (name = _option_name(opt); any(w -> occursin(w, name), _VIEWER_WORDS))
 
 # Block Jacobi and SNES's colouring read their options when first set up, inside the solve.
 function _with_options(f::F, h::TSHandles) where {F}
