@@ -8292,6 +8292,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         plane = PETSc.DMStag(pl, MPI.COMM_SELF, (open_edge, open_edge), (2, 2), (0, 1, 1), 1)
         index = collect(1.0:16.0)
         a = on_grid(index, plane)
+        # PETSc.jl 0.5 gives a DMStag a type of its own, from which the array's type follows.
+        PETScDiffEq.PETScCompat.V05 &&
+            @test @inferred(on_grid(index, plane)) isa PETScDiffEq.StagArray
         @test [a[loc, 1, 1, 1] for loc in (DOWN, LEFT, ELEM)] == [1, 2, 3]
         @test a[RIGHT, 1, 1, 1] == a[LEFT, 1, 2, 1] == 5
         @test a[LEFT, 1, 3, 1] == 7
@@ -8581,6 +8584,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test stratum(squares, 2) == 0:3
         @test stratum(squares, 0) == 4:12
         a = on_mesh(collect(1.0:17.0), squares)
+        PETScDiffEq.PETScCompat.V05 &&
+            @test @inferred(on_mesh(collect(1.0:17.0), squares)) isa PETScDiffEq.PlexArray
         @test (a[1, 0], a[2, 0], a[2, 3]) == (1, 2, 8)
         @test (a[1, 4], a[1, 12]) == (9, 17)
         @test checkbounds(Bool, a, 2, 3)

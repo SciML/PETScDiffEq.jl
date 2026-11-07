@@ -1187,6 +1187,8 @@ function reshape_local_array(x, dm)
 end
 @static if PETScCompat.V05
     reshape_local_array(x, dm::PETSc.DMDA) = PETScCompat.reshape_local_array(x, dm)
+    reshape_local_array(x, dm::PETSc.DMStag) = _stag_array(x, dm)
+    reshape_local_array(x, dm::PETSc.DMPlex) = _plex_array(x, dm)
 end
 
 # LibPETSc.PetscInt is a non-constant global, slow to convert to in a hot ccall.

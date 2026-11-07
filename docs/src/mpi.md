@@ -240,9 +240,13 @@ and the Jacobian, the state is scattered into a local vector from `DMGetLocalVec
 points within the stencil width. `du` is the owned block. `PETScDiffEq.reshape_local_array(x, dm)`
 views either one by grid point in global numbering, as `x[c, i]` on a 1-D grid and `x[c, i, j]`
 on a 2-D one, where `c` is the degree of freedom at the point. It is PETSc.jl's
-`reshape_local_array`, which PETSc.jl 0.4 calls `reshapelocalarray`. With `DM_BOUNDARY_GHOSTED`
-the ghost points past the edge of the grid read zero, so this heat equation is zero at both
-ends:
+`reshape_local_array`, which PETSc.jl 0.4 calls `reshapelocalarray`. `f` hands both arrays to
+a function of its own that runs the loop: on PETSc.jl 0.4 every DM has the one Julia type
+`PetscDM`, from which Julia cannot tell what array `reshape_local_array` returns, and a loop in
+`f` itself, like one that reads a global such as `dx`, would look up every index at run time,
+which made a 2-D form of this heat equation on 64 by 64 points 30 times slower. With
+`DM_BOUNDARY_GHOSTED` the ghost points past the edge of the grid read zero, so this heat
+equation is zero at both ends:
 
 ```julia
 using MPI, PETScDiffEq, SciMLBase
@@ -253,11 +257,12 @@ petsclib = PETSc.getlib(; PetscScalar = Float64)
 PETSc.initialize(petsclib)
 N = 64
 dx = 1 / (N + 1)
-da = PETSc.DMDA(petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), 1, 1)
+da = PETSc.DMDA(petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), 1; stencil_width = 1)
 
-function heat!(du, u, da, t)
-    U = PETScDiffEq.reshape_local_array(u, da)
-    D = PETScDiffEq.reshape_local_array(du, da)
+heat!(du, u, da, t) =
+    laplacian!(PETScDiffEq.reshape_local_array(du, da), PETScDiffEq.reshape_local_array(u, da), dx)
+
+function laplacian!(D, U, dx)
     for i in axes(D, 2)
         D[1, i] = (U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2
     end
@@ -268,6 +273,11 @@ prob = ODEProblem(heat!, sinpi.((xs .+ (1:xm)) .* dx), (0.0, 0.1), da)
 sol = solve(prob, TSRK("5dp"; dm = da))
 sol_bdf = solve(prob, TSImplicit("bdf"; dm = da))
 ```
+
+PETSc.jl before 0.5.4 takes the stencil width as the sixth argument instead,
+`PETSc.DMDA(petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), 1, 1)`, and so
+does its `PETSc.DMStag` below; 0.5.4 and later still take that form, with a deprecation
+warning.
 
 With a `dm` the implicit algorithms need no `jac_prototype`. Their Jacobian is the DM's own
 matrix from `DMCreateMatrix`, whose pattern comes from the DM's stencil. Without a `jac` PETSc
@@ -339,12 +349,15 @@ the stencil width and `DMSTAG_STENCIL_BOX`, PETSc.jl's default, the diagonal one
 with fluxes on the vertices, zero at both ends, and pressures in the cells:
 
 ```julia
-stag = PETSc.DMStag(petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), (1, 1), 1)
-LEFT, RIGHT, CELL = LibPETSc.DMSTAG_LEFT, LibPETSc.DMSTAG_RIGHT, LibPETSc.DMSTAG_ELEMENT
+stag = PETSc.DMStag(
+    petsclib, MPI.COMM_WORLD, (LibPETSc.DM_BOUNDARY_GHOSTED,), (N,), (1, 1); stencil_width = 1,
+)
+const LEFT, RIGHT, CELL = LibPETSc.DMSTAG_LEFT, LibPETSc.DMSTAG_RIGHT, LibPETSc.DMSTAG_ELEMENT
 
-function wave!(du, u, stag, t)
-    U = PETScDiffEq.reshape_local_array(u, stag)
-    D = PETScDiffEq.reshape_local_array(du, stag)
+wave!(du, u, stag, t) =
+    wave_grid!(PETScDiffEq.reshape_local_array(du, stag), PETScDiffEq.reshape_local_array(u, stag), N)
+
+function wave_grid!(D, U, N)
     for i in axes(D, 1)
         D[LEFT, 1, i] = i == 1 || i == N + 1 ? 0.0 : (U[CELL, 1, i - 1] - U[CELL, 1, i]) * N
         i <= N && (D[CELL, 1, i] = (U[LEFT, 1, i] - U[RIGHT, 1, i]) * N)
@@ -425,8 +438,12 @@ for v in owned
     U0[1, v] = sinpi(v / 10)
 end
 
-function rd!(du, u, dm, t)
-    U, D = PETScDiffEq.reshape_local_array(u, dm), PETScDiffEq.reshape_local_array(du, dm)
+rd!(du, u, dm, t) = rd_mesh!(
+    PETScDiffEq.reshape_local_array(du, dm), PETScDiffEq.reshape_local_array(u, dm),
+    owned, neighbours,
+)
+
+function rd_mesh!(D, U, owned, neighbours)
     for v in owned
         D[1, v] = 256 * sum(U[1, w] - U[1, v] for w in neighbours[v]) - U[1, v]^3
     end
@@ -498,13 +515,8 @@ that. Both build their Jacobian only so: the DM's matrix holds one half of the s
 is `PETScAdjoint`. The wave equation on the DMDA above:
 
 ```julia
-function wave!(ddu, du, u, da, t)
-    U = PETScDiffEq.reshape_local_array(u, da)
-    D = PETScDiffEq.reshape_local_array(ddu, da)
-    for i in axes(D, 2)
-        D[1, i] = (U[1, i - 1] - 2U[1, i] + U[1, i + 1]) / dx^2
-    end
-end
+wave!(ddu, du, u, da, t) =
+    laplacian!(PETScDiffEq.reshape_local_array(ddu, da), PETScDiffEq.reshape_local_array(u, da), dx)
 
 u0 = sinpi.((xs .+ (1:xm)) .* dx)
 prob = SecondOrderODEProblem(wave!, zero(u0), u0, (0.0, 1.0), da)
