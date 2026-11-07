@@ -7204,8 +7204,8 @@ const _VIEWER_WORDS = (
     "eigenvalues", "singularvalues", "residual", "draw", "saws", "display", "plot", "help",
     "adapt_error", "extrude", "forest",
 )
-_viewer_option(opt) = startswith(opt, "-") &&
-    any(w -> occursin(w, lowercase(first(split(opt[2:end], "=")))), _VIEWER_WORDS)
+_viewer_option(opt) =
+    startswith(opt, "-") && (name = _option_name(opt); any(w -> occursin(w, name), _VIEWER_WORDS))
 
 # PETSc reads these from its global options alone, or only beside a deprecated name.
 const _UNREAD_OPTIONS = ("options_left", "options_suppress_deprecated_warnings")

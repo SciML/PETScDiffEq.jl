@@ -876,8 +876,9 @@ const _ADJOINT_REFUSED_KWARGS = (
 const _ADJOINT_OWNED_KWARGS =
     (:saveat, :save_everystep, :save_start, :save_end, :dense, :extra_options, :sensealg)
 
-_names_option(opt, name) =
-    startswith(opt, "-") && lowercase(first(split(opt[2:end], "="))) == name
+_option_name(opt) = (i = findfirst('=', opt);
+    lowercase(SubString(opt, 2, i === nothing ? lastindex(opt) : prevind(opt, i))))
+_names_option(opt, name) = startswith(opt, "-") && _option_name(opt) == name
 
 _unset(v) = _no_callback(v) || ((v isa Tuple || v isa AbstractArray) && isempty(v))
 
