@@ -18,7 +18,11 @@ so pass `TSImplicit("bdf"; order = 5)` when comparing against a higher-order met
 command-line style tokens passed to PETSc for that solve, which are parsed after the
 options this package sets and so take precedence. So `-ts_atol` and `-ts_rtol` replace
 `abstol` and `reltol`, a vector of either included, wherever the solve uses a tolerance and
-in `integrator.opts`, as `-ts_max_steps` replaces `maxiters`.
+in `integrator.opts`, as `-ts_max_steps` replaces `maxiters`. PETSc ignores a name it does not
+know, and the options of a type or object the solve does not use, such as `-ts_rosw_type` in
+`TSRK`, so once a solve or an integrator ends, a warning names those PETSc never read, once
+for each such set of names. `-options_left` has no effect in `petsc_options`, since PETSc reads
+it from its global options alone.
 
 Only `TSARKIMEX` treats the two parts of a `SplitODEProblem` differently. The other solvers
 that take an `ODEProblem` take a `SplitODEProblem` as the sum of its parts.

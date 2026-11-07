@@ -64,10 +64,14 @@ reduces over the ranks itself, for instance with `MPI.Allreduce`. The package re
 conditions as well, so ranks whose conditions disagree still stay together: a
 `DiscreteCallback` fires when its condition is `true` on any rank, and a `ContinuousCallback`
 or `VectorContinuousCallback` fires at the earliest event any rank finds, with that rank's
-crossing. The affect then runs on every rank whatever its own condition gave, so it has to be
-collective as well: an affect that calls `terminate!` has to call it on every rank. A condition,
-affect, `initialize` or `finalize` that throws on some ranks makes every rank throw, as `f`
-does, so an affect that throws has to do so after its own communication.
+crossing. A `VectorContinuousCallback`'s mask also holds the crossings other ranks find
+within ten ulps of that time, as one rank's simultaneous crossings are, and an entry that two
+ranks cross in opposite directions takes its sign from the rank with the earlier root, or the
+lower rank when the roots are equal. The affect then runs on every rank whatever its own
+condition gave, so it has to be collective as well: an affect that calls `terminate!` has to
+call it on every rank. A condition, affect, `initialize` or `finalize` that throws on some
+ranks makes every rank throw, as `f` does, so an affect that throws has to do so after its
+own communication.
 
 The implicit algorithms build their Jacobian as a distributed PETSc matrix whose pattern
 comes from the problem's `jac_prototype`, which then holds this rank's rows only: it is

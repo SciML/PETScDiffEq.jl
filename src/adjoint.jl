@@ -1385,13 +1385,15 @@ function _discrete_adjoint_unlocked(
             prob, alg, sensealg, t, dgdu_discrete, dgdp_discrete, g, dgdu_continuous,
             dgdp_continuous, comm, dm,
         )
-        for key in (:tstops, :d_discontinuities)
-            _check_real(get(given, key, ()), key)
-        end
+        stops = get(given, :tstops, ())
+        _late(stops) || _check_real(stops, :tstops)
+        _check_real(get(given, :d_discontinuities, ()), :d_discontinuities)
         given, checked, Bool(no_start)
     end
     R = first(_eltypes(prob))
-    tstops = _times(R, get(solve_kwargs, :tstops, ()))
+    given_stops = get(solve_kwargs, :tstops, ())
+    late = _late(given_stops)
+    tstops = late ? R[] : _times(R, given_stops)
     jumps = _times(R, get(solve_kwargs, :d_discontinuities, ()))
     solve_kwargs = Base.structdiff(solve_kwargs, NamedTuple{(:tstops, :d_discontinuities)})
     dyn = prob.f isa SciMLBase.DynamicalODEFunction
@@ -1407,7 +1409,7 @@ function _discrete_adjoint_unlocked(
         (
             cost_t, skip_start, np, dgdp_discrete === nothing, prob.f.jac === nothing,
             prob.f.paramjac === nothing, is_split && prob.f.f2.jac === nothing,
-            is_split && prob.f.f2.paramjac === nothing, tstops, jumps, integral,
+            is_split && prob.f.f2.paramjac === nothing, tstops, late, jumps, integral,
         ),
     )
 
@@ -1426,6 +1428,16 @@ function _discrete_adjoint_unlocked(
     adj, q, ex = nothing, nothing, nothing
     local du0, dp
     try
+        # `solve` calls a tstops function once set up, so its first step is estimated without them.
+        if late
+            tstops = _checked_everywhere(comm) do
+                given = given_stops(ctx.p, prob.tspan)
+                _check_real(given, :tstops)
+                _times(R, given)
+            end
+            comm === nothing || _check_agreement(comm, (tstops,))
+            stopping = !isempty(tstops) || !isempty(jumps)
+        end
         cost_s = h.tdir .* cost_t
         implicit, arkimex, adaptive = _check_adjoint_ts(h, alg, integral, is_split)
         is_split && comm !== nothing && dm === nothing && _checked_everywhere(comm) do
@@ -1659,6 +1671,7 @@ function _discrete_adjoint_unlocked(
                     (ex === nothing || ex.err === nothing) && rethrow()
             end
             _throw_callback_error(ctx, adj, comm, q, ex)
+            _warn_unread_options(h)
             reason = LibPETSc.TSGetConvergedReason(pl, ts)
             reason == LibPETSc.TS_CONVERGED_ITS || throw(
                 ArgumentError(
@@ -1724,7 +1737,8 @@ _partitioned_costs(
 
 function _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...)
     costs = _wraps(prob, alg) ? _partitioned_costs(prob.u0; kwargs...) : kwargs
-    return _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; costs...))
+    banded = _banded_as_sparse(prob, Float64)
+    return _locked(() -> _discrete_adjoint_unlocked(banded, alg, sensealg; costs...))
 end
 
 # The SciMLSensitivity extension has the method for a PETScAdjoint, built on ChainRulesCore.

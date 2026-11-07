@@ -777,6 +777,22 @@ const METHODS = (
         end
     end
 
+    @testset "an option PETSc reads on some ranks only is not named as unread" begin
+        named(f) = filter(
+            l -> startswith(string(l.message), "PETSc never read"), Test.collect_test_logs(f)[1],
+        )
+        prob = ODEProblem(heat_function(heat!, rows; jac = true), heat0(rows), SPAN)
+        # Only the ranks telescope keeps set up its inner solver.
+        telescope = [
+            "-pc_type", "telescope", "-pc_telescope_reduction_factor", "$nranks",
+            "-telescope_ksp_type", "preonly", "-telescope_pc_type", "lu",
+        ]
+        @test isempty(named(() -> solve(prob, TSImplicit("bdf", telescope; comm); TOL...)))
+        typo = TSImplicit("bdf", ["-ts_adapt_dtmax", "0.01"]; comm)
+        logs = named(() -> solve(prob, typo; TOL...))
+        @test length(logs) == 1 && occursin("-ts_adapt_dtmax", string(logs[1].message))
+    end
+
     @testset "AutoForwardDiff colours the whole pattern for every rank" begin
         ad = AutoForwardDiff()
         heat(idx, f; jac = false) = ODEProblem(heat_function(f, idx; jac), heat0(idx), SPAN)
