@@ -901,6 +901,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     mass_slope::Bool
     tend::R
     attempt_margin::Int
+    trial::Int
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -2834,6 +2835,69 @@ function _check_attempts!(
     return LibPETSc.PetscErrorCode(0)
 end
 
+# TSRollBack_RK's subtraction can cancel the state, so the trial after a rejection starts
+# from the first stage vector, which still holds the step's start.
+function _restart_trial!(ts_ptr::Ptr{C}, t)::LibPETSc.PetscErrorCode where {C <: TSContext}
+    _at_step_start(_lib_type(C), ts_ptr, t) || return LibPETSc.PetscErrorCode(0)
+    return _restart_trial_body!(_hooked(ts_ptr)...)
+end
+
+# The untyped entry point, for code another package precompiles.
+_restart_trial!(ts_ptr::LibPETSc.CTS, t)::LibPETSc.PetscErrorCode =
+    _restart_trial_body!(_hooked(ts_ptr)...)
+
+function _restart_trial_body!(ctx, ts)::LibPETSc.PetscErrorCode
+    code, rejected = _rejected(ctx.petsclib, ts.ptr)
+    code == 0 && 0 <= ctx.trial < rejected || return LibPETSc.PetscErrorCode(0)
+    ctx.trial = rejected
+    try
+        pl = ctx.petsclib
+        ns, stages = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{LibPETSc.CVec}}(C_NULL)
+        x = Ref{LibPETSc.CVec}(C_NULL)
+        _check_code(
+            ccall(
+                _symbol(pl, Val(:TSGetStages)), _Err,
+                (LibPETSc.CTS, Ptr{Cvoid}, Ptr{Ptr{LibPETSc.CVec}}), ts, ns, stages,
+            ),
+        )
+        _check_code(
+            ccall(
+                _symbol(pl, :TSGetSolution), _Err, (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts, x,
+            ),
+        )
+        _check_code(
+            ccall(
+                _symbol(pl, :VecCopy), _Err, (LibPETSc.CVec, LibPETSc.CVec),
+                unsafe_load(stages[]), x[],
+            ),
+        )
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+function _mark_trial!(ctx, ts_ptr)
+    ctx.trial < 0 && return nothing
+    code, rejected = _rejected(ctx.petsclib, ts_ptr)
+    code == 0 && (ctx.trial = rejected)
+    return nothing
+end
+
+# Runs at every stage, so only an adaptive TSRK has it.
+function _set_trial_restart!(pl, ts, ctx, on::Bool)
+    POST_STEP_CTX[ts.ptr] = (ctx, ts)
+    ctx.trial = on ? 0 : -1
+    _check_code(
+        ccall(
+            _symbol(pl, :TSSetPreStage), LibPETSc.PetscErrorCode, (LibPETSc.CTS, Ptr{Cvoid}),
+            ts, on ? _callbacks(ctx).restart_trial : C_NULL,
+        ),
+    )
+    return nothing
+end
+
 const _MAX_REJECT_OPTIONS = ("ts_max_reject", "ts_max_step_rejections")
 
 function _arm_attempts!(ctx, ts_ptr)
@@ -4124,6 +4188,18 @@ for pl in PETSc.petsclibs
             return code, Int(n[]) + Int(r[])
         end
 
+        function _rejected(::$L, ts)
+            r = Ref{$I}(0)
+            code = ccall((:TSGetStepRejections, $lib), _Err, (Ptr{Cvoid}, Ptr{$I}), ts, r)
+            return code, Int(r[])
+        end
+
+        function _at_step_start(::Type{$L}, ts, t)
+            s = Ref{$(real(T))}(0)
+            code = ccall((:TSGetTime, $lib), _Err, (Ptr{Cvoid}, Ptr{$(real(T))}), ts, s)
+            return code != 0 || s[] == t
+        end
+
         function _local_size(::$L, v)
             n = Ref{$I}(0)
             _check_code(ccall((:VecGetLocalSize, $lib), _Err, (LibPETSc.CVec, Ptr{$I}), v, n))
@@ -4802,6 +4878,7 @@ end
 function _monitor_at!(ctx, ts_ptr, step, t, x)
     try
         _arm_attempts!(ctx, ts_ptr)
+        _mark_trial!(ctx, ts_ptr)
         (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
             _hold_work_vec!(ctx, ts_ptr)
         tol = _near(t, ctx.tbound)
@@ -4883,6 +4960,7 @@ const _CALLBACK_SIGNATURES = (
     post_step = (:_post_step!, (:PtrC,)),
     stage_check = (:_check_stage!, (:PtrC, :R, :CVec, :Ptr)),
     attempt_check = (:_check_attempts!, (:PtrC, :R, :CVec, :Ptr)),
+    restart_trial = (:_restart_trial!, (:PtrC, :R)),
 )
 
 _callback_type(a, R, C) = a === :R ? R : a === :RefC ? Ref{C} : a === :PtrC ? Ptr{C} :
@@ -4973,6 +5051,26 @@ function _check_inttype(petsclib)
             "library it loaded uses $(PETSc.inttype(petsclib))",
     )
     return nothing
+end
+
+const PETSC_WITHOUT_MPI = Dict{String, Bool}()
+
+# Only a PETSc built without MPI exports MPIUNI_Memcpy, as PETSc_jll's Windows builds before
+# 3.25 do. On Windows PETSc.jl fails to create any PETSc object with such a build.
+_without_mpi(petsclib) = get!(PETSC_WITHOUT_MPI, petsclib.petsc_library) do
+    Libdl.dlsym_e(Libdl.dlopen(petsclib.petsc_library), :MPIUNI_Memcpy) != C_NULL
+end
+
+function _check_windows_mpi(petsclib)
+    Sys.iswindows() && _without_mpi(petsclib) || return nothing
+    throw(
+        ArgumentError(
+            "PETSc $(_petsc_version(petsclib)) is built without MPI, as Windows PETSc_jll " *
+                "is before 3.25, and on Windows PETSc.jl fails to create any PETSc object " *
+                "with it; PETSc_jll 3.25, the first Windows build with MPI, needs Julia 1.12 " *
+                "or newer",
+        ),
+    )
 end
 
 # TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
@@ -6316,6 +6414,7 @@ function _setup_problem(
     comm === nothing && dm === nothing && _check_square(prob.f.jac_prototype, n)
     petsclib = _petsclib(S)
     _check_inttype(petsclib)
+    _check_windows_mpi(petsclib)
     PETScCompat.isinitialized(petsclib) || PETSc.initialize(petsclib)
     _arm_exit_cleanup!(petsclib)
     if dm !== nothing
@@ -6540,7 +6639,7 @@ function _setup_problem(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
-        nothing, mass_slope, tf, -1,
+        nothing, mass_slope, tf, -1, -1,
     )::TSContext
     h = Base.inferencebarrier(TSHandles)(
         ctx, petsclib, LibPETSc.TS(petsclib), uvec, nothing, nothing, ad_calls, nothing,
@@ -6931,6 +7030,7 @@ function _setup_problem(
                     ctx.attempt_margin = 13
                 end
             end
+            !fixed && chosen == "rk" && _set_trial_restart!(petsclib, ts, ctx, true)
             ctx.linear = _uses_ifunction(alg) &&
                 _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly")
             if running != ctx.alg_name
@@ -7670,6 +7770,7 @@ function _set_adaptive!(h::TSHandles, adaptive::Bool)
         ctx.attempt_margin = adaptive ? 13 : -1
         _set_stage_check!(pl, ts, ctx, C_NULL)
     end
+    LibPETSc.TSGetType(pl, ts) == "rk" && _set_trial_restart!(pl, ts, ctx, adaptive)
     ctx.alg_name == "bdf" && !any(o -> _names_option(o, "snes_lag_jacobian"), opts) &&
         _set_jacobian_lag!(pl, _snes(pl, ts.ptr), adaptive ? 5 : 1)
     return nothing
@@ -8059,8 +8160,8 @@ function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
     s = integ.tdir * t
     s < integ.tdir * integ.t &&
         throw(ArgumentError("cannot add a saveat at $t, behind the current time $(integ.t)"))
-    i = searchsortedfirst(ctx.saveat, s)
-    (i <= length(ctx.saveat) && ctx.saveat[i] == s) || insert!(ctx.saveat, i, s)
+    i = searchsortedlast(ctx.saveat, s; lt = <) + 1
+    insert!(ctx.saveat, i, s)
     i < ctx.saveat_idx && (ctx.saveat_idx += 1)
     return nothing
 end
@@ -8316,9 +8417,9 @@ end
 function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
     return (
         (prev < 0 && cb.affect! !== nothing) || (prev > 0 && cb.affect_neg! !== nothing)
-    ) && prev * next <= 0
+    ) && sign(prev) * sign(next) <= 0
 end
-_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev * next <= 0
+_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && sign(prev) * sign(next) <= 0
 
 function _event_root(integ::PETScIntegrator, cb, lo, hi, i::Int, buf)
     condition(t, _) = _fill_conditions!(buf, integ, cb, t)[i]
@@ -8407,8 +8508,18 @@ function _agreed_event(integ::PETScIntegrator, cb, k::Int)
     hits = findall(!iszero, view(seen, 2, :))
     isempty(hits) && return nothing
     j = hits[argmin([integ.tdir * seen[3, i] for i in hits])]
-    crossing = cb isa SciMLBase.VectorContinuousCallback ? Int8.(seen[4:end, j]) : seen[4, j]
-    return (oftype(integ.t, seen[3, j]), crossing)
+    t = oftype(integ.t, seen[3, j])
+    cb isa SciMLBase.VectorContinuousCallback || return (t, seen[4, j])
+    # Other ranks' roots within `_find_event`'s tolerance add their entries, earliest first.
+    crossing = zeros(Int8, m)
+    together = 10 * eps(t)
+    for i in sort(hits; by = i -> integ.tdir * seen[3, i])
+        integ.tdir * seen[3, i] <= integ.tdir * seen[3, j] + together || break
+        for r in 1:m
+            crossing[r] == 0 && (crossing[r] = seen[3 + r, i])
+        end
+    end
+    return (t, crossing)
 end
 
 _mark_fired!(ev, ::SciMLBase.ContinuousCallback, _, t) = (ev[1] = t; nothing)
@@ -8670,8 +8781,8 @@ function _reject_step!(integ::PETScIntegrator, before, outer, taken)
     _write_state!(h, integ.u)
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
-    floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
-    forced = get(integ.kwargs, :force_dtmin, false) === true
+    floor = abs(getfield(integ.opts, :dtmin))
+    forced = getfield(integ.opts, :force_dtmin)
     dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, code)
     if dt === nothing || _attempts(ctx, pl, h.ts) >= ctx.maxiters
         dt === nothing && code != 0 && _warn_failed_step(integ.alg, code, integ.opts.verbose)
@@ -9393,6 +9504,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
         _hold_work_vec!(ctx, h.ts)
     _arm_attempts!(ctx, h.ts.ptr)
+    _mark_trial!(ctx, h.ts.ptr)
     failure = _run!(h) do
         LibPETSc.TSStep(pl, h.ts)
         _linear_bdf_slope!(h)
