@@ -121,7 +121,9 @@ whose residual has to be in place, along with `ODEFunction`'s `jac`, `jac_protot
 matrix. An operator that `SciMLOperators.isconstant` calls not constant, such as one with an
 update function, is refused, and so is a matrix-free `FunctionOperator`. Supply a
 `jac_prototype` for anything sparse: without one the Jacobian is dense and forces a dense
-factorization.
+factorization. A `Diagonal`, `Bidiagonal`, `Tridiagonal` or `SymTridiagonal` prototype of an
+`ODEFunction` or `DAEFunction` is taken as its sparse pattern, and a `jac` fills a matrix of
+the prototype's type, as in OrdinaryDiffEq; one of another structured type is taken as dense.
 
 `TSARKIMEX` integrates the `f1` of a `SplitODEProblem` implicitly and its `f2` explicitly.
 Every other algorithm solves it as the `ODEProblem` of `f1 + f2` and returns that problem's
