@@ -4103,6 +4103,49 @@ function _copy_jac!(J::SparseMatrixCSC, A::AbstractMatrix)
     return nothing
 end
 
+# LinearAlgebra's banded matrices. As a `jac_prototype` each is solved as its sparse pattern,
+# and a `jac` fills one of the prototype's type, as OrdinaryDiffEq's FBDF hands it.
+const _Banded = Union{
+    LinearAlgebra.Diagonal, LinearAlgebra.Bidiagonal, LinearAlgebra.Tridiagonal,
+    LinearAlgebra.SymTridiagonal,
+}
+
+# Without its stored zeros, as the dense method skips zeros, so a sparser prototype still fits.
+_copy_jac!(J::SparseMatrixCSC, A::_Banded) =
+    _copy_jac!(J, SparseArrays.dropzeros!(SparseMatrixCSC(A)))
+
+struct BandedJac{F, B}
+    jac::F
+    B::B
+end
+
+(j::BandedJac)(J, u, p, t) = (j.jac(j.B, u, p, t); _copy_band!(J, j.B))
+(j::BandedJac)(J, du, u, p, gamma, t) = (j.jac(j.B, du, u, p, gamma, t); _copy_band!(J, j.B))
+
+_copy_band!(J, B) = (copyto!(J, B); nothing)
+# J has B's pattern, so B holds nothing outside it.
+function _copy_band!(J::SparseMatrixCSC, B)
+    rows, vals = rowvals(J), nonzeros(J)
+    @inbounds for j in axes(J, 2), k in nzrange(J, j)
+        vals[k] = B[rows[k], j]
+    end
+    return nothing
+end
+
+_banded_as_sparse(prob, S) = prob
+function _banded_as_sparse(
+        prob::Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}, S,
+    )
+    f = prob.f
+    f isa Union{SciMLBase.ODEFunction, SciMLBase.DAEFunction} && f.jac_prototype isa _Banded ||
+        return prob
+    P = f.jac_prototype
+    jac = f.jac === nothing || !SciMLBase.isinplace(prob) ? f.jac :
+        BandedJac(f.jac, fill!(similar(P, S), zero(S)))
+    pattern = SparseMatrixCSC(LinearAlgebra.fillstored!(similar(P, Float64), 1))
+    return _rebuilt(prob, SciMLBase.remake(f; jac, jac_prototype = pattern), prob.p)
+end
+
 # PETSc.jl's array accessor allocates on every call.
 function _readvec!(dest, pl, v)
     a = LibPETSc.VecGetArrayRead(pl, v)
@@ -6242,7 +6285,11 @@ function _save_plan(R, t0, tf, tdir, saveat, save_everystep, save_start, save_en
     return saveat_times, save_everystep, save_start, save_end, end_saveat, bound
 end
 
-function _setup(
+# A banded `jac_prototype` becomes its sparse pattern behind a function barrier.
+_setup(problem::SupportedProblem, alg::AnyPETScTS; eltypes = _eltypes(problem), kwargs...) =
+    _setup_problem(_banded_as_sparse(problem, eltypes[2]), alg; eltypes, kwargs...)
+
+function _setup_problem(
         problem::SupportedProblem,
         alg::AnyPETScTS;
         dt = nothing,
@@ -7298,10 +7345,13 @@ _same_field(s, x, i) = fieldname(typeof(x), i) === :jac_prototype ?
 
 _pattern(J::SparseMatrixCSC) = (size(J), copy(J.colptr), J.rowval[1:SparseArrays.nnz(J)])
 _pattern(J::AbstractArray) = (typeof(J), size(J))
+# A Bidiagonal's type does not say which side its second band is on.
+_pattern(J::LinearAlgebra.Bidiagonal) = (typeof(J), size(J), J.uplo)
 _pattern(J) = _snap(J)
 _same_pattern(s, J::SparseMatrixCSC) = s isa Tuple{Tuple, Vector, Vector} &&
     s[1] == size(J) && s[2] == J.colptr && s[3] == view(J.rowval, 1:SparseArrays.nnz(J))
 _same_pattern(s, J::AbstractArray) = s == (typeof(J), size(J))
+_same_pattern(s, J::LinearAlgebra.Bidiagonal) = s == _pattern(J)
 _same_pattern(s, J) = _same(s, J)
 
 # An operator mass matrix or prototype can change in place behind an identical object.
@@ -8011,14 +8061,14 @@ SciMLBase.set_u!(integ::PETScIntegrator, u) = _locked(() -> _set_u_unlocked(inte
 _initializealg(integ::PETScIntegrator) =
     get(integ.kwargs, :initializealg, DiffEqBase.DefaultInit())
 
-_with_p(prob, p) = p === prob.p ? prob : _replace_p(prob, p)
-_replace_p(prob::SciMLBase.AbstractODEProblem, p) =
+_with_p(prob, p) = p === prob.p ? prob : _rebuilt(prob, prob.f, p)
+_rebuilt(prob::SciMLBase.AbstractODEProblem, f, p) =
     SciMLBase.ODEProblem{SciMLBase.isinplace(prob)}(
-    prob.f, prob.u0, prob.tspan, p, prob.problem_type; prob.kwargs...,
+    f, prob.u0, prob.tspan, p, prob.problem_type; prob.kwargs...,
 )
-_replace_p(prob::SciMLBase.AbstractDAEProblem, p) =
+_rebuilt(prob::SciMLBase.AbstractDAEProblem, f, p) =
     SciMLBase.DAEProblem{SciMLBase.isinplace(prob)}(
-    prob.f, prob.du0, prob.u0, prob.tspan, p;
+    f, prob.du0, prob.u0, prob.tspan, p;
     differential_vars = prob.differential_vars, prob.kwargs...,
 )
 
@@ -8044,7 +8094,7 @@ end
 function _initialize_state!(integ::PETScIntegrator, init, slope = integ.h.ctx.fend)
     h = integ.h
     ctx = h.ctx
-    prob = _with_p(_summed(integ.prob, integ.alg), integ.p)
+    prob = _with_p(_banded_as_sparse(_summed(integ.prob, integ.alg), eltype(h.u0)), integ.p)
     u = integ.u isa Array ? vec(integ.u) : Vector(integ.u)
     du = ctx.dae && slope !== nothing ? integ.tdir .* slope : _start_du(prob, u)
     before = h.ad_calls === nothing ? 0 : h.ad_calls[]
@@ -8948,7 +8998,7 @@ function _reuse!(
     a = h.again
     (a === nothing || h.destroyed || h.fresh === nothing) && return false
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
-    ps = _summed(prob, a.alg)
+    ps = _banded_as_sparse(_summed(prob, a.alg), S)
     t0u, tfu = R(ps.tspan[1]), R(ps.tspan[2])
     isfinite(t0u) && !isnan(tfu) && tfu != -h.tdir || return false
     t0, tf = h.tdir * t0u, h.tdir * tfu

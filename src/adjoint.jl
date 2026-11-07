@@ -1736,7 +1736,8 @@ _partitioned_costs(
 
 function _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...)
     costs = _wraps(prob, alg) ? _partitioned_costs(prob.u0; kwargs...) : kwargs
-    return _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; costs...))
+    banded = _banded_as_sparse(prob, Float64)
+    return _locked(() -> _discrete_adjoint_unlocked(banded, alg, sensealg; costs...))
 end
 
 # The SciMLSensitivity extension has the method for a PETScAdjoint, built on ChainRulesCore.
