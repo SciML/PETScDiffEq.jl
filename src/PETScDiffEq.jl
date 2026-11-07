@@ -5010,6 +5010,26 @@ function _check_inttype(petsclib)
     return nothing
 end
 
+const PETSC_WITHOUT_MPI = Dict{String, Bool}()
+
+# Only a PETSc built without MPI exports MPIUNI_Memcpy, as PETSc_jll's Windows builds before
+# 3.25 do. On Windows PETSc.jl fails to create any PETSc object with such a build.
+_without_mpi(petsclib) = get!(PETSC_WITHOUT_MPI, petsclib.petsc_library) do
+    Libdl.dlsym_e(Libdl.dlopen(petsclib.petsc_library), :MPIUNI_Memcpy) != C_NULL
+end
+
+function _check_windows_mpi(petsclib)
+    Sys.iswindows() && _without_mpi(petsclib) || return nothing
+    throw(
+        ArgumentError(
+            "PETSc $(_petsc_version(petsclib)) is built without MPI, as Windows PETSc_jll " *
+                "is before 3.25, and on Windows PETSc.jl fails to create any PETSc object " *
+                "with it; PETSc_jll 3.25, the first Windows build with MPI, needs Julia 1.12 " *
+                "or newer",
+        ),
+    )
+end
+
 # TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
 # No limit has to be PETSc's own largest count, which is wider than `Int` on 32-bit.
 _maxsteps(maxiters) = maxiters == typemax(Int) ? typemax(LibPETSc.PetscInt) :
@@ -6347,6 +6367,7 @@ function _setup(
     comm === nothing && dm === nothing && _check_square(prob.f.jac_prototype, n)
     petsclib = _petsclib(S)
     _check_inttype(petsclib)
+    _check_windows_mpi(petsclib)
     PETScCompat.isinitialized(petsclib) || PETSc.initialize(petsclib)
     _arm_exit_cleanup!(petsclib)
     if dm !== nothing
@@ -8089,8 +8110,8 @@ function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
     s = integ.tdir * t
     s < integ.tdir * integ.t &&
         throw(ArgumentError("cannot add a saveat at $t, behind the current time $(integ.t)"))
-    i = searchsortedfirst(ctx.saveat, s)
-    (i <= length(ctx.saveat) && ctx.saveat[i] == s) || insert!(ctx.saveat, i, s)
+    i = searchsortedlast(ctx.saveat, s; lt = <) + 1
+    insert!(ctx.saveat, i, s)
     i < ctx.saveat_idx && (ctx.saveat_idx += 1)
     return nothing
 end
@@ -8346,9 +8367,9 @@ end
 function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
     return (
         (prev < 0 && cb.affect! !== nothing) || (prev > 0 && cb.affect_neg! !== nothing)
-    ) && prev * next <= 0
+    ) && sign(prev) * sign(next) <= 0
 end
-_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev * next <= 0
+_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && sign(prev) * sign(next) <= 0
 
 function _event_root(integ::PETScIntegrator, cb, lo, hi, i::Int, buf)
     condition(t, _) = _fill_conditions!(buf, integ, cb, t)[i]
@@ -8437,8 +8458,18 @@ function _agreed_event(integ::PETScIntegrator, cb, k::Int)
     hits = findall(!iszero, view(seen, 2, :))
     isempty(hits) && return nothing
     j = hits[argmin([integ.tdir * seen[3, i] for i in hits])]
-    crossing = cb isa SciMLBase.VectorContinuousCallback ? Int8.(seen[4:end, j]) : seen[4, j]
-    return (oftype(integ.t, seen[3, j]), crossing)
+    t = oftype(integ.t, seen[3, j])
+    cb isa SciMLBase.VectorContinuousCallback || return (t, seen[4, j])
+    # Other ranks' roots within `_find_event`'s tolerance add their entries, earliest first.
+    crossing = zeros(Int8, m)
+    together = 10 * eps(t)
+    for i in sort(hits; by = i -> integ.tdir * seen[3, i])
+        integ.tdir * seen[3, i] <= integ.tdir * seen[3, j] + together || break
+        for r in 1:m
+            crossing[r] == 0 && (crossing[r] = seen[3 + r, i])
+        end
+    end
+    return (t, crossing)
 end
 
 _mark_fired!(ev, ::SciMLBase.ContinuousCallback, _, t) = (ev[1] = t; nothing)
@@ -8700,8 +8731,8 @@ function _reject_step!(integ::PETScIntegrator, before, outer, taken)
     _write_state!(h, integ.u)
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
-    floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
-    forced = get(integ.kwargs, :force_dtmin, false) === true
+    floor = abs(getfield(integ.opts, :dtmin))
+    forced = getfield(integ.opts, :force_dtmin)
     dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, code)
     if dt === nothing || _attempts(ctx, pl, h.ts) >= ctx.maxiters
         dt === nothing && code != 0 && _warn_failed_step(integ.alg, code, integ.opts.verbose)
