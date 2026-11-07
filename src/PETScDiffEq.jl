@@ -901,6 +901,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     mass_slope::Bool
     tend::R
     attempt_margin::Int
+    trial::Int
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -2834,6 +2835,69 @@ function _check_attempts!(
     return LibPETSc.PetscErrorCode(0)
 end
 
+# TSRollBack_RK's subtraction can cancel the state, so the trial after a rejection starts
+# from the first stage vector, which still holds the step's start.
+function _restart_trial!(ts_ptr::Ptr{C}, t)::LibPETSc.PetscErrorCode where {C <: TSContext}
+    _at_step_start(_lib_type(C), ts_ptr, t) || return LibPETSc.PetscErrorCode(0)
+    return _restart_trial_body!(_hooked(ts_ptr)...)
+end
+
+# The untyped entry point, for code another package precompiles.
+_restart_trial!(ts_ptr::LibPETSc.CTS, t)::LibPETSc.PetscErrorCode =
+    _restart_trial_body!(_hooked(ts_ptr)...)
+
+function _restart_trial_body!(ctx, ts)::LibPETSc.PetscErrorCode
+    code, rejected = _rejected(ctx.petsclib, ts.ptr)
+    code == 0 && 0 <= ctx.trial < rejected || return LibPETSc.PetscErrorCode(0)
+    ctx.trial = rejected
+    try
+        pl = ctx.petsclib
+        ns, stages = Ref{PETSc.inttype(pl)}(0), Ref{Ptr{LibPETSc.CVec}}(C_NULL)
+        x = Ref{LibPETSc.CVec}(C_NULL)
+        _check_code(
+            ccall(
+                _symbol(pl, Val(:TSGetStages)), _Err,
+                (LibPETSc.CTS, Ptr{Cvoid}, Ptr{Ptr{LibPETSc.CVec}}), ts, ns, stages,
+            ),
+        )
+        _check_code(
+            ccall(
+                _symbol(pl, :TSGetSolution), _Err, (LibPETSc.CTS, Ptr{LibPETSc.CVec}), ts, x,
+            ),
+        )
+        _check_code(
+            ccall(
+                _symbol(pl, :VecCopy), _Err, (LibPETSc.CVec, LibPETSc.CVec),
+                unsafe_load(stages[]), x[],
+            ),
+        )
+    catch e
+        ctx.err = e
+        return LibPETSc.PetscErrorCode(CALLBACK_THREW)
+    end
+    return LibPETSc.PetscErrorCode(0)
+end
+
+function _mark_trial!(ctx, ts_ptr)
+    ctx.trial < 0 && return nothing
+    code, rejected = _rejected(ctx.petsclib, ts_ptr)
+    code == 0 && (ctx.trial = rejected)
+    return nothing
+end
+
+# Runs at every stage, so only an adaptive TSRK has it.
+function _set_trial_restart!(pl, ts, ctx, on::Bool)
+    POST_STEP_CTX[ts.ptr] = (ctx, ts)
+    ctx.trial = on ? 0 : -1
+    _check_code(
+        ccall(
+            _symbol(pl, :TSSetPreStage), LibPETSc.PetscErrorCode, (LibPETSc.CTS, Ptr{Cvoid}),
+            ts, on ? _callbacks(ctx).restart_trial : C_NULL,
+        ),
+    )
+    return nothing
+end
+
 const _MAX_REJECT_OPTIONS = ("ts_max_reject", "ts_max_step_rejections")
 
 function _arm_attempts!(ctx, ts_ptr)
@@ -4039,6 +4103,49 @@ function _copy_jac!(J::SparseMatrixCSC, A::AbstractMatrix)
     return nothing
 end
 
+# LinearAlgebra's banded matrices. As a `jac_prototype` each is solved as its sparse pattern,
+# and a `jac` fills one of the prototype's type, as OrdinaryDiffEq's FBDF hands it.
+const _Banded = Union{
+    LinearAlgebra.Diagonal, LinearAlgebra.Bidiagonal, LinearAlgebra.Tridiagonal,
+    LinearAlgebra.SymTridiagonal,
+}
+
+# Without its stored zeros, as the dense method skips zeros, so a sparser prototype still fits.
+_copy_jac!(J::SparseMatrixCSC, A::_Banded) =
+    _copy_jac!(J, SparseArrays.dropzeros!(SparseMatrixCSC(A)))
+
+struct BandedJac{F, B}
+    jac::F
+    B::B
+end
+
+(j::BandedJac)(J, u, p, t) = (j.jac(j.B, u, p, t); _copy_band!(J, j.B))
+(j::BandedJac)(J, du, u, p, gamma, t) = (j.jac(j.B, du, u, p, gamma, t); _copy_band!(J, j.B))
+
+_copy_band!(J, B) = (copyto!(J, B); nothing)
+# J has B's pattern, so B holds nothing outside it.
+function _copy_band!(J::SparseMatrixCSC, B)
+    rows, vals = rowvals(J), nonzeros(J)
+    @inbounds for j in axes(J, 2), k in nzrange(J, j)
+        vals[k] = B[rows[k], j]
+    end
+    return nothing
+end
+
+_banded_as_sparse(prob, S) = prob
+function _banded_as_sparse(
+        prob::Union{SciMLBase.AbstractODEProblem, SciMLBase.AbstractDAEProblem}, S,
+    )
+    f = prob.f
+    f isa Union{SciMLBase.ODEFunction, SciMLBase.DAEFunction} && f.jac_prototype isa _Banded ||
+        return prob
+    P = f.jac_prototype
+    jac = f.jac === nothing || !SciMLBase.isinplace(prob) ? f.jac :
+        BandedJac(f.jac, fill!(similar(P, S), zero(S)))
+    pattern = SparseMatrixCSC(LinearAlgebra.fillstored!(similar(P, Float64), 1))
+    return _rebuilt(prob, SciMLBase.remake(f; jac, jac_prototype = pattern), prob.p)
+end
+
 # PETSc.jl's array accessor allocates on every call.
 function _readvec!(dest, pl, v)
     a = LibPETSc.VecGetArrayRead(pl, v)
@@ -4079,6 +4186,18 @@ for pl in PETSc.petsclibs
             code == 0 || return code, 0
             code = ccall((:TSGetStepRejections, $lib), _Err, (Ptr{Cvoid}, Ptr{$I}), ts, r)
             return code, Int(n[]) + Int(r[])
+        end
+
+        function _rejected(::$L, ts)
+            r = Ref{$I}(0)
+            code = ccall((:TSGetStepRejections, $lib), _Err, (Ptr{Cvoid}, Ptr{$I}), ts, r)
+            return code, Int(r[])
+        end
+
+        function _at_step_start(::Type{$L}, ts, t)
+            s = Ref{$(real(T))}(0)
+            code = ccall((:TSGetTime, $lib), _Err, (Ptr{Cvoid}, Ptr{$(real(T))}), ts, s)
+            return code != 0 || s[] == t
         end
 
         function _local_size(::$L, v)
@@ -4759,6 +4878,7 @@ end
 function _monitor_at!(ctx, ts_ptr, step, t, x)
     try
         _arm_attempts!(ctx, ts_ptr)
+        _mark_trial!(ctx, ts_ptr)
         (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
             _hold_work_vec!(ctx, ts_ptr)
         tol = _near(t, ctx.tbound)
@@ -4840,6 +4960,7 @@ const _CALLBACK_SIGNATURES = (
     post_step = (:_post_step!, (:PtrC,)),
     stage_check = (:_check_stage!, (:PtrC, :R, :CVec, :Ptr)),
     attempt_check = (:_check_attempts!, (:PtrC, :R, :CVec, :Ptr)),
+    restart_trial = (:_restart_trial!, (:PtrC, :R)),
 )
 
 _callback_type(a, R, C) = a === :R ? R : a === :RefC ? Ref{C} : a === :PtrC ? Ptr{C} :
@@ -4930,6 +5051,26 @@ function _check_inttype(petsclib)
             "library it loaded uses $(PETSc.inttype(petsclib))",
     )
     return nothing
+end
+
+const PETSC_WITHOUT_MPI = Dict{String, Bool}()
+
+# Only a PETSc built without MPI exports MPIUNI_Memcpy, as PETSc_jll's Windows builds before
+# 3.25 do. On Windows PETSc.jl fails to create any PETSc object with such a build.
+_without_mpi(petsclib) = get!(PETSC_WITHOUT_MPI, petsclib.petsc_library) do
+    Libdl.dlsym_e(Libdl.dlopen(petsclib.petsc_library), :MPIUNI_Memcpy) != C_NULL
+end
+
+function _check_windows_mpi(petsclib)
+    Sys.iswindows() && _without_mpi(petsclib) || return nothing
+    throw(
+        ArgumentError(
+            "PETSc $(_petsc_version(petsclib)) is built without MPI, as Windows PETSc_jll " *
+                "is before 3.25, and on Windows PETSc.jl fails to create any PETSc object " *
+                "with it; PETSc_jll 3.25, the first Windows build with MPI, needs Julia 1.12 " *
+                "or newer",
+        ),
+    )
 end
 
 # TSSetMaxSteps reads -1 as PETSC_DETERMINE and refuses anything lower.
@@ -6144,7 +6285,11 @@ function _save_plan(R, t0, tf, tdir, saveat, save_everystep, save_start, save_en
     return saveat_times, save_everystep, save_start, save_end, end_saveat, bound
 end
 
-function _setup(
+# A banded `jac_prototype` becomes its sparse pattern behind a function barrier.
+_setup(problem::SupportedProblem, alg::AnyPETScTS; eltypes = _eltypes(problem), kwargs...) =
+    _setup_problem(_banded_as_sparse(problem, eltypes[2]), alg; eltypes, kwargs...)
+
+function _setup_problem(
         problem::SupportedProblem,
         alg::AnyPETScTS;
         dt = nothing,
@@ -6269,6 +6414,7 @@ function _setup(
     comm === nothing && dm === nothing && _check_square(prob.f.jac_prototype, n)
     petsclib = _petsclib(S)
     _check_inttype(petsclib)
+    _check_windows_mpi(petsclib)
     PETScCompat.isinitialized(petsclib) || PETSc.initialize(petsclib)
     _arm_exit_cleanup!(petsclib)
     if dm !== nothing
@@ -6493,7 +6639,7 @@ function _setup(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
-        nothing, mass_slope, tf, -1,
+        nothing, mass_slope, tf, -1, -1,
     )::TSContext
     h = Base.inferencebarrier(TSHandles)(
         ctx, petsclib, LibPETSc.TS(petsclib), uvec, nothing, nothing, ad_calls, nothing,
@@ -6884,6 +7030,7 @@ function _setup(
                     ctx.attempt_margin = 13
                 end
             end
+            !fixed && chosen == "rk" && _set_trial_restart!(petsclib, ts, ctx, true)
             ctx.linear = _uses_ifunction(alg) &&
                 _snes_type(petsclib, ts.ptr) in ("ksponly", "ksptransposeonly")
             if running != ctx.alg_name
@@ -7240,10 +7387,13 @@ _same_field(s, x, i) = fieldname(typeof(x), i) === :jac_prototype ?
 
 _pattern(J::SparseMatrixCSC) = (size(J), copy(J.colptr), J.rowval[1:SparseArrays.nnz(J)])
 _pattern(J::AbstractArray) = (typeof(J), size(J))
+# A Bidiagonal's type does not say which side its second band is on.
+_pattern(J::LinearAlgebra.Bidiagonal) = (typeof(J), size(J), J.uplo)
 _pattern(J) = _snap(J)
 _same_pattern(s, J::SparseMatrixCSC) = s isa Tuple{Tuple, Vector, Vector} &&
     s[1] == size(J) && s[2] == J.colptr && s[3] == view(J.rowval, 1:SparseArrays.nnz(J))
 _same_pattern(s, J::AbstractArray) = s == (typeof(J), size(J))
+_same_pattern(s, J::LinearAlgebra.Bidiagonal) = s == _pattern(J)
 _same_pattern(s, J) = _same(s, J)
 
 # An operator mass matrix or prototype can change in place behind an identical object.
@@ -7663,6 +7813,7 @@ function _set_adaptive!(h::TSHandles, adaptive::Bool)
         ctx.attempt_margin = adaptive ? 13 : -1
         _set_stage_check!(pl, ts, ctx, C_NULL)
     end
+    LibPETSc.TSGetType(pl, ts) == "rk" && _set_trial_restart!(pl, ts, ctx, adaptive)
     ctx.alg_name == "bdf" && !any(o -> _names_option(o, "snes_lag_jacobian"), opts) &&
         _set_jacobian_lag!(pl, _snes(pl, ts.ptr), adaptive ? 5 : 1)
     return nothing
@@ -7953,14 +8104,14 @@ SciMLBase.set_u!(integ::PETScIntegrator, u) = _locked(() -> _set_u_unlocked(inte
 _initializealg(integ::PETScIntegrator) =
     get(integ.kwargs, :initializealg, DiffEqBase.DefaultInit())
 
-_with_p(prob, p) = p === prob.p ? prob : _replace_p(prob, p)
-_replace_p(prob::SciMLBase.AbstractODEProblem, p) =
+_with_p(prob, p) = p === prob.p ? prob : _rebuilt(prob, prob.f, p)
+_rebuilt(prob::SciMLBase.AbstractODEProblem, f, p) =
     SciMLBase.ODEProblem{SciMLBase.isinplace(prob)}(
-    prob.f, prob.u0, prob.tspan, p, prob.problem_type; prob.kwargs...,
+    f, prob.u0, prob.tspan, p, prob.problem_type; prob.kwargs...,
 )
-_replace_p(prob::SciMLBase.AbstractDAEProblem, p) =
+_rebuilt(prob::SciMLBase.AbstractDAEProblem, f, p) =
     SciMLBase.DAEProblem{SciMLBase.isinplace(prob)}(
-    prob.f, prob.du0, prob.u0, prob.tspan, p;
+    f, prob.du0, prob.u0, prob.tspan, p;
     differential_vars = prob.differential_vars, prob.kwargs...,
 )
 
@@ -7986,7 +8137,7 @@ end
 function _initialize_state!(integ::PETScIntegrator, init, slope = integ.h.ctx.fend)
     h = integ.h
     ctx = h.ctx
-    prob = _with_p(_summed(integ.prob, integ.alg), integ.p)
+    prob = _with_p(_banded_as_sparse(_summed(integ.prob, integ.alg), eltype(h.u0)), integ.p)
     u = integ.u isa Array ? vec(integ.u) : Vector(integ.u)
     du = ctx.dae && slope !== nothing ? integ.tdir .* slope : _start_du(prob, u)
     before = h.ad_calls === nothing ? 0 : h.ad_calls[]
@@ -8052,8 +8203,8 @@ function SciMLBase.add_saveat!(integ::PETScIntegrator, t)
     s = integ.tdir * t
     s < integ.tdir * integ.t &&
         throw(ArgumentError("cannot add a saveat at $t, behind the current time $(integ.t)"))
-    i = searchsortedfirst(ctx.saveat, s)
-    (i <= length(ctx.saveat) && ctx.saveat[i] == s) || insert!(ctx.saveat, i, s)
+    i = searchsortedlast(ctx.saveat, s; lt = <) + 1
+    insert!(ctx.saveat, i, s)
     i < ctx.saveat_idx && (ctx.saveat_idx += 1)
     return nothing
 end
@@ -8309,9 +8460,9 @@ end
 function _is_event(prev, next, cb::SciMLBase.ContinuousCallback)
     return (
         (prev < 0 && cb.affect! !== nothing) || (prev > 0 && cb.affect_neg! !== nothing)
-    ) && prev * next <= 0
+    ) && sign(prev) * sign(next) <= 0
 end
-_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && prev * next <= 0
+_is_event(prev, next, ::SciMLBase.VectorContinuousCallback) = prev != 0 && sign(prev) * sign(next) <= 0
 
 function _event_root(integ::PETScIntegrator, cb, lo, hi, i::Int, buf)
     condition(t, _) = _fill_conditions!(buf, integ, cb, t)[i]
@@ -8400,8 +8551,18 @@ function _agreed_event(integ::PETScIntegrator, cb, k::Int)
     hits = findall(!iszero, view(seen, 2, :))
     isempty(hits) && return nothing
     j = hits[argmin([integ.tdir * seen[3, i] for i in hits])]
-    crossing = cb isa SciMLBase.VectorContinuousCallback ? Int8.(seen[4:end, j]) : seen[4, j]
-    return (oftype(integ.t, seen[3, j]), crossing)
+    t = oftype(integ.t, seen[3, j])
+    cb isa SciMLBase.VectorContinuousCallback || return (t, seen[4, j])
+    # Other ranks' roots within `_find_event`'s tolerance add their entries, earliest first.
+    crossing = zeros(Int8, m)
+    together = 10 * eps(t)
+    for i in sort(hits; by = i -> integ.tdir * seen[3, i])
+        integ.tdir * seen[3, i] <= integ.tdir * seen[3, j] + together || break
+        for r in 1:m
+            crossing[r] == 0 && (crossing[r] = seen[3 + r, i])
+        end
+    end
+    return (t, crossing)
 end
 
 _mark_fired!(ev, ::SciMLBase.ContinuousCallback, _, t) = (ev[1] = t; nothing)
@@ -8663,8 +8824,8 @@ function _reject_step!(integ::PETScIntegrator, before, outer, taken)
     _write_state!(h, integ.u)
     LibPETSc.TSSetTime(pl, h.ts, integ.tdir * integ.t)
     LibPETSc.TSSetStepNumber(pl, h.ts, LibPETSc.PetscInt(nstep))
-    floor = abs(oftype(integ.t, something(get(integ.kwargs, :dtmin, nothing), 0.0)))
-    forced = get(integ.kwargs, :force_dtmin, false) === true
+    floor = abs(getfield(integ.opts, :dtmin))
+    forced = getfield(integ.opts, :force_dtmin)
     dt, at_floor = _retry_step(h, integ.tdir * integ.t, taken, floor, forced, code)
     if dt === nothing || _attempts(ctx, pl, h.ts) >= ctx.maxiters
         dt === nothing && code != 0 && _warn_failed_step(integ.alg, code, integ.opts.verbose)
@@ -8880,7 +9041,7 @@ function _reuse!(
     a = h.again
     (a === nothing || h.destroyed || h.fresh === nothing) && return false
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
-    ps = _summed(prob, a.alg)
+    ps = _banded_as_sparse(_summed(prob, a.alg), S)
     t0u, tfu = R(ps.tspan[1]), R(ps.tspan[2])
     isfinite(t0u) && !isnan(tfu) && tfu != -h.tdir || return false
     t0, tf = h.tdir * t0u, h.tdir * tfu
@@ -9387,6 +9548,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     (ctx.retry_fp || ctx.comm !== nothing) && ctx.workvec == C_NULL &&
         _hold_work_vec!(ctx, h.ts)
     _arm_attempts!(ctx, h.ts.ptr)
+    _mark_trial!(ctx, h.ts.ptr)
     failure = _run!(h) do
         LibPETSc.TSStep(pl, h.ts)
         _linear_bdf_slope!(h)
