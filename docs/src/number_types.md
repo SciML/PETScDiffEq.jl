@@ -6,9 +6,12 @@ single-precision build when the span is `Float32` as well, following OrdinaryDif
 to give a single-precision problem a `Float32` span, and in the double-precision build when
 the span is `Float64`, with the saved states given back in single precision. DiffEqBase
 promotes the span to the type of `dt`, so a single-precision solve takes `dt = 0.01f0`
-rather than `dt = 0.01`, and it makes a whole-number span `Float64`. Any other real state,
-whole numbers included, is solved in `Float64` and comes back in it. Where PETSc.jl has not
-loaded the single-precision build, as with a library set with `PETSc.set_library!`, a
+rather than `dt = 0.01`, and it makes a whole-number span `Float64`. SciMLBase makes a
+whole-number state `Float64` as well, and it comes back in it. DiffEqBase refuses any other
+element type, such as `Float16`, `BigFloat`, `Rational` or a ForwardDiff dual, since these
+methods do not take arbitrary number types; to differentiate a solve, use Zygote, with or
+without `sensealg = PETScAdjoint()`, as in [Adjoint sensitivities](@ref). Where PETSc.jl has
+not loaded the single-precision build, as with a library set with `PETSc.set_library!`, a
 single-precision state runs in the double-precision one, and a problem whose build is not
 loaded at all is refused with an `ArgumentError` that names it. On 32-bit x86 a
 single-precision state always runs in the double-precision build: there PETSc_jll's

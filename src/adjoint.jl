@@ -876,8 +876,9 @@ const _ADJOINT_REFUSED_KWARGS = (
 const _ADJOINT_OWNED_KWARGS =
     (:saveat, :save_everystep, :save_start, :save_end, :dense, :extra_options, :sensealg)
 
-_names_option(opt, name) =
-    startswith(opt, "-") && lowercase(first(split(opt[2:end], "="))) == name
+_option_name(opt) = (i = findfirst('=', opt);
+    lowercase(SubString(opt, 2, i === nothing ? lastindex(opt) : prevind(opt, i))))
+_names_option(opt, name) = startswith(opt, "-") && _option_name(opt) == name
 
 _unset(v) = _no_callback(v) || ((v isa Tuple || v isa AbstractArray) && isempty(v))
 
@@ -1671,6 +1672,7 @@ function _discrete_adjoint_unlocked(
                     (ex === nothing || ex.err === nothing) && rethrow()
             end
             _throw_callback_error(ctx, adj, comm, q, ex)
+            _warn_unread_options(h)
             reason = LibPETSc.TSGetConvergedReason(pl, ts)
             reason == LibPETSc.TS_CONVERGED_ITS || throw(
                 ArgumentError(
@@ -1736,7 +1738,8 @@ _partitioned_costs(
 
 function _discrete_adjoint(prob, alg::AnyPETScTS, sensealg::PETScAdjoint; kwargs...)
     costs = _wraps(prob, alg) ? _partitioned_costs(prob.u0; kwargs...) : kwargs
-    return _locked(() -> _discrete_adjoint_unlocked(prob, alg, sensealg; costs...))
+    banded = _banded_as_sparse(prob, Float64)
+    return _locked(() -> _discrete_adjoint_unlocked(banded, alg, sensealg; costs...))
 end
 
 # The SciMLSensitivity extension has the method for a PETScAdjoint, built on ChainRulesCore.
