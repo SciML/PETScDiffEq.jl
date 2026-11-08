@@ -43,29 +43,30 @@ jobs:
         # PETSc_jll 3.25 has no 32-bit builds, and Julia 1.10 cannot resolve 3.25, so the
         # 32-bit lane runs where it gets 3.22.
         # One 32-bit process runs out of address space compiling the whole suite, so it runs in parts.
+        # Ubuntu 24.04 still ships an i386 libxml2.so.2, which Hwloc_jll 2.15.0+2's i686 build loads.
         include:
           - version: '1.10'
-            os: ubuntu-latest
+            os: ubuntu-24.04
             arch: x86
             group: All
             part: 1/5
           - version: '1.10'
-            os: ubuntu-latest
+            os: ubuntu-24.04
             arch: x86
             group: All
             part: 2/5
           - version: '1.10'
-            os: ubuntu-latest
+            os: ubuntu-24.04
             arch: x86
             group: All
             part: 3/5
           - version: '1.10'
-            os: ubuntu-latest
+            os: ubuntu-24.04
             arch: x86
             group: All
             part: 4/5
           - version: '1.10'
-            os: ubuntu-latest
+            os: ubuntu-24.04
             arch: x86
             group: All
             part: 5/5
