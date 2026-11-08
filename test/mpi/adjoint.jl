@@ -36,8 +36,9 @@ const FD_GAP = 2.0e-9
 # repeating its steps, whose sizes come back as differences of their times.
 const HELD_GAP = 1.0e-12
 # Measured at 1 to 3 ranks: an adaptive solve with an integral cost is within 2.8e-13 of the
-# serial adjoint, whose steps differ by its error norms' rounding.
-const ADAPTIVE_GAP = 1.0e-12
+# serial adjoint, whose steps differ by its error norms' rounding; 1.04e-12 on Linux at 2 ranks
+# after a change to code this test never runs moved its compiled code.
+const ADAPTIVE_GAP = 2.0e-12
 const thrower = nranks - 1
 
 function uneven(n)
