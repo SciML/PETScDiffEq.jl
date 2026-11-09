@@ -1,0 +1,41 @@
+solver,package,abstol,reltol,error,time_s,steps,rejects,nf,njacs,newton_iters
+"TSDAE(""bdf""; order = 5)",PETScDiffEq,1e-06,1e-02,5.882e-05,5.2436e-03,121,11,962,411,411
+"TSDAE(""bdf""; order = 5)",PETScDiffEq,1e-07,1e-03,4.468e-06,4.8623e-03,134,15,887,365,365
+"TSDAE(""bdf""; order = 5)",PETScDiffEq,1e-08,1e-04,9.812e-06,4.7905e-03,150,13,866,347,347
+"TSDAE(""bdf""; order = 5)",PETScDiffEq,1e-09,1e-05,1.851e-06,5.0687e-03,186,6,937,368,368
+"TSDAE(""bdf""; order = 5)",PETScDiffEq,1e-10,1e-06,3.270e-07,6.4178e-03,246,9,1174,455,455
+"DFBDF",OrdinaryDiffEq,1e-06,1e-02,6.408e-05,1.9640e-04,114,4,317,4,292
+"DFBDF",OrdinaryDiffEq,1e-07,1e-03,1.085e-05,2.8130e-04,170,5,434,6,400
+"DFBDF",OrdinaryDiffEq,1e-08,1e-04,1.007e-06,4.2454e-04,259,9,684,4,660
+"DFBDF",OrdinaryDiffEq,1e-09,1e-05,7.519e-08,5.7796e-04,318,9,845,7,801
+"DFBDF",OrdinaryDiffEq,1e-10,1e-06,1.108e-08,8.2490e-04,480,8,1153,6,1118
+"IDA",Sundials,1e-06,1e-02,1.392e-04,1.2009e-04,99,5,186,44,186
+"IDA",Sundials,1e-07,1e-03,9.408e-07,1.3799e-04,158,1,223,29,223
+"IDA",Sundials,1e-08,1e-04,4.604e-06,2.0277e-04,233,6,349,39,349
+"IDA",Sundials,1e-09,1e-05,3.041e-08,2.7162e-04,333,8,479,47,479
+"IDA",Sundials,1e-10,1e-06,3.485e-08,3.8289e-04,508,9,700,49,700
+"TSImplicit(""bdf""; order = 5), mass matrix",PETScDiffEq,1e-06,1e-02,6.971e-05,5.0166e-03,128,7,919,389,389
+"TSImplicit(""bdf""; order = 5), mass matrix",PETScDiffEq,1e-07,1e-03,1.311e-05,4.5927e-03,140,11,822,335,335
+"TSImplicit(""bdf""; order = 5), mass matrix",PETScDiffEq,1e-08,1e-04,1.096e-05,4.5520e-03,157,7,801,318,318
+"TSImplicit(""bdf""; order = 5), mass matrix",PETScDiffEq,1e-09,1e-05,1.879e-06,5.0947e-03,192,3,894,349,349
+"TSImplicit(""bdf""; order = 5), mass matrix",PETScDiffEq,1e-10,1e-06,3.201e-07,6.0313e-03,245,3,1091,421,421
+"FBDF, mass matrix",OrdinaryDiffEq,1e-06,1e-02,3.771e-05,1.6021e-04,98,3,300,5,265
+"FBDF, mass matrix",OrdinaryDiffEq,1e-07,1e-03,8.965e-06,2.3757e-04,136,4,477,4,448
+"FBDF, mass matrix",OrdinaryDiffEq,1e-08,1e-04,1.767e-06,3.7166e-04,195,7,579,5,537
+"FBDF, mass matrix",OrdinaryDiffEq,1e-09,1e-05,2.226e-07,5.1621e-04,262,9,712,5,670
+"FBDF, mass matrix",OrdinaryDiffEq,1e-10,1e-06,1.562e-09,7.4840e-04,392,13,957,6,917
+"TSRosW(""ra34pw2""), mass matrix",PETScDiffEq,1e-06,1e-02,1.321e-04,1.3917e-03,35,0,175,35,140
+"TSRosW(""ra34pw2""), mass matrix",PETScDiffEq,1e-07,1e-03,1.729e-05,2.1038e-03,60,0,300,60,240
+"TSRosW(""ra34pw2""), mass matrix",PETScDiffEq,1e-08,1e-04,2.083e-06,3.6547e-03,113,1,570,114,456
+"TSRosW(""ra34pw2""), mass matrix",PETScDiffEq,1e-09,1e-05,2.292e-07,6.8587e-03,226,1,1135,227,908
+"TSRosW(""ra34pw2""), mass matrix",PETScDiffEq,1e-10,1e-06,2.414e-08,1.3936e-02,470,3,2365,473,1892
+"ROS34PW2, mass matrix",OrdinaryDiffEq,1e-06,1e-02,2.630e-05,7.5446e-05,67,0,538,67,0
+"ROS34PW2, mass matrix",OrdinaryDiffEq,1e-07,1e-03,4.870e-06,1.1300e-04,104,0,834,104,0
+"ROS34PW2, mass matrix",OrdinaryDiffEq,1e-08,1e-04,7.409e-07,1.8558e-04,175,0,1402,175,0
+"ROS34PW2, mass matrix",OrdinaryDiffEq,1e-09,1e-05,9.459e-08,3.3768e-04,323,1,2590,323,0
+"ROS34PW2, mass matrix",OrdinaryDiffEq,1e-10,1e-06,1.073e-08,6.5769e-04,634,0,5074,634,0
+"Rodas5P, mass matrix",OrdinaryDiffEq,1e-06,1e-02,2.032e-07,8.8601e-05,53,0,638,53,0
+"Rodas5P, mass matrix",OrdinaryDiffEq,1e-07,1e-03,6.709e-08,1.0893e-04,66,0,794,66,0
+"Rodas5P, mass matrix",OrdinaryDiffEq,1e-08,1e-04,1.807e-08,1.3660e-04,84,0,1010,84,0
+"Rodas5P, mass matrix",OrdinaryDiffEq,1e-09,1e-05,4.000e-09,1.7496e-04,109,0,1310,109,0
+"Rodas5P, mass matrix",OrdinaryDiffEq,1e-10,1e-06,7.399e-10,2.4418e-04,152,0,1826,152,0
