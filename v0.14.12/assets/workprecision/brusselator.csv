@@ -1,0 +1,51 @@
+solver,package,abstol,reltol,error,time_s,steps,rejects,nf,njacs,newton_iters
+"TSRosW(""ra34pw2"")",PETScDiffEq,1e-05,1e-03,1.717e-03,2.3239e-02,44,9,265,53,212
+"TSRosW(""ra34pw2"")",PETScDiffEq,1e-06,1e-04,2.229e-04,3.6037e-02,89,10,495,99,396
+"TSRosW(""ra34pw2"")",PETScDiffEq,1e-07,1e-05,2.447e-05,6.4759e-02,186,6,960,192,768
+"TSRosW(""ra34pw2"")",PETScDiffEq,1e-08,1e-06,2.502e-06,1.1823e-01,395,0,1975,395,1580
+"TSRosW(""ra34pw2"")",PETScDiffEq,1e-09,1e-07,2.550e-07,2.4999e-01,849,0,4245,849,3396
+"TSRosW(""ra34pw2""), LU",PETScDiffEq,1e-05,1e-03,1.717e-03,1.1852e-02,44,9,265,53,212
+"TSRosW(""ra34pw2""), LU",PETScDiffEq,1e-06,1e-04,2.227e-04,2.2041e-02,89,10,495,99,396
+"TSRosW(""ra34pw2""), LU",PETScDiffEq,1e-07,1e-05,2.445e-05,3.8412e-02,186,6,960,192,768
+"TSRosW(""ra34pw2""), LU",PETScDiffEq,1e-08,1e-06,2.516e-06,7.5786e-02,395,0,1975,395,1580
+"TSRosW(""ra34pw2""), LU",PETScDiffEq,1e-09,1e-07,2.553e-07,1.6007e-01,849,0,4245,849,3396
+"ROS34PW2",OrdinaryDiffEq,1e-05,1e-03,5.266e-04,1.1893e-02,63,5,559,57,0
+"ROS34PW2",OrdinaryDiffEq,1e-06,1e-04,2.868e-05,2.1543e-02,118,9,955,89,0
+"ROS34PW2",OrdinaryDiffEq,1e-07,1e-05,2.870e-06,3.9878e-02,232,11,1594,124,0
+"ROS34PW2",OrdinaryDiffEq,1e-08,1e-06,1.917e-07,7.7710e-02,475,12,2725,155,0
+"ROS34PW2",OrdinaryDiffEq,1e-09,1e-07,1.305e-07,1.6171e-01,1013,16,5133,203,0
+"TSImplicit(""bdf""; order = 5)",PETScDiffEq,1e-05,1e-03,2.876e-03,3.1032e-02,63,8,412,169,169
+"TSImplicit(""bdf""; order = 5)",PETScDiffEq,1e-06,1e-04,9.188e-04,3.6313e-02,87,9,497,199,199
+"TSImplicit(""bdf""; order = 5)",PETScDiffEq,1e-07,1e-05,1.208e-04,4.6565e-02,122,10,673,269,269
+"TSImplicit(""bdf""; order = 5)",PETScDiffEq,1e-08,1e-06,1.698e-05,6.2571e-02,173,14,940,375,375
+"TSImplicit(""bdf""; order = 5)",PETScDiffEq,1e-09,1e-07,2.449e-06,7.8295e-02,246,10,1244,492,492
+"TSImplicit(""bdf""; order = 5), LU",PETScDiffEq,1e-05,1e-03,2.876e-03,2.4559e-02,63,8,404,165,165
+"TSImplicit(""bdf""; order = 5), LU",PETScDiffEq,1e-06,1e-04,9.188e-04,2.9237e-02,87,9,493,197,197
+"TSImplicit(""bdf""; order = 5), LU",PETScDiffEq,1e-07,1e-05,1.208e-04,3.7837e-02,122,10,645,255,255
+"TSImplicit(""bdf""; order = 5), LU",PETScDiffEq,1e-08,1e-06,1.698e-05,5.0955e-02,173,14,884,347,347
+"TSImplicit(""bdf""; order = 5), LU",PETScDiffEq,1e-09,1e-07,2.449e-06,7.0320e-02,246,10,1236,488,488
+"FBDF",OrdinaryDiffEq,1e-05,1e-03,1.507e-03,8.1769e-03,94,2,253,2,232
+"FBDF",OrdinaryDiffEq,1e-06,1e-04,1.296e-04,1.1505e-02,128,6,367,1,360
+"FBDF",OrdinaryDiffEq,1e-07,1e-05,2.558e-05,1.3306e-02,168,9,417,1,410
+"FBDF",OrdinaryDiffEq,1e-08,1e-06,3.835e-06,1.6966e-02,242,8,559,1,552
+"FBDF",OrdinaryDiffEq,1e-09,1e-07,6.017e-07,2.1925e-02,370,9,701,1,694
+"TSARKIMEX(""4"")",PETScDiffEq,1e-05,1e-03,NaN,NaN,7,1,510,140,138
+"TSARKIMEX(""4"")",PETScDiffEq,1e-06,1e-04,2.243e-04,8.1877e-02,23,6,1020,436,435
+"TSARKIMEX(""4"")",PETScDiffEq,1e-07,1e-05,1.735e-05,1.0345e-01,36,8,1439,608,607
+"TSARKIMEX(""4"")",PETScDiffEq,1e-08,1e-06,1.806e-06,1.2782e-01,59,10,1926,789,788
+"TSARKIMEX(""4"")",PETScDiffEq,1e-09,1e-07,1.074e-07,1.7601e-01,101,8,2750,1101,1100
+"KenCarp4",OrdinaryDiffEq,1e-05,1e-03,4.426e-04,1.3645e-02,20,0,612,12,491
+"KenCarp4",OrdinaryDiffEq,1e-06,1e-04,3.142e-04,1.6008e-02,23,0,753,12,632
+"KenCarp4",OrdinaryDiffEq,1e-07,1e-05,1.493e-04,1.8423e-02,30,2,873,11,766
+"KenCarp4",OrdinaryDiffEq,1e-08,1e-06,1.224e-05,2.6243e-02,43,4,1271,14,1122
+"KenCarp4",OrdinaryDiffEq,1e-09,1e-07,2.471e-06,3.8640e-02,62,6,1924,18,1719
+"Rodas5P",OrdinaryDiffEq,1e-05,1e-03,9.890e-05,1.0952e-02,37,3,507,37,0
+"Rodas5P",OrdinaryDiffEq,1e-06,1e-04,2.925e-05,1.5728e-02,53,5,731,53,0
+"Rodas5P",OrdinaryDiffEq,1e-07,1e-05,6.970e-06,2.1528e-02,75,5,1017,75,0
+"Rodas5P",OrdinaryDiffEq,1e-08,1e-06,8.105e-07,3.2154e-02,113,7,1527,113,0
+"Rodas5P",OrdinaryDiffEq,1e-09,1e-07,8.169e-08,4.7571e-02,170,8,2276,170,0
+"CVODE_BDF, banded",Sundials,1e-05,1e-03,2.538e-03,3.5228e-03,92,2,120,2,117
+"CVODE_BDF, banded",Sundials,1e-06,1e-04,2.925e-04,4.4603e-03,111,3,144,3,141
+"CVODE_BDF, banded",Sundials,1e-07,1e-05,2.966e-05,6.3641e-03,155,7,201,3,198
+"CVODE_BDF, banded",Sundials,1e-08,1e-06,2.597e-06,8.1562e-03,218,6,262,4,259
+"CVODE_BDF, banded",Sundials,1e-09,1e-07,5.424e-07,1.0400e-02,294,5,342,5,339
