@@ -1617,6 +1617,38 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             integ.opts.adaptive = false
             @test_throws "the options pick `-ts_adapt_type`" (integ.opts.adaptive = true)
         end
+
+        @testset "adaptive = false with an adaptive step control in the options adapts" begin
+            basic = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "basic"])
+            breaks = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du[1] = t > 0.5 ? NaN : -u[1]; nothing), [1.0], (0.0, 1.0),
+            )
+            cross = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5, integ -> nothing; dtrelax = 0.5,
+            )
+            for (pr, kw) in (
+                    (prob, (; isoutofdomain = (u, p, t) -> 0.8 < t < 0.9)),
+                    (prob, (; dtmin = 0.01, isoutofdomain = below(0.6))),
+                    (prob, (; abstol = 1.0e-8, reltol = 1.0e-8, callback = cross)),
+                    (breaks, (; verbose = false)),
+                    (breaks, (; dtmin = 0.01, verbose = false)),
+                )
+                ref = SciMLBase.solve(pr, alg; dt = 0.1, kw...)
+                integ = SciMLBase.init(pr, basic; dt = 0.1, adaptive = false, kw...)
+                @test SciMLBase.isadaptive(integ)
+                @test integ.opts.adaptive
+                for sol in (
+                        SciMLBase.solve!(integ),
+                        SciMLBase.solve(pr, basic; dt = 0.1, adaptive = false, kw...),
+                    )
+                    @test sol.retcode == ref.retcode
+                    @test sol.t == ref.t
+                    @test sol.u == ref.u
+                end
+            end
+            integ = SciMLBase.init(prob, basic; dt = 0.1, adaptive = false)
+            @test_throws "the options pick `-ts_adapt_type`" (integ.opts.adaptive = false)
+        end
     end
 
     @testset "d_discontinuities and force_dtmin as OrdinaryDiffEq has them" begin

@@ -7008,10 +7008,10 @@ function _setup_problem(
             # glle steps with its own controller under PETSc's `none`.
             ctx.dtmin = _floor(
                 R, dtmin, force_dtmin,
-                adaptive && adapts !== false && (!fixed || running == "glle"),
+                adapts !== false && (!fixed || adaptive && running == "glle"),
             )
             ctx.retry_fp = !fixed && (comm === nothing || !_uses_ifunction(alg)) &&
-                adaptive && adapts !== false
+                adapts !== false
             if ctx.dtmin > 0 || ctx.unstable !== nothing || comm !== nothing
                 _set_post_step!(petsclib, ts, ctx)
             end
@@ -7997,7 +7997,7 @@ function _make_opts(
     ) where {R}
     ctx = h.ctx
     return PETScIntegratorOpts(
-        h, get(kwargs, :adaptive, true) === true && !h.fixed,
+        h, !h.fixed,
         _own_tol(h.abstol), _own_tol(h.reltol),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
