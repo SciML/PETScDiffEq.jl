@@ -6340,6 +6340,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 end
                 @test seen[2] ≈ seen[1] / 2
             end
+            fired = Ref(false)
+            cb = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5,
+                integ -> (fired[] = true; SciMLBase.set_proposed_dt!(integ, 1.0e-3)),
+            )
+            integ = SciMLBase.init(
+                prob, PETScDiffEq.TSRK("5dp"); adaptive = false, dt = 0.1, callback = cb,
+            )
+            while !fired[]
+                SciMLBase.step!(integ)
+            end
+            for _ in 1:2
+                SciMLBase.step!(integ)
+                @test integ.dt ≈ 1.0e-3
+            end
         end
 
         @testset "a bouncing ball" begin
