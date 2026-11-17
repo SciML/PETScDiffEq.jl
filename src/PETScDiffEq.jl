@@ -2368,6 +2368,7 @@ _unsupported_deriv(deriv) = ArgumentError(
 const PETSC_ERR_SUP = 56
 const PETSC_ERR_MAT_LU_ZRPVT = 71
 const PETSC_ERR_FP = 72
+const PETSC_ERR_USER = 83
 const PETSC_ERR_MISSING_FACTOR = 92
 const CALLBACK_THREW = 1
 
@@ -7293,9 +7294,10 @@ function _object_type(pl, obj)
     return name[] == C_NULL ? "" : unsafe_string(name[])
 end
 
-# Whether PETSc registers `solver`, and whether it makes this factorization of an `mtype` matrix.
+# Whether PETSc's `solver`, or any when it is `nothing`, supports an `mtype` matrix, and
+# whether it makes this factorization of one.
 function _factors(pl, solver, mtype, ftype)
-    found, create = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL)
+    supports, create = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL)
     _check_code(
         ccall(
             _symbol(pl, :MatSolverTypeGet), _Err,
@@ -7303,74 +7305,65 @@ function _factors(pl, solver, mtype, ftype)
                 Cstring, Cstring, LibPETSc.MatFactorType, Ptr{LibPETSc.PetscBool},
                 Ptr{LibPETSc.PetscBool}, Ptr{Ptr{Cvoid}},
             ),
-            solver, mtype, ftype, found, C_NULL, create,
+            something(solver, Cstring(C_NULL)), mtype, ftype, C_NULL, supports, create,
         ),
     )
-    return found[] == LibPETSc.PETSC_TRUE, create[] != C_NULL
+    return supports[] == LibPETSc.PETSC_TRUE, create[] != C_NULL
 end
 
-const _FACTOR_PCS = Dict(
-    "lu" => LibPETSc.MAT_FACTOR_LU, "cholesky" => LibPETSc.MAT_FACTOR_CHOLESKY,
-    "ilu" => LibPETSc.MAT_FACTOR_ILU, "icc" => LibPETSc.MAT_FACTOR_ICC,
-)
+# MatFactorType's names, from MAT_FACTOR_LU on.
+const _FACTOR_TYPES = ("LU", "CHOLESKY", "ILU", "ICC", "ILUDT", "QR")
 
 # PETSc takes a solver that cannot handle the Jacobian's matrix type and fails in the first
-# linear solve with a bare code, so the error names the matrix type and the solver.
+# linear solve with a bare code. Its message for the first error says when that was the cause.
 function _refuse_matrix_type(e, h)
-    e isa LibPETSc.PetscError && e.code in (PETSC_ERR_SUP, PETSC_ERR_MISSING_FACTOR) ||
+    e isa LibPETSc.PetscError || return nothing
+    pl, text, why = h.petsclib, Ref{Ptr{Cchar}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscErrorMessage), _Err, (_Err, Ptr{Ptr{Cchar}}, Ptr{Ptr{Cchar}}),
+            e.code, text, why,
+        ),
+    )
+    why = why[] == C_NULL ? "" : rstrip(unsafe_string(why[]), '.')
+    named = match(
+        r"^MatSolverType (\S+) does not support (?:factorization type (\S+) for )?matrix type \S+$",
+        why,
+    )
+    unnamed = match(r"^Could not locate a solver type for factorization type (\S+) and ", why)
+    # Whether this solver supports a `seqaij` matrix, with the factorization PETSc names if
+    # it names one; MatSolverTypeGet finds the type support whatever factorization it is given.
+    aij = if e.code == PETSC_ERR_MISSING_FACTOR && named !== nothing
+        ftype = something(findfirst(==(named[2]), _FACTOR_TYPES), 1)
+        supports, factors =
+            _factors(pl, String(named[1]), "seqaij", LibPETSc.MatFactorType(ftype))
+        named[2] === nothing ? supports : factors
+    elseif e.code == PETSC_ERR_MISSING_FACTOR && unnamed !== nothing
+        ftype = findfirst(==(unnamed[1]), _FACTOR_TYPES)
+        ftype !== nothing && last(_factors(pl, nothing, "seqaij", LibPETSc.MatFactorType(ftype)))
+    elseif e.code == PETSC_ERR_SUP && startswith(why, "No method creategraph for Mat of type ") ||
+            e.code == PETSC_ERR_USER && why == "Require AIJ matrix"
+        # GAMG builds its graph from an AIJ matrix only.
+        true
+    else
         return nothing
-    pl, ksp, pc = h.petsclib, Ref{LibPETSc.CKSP}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
-    set, P = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL)
+    end
+    P = Ref{Ptr{Cvoid}}(C_NULL)
     _check_code(
         ccall(
-            _symbol(pl, :SNESGetKSP), _Err, (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}),
-            _snes(pl, h.ts.ptr), ksp,
+            _symbol(pl, :SNESGetJacobian), _Err,
+            (LibPETSc.CSNES, Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Cvoid}, Ptr{Cvoid}),
+            _snes(pl, h.ts.ptr), C_NULL, P, C_NULL, C_NULL,
         ),
     )
-    _check_code(
-        ccall(_symbol(pl, :KSPGetPC), _Err, (LibPETSc.CKSP, Ptr{Ptr{Cvoid}}), ksp[], pc),
-    )
-    # PCGetOperators would create a matrix that is not set.
-    _check_code(
-        ccall(
-            _symbol(pl, :PCGetOperatorsSet), _Err,
-            (Ptr{Cvoid}, Ptr{LibPETSc.PetscBool}, Ptr{LibPETSc.PetscBool}), pc[], C_NULL, set,
-        ),
-    )
-    set[] == LibPETSc.PETSC_TRUE || return nothing
-    _check_code(
-        ccall(
-            _symbol(pl, :PCGetOperators), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}),
-            pc[], C_NULL, P,
-        ),
-    )
-    pc_type, mtype = _object_type(pl, pc[]), _object_type(pl, P[])
-    hint = "a sparse `jac_prototype` makes that matrix `seqaij`"
-    # Only AIJ matrices build the graph GAMG coarsens.
-    e.code == PETSC_ERR_SUP && pc_type == "gamg" && mtype == "seqdense" && throw(
-        ArgumentError(
-            "PETSc's `gamg` needs an AIJ matrix, not the `seqdense` one that holds this " *
-                "solve's Jacobian; $hint",
-        ),
-    )
-    e.code == PETSC_ERR_MISSING_FACTOR && haskey(_FACTOR_PCS, pc_type) || return nothing
-    name = Ref{Ptr{Cchar}}(C_NULL)
-    _check_code(
-        ccall(
-            _symbol(pl, :PCFactorGetMatSolverType), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}),
-            pc[], name,
-        ),
-    )
-    name[] == C_NULL && return nothing
-    solver, ftype = unsafe_string(name[]), _FACTOR_PCS[pc_type]
-    registered, factors = _factors(pl, solver, mtype, ftype)
-    registered && !factors || return nothing
-    aij = mtype == "seqdense" && last(_factors(pl, solver, "seqaij", ftype))
+    P[] == C_NULL && return nothing
+    mtype = _object_type(pl, P[])
+    hint = mtype == "seqdense" && aij ?
+        "; with a sparse `jac_prototype` that matrix is `seqaij`, a type this solver supports" : ""
     throw(
         ArgumentError(
-            "PETSc's `$solver` has no $(uppercase(pc_type)) factorization of the `$mtype` " *
-                "matrix that holds this solve's Jacobian" *
-                (aij ? "; $hint, which `$solver` factors" : ""),
+            "PETSc's linear solver cannot take the `$mtype` matrix that holds this solve's " *
+                "Jacobian: $why$hint",
         ),
     )
 end

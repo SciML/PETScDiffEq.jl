@@ -10139,15 +10139,20 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             sparse = SciMLBase.ODEProblem(
                 SciMLBase.ODEFunction(lin!; jac_prototype = A), ones(n), (0.0, 1.0),
             )
-            cases = [(["-pc_type", "gamg"], "`gamg` needs an AIJ matrix")]
-            pl = PETScDiffEq._petsclib(Float64)
-            ccall(PETScDiffEq._symbol(pl, :MatInitializePackage), Cint, ())
-            lu = PETScDiffEq.LibPETSc.MAT_FACTOR_LU
-            # Not every PETSc build has SuiteSparse.
-            last(PETScDiffEq._factors(pl, "umfpack", "seqaij", lu)) && push!(
-                cases,
-                (["-pc_type", "lu", "-pc_factor_mat_solver_type", "umfpack"], "`umfpack` has no LU"),
-            )
+            umfpack = ["-pc_type", "lu", "-pc_factor_mat_solver_type", "umfpack"]
+            cases = [
+                (["-pc_type", "gamg"], "No method creategraph"),
+                (["-pc_type", "gamg", "-pc_gamg_type", "classical"], "Require AIJ matrix"),
+                (["-pc_type", "icc"], "Could not locate a solver type for factorization type ICC"),
+            ]
+            # Not every PETSc build has SuiteSparse, and one without it fails on `seqaij` too.
+            on_sparse = try
+                SciMLBase.solve(sparse, PETScDiffEq.TSImplicit("bdf", umfpack)).retcode
+            catch
+                nothing
+            end
+            on_sparse == SciMLBase.ReturnCode.Success &&
+                push!(cases, (umfpack, "MatSolverType umfpack does not support matrix type"))
             for (opts, message) in cases
                 for ad in (PETScDiffEq.AutoForwardDiff(), PETScDiffEq.AutoFiniteDiff())
                     alg = PETScDiffEq.TSImplicit("bdf", opts; autodiff = ad)
@@ -10159,6 +10164,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 integ = SciMLBase.init(dense, PETScDiffEq.TSImplicit("bdf", opts))
                 @test_throws ArgumentError SciMLBase.step!(integ)
             end
+            # GMRES has no natural norm, which PETSc finds before it sets up GAMG.
+            natural = ["-pc_type", "gamg", "-ksp_type", "gmres", "-ksp_norm_type", "natural"]
+            @test_throws PETScDiffEq.LibPETSc.PetscError(56) SciMLBase.solve(
+                dense, PETScDiffEq.TSImplicit("bdf", natural),
+            )
         end
 
         @testset "an option PETSc reads inside the solve is in force there" begin
