@@ -10131,6 +10131,36 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "a solver the dense Jacobian cannot take is named with its matrix type" begin
+            n = 8
+            A = spdiagm(-1 => ones(n - 1), 0 => fill(-2.0, n), 1 => ones(n - 1))
+            lin!(du, u, p, t) = mul!(du, A, u)
+            dense = SciMLBase.ODEProblem(lin!, ones(n), (0.0, 1.0))
+            sparse = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(lin!; jac_prototype = A), ones(n), (0.0, 1.0),
+            )
+            cases = [(["-pc_type", "gamg"], "`gamg` needs an AIJ matrix")]
+            pl = PETScDiffEq._petsclib(Float64)
+            ccall(PETScDiffEq._symbol(pl, :MatInitializePackage), Cint, ())
+            lu = PETScDiffEq.LibPETSc.MAT_FACTOR_LU
+            # Not every PETSc build has SuiteSparse.
+            last(PETScDiffEq._factors(pl, "umfpack", "seqaij", lu)) && push!(
+                cases,
+                (["-pc_type", "lu", "-pc_factor_mat_solver_type", "umfpack"], "`umfpack` has no LU"),
+            )
+            for (opts, message) in cases
+                for ad in (PETScDiffEq.AutoForwardDiff(), PETScDiffEq.AutoFiniteDiff())
+                    alg = PETScDiffEq.TSImplicit("bdf", opts; autodiff = ad)
+                    @test SciMLBase.solve(sparse, alg).retcode == SciMLBase.ReturnCode.Success
+                    @test_throws [message, "`seqdense`", "sparse `jac_prototype`"] SciMLBase.solve(
+                        dense, alg,
+                    )
+                end
+                integ = SciMLBase.init(dense, PETScDiffEq.TSImplicit("bdf", opts))
+                @test_throws ArgumentError SciMLBase.step!(integ)
+            end
+        end
+
         @testset "an option PETSc reads inside the solve is in force there" begin
             n = 8
             A = spdiagm(-1 => ones(n - 1), 0 => fill(-2.0, n), 1 => ones(n - 1))

@@ -2368,6 +2368,7 @@ _unsupported_deriv(deriv) = ArgumentError(
 const PETSC_ERR_SUP = 56
 const PETSC_ERR_MAT_LU_ZRPVT = 71
 const PETSC_ERR_FP = 72
+const PETSC_ERR_MISSING_FACTOR = 92
 const CALLBACK_THREW = 1
 
 # Dense LU raises on a zero pivot whatever -ts_error_if_step_fails says.
@@ -7282,6 +7283,98 @@ end
 
 _viewers_off(pl) = LibPETSc.PetscOptionsGetCreateViewerOff(pl) != LibPETSc.PETSC_FALSE
 
+function _object_type(pl, obj)
+    name = Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscObjectGetType), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}), obj, name,
+        ),
+    )
+    return name[] == C_NULL ? "" : unsafe_string(name[])
+end
+
+# Whether PETSc registers `solver`, and whether it makes this factorization of an `mtype` matrix.
+function _factors(pl, solver, mtype, ftype)
+    found, create = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :MatSolverTypeGet), _Err,
+            (
+                Cstring, Cstring, LibPETSc.MatFactorType, Ptr{LibPETSc.PetscBool},
+                Ptr{LibPETSc.PetscBool}, Ptr{Ptr{Cvoid}},
+            ),
+            solver, mtype, ftype, found, C_NULL, create,
+        ),
+    )
+    return found[] == LibPETSc.PETSC_TRUE, create[] != C_NULL
+end
+
+const _FACTOR_PCS = Dict(
+    "lu" => LibPETSc.MAT_FACTOR_LU, "cholesky" => LibPETSc.MAT_FACTOR_CHOLESKY,
+    "ilu" => LibPETSc.MAT_FACTOR_ILU, "icc" => LibPETSc.MAT_FACTOR_ICC,
+)
+
+# PETSc takes a solver that cannot handle the Jacobian's matrix type and fails in the first
+# linear solve with a bare code, so the error names the matrix type and the solver.
+function _refuse_matrix_type(e, h)
+    e isa LibPETSc.PetscError && e.code in (PETSC_ERR_SUP, PETSC_ERR_MISSING_FACTOR) ||
+        return nothing
+    pl, ksp, pc = h.petsclib, Ref{LibPETSc.CKSP}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    set, P = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :SNESGetKSP), _Err, (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}),
+            _snes(pl, h.ts.ptr), ksp,
+        ),
+    )
+    _check_code(
+        ccall(_symbol(pl, :KSPGetPC), _Err, (LibPETSc.CKSP, Ptr{Ptr{Cvoid}}), ksp[], pc),
+    )
+    # PCGetOperators would create a matrix that is not set.
+    _check_code(
+        ccall(
+            _symbol(pl, :PCGetOperatorsSet), _Err,
+            (Ptr{Cvoid}, Ptr{LibPETSc.PetscBool}, Ptr{LibPETSc.PetscBool}), pc[], C_NULL, set,
+        ),
+    )
+    set[] == LibPETSc.PETSC_TRUE || return nothing
+    _check_code(
+        ccall(
+            _symbol(pl, :PCGetOperators), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}),
+            pc[], C_NULL, P,
+        ),
+    )
+    pc_type, mtype = _object_type(pl, pc[]), _object_type(pl, P[])
+    hint = "a sparse `jac_prototype` makes that matrix `seqaij`"
+    # Only AIJ matrices build the graph GAMG coarsens.
+    e.code == PETSC_ERR_SUP && pc_type == "gamg" && mtype == "seqdense" && throw(
+        ArgumentError(
+            "PETSc's `gamg` needs an AIJ matrix, not the `seqdense` one that holds this " *
+                "solve's Jacobian; $hint",
+        ),
+    )
+    e.code == PETSC_ERR_MISSING_FACTOR && haskey(_FACTOR_PCS, pc_type) || return nothing
+    name = Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :PCFactorGetMatSolverType), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}),
+            pc[], name,
+        ),
+    )
+    name[] == C_NULL && return nothing
+    solver, ftype = unsafe_string(name[]), _FACTOR_PCS[pc_type]
+    registered, factors = _factors(pl, solver, mtype, ftype)
+    registered && !factors || return nothing
+    aij = mtype == "seqdense" && last(_factors(pl, solver, "seqaij", ftype))
+    throw(
+        ArgumentError(
+            "PETSc's `$solver` has no $(uppercase(pc_type)) factorization of the `$mtype` " *
+                "matrix that holds this solve's Jacobian" *
+                (aij ? "; $hint, which `$solver` factors" : ""),
+        ),
+    )
+end
+
 # Under a distributed comm the error is returned, to raise once the ranks agree on who threw.
 function _run!(f::F, h::TSHandles) where {F}
     ctx = h.ctx
@@ -7290,7 +7383,8 @@ function _run!(f::F, h::TSHandles) where {F}
             _quiet_errors(() -> _with_options(f, h), h)
         catch e
             if ctx.comm === nothing
-                ctx.err === nothing && !_failed_step(e, h) && rethrow()
+                ctx.err === nothing && !_failed_step(e, h) &&
+                    (_refuse_matrix_type(e, h); rethrow())
             elseif !_failed_step(e, h)
                 return e
             end
