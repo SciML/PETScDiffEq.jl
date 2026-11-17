@@ -9146,7 +9146,13 @@ function _reinit_unlocked(
         p = integ.p,
     )
     written = getfield(integ.opts, :written)
-    kept = NamedTuple{Tuple(written)}(map(k -> getfield(integ.opts, k), Tuple(written)))
+    # No setter sees a tolerance vector written in place, so compare it with the one set up.
+    moved = filter(
+        k -> _anywhere(old.ctx.comm, getfield(integ.opts, k) != getfield(old, k)),
+        [:abstol, :reltol],
+    )
+    carried = Tuple(union(written, moved))
+    kept = NamedTuple{carried}(map(k -> getfield(integ.opts, k), carried))
     setup_kwargs = merge(integ.kwargs, kept)
     # As in OrdinaryDiffEq, a fixed step made live keeps the step it has.
     get(setup_kwargs, :adaptive, true) === false && get(setup_kwargs, :dt, nothing) === nothing &&
@@ -9163,7 +9169,7 @@ function _reinit_unlocked(
     end
     stops = vcat(tstops, d_discontinuities)
     before = erase_sol && saveat === nothing && reinit_dae && old.fresh !== nothing &&
-        !old.destroyed && isempty(getfield(integ.opts, :written)) ? _ts_state(old) : nothing
+        !old.destroyed && isempty(carried) ? _ts_state(old) : nothing
     reused = before !== nothing && _reuse!(old, prob, stops)
     h = reused ? old : _setup(
             prob, integ.alg; tstops = stops, setup_kwargs..., direction = integ.tdir,

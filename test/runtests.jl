@@ -2230,7 +2230,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.stats.naccept >= 100
         end
 
-        @testset "tolerances assigned on opts survive reinit!, as in OrdinaryDiffEq" begin
+        @testset "tolerances changed on opts survive reinit!, as in OrdinaryDiffEq" begin
             alg = PETScDiffEq.TSRK("5dp")
             ref = SciMLBase.solve(prob, alg; abstol = 1.0e-12, reltol = 1.0e-10)
             for tighten! in (
@@ -2252,6 +2252,31 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             theirs.opts.abstol, theirs.opts.reltol = 1.0e-12, 1.0e-10
             SciMLBase.reinit!(theirs)
             @test (theirs.opts.abstol, theirs.opts.reltol) == (1.0e-12, 1.0e-10)
+
+            integ = SciMLBase.init(prob, alg; abstol = [1.0e-4], reltol = [1.0e-3])
+            integ.opts.abstol .= 1.0e-12
+            integ.opts.reltol .= 1.0e-10
+            SciMLBase.reinit!(integ)
+            @test (integ.opts.abstol, integ.opts.reltol) == ([1.0e-12], [1.0e-10])
+            sol = SciMLBase.solve!(integ)
+            fresh = SciMLBase.solve(prob, alg; abstol = [1.0e-12], reltol = [1.0e-10])
+            @test sol.t == fresh.t
+            @test sol.u == fresh.u
+
+            again = map((1.0e-6, [1.0e-6])) do abstol
+                pair = map((alg, Tsit5())) do solver
+                    auto = SciMLBase.init(
+                        prob, solver; reltol = 1.0e-3, abstol = copy(abstol),
+                        callback = DiffEqCallbacks.AutoAbstol(),
+                    )
+                    SciMLBase.solve!(auto)
+                    SciMLBase.reinit!(auto)
+                    return auto
+                end
+                @test pair[1].opts.abstol ≈ pair[2].opts.abstol rtol = 1.0e-6
+                return SciMLBase.solve!(pair[1]).t
+            end
+            @test again[1] == again[2]
         end
 
         @testset "callbacks are initialised again unless told not to" begin
@@ -5519,7 +5544,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 integ.opts.reltol .= 1.0e-2
                 @test SciMLBase.solve!(integ).t == run(; reltol = 1.0e-2, abstol = 1.0e-3).t
                 SciMLBase.reinit!(integ)
-                @test integ.opts.reltol == fill(1.0e-6, 3)
+                @test integ.opts.reltol == fill(1.0e-2, 3)
                 integ.opts.reltol[2] = -1.0
                 @test_throws ArgumentError SciMLBase.step!(integ)
                 SciMLBase.terminate!(integ)

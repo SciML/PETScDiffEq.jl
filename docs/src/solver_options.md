@@ -199,8 +199,7 @@ integrator goes on at its fixed size through both, as OrdinaryDiffEq's does, and
 shows the estimate. `get_proposed_dt` is signed, negative on a reversed span, and
 `set_proposed_dt!` also takes another integrator whose proposed step it copies. `set_abstol!`
 and `set_reltol!` hold for the steps after and, like any option assigned on `opts`, such as
-`maxiters`, `dtmax` or `save_start`, carry through `reinit!` as in OrdinaryDiffEq. A tolerance
-vector only changed in place goes back at `reinit!` to the one `init` was given, unlike in
+`maxiters`, `dtmax` or `save_start`, carry through `reinit!` as in
 OrdinaryDiffEq. With `erase_sol = false` the new start is not saved again, as in
 OrdinaryDiffEq, and a solution saved under `save_idxs` without dense output stays without it
 when the new `saveat` would otherwise turn it on, since a partial state gives no derivative to
