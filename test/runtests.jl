@@ -1600,6 +1600,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 prob, none; dt = 0.25, isoutofdomain = (u, p, t) -> (asked[] += 1; false),
             )
             @test asked[] == 0
+            floored = (; dt = 0.01, dtmin = 0.05)
+            ref = SciMLBase.solve(prob, alg; floored..., adaptive = false)
+            @test ref.retcode == SciMLBase.ReturnCode.Success
+            @test SciMLBase.solve(prob, none; floored...).t == ref.t
+            @test SciMLBase.solve!(SciMLBase.init(prob, none; floored...)).t == ref.t
+            integ = SciMLBase.init(prob, none; dt = 0.01)
+            integ.opts.dtmin = 0.05
+            @test SciMLBase.solve!(integ).t == ref.t
+            cross = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5, integ -> nothing; dtrelax = 0.5,
+            )
+            relaxed = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, callback = cross)
+            @test SciMLBase.solve(prob, none; dt = 0.1, callback = cross).t == relaxed.t
             integ = SciMLBase.init(prob, none; dt = 0.1)
             integ.opts.adaptive = false
             @test_throws "the options pick `-ts_adapt_type`" (integ.opts.adaptive = true)

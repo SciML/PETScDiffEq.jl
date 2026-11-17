@@ -7005,7 +7005,11 @@ function _setup_problem(
                 )
                 @warn setup_warnings[end]
             end
-            ctx.dtmin = _floor(R, dtmin, force_dtmin, adaptive && adapts !== false)
+            # glle steps with its own controller under PETSc's `none`.
+            ctx.dtmin = _floor(
+                R, dtmin, force_dtmin,
+                adaptive && adapts !== false && (!fixed || running == "glle"),
+            )
             ctx.retry_fp = !fixed && (comm === nothing || !_uses_ifunction(alg)) &&
                 adaptive && adapts !== false
             if ctx.dtmin > 0 || ctx.unstable !== nothing || comm !== nothing
