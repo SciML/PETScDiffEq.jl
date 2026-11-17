@@ -6316,6 +6316,32 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test proposed[2] ≈ proposed[1] / 100
         end
 
+        @testset "the affect! sees the relaxed step and its own proposal is kept" begin
+            for vector in (false, true)
+                seen = map((1, 0.5)) do dtrelax
+                    inside = Float64[]
+                    affect!(integ, _...) = (
+                        push!(inside, SciMLBase.get_proposed_dt(integ));
+                        SciMLBase.set_proposed_dt!(integ, 1.0e-3)
+                    )
+                    cb = vector ?
+                        SciMLBase.VectorContinuousCallback(
+                            (out, u, t, integ) -> (out[1] = u[1] - 0.5), affect!, 1; dtrelax,
+                        ) :
+                        SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.5, affect!; dtrelax)
+                    integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); callback = cb)
+                    while isempty(inside)
+                        SciMLBase.step!(integ)
+                    end
+                    @test SciMLBase.get_proposed_dt(integ) == 1.0e-3
+                    SciMLBase.step!(integ)
+                    @test integ.dt ≈ 1.0e-3
+                    inside[1]
+                end
+                @test seen[2] ≈ seen[1] / 2
+            end
+        end
+
         @testset "a bouncing ball" begin
             function ball!(du, u, p, t)
                 du[1] = u[2]
