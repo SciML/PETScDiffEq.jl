@@ -6852,6 +6852,8 @@ function _setup_problem(
                 try
                     # Monitors and viewers are made here, so they follow the solve's own options.
                     _with_options(() -> LibPETSc.TSSetFromOptions(petsclib, ts), h)
+                    # Set after the options, as -ts_monitor_cancel removes every monitor set before.
+                    LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
                 catch e
                     e isa LibPETSc.PetscError || rethrow()
                     throw(
@@ -6864,9 +6866,8 @@ function _setup_problem(
                 end
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
+                LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             end
-            # Set after the options, as -ts_monitor_cancel removes every monitor set before.
-            LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             # The integrator resets PETSc's step limit from maxiters before each step.
             limit = LibPETSc.TSGetMaxSteps(petsclib, ts)
             limit == _maxsteps(ctx.maxiters) || (ctx.maxiters = Int(limit))

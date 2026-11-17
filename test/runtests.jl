@@ -10135,6 +10135,13 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             @test PETScDiffEq.HANDLES_MADE[] - made == 1
             @test all(s -> s.t == ref.t && s.u == ref.u, sols)
+            nan!(du, u, p, t) = (du[1] = t > 0.5 ? NaN : -u[1]; nothing)
+            bad = SciMLBase.ODEProblem(nan!, [1.0], (0.0, 1.0))
+            failed = SciMLBase.solve(bad, PETScDiffEq.TSRK("5dp"))
+            sol = SciMLBase.solve(bad, alg)
+            @test sol.retcode == failed.retcode == SciMLBase.ReturnCode.Unstable
+            @test sol.t[end] == failed.t[end] > 0.4
+            @test sol.u[end] == failed.u[end]
         end
 
         @testset "options PETSc refuses at setup are an ArgumentError" begin
