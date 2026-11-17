@@ -1646,6 +1646,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     @test sol.u == ref.u
                 end
             end
+            ref = SciMLBase.solve(prob, alg)
+            sol = SciMLBase.solve(prob, basic; adaptive = false)
+            @test sol.retcode == ref.retcode
+            @test sol.t == ref.t
+            @test sol.u == ref.u
             integ = SciMLBase.init(prob, basic; dt = 0.1, adaptive = false)
             @test_throws "the options pick `-ts_adapt_type`" (integ.opts.adaptive = false)
         end
@@ -2556,6 +2561,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         end
         @test SciMLBase.solve(prob, glle; fixed..., dtmin = 0.2).retcode ==
             SciMLBase.ReturnCode.Success
+        none = PETScDiffEq.TSGeneric("glle", ["-ts_adapt_type", "none"])
+        @test SciMLBase.solve(prob, none; dt = 0.1, dtmin = 0.2).t ==
+            SciMLBase.solve(prob, glle; fixed...).t
         @test_throws why SciMLBase.init(prob, glle; fixed...)
         @test_throws why SciMLBase.init(
             prob, PETScDiffEq.TSGeneric("bdf", ["-ts_type", "glle"]); fixed...,
