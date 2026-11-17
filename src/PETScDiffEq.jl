@@ -7844,7 +7844,9 @@ The integrator `SciMLBase.init` returns for a PETSc TS algorithm. Step it with
 restart it with `reinit!`. Between steps `u`, `uprev`, `t`, `tprev` and `dt`
 are readable, `integ(t)`, `integ(t, Val{1})`, `integ(t; idxs)` and `integ(out, t)` give the
 state or its slope inside the step just taken, and `add_tstop!` schedules a time to land on
-exactly. Assigning `u` or `t` takes effect at the next step, as `set_u!` and `set_t!` do.
+exactly. `integ.ps[sym]` gets and sets parameters by symbol, editing `p` in place, so
+`prob.p` sees writes that assigning `integ.p` would replace. Assigning `u` or `t` takes
+effect at the next step, as `set_u!` and `set_t!` do.
 
 These are in the types PETSc steps in. The clock, and so `t`, `dt` and the saved times, is
 `Float32` for a `Float32` or `ComplexF32` state with a `Float32` span and `Float64`
@@ -7953,9 +7955,10 @@ function Base.setproperty!(integ::PETScIntegrator, name::Symbol, v)
 end
 
 Base.getproperty(integ::PETScIntegrator, name::Symbol) =
-    name === :stats ? getfield(integ, :sol).stats : getfield(integ, name)
+    name === :stats ? getfield(integ, :sol).stats :
+    name === :ps ? SII.ParameterIndexingProxy(integ) : getfield(integ, name)
 Base.propertynames(integ::PETScIntegrator, private::Bool = false) =
-    (fieldnames(typeof(integ))..., :stats)
+    (fieldnames(typeof(integ))..., :stats, :ps)
 SciMLBase.has_stats(::PETScIntegrator) = true
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
