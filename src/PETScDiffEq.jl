@@ -8167,12 +8167,41 @@ function _initial_failure!(integ::PETScIntegrator)
     return nothing
 end
 
+# The algebraic rows of the residual a `CheckInit` after a callback reads on a mass matrix,
+# or nothing where no such check follows.
+function _check_residual(integ::PETScIntegrator, init)
+    h = integ.h
+    ctx = h.ctx
+    !ctx.dae && ctx.M !== nothing || return nothing
+    _resolve_init(something(init, _initializealg(integ)), integ.prob.f) isa
+        SciMLBase.CheckInit || return nothing
+    u = integ.u isa Array ? vec(integ.u) : Vector(integ.u)
+    r = similar(u)
+    mass = _mass_of(integ.prob)
+    eqs = mass === nothing || mass == LinearAlgebra.I ? falses(length(u)) : _zero_rows(mass)
+    _anywhere(ctx.comm, any(eqs)) || return nothing
+    _checked_everywhere(() -> h.f_init(r, u, integ.p, integ.t), ctx.comm)
+    r[.!eqs] .= 0
+    return r
+end
+
+# The state and the residual a callback finds, which a `CheckInit` after it compares against.
+function _found(integ::PETScIntegrator, init)
+    r = _check_residual(integ, init)
+    return r === nothing ? nothing : (copy(integ.u), r)
+end
+
 function _reinitialize!(integ::PETScIntegrator, init, before, slope = integ.h.ctx.fend)
     ctx = integ.h.ctx
     ctx.dae || ctx.M !== nothing || return nothing
     init = _resolve_init(something(init, _initializealg(integ)), integ.prob.f)
     # PETSc keeps a DAEProblem's derivative to itself, so a state left alone passes the check.
     ctx.dae && init isa SciMLBase.CheckInit && _everywhere(ctx.comm, integ.u == before) &&
+        return nothing
+    # PETSc's interpolant can miss a mass matrix's algebraic equations by more than abstol, so
+    # a callback that changes neither the state nor their residual passes the check.
+    before isa Tuple && _everywhere(ctx.comm, integ.u == before[1]) &&
+        _everywhere(ctx.comm, isequal(_check_residual(integ, init), before[2])) &&
         return nothing
     _initialize_state!(integ, init, slope) || _initial_failure!(integ)
     return nothing
@@ -8636,7 +8665,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     pre = ctx.save_everystep && !saved && !best_cb.save_positions[1] ? copy(integ.u) : nothing
     integ.derivative_discontinuity = true
     _pin_step!(integ)
-    before = ctx.dae ? copy(integ.u) : nothing
+    before = ctx.dae ? copy(integ.u) : _found(integ, best_cb.initializealg)
     stop = let cb = best_cb, crossing = best_crossing
         _affect!(integ) do
             _checked_everywhere(() -> _fire!(integ, cb, crossing), ctx.comm)
@@ -8673,7 +8702,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
         saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
-        before = ctx.dae ? copy(integ.u) : nothing
+        before = ctx.dae ? copy(integ.u) : _found(integ, cb.initializealg)
         stop = _affect!(() -> _checked_everywhere(() -> cb.affect!(integ), ctx.comm), integ)
         integ.finished && return nothing
         stop === nothing || (_stop!(integ, cb, stop, nothing); return nothing)
@@ -8700,6 +8729,7 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     h = integ.h
     cbs = (integ.callbacks..., integ.continuous...)
     before = copy(integ.u)
+    found = h.ctx.dae || isempty(cbs) ? before : _found(integ, nothing)
     modified = false
     _checked_everywhere(h.ctx.comm) do
         for cb in cbs
@@ -8709,7 +8739,7 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
         end
     end
     integ.derivative_discontinuity = false
-    _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, before)
+    _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, found)
     integ.finished && return nothing
     initialize_save && integ.opts.save_discretes && _discretes(integ.sol) !== nothing &&
         SciMLBase.save_discretes_if_enabled!(integ, integ.opts.callback; skip_duplicates = true)

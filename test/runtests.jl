@@ -3542,6 +3542,54 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test abs(sol.u[i][2] - (1 - sol.u[i][1])) <= 1.0e-8
             @test abs(sol.u[i + 1][2] - (1 - sol.u[i + 1][1]) / 2) <= 1.0e-8
         end
+
+        @testset "a callback that leaves the residual alone is not checked again" begin
+            square(gain, p) = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (du[1] = -u[1] + sin(t); du[2] = u[2] - gain(p) * u[1]^2);
+                    mass_matrix = Diagonal([1.0, 0.0]),
+                ), [1.0, 1.0], (0.0, 3.0), p,
+            )
+            crossing(affect) = SciMLBase.ContinuousCallback((u, t, integ) -> u[2] - 0.64, affect)
+            loose = (abstol = 1.0e-6, reltol = 1.0e-6)
+            for alg in (PETScDiffEq.TSRosW(), PETScDiffEq.TSARKIMEX("4"))
+                events = Float64[]
+                sol = SciMLBase.solve(
+                    square(p -> p[1], [1.0]), alg; loose...,
+                    callback = crossing(integ -> push!(events, integ.t)),
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test isapprox(events, [0.2635463, 1.5096882, 2.591437]; atol = 1.0e-3)
+                k = Ref(1.0)
+                for (prob, change!) in (
+                        (square(p -> p[1], [1.0]), integ -> (integ.p[1] = 2.0; nothing)),
+                        (square(p -> p[], Ref(1.0)), integ -> (integ.p[] = 2.0; nothing)),
+                        (square(p -> k[], SciMLBase.NullParameters()), _ -> (k[] = 2.0; nothing)),
+                    )
+                    @test_throws SciMLBase.CheckInitFailureError SciMLBase.solve(
+                        prob, alg; callback = crossing(change!), loose...,
+                    )
+                end
+                sol = SciMLBase.solve(
+                    square(p -> p[1], [1.0]), alg; initializealg = brown, loose...,
+                    callback = crossing(integ -> (integ.p[1] = 2.0; nothing)),
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test abs(sol.u[end][2] - 2 * sol.u[end][1]^2) < 1.0e-5
+            end
+
+            fall!(r, du, u, p, t) = (r[1] = du[1] + u[1]; r[2] = u[2] - p[1] * u[1]; nothing)
+            fall = SciMLBase.DAEProblem(
+                fall!, [-1.0, -1.0], [1.0, 1.0], (0.0, 1.0), Any[1.0, Ref(0)];
+                differential_vars = [true, false],
+            )
+            sol = SciMLBase.solve(
+                fall, PETScDiffEq.TSDAE();
+                callback = SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.5, integ -> nothing),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test isapprox(sol.u[end][1], exp(-1.0); rtol = 1.0e-2)
+        end
     end
 
     struct CannedInit
