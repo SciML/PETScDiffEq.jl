@@ -10169,6 +10169,24 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws PETScDiffEq.LibPETSc.PetscError(56) SciMLBase.solve(
                 dense, PETScDiffEq.TSImplicit("bdf", natural),
             )
+            # UMFPACK makes no ILU of `seqaij` either, and ASM's dense blocks are not the Jacobian.
+            ilu = ["-pc_type", "ilu", "-pc_factor_mat_solver_type", "umfpack"]
+            asm = [
+                "-pc_type", "asm", "-pc_asm_overlap", "0", "-pc_asm_sub_mat_type", "seqdense",
+                "-sub_pc_type", "lu", "-sub_pc_factor_mat_solver_type", "umfpack",
+            ]
+            for (prob, opts, own) in ((dense, ilu, true), (sparse, asm, false))
+                on_sparse == SciMLBase.ReturnCode.Success || break
+                err = try
+                    SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf", opts))
+                catch e
+                    e
+                end
+                text = err isa ArgumentError ? err.msg : ""
+                @test occursin("MatSolverType umfpack does not support matrix type seqdense", text)
+                @test occursin("this solve's Jacobian", text) == own
+                @test !occursin("jac_prototype", text)
+            end
         end
 
         @testset "an option PETSc reads inside the solve is in force there" begin

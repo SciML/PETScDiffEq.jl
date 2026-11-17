@@ -7311,8 +7311,48 @@ function _factors(pl, solver, mtype, ftype)
     return supports[] == LibPETSc.PETSC_TRUE, create[] != C_NULL
 end
 
-# MatFactorType's names, from MAT_FACTOR_LU on.
-const _FACTOR_TYPES = ("LU", "CHOLESKY", "ILU", "ICC", "ILUDT", "QR")
+const _FACTOR_PCS = Dict(
+    "lu" => LibPETSc.MAT_FACTOR_LU, "cholesky" => LibPETSc.MAT_FACTOR_CHOLESKY,
+    "ilu" => LibPETSc.MAT_FACTOR_ILU, "icc" => LibPETSc.MAT_FACTOR_ICC,
+)
+
+# The type of the KSP's own preconditioner, of the matrix it is given, and the solver it
+# factors with, if it names one.
+function _top_pc(pl, ts)
+    ksp, pc = Ref{LibPETSc.CKSP}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    set, P, name = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :SNESGetKSP), _Err, (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}),
+            _snes(pl, ts.ptr), ksp,
+        ),
+    )
+    _check_code(
+        ccall(_symbol(pl, :KSPGetPC), _Err, (LibPETSc.CKSP, Ptr{Ptr{Cvoid}}), ksp[], pc),
+    )
+    # PCGetOperators would create a matrix that is not set.
+    _check_code(
+        ccall(
+            _symbol(pl, :PCGetOperatorsSet), _Err,
+            (Ptr{Cvoid}, Ptr{LibPETSc.PetscBool}, Ptr{LibPETSc.PetscBool}), pc[], C_NULL, set,
+        ),
+    )
+    set[] == LibPETSc.PETSC_TRUE || return "", "", nothing
+    _check_code(
+        ccall(
+            _symbol(pl, :PCGetOperators), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}),
+            pc[], C_NULL, P,
+        ),
+    )
+    pc_type = _object_type(pl, pc[])
+    haskey(_FACTOR_PCS, pc_type) && _check_code(
+        ccall(
+            _symbol(pl, :PCFactorGetMatSolverType), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}),
+            pc[], name,
+        ),
+    )
+    return pc_type, _object_type(pl, P[]), name[] == C_NULL ? nothing : unsafe_string(name[])
+end
 
 # PETSc takes a solver that cannot handle the Jacobian's matrix type and fails in the first
 # linear solve with a bare code. Its message for the first error says when that was the cause.
@@ -7327,42 +7367,40 @@ function _refuse_matrix_type(e, h)
     )
     why = why[] == C_NULL ? "" : rstrip(unsafe_string(why[]), '.')
     named = match(
-        r"^MatSolverType (\S+) does not support (?:factorization type (\S+) for )?matrix type \S+$",
+        r"^MatSolverType (\S+) does not support (?:factorization type (\S+) for )?matrix type (\S+)$",
         why,
     )
-    unnamed = match(r"^Could not locate a solver type for factorization type (\S+) and ", why)
-    # Whether this solver supports a `seqaij` matrix, with the factorization PETSc names if
-    # it names one; MatSolverTypeGet finds the type support whatever factorization it is given.
-    aij = if e.code == PETSC_ERR_MISSING_FACTOR && named !== nothing
-        ftype = something(findfirst(==(named[2]), _FACTOR_TYPES), 1)
-        supports, factors =
-            _factors(pl, String(named[1]), "seqaij", LibPETSc.MatFactorType(ftype))
-        named[2] === nothing ? supports : factors
+    unnamed = match(
+        r"^Could not locate a solver type for factorization type (\S+) and matrix type (\S+)$",
+        why,
+    )
+    graph = match(r"^No method creategraph for Mat of type (\S+)$", why)
+    if e.code == PETSC_ERR_MISSING_FACTOR && named !== nothing
+        solver, ftype, mtype, gamg = String(named[1]), named[2], named[3], false
     elseif e.code == PETSC_ERR_MISSING_FACTOR && unnamed !== nothing
-        ftype = findfirst(==(unnamed[1]), _FACTOR_TYPES)
-        ftype !== nothing && last(_factors(pl, nothing, "seqaij", LibPETSc.MatFactorType(ftype)))
-    elseif e.code == PETSC_ERR_SUP && startswith(why, "No method creategraph for Mat of type ") ||
-            e.code == PETSC_ERR_USER && why == "Require AIJ matrix"
-        # GAMG builds its graph from an AIJ matrix only.
-        true
+        solver, ftype, mtype, gamg = nothing, unnamed[1], unnamed[2], false
+    elseif e.code == PETSC_ERR_SUP && graph !== nothing
+        solver, ftype, mtype, gamg = nothing, nothing, graph[1], true
+    elseif e.code == PETSC_ERR_USER && why == "Require AIJ matrix"
+        solver, ftype, mtype, gamg = nothing, nothing, nothing, true
     else
         return nothing
     end
-    P = Ref{Ptr{Cvoid}}(C_NULL)
-    _check_code(
-        ccall(
-            _symbol(pl, :SNESGetJacobian), _Err,
-            (LibPETSc.CSNES, Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Cvoid}, Ptr{Cvoid}),
-            _snes(pl, h.ts.ptr), C_NULL, P, C_NULL, C_NULL,
-        ),
+    pc_type, jtype, pc_solver = _top_pc(pl, h.ts)
+    # The message is about the Jacobian only when the KSP's own preconditioner failed on it.
+    own = something(mtype, jtype) == jtype && (
+        gamg ? pc_type == "gamg" :
+            haskey(_FACTOR_PCS, pc_type) && solver == pc_solver &&
+            something(ftype, uppercase(pc_type)) == uppercase(pc_type)
     )
-    P[] == C_NULL && return nothing
-    mtype = _object_type(pl, P[])
-    hint = mtype == "seqdense" && aij ?
-        "; with a sparse `jac_prototype` that matrix is `seqaij`, a type this solver supports" : ""
+    own || throw(ArgumentError("PETSc's linear solver cannot take a matrix it was given: $why"))
+    # GAMG builds its graph from an AIJ matrix only.
+    aij = gamg || last(_factors(pl, solver, "seqaij", _FACTOR_PCS[pc_type]))
+    hint = jtype == "seqdense" && aij ?
+        "; with a sparse `jac_prototype` that matrix is `seqaij`, which this solver supports" : ""
     throw(
         ArgumentError(
-            "PETSc's linear solver cannot take the `$mtype` matrix that holds this solve's " *
+            "PETSc's linear solver cannot take the `$jtype` matrix that holds this solve's " *
                 "Jacobian: $why$hint",
         ),
     )
