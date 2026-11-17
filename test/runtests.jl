@@ -2230,6 +2230,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.stats.naccept >= 100
         end
 
+        @testset "tolerances assigned on opts survive reinit!, as in OrdinaryDiffEq" begin
+            alg = PETScDiffEq.TSRK("5dp")
+            ref = SciMLBase.solve(prob, alg; abstol = 1.0e-12, reltol = 1.0e-10)
+            for tighten! in (
+                    integ -> (integ.opts.abstol = 1.0e-12; integ.opts.reltol = 1.0e-10),
+                    integ -> (
+                        SciMLBase.set_abstol!(integ, 1.0e-12);
+                        SciMLBase.set_reltol!(integ, 1.0e-10)
+                    ),
+                )
+                integ = SciMLBase.init(prob, alg; abstol = 1.0e-4, reltol = 1.0e-3)
+                tighten!(integ)
+                SciMLBase.reinit!(integ)
+                @test (integ.opts.abstol, integ.opts.reltol) == (1.0e-12, 1.0e-10)
+                sol = SciMLBase.solve!(integ)
+                @test sol.t == ref.t
+                @test sol.u == ref.u
+            end
+            theirs = SciMLBase.init(prob, Tsit5(); abstol = 1.0e-4, reltol = 1.0e-3)
+            theirs.opts.abstol, theirs.opts.reltol = 1.0e-12, 1.0e-10
+            SciMLBase.reinit!(theirs)
+            @test (theirs.opts.abstol, theirs.opts.reltol) == (1.0e-12, 1.0e-10)
+        end
+
         @testset "callbacks are initialised again unless told not to" begin
             n_init = Ref(0)
             cb = SciMLBase.DiscreteCallback(

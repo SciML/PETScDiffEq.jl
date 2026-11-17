@@ -9145,7 +9145,7 @@ function _reinit_unlocked(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
         p = integ.p,
     )
-    written = filter(!in((:abstol, :reltol)), getfield(integ.opts, :written))
+    written = getfield(integ.opts, :written)
     kept = NamedTuple{Tuple(written)}(map(k -> getfield(integ.opts, k), Tuple(written)))
     setup_kwargs = merge(integ.kwargs, kept)
     # As in OrdinaryDiffEq, a fixed step made live keeps the step it has.
