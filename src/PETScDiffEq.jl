@@ -7973,7 +7973,7 @@ function _set_proposed_dt_unlocked(integ::PETScIntegrator, dt)
     h, opts = integ.h, integ.opts
     dt = _smallest(h.ctx.comm, abs(oftype(integ.t, dt)))
     # OrdinaryDiffEq raises an adaptive step to the spacing at t, and the adaptor grows it back.
-    h.fixed || (dt = max(dt, eps(integ.t), _min_step(integ.t)))
+    h.fixed || (dt = max(dt, eps(integ.t)))
     _hand_step!(h, dt, getfield(opts, :dtmin), getfield(opts, :force_dtmin))
     _cap_step!(h.petsclib, h.ts, h.fixed)
     return nothing

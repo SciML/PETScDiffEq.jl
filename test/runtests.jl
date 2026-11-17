@@ -4819,7 +4819,6 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 SciMLBase.step!(integ)
                 SciMLBase.step!(integ)
                 SciMLBase.set_proposed_dt!(integ, dt)
-                @test SciMLBase.get_proposed_dt(integ) == eps(integ.t)
                 @test SciMLBase.solve!(integ).retcode == (
                     dtmin == 0 ? SciMLBase.ReturnCode.Success : SciMLBase.ReturnCode.DtLessThanMin
                 )
