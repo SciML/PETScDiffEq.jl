@@ -7993,7 +7993,7 @@ function _make_opts(
     ) where {R}
     ctx = h.ctx
     return PETScIntegratorOpts(
-        h, get(kwargs, :adaptive, true) === true,
+        h, get(kwargs, :adaptive, true) === true && !h.fixed,
         _own_tol(h.abstol), _own_tol(h.reltol),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
