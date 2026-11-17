@@ -200,7 +200,8 @@ shows the estimate. `get_proposed_dt` is signed, negative on a reversed span, an
 `set_proposed_dt!` also takes another integrator whose proposed step it copies. `set_abstol!`
 and `set_reltol!` hold for the steps after and, like any option assigned on `opts`, such as
 `maxiters`, `dtmax` or `save_start`, carry through `reinit!` as in
-OrdinaryDiffEq. With `erase_sol = false` the new start is not saved again, as in
+OrdinaryDiffEq. So does a tolerance vector written in place, as `AutoAbstol` writes one,
+while `-ts_atol` and `-ts_rtol` in the options set the tolerances again at `reinit!`. With `erase_sol = false` the new start is not saved again, as in
 OrdinaryDiffEq, and a solution saved under `save_idxs` without dense output stays without it
 when the new `saveat` would otherwise turn it on, since a partial state gives no derivative to
 interpolate with.

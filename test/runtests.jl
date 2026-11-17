@@ -2262,6 +2262,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             fresh = SciMLBase.solve(prob, alg; abstol = [1.0e-12], reltol = [1.0e-10])
             @test sol.t == fresh.t
             @test sol.u == fresh.u
+            SciMLBase.reinit!(integ; saveat = 0.5)
+            @test (integ.opts.abstol, integ.opts.reltol) == ([1.0e-12], [1.0e-10])
+            fresh = SciMLBase.solve(
+                prob, alg; abstol = [1.0e-12], reltol = [1.0e-10], saveat = 0.5,
+            )
+            @test SciMLBase.solve!(integ).u == fresh.u
+
+            plain = SciMLBase.init(prob, alg; abstol = [1.0e-6], reltol = [1.0e-3])
+            made = PETScDiffEq.HANDLES_MADE[]
+            SciMLBase.reinit!(plain)
+            @test PETScDiffEq.HANDLES_MADE[] == made
 
             again = map((1.0e-6, [1.0e-6])) do abstol
                 pair = map((alg, Tsit5())) do solver

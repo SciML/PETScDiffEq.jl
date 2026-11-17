@@ -9229,7 +9229,7 @@ function _reinit_unlocked(
         h, setup_kwargs; tstops = integ.tstops, d_discontinuities = d_discontinuities,
         callback = getfield(integ.opts, :callback),
     )
-    append!(getfield(integ.opts, :written), written)
+    append!(getfield(integ.opts, :written), carried)
     integ.finished = false
     integ.iter = 0
     dt === nothing || _use_dt!(integ, dt, reset_dt === true)
