@@ -11058,7 +11058,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
-        @testset "step! allocates nothing" begin
+        @testset "an explicit step! and isadaptive allocate nothing" begin
             lv = SciMLBase.ODEProblem(
                 lotka_volterra!, [1.0, 1.0], (0.0, 1.0e6), [1.5, 1.0, 3.0, 1.0],
             )
@@ -11074,6 +11074,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
                 steps(integ, 2)
                 @test (@allocated steps(integ, 100)) == 0
+                SciMLBase.isadaptive(integ)
+                @test (@allocated SciMLBase.isadaptive(integ)) == 0
                 @test !SciMLBase.done(integ)
                 SciMLBase.terminate!(integ)
             end

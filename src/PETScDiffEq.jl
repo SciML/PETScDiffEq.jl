@@ -7895,7 +7895,7 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
         changed && _set_adaptive!(h, getfield(o, :adaptive))
         h.ctx.dtmin = _floor(
             R, getfield(o, :dtmin), getfield(o, :force_dtmin),
-            getfield(o, :adaptive) && _adapts(h.ctx.alg_name) !== false,
+            getfield(o, :adaptive) && h.ctx.adapts !== false,
         )
     elseif name === :dtmax
         adapt = LibPETSc.TSGetAdapt(pl, h.ts)
@@ -7911,7 +7911,7 @@ Base.setproperty!(o::PETScIntegratorOpts, name::Symbol, v) =
 
 function _check_live_adaptive(h::TSHandles)
     pl, ctx = h.petsclib, h.ctx
-    adapts = _adapts(ctx.alg_name)
+    adapts = ctx.adapts
     adapts === false && return nothing
     why = adapts === nothing ? "PETScDiffEq does not know whether `$(ctx.alg_name)` has an " *
         "error estimate" :
@@ -7931,7 +7931,7 @@ end
 # Puts in or takes out what `_setup` installs for an adaptive step.
 function _set_adaptive!(h::TSHandles, adaptive::Bool)
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
-    _adapts(ctx.alg_name) === true || return nothing
+    ctx.adapts === true || return nothing
     _check_code(
         ccall(
             _symbol(pl, :TSAdaptSetType), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Cstring),
