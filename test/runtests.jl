@@ -10746,6 +10746,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test integ.stats.naccept > 0
         end
 
+        @testset "integ.ps gets and sets a parameter by symbol" begin
+            scaled!(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
+            sys = SciMLBase.SymbolCache([:a], [:k], :t)
+            scaled() = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(scaled!; sys), [1.0], (0.0, 1.0), [1.0],
+            )
+            pr = scaled()
+            integ = SciMLBase.init(pr, PETScDiffEq.TSRK("5dp"); dt = 0.1)
+            @test :ps in propertynames(integ)
+            @test integ.ps[:k] == 1.0
+            integ.ps[:k] = 2.0
+            @test integ.ps[:k] == 2.0
+            @test pr.p == [2.0]
+            function run(set!, alg)
+                i = SciMLBase.init(scaled(), alg; dt = 0.1, adaptive = false)
+                foreach(_ -> SciMLBase.step!(i), 1:5)
+                set!(i)
+                return SciMLBase.solve!(i).u[end]
+            end
+            for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRK("3bs"))
+                @test run(i -> (i.ps[:k] = 2.0), alg) == run(i -> (i.p = [2.0]), alg)
+            end
+        end
+
         @testset "the last step after the integrator has finished" begin
             for alg in (
                     PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW("ra34pw2"),
