@@ -4190,13 +4190,17 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         for options in (
                 ["-snes_type", "ksponly", "-snes_lag_jacobian=-2"],
                 ["-snes_type", "ksponly", "-snes_lag_preconditioner=-2"],
-                ["-snes_lag_jacobian=3", "-snes_lag_jacobian_persists"],
             )
             @test check(
                 SciMLBase.EnsembleProblem(lv; prob_func = vary),
                 PETScDiffEq.TSImplicit("beuler", options), 3; dt = 0.01, adaptive = false,
             ) == 0
         end
+        # An adaptive BDF solve sets its own lag, which this makes persist.
+        @test check(
+            SciMLBase.EnsembleProblem(lv; prob_func = vary),
+            PETScDiffEq.TSImplicit("bdf", ["-snes_lag_jacobian_persists"]), 3,
+        ) == 0
         npc = [
             "-snes_type", "nrichardson", "-snes_npc_side", "left", "-snes_linesearch_type", "basic",
             "-snes_max_it", "4", "-npc_snes_type", "ksponly", "-npc_ksp_type", "preonly",

@@ -6234,7 +6234,6 @@ const _NO_REUSE_OPTIONS = (
     "ts_view", "ts_adjoint",
     # A lag of -2 becomes -1 once the SNES builds its matrix, and a persisting lag counts on.
     "snes_lag_jacobian", "snes_lag_jacobian_persists", "snes_lag_preconditioner",
-    "snes_lag_preconditioner_persists",
     # Only TSSetEvaluationTimes resets the count of solutions TSSolve has stored.
     "ts_time_span", "ts_eval_times",
 )
@@ -7460,8 +7459,10 @@ end
 The objects are freed when the outermost `reusing` returns. Solves made by other tasks
 while `f` runs may reuse them too. A solve is made as before when it has a callback,
 `tstops`, `isoutofdomain` or a Float32 clock, runs over a communicator or a DM, has a state
-that is not a real `Array`, or uses a method `reinit!` cannot reuse; one whose `f`, mass
-matrix, Jacobian sparsity, algorithm or keywords differ from every kept solve's starts anew.
+that is not a real `Array`, uses a method `reinit!` cannot reuse, or passes an option whose
+PETSc state outlives a solve, as `-snes_lag_jacobian`, `-ts_time_span` and `-ts_monitor` do;
+one whose `f`, mass matrix, Jacobian sparsity, algorithm or keywords differ from every kept
+solve's starts anew.
 """
 function reusing(f)
     _locked(() -> (REUSERS[] += 1))
