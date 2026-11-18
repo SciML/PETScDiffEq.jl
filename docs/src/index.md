@@ -61,7 +61,8 @@ leave it out, and the first step is then
 Hairer and Wanner's estimate as OrdinaryDiffEq uses it, taken with the `abstol` and `reltol`
 keywords (SciML's defaults, `abstol = 1e-6` and `reltol = 1e-3`, when not given). DAE and mass-matrix
 problems start from a small step instead. A solve PETSc steps at a fixed size needs `dt`:
-`adaptive = false`, `-ts_adapt_type none`, the fixed-step families (`TSImplicit` and `TSDAE`
+`adaptive = false` (unless `petsc_options` pick an adaptive `-ts_adapt_type`, which wins),
+`-ts_adapt_type none`, the fixed-step families (`TSImplicit` and `TSDAE`
 other than `bdf`, `TSIRK`, `TSMPRK`), and subtypes registered without an embedded error
 estimate. What counts is the type PETSc runs after `petsc_options`: `TSImplicit("beuler",
 ["-ts_type", "bdf"])` runs without `dt` and `TSImplicit("bdf", ["-ts_type", "beuler"])` needs

@@ -531,7 +531,8 @@ smaller one damps the highest frequencies more.
 Adapts on PETSc's error estimate for the method, which PETSc leaves off unless asked, so
 `reltol` and `abstol` apply. PETSc weighs the velocity and the position with one tolerance
 per component of the position, so a vector tolerance on the state `[v; u]` takes the smaller
-of each velocity and position pair. `adaptive = false` steps at the `dt` you give. PETSc
+of each velocity and position pair. `adaptive = false` steps at the `dt` you give, unless
+`petsc_options` pick an adaptive `-ts_adapt_type`, which wins. PETSc
 forms the velocity and the acceleration from the step's change in position, so an adaptive
 solve ends with `Unstable` when a component's change falls below the position's floating
 point spacing while the velocity it would carry exceeds the tolerance. A tight tolerance
@@ -2368,6 +2369,8 @@ _unsupported_deriv(deriv) = ArgumentError(
 const PETSC_ERR_SUP = 56
 const PETSC_ERR_MAT_LU_ZRPVT = 71
 const PETSC_ERR_FP = 72
+const PETSC_ERR_USER = 83
+const PETSC_ERR_MISSING_FACTOR = 92
 const CALLBACK_THREW = 1
 
 # Dense LU raises on a zero pivot whatever -ts_error_if_step_fails says.
@@ -6780,7 +6783,6 @@ function _setup_problem(
             elseif _uses_ifunction(alg)
                 _difference_jacobian!(petsclib, ts, nothing, ctxptr)
             end
-            LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
             dt_given && _hand_step!(h, dt, dtmin, force_dtmin)
             LibPETSc.TSSetMaxTime(petsclib, ts, _max_time(tf))
@@ -6855,6 +6857,8 @@ function _setup_problem(
                 try
                     # Monitors and viewers are made here, so they follow the solve's own options.
                     _with_options(() -> LibPETSc.TSSetFromOptions(petsclib, ts), h)
+                    # Set after the options, as -ts_monitor_cancel removes every monitor set before.
+                    LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
                 catch e
                     e isa LibPETSc.PetscError || rethrow()
                     throw(
@@ -6867,6 +6871,7 @@ function _setup_problem(
                 end
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
+                LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             end
             # The integrator resets PETSc's step limit from maxiters before each step.
             limit = LibPETSc.TSGetMaxSteps(petsclib, ts)
@@ -6978,10 +6983,14 @@ function _setup_problem(
                 _set_ksp_type!(petsclib, ts, "gmres")
             end
             adapts = _adapts(running)
+            # glle reports `none` but steps with its own controller unless an option sets
+            # `-ts_adapt_type`, of which it takes only `none`.
+            adapting = !fixed || running == "glle" &&
+                !any(o -> _names_option(o, "ts_adapt_type"), effective_options)
             dt_option = any(effective_options) do o
                 _names_petsc_option(petsclib, o, "ts_dt")
             end
-            if !dt_given && !dt_option && !(adaptive && adapts === true)
+            if !dt_given && !dt_option && !((adaptive || adapting) && adapts === true)
                 throw(
                     ArgumentError(
                         "PETScDiffEq needs `dt` unless the solve adapts on an error estimate " *
@@ -7007,9 +7016,9 @@ function _setup_problem(
                 )
                 @warn setup_warnings[end]
             end
-            ctx.dtmin = _floor(R, dtmin, force_dtmin, adaptive && adapts !== false)
+            ctx.dtmin = _floor(R, dtmin, force_dtmin, adapting && adapts !== false)
             ctx.retry_fp = !fixed && (comm === nothing || !_uses_ifunction(alg)) &&
-                adaptive && adapts !== false
+                adapts !== false
             if ctx.dtmin > 0 || ctx.unstable !== nothing || comm !== nothing
                 _set_post_step!(petsclib, ts, ctx)
             end
@@ -7284,6 +7293,128 @@ end
 
 _viewers_off(pl) = LibPETSc.PetscOptionsGetCreateViewerOff(pl) != LibPETSc.PETSC_FALSE
 
+function _object_type(pl, obj)
+    name = Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscObjectGetType), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}), obj, name,
+        ),
+    )
+    return name[] == C_NULL ? "" : unsafe_string(name[])
+end
+
+# Whether PETSc's `solver`, or any when it is `nothing`, supports an `mtype` matrix, and
+# whether it makes this factorization of one.
+function _factors(pl, solver, mtype, ftype)
+    supports, create = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :MatSolverTypeGet), _Err,
+            (
+                Cstring, Cstring, LibPETSc.MatFactorType, Ptr{LibPETSc.PetscBool},
+                Ptr{LibPETSc.PetscBool}, Ptr{Ptr{Cvoid}},
+            ),
+            something(solver, Cstring(C_NULL)), mtype, ftype, C_NULL, supports, create,
+        ),
+    )
+    return supports[] == LibPETSc.PETSC_TRUE, create[] != C_NULL
+end
+
+const _FACTOR_PCS = Dict(
+    "lu" => LibPETSc.MAT_FACTOR_LU, "cholesky" => LibPETSc.MAT_FACTOR_CHOLESKY,
+    "ilu" => LibPETSc.MAT_FACTOR_ILU, "icc" => LibPETSc.MAT_FACTOR_ICC,
+)
+
+# The type of the KSP's own preconditioner, of the matrix it is given, and the solver it
+# factors with, if it names one.
+function _top_pc(pl, ts)
+    ksp, pc = Ref{LibPETSc.CKSP}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    set, P, name = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :SNESGetKSP), _Err, (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}),
+            _snes(pl, ts.ptr), ksp,
+        ),
+    )
+    _check_code(
+        ccall(_symbol(pl, :KSPGetPC), _Err, (LibPETSc.CKSP, Ptr{Ptr{Cvoid}}), ksp[], pc),
+    )
+    # PCGetOperators would create a matrix that is not set.
+    _check_code(
+        ccall(
+            _symbol(pl, :PCGetOperatorsSet), _Err,
+            (Ptr{Cvoid}, Ptr{LibPETSc.PetscBool}, Ptr{LibPETSc.PetscBool}), pc[], C_NULL, set,
+        ),
+    )
+    set[] == LibPETSc.PETSC_TRUE || return "", "", nothing
+    _check_code(
+        ccall(
+            _symbol(pl, :PCGetOperators), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}),
+            pc[], C_NULL, P,
+        ),
+    )
+    pc_type = _object_type(pl, pc[])
+    haskey(_FACTOR_PCS, pc_type) && _check_code(
+        ccall(
+            _symbol(pl, :PCFactorGetMatSolverType), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}),
+            pc[], name,
+        ),
+    )
+    return pc_type, _object_type(pl, P[]), name[] == C_NULL ? nothing : unsafe_string(name[])
+end
+
+# PETSc takes a solver that cannot handle the Jacobian's matrix type and fails in the first
+# linear solve with a bare code. Its message for the first error says when that was the cause.
+function _refuse_matrix_type(e, h)
+    e isa LibPETSc.PetscError || return nothing
+    pl, text, why = h.petsclib, Ref{Ptr{Cchar}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscErrorMessage), _Err, (_Err, Ptr{Ptr{Cchar}}, Ptr{Ptr{Cchar}}),
+            e.code, text, why,
+        ),
+    )
+    why = why[] == C_NULL ? "" : rstrip(unsafe_string(why[]), '.')
+    named = match(
+        r"^MatSolverType (\S+) does not support (?:factorization type (\S+) for )?matrix type (\S+)$",
+        why,
+    )
+    unnamed = match(
+        r"^Could not locate a solver type for factorization type (\S+) and matrix type (\S+)$",
+        why,
+    )
+    graph = match(r"^No method creategraph for Mat of type (\S+)$", why)
+    if e.code == PETSC_ERR_MISSING_FACTOR && named !== nothing
+        solver, ftype, mtype, gamg = String(named[1]), named[2], named[3], false
+    elseif e.code == PETSC_ERR_MISSING_FACTOR && unnamed !== nothing
+        solver, ftype, mtype, gamg = nothing, unnamed[1], unnamed[2], false
+    elseif e.code == PETSC_ERR_SUP && graph !== nothing
+        solver, ftype, mtype, gamg = nothing, nothing, graph[1], true
+    elseif e.code == PETSC_ERR_USER && why == "Require AIJ matrix"
+        solver, ftype, mtype, gamg = nothing, nothing, nothing, true
+    else
+        return nothing
+    end
+    pc_type, jtype, pc_solver = _top_pc(pl, h.ts)
+    # The message is about the Jacobian only when the KSP's own preconditioner failed on it.
+    own = something(mtype, jtype) == jtype && (
+        gamg ? pc_type == "gamg" :
+            haskey(_FACTOR_PCS, pc_type) && solver == pc_solver &&
+            something(ftype, uppercase(pc_type)) == uppercase(pc_type)
+    )
+    own || throw(ArgumentError("PETSc's linear solver cannot take a matrix it was given: $why"))
+    # GAMG builds its graph from an AIJ matrix only.
+    aij = gamg || last(_factors(pl, solver, "seqaij", _FACTOR_PCS[pc_type]))
+    hint = jtype == "seqdense" && aij ?
+        "; with a sparse `jac_prototype` that matrix is `seqaij`, which this solver supports" : ""
+    throw(
+        ArgumentError(
+            "PETSc's linear solver cannot take the `$jtype` matrix that holds this solve's " *
+                "Jacobian: $why$hint",
+        ),
+    )
+end
+
 # Under a distributed comm the error is returned, to raise once the ranks agree on who threw.
 function _run!(f::F, h::TSHandles) where {F}
     ctx = h.ctx
@@ -7292,7 +7423,8 @@ function _run!(f::F, h::TSHandles) where {F}
             _quiet_errors(() -> _with_options(f, h), h)
         catch e
             if ctx.comm === nothing
-                ctx.err === nothing && !_failed_step(e, h) && rethrow()
+                ctx.err === nothing && !_failed_step(e, h) &&
+                    (_refuse_matrix_type(e, h); rethrow())
             elseif !_failed_step(e, h)
                 return e
             end
@@ -7846,7 +7978,10 @@ The integrator `SciMLBase.init` returns for a PETSc TS algorithm. Step it with
 restart it with `reinit!`. Between steps `u`, `uprev`, `t`, `tprev` and `dt`
 are readable, `integ(t)`, `integ(t, Val{1})`, `integ(t; idxs)` and `integ(out, t)` give the
 state or its slope inside the step just taken, and `add_tstop!` schedules a time to land on
-exactly. Assigning `u` or `t` takes effect at the next step, as `set_u!` and `set_t!` do.
+exactly. `integ.ps[sym]` gets and sets parameters by symbol, and a write is a
+`derivative_discontinuity!(integ, true)`, so the next step restarts the method and
+initializes a DAE again. Assigning `u` or `t` takes effect at the next step, as `set_u!` and
+`set_t!` do.
 
 These are in the types PETSc steps in. The clock, and so `t`, `dt` and the saved times, is
 `Float32` for a `Float32` or `ComplexF32` state with a `Float32` span and `Float64`
@@ -7937,6 +8072,10 @@ end
 SciMLBase.derivative_discontinuity!(integ::PETScIntegrator, bool::Bool) =
     _locked(() -> _discontinuity_unlocked(integ, bool))
 
+# SciMLBase before 3.51 leaves a `ps` write undeclared.
+SII.finalize_parameters_hook!(integ::PETScIntegrator, _) =
+    SciMLBase.derivative_discontinuity!(integ, true)
+
 function _set_p_unlocked(integ::PETScIntegrator, v)
     setfield!(integ, :p, convert(fieldtype(typeof(integ), :p), v))
     h = integ.h
@@ -7955,9 +8094,10 @@ function Base.setproperty!(integ::PETScIntegrator, name::Symbol, v)
 end
 
 Base.getproperty(integ::PETScIntegrator, name::Symbol) =
-    name === :stats ? getfield(integ, :sol).stats : getfield(integ, name)
+    name === :stats ? getfield(integ, :sol).stats :
+    invoke(getproperty, Tuple{SciMLBase.DEIntegrator, Symbol}, integ, name)
 Base.propertynames(integ::PETScIntegrator, private::Bool = false) =
-    (fieldnames(typeof(integ))..., :stats)
+    (fieldnames(typeof(integ))..., :stats, :ps)
 SciMLBase.has_stats(::PETScIntegrator) = true
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
@@ -7973,10 +8113,10 @@ function _set_proposed_dt_unlocked(integ::PETScIntegrator, dt)
     end
     integ.finished && return nothing
     h, opts = integ.h, integ.opts
-    _hand_step!(
-        h, _smallest(h.ctx.comm, abs(oftype(integ.t, dt))), getfield(opts, :dtmin),
-        getfield(opts, :force_dtmin),
-    )
+    dt = _smallest(h.ctx.comm, abs(oftype(integ.t, dt)))
+    # OrdinaryDiffEq raises an adaptive step to the spacing at t, and the adaptor grows it back.
+    h.fixed || (dt = max(dt, eps(integ.t)))
+    _hand_step!(h, dt, getfield(opts, :dtmin), getfield(opts, :force_dtmin))
     _cap_step!(h.petsclib, h.ts, h.fixed)
     return nothing
 end
@@ -7995,7 +8135,7 @@ function _make_opts(
     ) where {R}
     ctx = h.ctx
     return PETScIntegratorOpts(
-        h, get(kwargs, :adaptive, true) === true,
+        h, !h.fixed,
         _own_tol(h.abstol), _own_tol(h.reltol),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
@@ -8677,6 +8817,9 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
         end
     end
     best === nothing && return false
+    if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
+        dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
+    end
     saved = _save_step!(integ, best, false; slack = zero(best))
     slope = ctx.fend
     _rollback!(integ, best, dt, true)
@@ -8701,10 +8844,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     modified && _reinitialize!(integ, best_cb.initializealg, before, slope)
     integ.finished && return true
     integ.derivative_discontinuity = false
-    if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
-        dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
-    end
-    _rollback!(integ, integ.t, dt, false)
+    _rollback!(integ, integ.t, _proposed_dt_unlocked(integ), false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
     if best_cb.save_positions[2]
         _save_here!(integ)
@@ -9197,8 +9337,14 @@ function _reinit_unlocked(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
         p = integ.p,
     )
-    written = filter(!in((:abstol, :reltol)), getfield(integ.opts, :written))
-    kept = NamedTuple{Tuple(written)}(map(k -> getfield(integ.opts, k), Tuple(written)))
+    written = getfield(integ.opts, :written)
+    # No setter sees a tolerance vector written in place, so compare it with the one set up.
+    moved = filter(
+        k -> _anywhere(old.ctx.comm, getfield(integ.opts, k) != getfield(old, k)),
+        [:abstol, :reltol],
+    )
+    carried = Tuple(union(written, moved))
+    kept = NamedTuple{carried}(map(k -> getfield(integ.opts, k), carried))
     setup_kwargs = merge(integ.kwargs, kept)
     # As in OrdinaryDiffEq, a fixed step made live keeps the step it has.
     get(setup_kwargs, :adaptive, true) === false && get(setup_kwargs, :dt, nothing) === nothing &&
@@ -9215,7 +9361,7 @@ function _reinit_unlocked(
     end
     stops = vcat(tstops, d_discontinuities)
     before = erase_sol && saveat === nothing && reinit_dae && old.fresh !== nothing &&
-        !old.destroyed && isempty(getfield(integ.opts, :written)) ? _ts_state(old) : nothing
+        !old.destroyed && isempty(carried) ? _ts_state(old) : nothing
     reused = before !== nothing && _reuse!(old, prob, stops)
     h = reused ? old : _setup(
             prob, integ.alg; tstops = stops, setup_kwargs..., direction = integ.tdir,
@@ -9275,7 +9421,7 @@ function _reinit_unlocked(
         h, setup_kwargs; tstops = integ.tstops, d_discontinuities = d_discontinuities,
         callback = getfield(integ.opts, :callback),
     )
-    append!(getfield(integ.opts, :written), written)
+    append!(getfield(integ.opts, :written), carried)
     integ.finished = false
     integ.iter = 0
     dt === nothing || _use_dt!(integ, dt, reset_dt === true)
