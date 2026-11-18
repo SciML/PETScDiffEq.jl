@@ -4863,6 +4863,27 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws "no derivative to build a Hermite" integ(integ.t + integ.dt / 2)
             SciMLBase.terminate!(integ)
         end
+
+        @testset "a step proposed below the spacing at t is raised to it, as OrdinaryDiffEq does" begin
+            sink = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du .= -100 .* sqrt.(abs.(u))), [1.0], (0.0, 1.0),
+            )
+            sol = SciMLBase.solve(
+                sink, PETScDiffEq.TSRK("5dp"); callback = DiffEqCallbacks.PositiveDomain(),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.t[end] == 1.0
+            for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW()),
+                    dt in (0.0, 1.0e-300), dtmin in (0.0, 1.0e-6)
+                integ = SciMLBase.init(prob, alg; dtmin)
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                SciMLBase.set_proposed_dt!(integ, dt)
+                @test SciMLBase.solve!(integ).retcode == (
+                    dtmin == 0 ? SciMLBase.ReturnCode.Success : SciMLBase.ReturnCode.DtLessThanMin
+                )
+            end
+        end
     end
 
     # Parameters `[d, e, k]`: `d` is timeseries partition 1 and `e` is partition 2.
@@ -10175,8 +10196,33 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 prob, PETScDiffEq.TSRK("5dp", ["-ts_monitor_cancel"]); dt = 0.1,
             )
             @test sol.retcode == SciMLBase.ReturnCode.Success
-            @test sol.t == [1.0]
+            @test sol.t == SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1).t
             @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-4
+        end
+
+        @testset "-ts_monitor_cancel keeps every step, saveat and dense output" begin
+            alg = PETScDiffEq.TSRK("5dp", ["-ts_monitor_cancel"])
+            ref = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp"); dt = 0.02, adaptive = false)
+            sol = SciMLBase.solve(prob, alg; dt = 0.02, adaptive = false)
+            @test sol.t == ref.t
+            @test sol.u == ref.u
+            @test sol.dense
+            @test abs(sol(0.5)[1] - exp(-0.5)) < 1.0e-10
+            @test SciMLBase.solve(prob, alg; dt = 0.02, adaptive = false, saveat = 0.25).t ==
+                0:0.25:1
+            made = PETScDiffEq.HANDLES_MADE[]
+            sols = PETScDiffEq.reusing() do
+                [SciMLBase.solve(prob, alg; dt = 0.02, adaptive = false) for _ in 1:2]
+            end
+            @test PETScDiffEq.HANDLES_MADE[] - made == 1
+            @test all(s -> s.t == ref.t && s.u == ref.u, sols)
+            nan!(du, u, p, t) = (du[1] = t > 0.5 ? NaN : -u[1]; nothing)
+            bad = SciMLBase.ODEProblem(nan!, [1.0], (0.0, 1.0))
+            failed = SciMLBase.solve(bad, PETScDiffEq.TSRK("5dp"))
+            sol = SciMLBase.solve(bad, alg)
+            @test sol.retcode == failed.retcode == SciMLBase.ReturnCode.Unstable
+            @test sol.t[end] == failed.t[end] > 0.4
+            @test sol.u[end] == failed.u[end]
         end
 
         @testset "options PETSc refuses at setup are an ArgumentError" begin
