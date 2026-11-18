@@ -4117,7 +4117,7 @@ function _copy_jac!(J::SparseMatrixCSC, A::SparseMatrixCSC)
         copyto!(J.nzval, 1, A.nzval, 1, n)
         return nothing
     end
-    rows, vals = rowvals(A), Base.unalias(J.nzval, nonzeros(A))
+    rows, vals = rowvals(A), A.nzval === J.nzval ? copy(A.nzval) : nonzeros(A)
     fill!(J.nzval, 0.0)
     @inbounds for j in axes(A, 2)
         p = J.colptr[j]
