@@ -8633,6 +8633,9 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
         end
     end
     best === nothing && return false
+    if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
+        dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
+    end
     saved = _save_step!(integ, best, false; slack = zero(best))
     slope = ctx.fend
     _rollback!(integ, best, dt, true)
@@ -8657,10 +8660,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     modified && _reinitialize!(integ, best_cb.initializealg, before, slope)
     integ.finished && return true
     integ.derivative_discontinuity = false
-    if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
-        dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
-    end
-    _rollback!(integ, integ.t, dt, false)
+    _rollback!(integ, integ.t, _proposed_dt_unlocked(integ), false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
     if best_cb.save_positions[2]
         _save_here!(integ)
