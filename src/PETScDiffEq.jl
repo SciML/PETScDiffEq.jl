@@ -9686,11 +9686,12 @@ end
 _fixed_step(h::TSHandles) =
     LibPETSc.TSAdaptGetType(h.petsclib, LibPETSc.TSGetAdapt(h.petsclib, h.ts)) == "none"
 
-_retcode(integ::PETScIntegrator) =
-    getfield(getfield(integ, :sol), :retcode)::SciMLBase.ReturnCode.T
+# `sol` is untyped and a ReturnCode crossing it is boxed: compare past it, with `code` constant.
+@inline _retcode_is(integ::PETScIntegrator, code) = _retcode_is(getfield(integ, :sol), code)
+_retcode_is(sol, code) = sol.retcode == code
 
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
-    integ.finished && _retcode(integ) == SciMLBase.ReturnCode.InitialFailure &&
+    integ.finished && _retcode_is(integ, SciMLBase.ReturnCode.InitialFailure) &&
         return nothing
     integ.finished && throw(
         ArgumentError(
@@ -9830,7 +9831,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     else
         _past_discontinuity!(integ)
         _live_stats!(integ)
-        _retcode(integ) == SciMLBase.ReturnCode.Default && (
+        _retcode_is(integ, SciMLBase.ReturnCode.Default) && (
             integ.sol =
                 SciMLBase.solution_new_retcode(integ.sol, SciMLBase.ReturnCode.Success)
         )
