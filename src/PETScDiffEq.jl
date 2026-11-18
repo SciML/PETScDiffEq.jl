@@ -531,7 +531,8 @@ smaller one damps the highest frequencies more.
 Adapts on PETSc's error estimate for the method, which PETSc leaves off unless asked, so
 `reltol` and `abstol` apply. PETSc weighs the velocity and the position with one tolerance
 per component of the position, so a vector tolerance on the state `[v; u]` takes the smaller
-of each velocity and position pair. `adaptive = false` steps at the `dt` you give. PETSc
+of each velocity and position pair. `adaptive = false` steps at the `dt` you give, unless
+`petsc_options` pick an adaptive `-ts_adapt_type`, which wins. PETSc
 forms the velocity and the acceleration from the step's change in position, so an adaptive
 solve ends with `Unstable` when a component's change falls below the position's floating
 point spacing while the velocity it would carry exceeds the tolerance. A tight tolerance
@@ -6978,10 +6979,14 @@ function _setup_problem(
                 _set_ksp_type!(petsclib, ts, "gmres")
             end
             adapts = _adapts(running)
+            # glle reports `none` but steps with its own controller unless an option sets
+            # `-ts_adapt_type`, of which it takes only `none`.
+            adapting = !fixed || running == "glle" &&
+                !any(o -> _names_option(o, "ts_adapt_type"), effective_options)
             dt_option = any(effective_options) do o
                 _names_petsc_option(petsclib, o, "ts_dt")
             end
-            if !dt_given && !dt_option && !(adaptive && adapts === true)
+            if !dt_given && !dt_option && !((adaptive || adapting) && adapts === true)
                 throw(
                     ArgumentError(
                         "PETScDiffEq needs `dt` unless the solve adapts on an error estimate " *
@@ -7007,13 +7012,9 @@ function _setup_problem(
                 )
                 @warn setup_warnings[end]
             end
-            # glle steps with its own controller under PETSc's `none`.
-            ctx.dtmin = _floor(
-                R, dtmin, force_dtmin,
-                adaptive && adapts !== false && (!fixed || running == "glle"),
-            )
+            ctx.dtmin = _floor(R, dtmin, force_dtmin, adapting && adapts !== false)
             ctx.retry_fp = !fixed && (comm === nothing || !_uses_ifunction(alg)) &&
-                adaptive && adapts !== false
+                adapts !== false
             if ctx.dtmin > 0 || ctx.unstable !== nothing || comm !== nothing
                 _set_post_step!(petsclib, ts, ctx)
             end
@@ -7999,7 +8000,7 @@ function _make_opts(
     ) where {R}
     ctx = h.ctx
     return PETScIntegratorOpts(
-        h, get(kwargs, :adaptive, true) === true && !h.fixed,
+        h, !h.fixed,
         _own_tol(h.abstol), _own_tol(h.reltol),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
