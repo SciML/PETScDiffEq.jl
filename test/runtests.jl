@@ -10579,6 +10579,8 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             knoll = ["-ksp_knoll", "true"]
             rosw(o) = SciMLBase.solve(prob, PETScDiffEq.TSRosW("ra34pw2", o))
             @test rosw(knoll).u == rosw([knoll; "-ksp_type"; "gmres"]).u
+            nonzero = ["-ksp_initial_guess_nonzero", "true"]
+            @test rosw(nonzero).u == rosw([nonzero; "-ksp_type"; "gmres"]).u
             for type in ("beuler", "bdf")
                 solve_with(o) = SciMLBase.solve(
                     prob, PETScDiffEq.TSImplicit(type, o); dt = 0.01, adaptive = false,
