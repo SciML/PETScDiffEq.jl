@@ -10575,6 +10575,20 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "a KSP option keeps PETSc's own solver for a small dense Jacobian" begin
+            knoll = ["-ksp_knoll", "true"]
+            rosw(o) = SciMLBase.solve(prob, PETScDiffEq.TSRosW("ra34pw2", o))
+            @test rosw(knoll).u == rosw([knoll; "-ksp_type"; "gmres"]).u
+            for type in ("beuler", "bdf")
+                solve_with(o) = SciMLBase.solve(
+                    prob, PETScDiffEq.TSImplicit(type, o); dt = 0.01, adaptive = false,
+                )
+                # A preonly KSP reads no Knoll guess.
+                sol = @test_logs (:warn, r"^PETSc never read -ksp_knoll") solve_with(knoll)
+                @test sol.u == solve_with(["-ksp_type", "preonly", "-pc_type", "lu"]).u
+            end
+        end
+
         @testset "an option PETSc never reads is named once the solve ends" begin
             lv!(du, u, p, t) = (du[1] = 1.5u[1] - u[1] * u[2]; du[2] = -3u[2] + u[1] * u[2]; nothing)
             prob = SciMLBase.ODEProblem(lv!, [1.0, 1.0], (0.0, 5.0))
