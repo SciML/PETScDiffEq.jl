@@ -83,4 +83,7 @@ throws `CheckInitFailureError`, and under `BrownFullBasicInit()` the algebraic v
 solved for again. On a `DAEProblem` the derivative is again the one the integrator holds,
 the slope at the end of the step the callback came after, which for a `ContinuousCallback`
 lies past the event, and `CheckInit()` takes a state the callback left alone as consistent.
+On a mass-matrix problem it takes a callback that leaves the residual of the algebraic
+equations as it was, and finite, as leaving them consistent, since the state PETSc gives at
+an event or a step end can miss them by more than `abstol`.
 The derivative the initialization ends with is the one `get_du` gives afterwards.

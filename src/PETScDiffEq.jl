@@ -5399,6 +5399,8 @@ mutable struct TSHandles{CTX, L, R, S}
     alg::Any
     user_options::Vector{String}
     switched::Bool
+    checks::Union{Nothing, Bool}
+    rows::Union{Nothing, BitVector}
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -6653,7 +6655,7 @@ function _setup_problem(
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
         nothing, nothing, nothing, false, alg, String[alg.petsc_options; extra_options],
-        false,
+        false, nothing, nothing,
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -8307,6 +8309,51 @@ function _initial_failure!(integ::PETScIntegrator)
     return nothing
 end
 
+# Whether a callback without its own `initializealg` is followed by a `CheckInit`.
+function _solve_checks(integ::PETScIntegrator)
+    h = integ.h
+    h.checks === nothing && (
+        h.checks = _resolve_init(_initializealg(integ), integ.prob.f) isa SciMLBase.CheckInit
+    )
+    return h.checks
+end
+
+# The zero rows of the mass matrix, which does not change during a solve.
+function _algebraic_rows(integ::PETScIntegrator)
+    h = integ.h
+    if h.rows === nothing
+        mass = _mass_of(integ.prob)
+        plain = mass === nothing || mass == LinearAlgebra.I
+        h.rows = plain ? falses(length(integ.u)) : BitVector(_zero_rows(mass))
+    end
+    return h.rows
+end
+
+# The algebraic rows of the residual a `CheckInit` after a callback reads on a mass matrix,
+# or nothing where no such check follows or they are not finite.
+function _check_residual(integ::PETScIntegrator, init)
+    h = integ.h
+    ctx = h.ctx
+    !ctx.dae && ctx.M !== nothing || return nothing
+    checks = init === nothing ? _solve_checks(integ) :
+        _resolve_init(init, integ.prob.f) isa SciMLBase.CheckInit
+    checks || return nothing
+    eqs = _algebraic_rows(integ)
+    _anywhere(ctx.comm, any(eqs)) || return nothing
+    u = integ.u isa Array ? vec(integ.u) : Vector(integ.u)
+    r = similar(u)
+    # An `f` that throws here leaves the callback to run and the check to follow it.
+    finite = try
+        h.f_init(r, u, integ.p, integ.t)
+        r .= ifelse.(eqs, r, zero(eltype(r)))
+        all(isfinite, r)
+    catch e
+        e isa InterruptException && rethrow()
+        false
+    end
+    return _everywhere(ctx.comm, finite) ? r : nothing
+end
+
 function _reinitialize!(integ::PETScIntegrator, init, before, slope = integ.h.ctx.fend)
     ctx = integ.h.ctx
     ctx.dae || ctx.M !== nothing || return nothing
@@ -8314,6 +8361,10 @@ function _reinitialize!(integ::PETScIntegrator, init, before, slope = integ.h.ct
     # PETSc keeps a DAEProblem's derivative to itself, so a state left alone passes the check.
     ctx.dae && init isa SciMLBase.CheckInit && _everywhere(ctx.comm, integ.u == before) &&
         return nothing
+    # The state PETSc gives at an event or a step end can miss a mass matrix's algebraic
+    # equations by more than abstol, so a callback that leaves their residual alone passes.
+    !ctx.dae && before !== nothing &&
+        _everywhere(ctx.comm, _check_residual(integ, init) == before) && return nothing
     _initialize_state!(integ, init, slope) || _initial_failure!(integ)
     return nothing
 end
@@ -8779,7 +8830,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     pre = ctx.save_everystep && !saved && !best_cb.save_positions[1] ? copy(integ.u) : nothing
     integ.derivative_discontinuity = true
     _pin_step!(integ)
-    before = ctx.dae ? copy(integ.u) : nothing
+    before = ctx.dae ? copy(integ.u) : _check_residual(integ, best_cb.initializealg)
     stop = let cb = best_cb, crossing = best_crossing
         _affect!(integ) do
             _checked_everywhere(() -> _fire!(integ, cb, crossing), ctx.comm)
@@ -8813,7 +8864,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
         saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
-        before = ctx.dae ? copy(integ.u) : nothing
+        before = ctx.dae ? copy(integ.u) : _check_residual(integ, cb.initializealg)
         stop = _affect!(() -> _checked_everywhere(() -> cb.affect!(integ), ctx.comm), integ)
         integ.finished && return nothing
         stop === nothing || (_stop!(integ, cb, stop, nothing); return nothing)
@@ -8849,7 +8900,8 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
         end
     end
     integ.derivative_discontinuity = false
-    _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, before)
+    _anywhere(h.ctx.comm, modified) &&
+        _reinitialize!(integ, nothing, h.ctx.dae ? before : nothing)
     integ.finished && return nothing
     initialize_save && integ.opts.save_discretes && _discretes(integ.sol) !== nothing &&
         SciMLBase.save_discretes_if_enabled!(integ, integ.opts.callback; skip_duplicates = true)
@@ -9025,8 +9077,8 @@ end
 
 function _take_discontinuity!(integ::PETScIntegrator)
     h = integ.h
-    # `set_u!` leaves `end_u` behind, so only a state nothing touched passes as consistent.
-    _reinitialize!(integ, nothing, copy(h.ctx.end_u))
+    # `set_u!` leaves `end_u` behind, so only a DAE state nothing touched passes as consistent.
+    _reinitialize!(integ, nothing, h.ctx.dae ? copy(h.ctx.end_u) : nothing)
     integ.derivative_discontinuity = false
     integ.finished && return nothing
     _write_state!(h, integ.u)
