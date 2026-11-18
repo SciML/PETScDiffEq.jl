@@ -1578,6 +1578,45 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test events[2][2]
         @test abs(only(events[2][1]) - only(events[1][1])) < 1.0e-8
         @test abs(only(events[2][1]) - (0.5 + log(1 / 0.7) / 21)) < 1.0e-8
+
+        @testset "PETSc's step control set to none steps as adaptive = false does" begin
+            outside = (u, p, t) -> 0.25 < t < 0.35
+            none = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
+            euler = PETScDiffEq.TSGeneric("euler"; explicit = true)
+            for (fixed, plain) in ((none, alg), (euler, euler))
+                ref = SciMLBase.solve(
+                    prob, plain; dt = 0.1, adaptive = false, isoutofdomain = outside,
+                )
+                integ = SciMLBase.init(prob, fixed; dt = 0.1, isoutofdomain = outside)
+                @test !SciMLBase.isadaptive(integ)
+                @test !integ.opts.adaptive
+                sol = SciMLBase.solve!(integ)
+                @test sol.retcode == ref.retcode == SciMLBase.ReturnCode.Success
+                @test sol.t == ref.t
+                @test sol.u == ref.u
+            end
+            asked = Ref(0)
+            SciMLBase.solve(
+                prob, none; dt = 0.25, isoutofdomain = (u, p, t) -> (asked[] += 1; false),
+            )
+            @test asked[] == 0
+            floored = (; dt = 0.01, dtmin = 0.05)
+            ref = SciMLBase.solve(prob, alg; floored..., adaptive = false)
+            @test ref.retcode == SciMLBase.ReturnCode.Success
+            @test SciMLBase.solve(prob, none; floored...).t == ref.t
+            @test SciMLBase.solve!(SciMLBase.init(prob, none; floored...)).t == ref.t
+            integ = SciMLBase.init(prob, none; dt = 0.01)
+            integ.opts.dtmin = 0.05
+            @test SciMLBase.solve!(integ).t == ref.t
+            cross = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5, integ -> nothing; dtrelax = 0.5,
+            )
+            relaxed = SciMLBase.solve(prob, alg; dt = 0.1, adaptive = false, callback = cross)
+            @test SciMLBase.solve(prob, none; dt = 0.1, callback = cross).t == relaxed.t
+            integ = SciMLBase.init(prob, none; dt = 0.1)
+            integ.opts.adaptive = false
+            @test_throws "the options pick `-ts_adapt_type`" (integ.opts.adaptive = true)
+        end
     end
 
     @testset "d_discontinuities and force_dtmin as OrdinaryDiffEq has them" begin
