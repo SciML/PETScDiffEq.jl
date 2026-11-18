@@ -3576,7 +3576,42 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
                 @test sol.retcode == SciMLBase.ReturnCode.Success
                 @test abs(sol.u[end][2] - 2 * sol.u[end][1]^2) < 1.0e-5
+                sol = SciMLBase.solve(
+                    SciMLBase.ODEProblem(
+                        SciMLBase.ODEFunction(
+                            (du, u, p, t) -> (
+                                du[1] = -u[1] + sin(t); du[2] = u[2] - u[1]^2; du[3] = p[1] * u[3]
+                            );
+                            mass_matrix = Diagonal([1.0, 0.0, 0.0]),
+                        ), [1.0, 1.0, 0.0], (0.0, 3.0), [1.0],
+                    ), alg; callback = crossing(integ -> (integ.p[1] = -integ.p[1]; nothing)),
+                    loose...,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
             end
+            sol = SciMLBase.solve(
+                square(p -> p[1], [1.0]), PETScDiffEq.TSRosW(); abstol = 1.0e-8, reltol = 1.0e-3,
+                callback = SciMLBase.DiscreteCallback((u, t, integ) -> true, integ -> nothing),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            at_half(g) = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(
+                    (du, u, p, t) -> (du[1] = 0; du[2] = t == 0.5 ? g() : u[2] - u[1]);
+                    mass_matrix = Diagonal([1.0, 0.0]),
+                ), [1.0, 1.0], (0.0, 1.0),
+            )
+            half = (u, t, integ) -> t - 0.5
+            beuler = PETScDiffEq.TSImplicit("beuler")
+            @test_throws SciMLBase.CheckInitFailureError SciMLBase.solve(
+                at_half(() -> NaN), beuler; dt = 1.0, adaptive = false,
+                callback = SciMLBase.ContinuousCallback(half, integ -> nothing),
+            )
+            sol = SciMLBase.solve(
+                at_half(() -> error("f fails at the event")), beuler; dt = 1.0, adaptive = false,
+                callback = SciMLBase.ContinuousCallback(half, SciMLBase.terminate!),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Terminated
+            @test sol.t[end] == 0.5
 
             fall!(r, du, u, p, t) = (r[1] = du[1] + u[1]; r[2] = u[2] - p[1] * u[1]; nothing)
             fall = SciMLBase.DAEProblem(

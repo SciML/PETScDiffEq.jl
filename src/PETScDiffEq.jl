@@ -5396,6 +5396,7 @@ mutable struct TSHandles{CTX, L, R, S}
     alg::Any
     user_options::Vector{String}
     switched::Bool
+    checks::Union{Nothing, Bool}
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -6650,7 +6651,7 @@ function _setup_problem(
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
         nothing, nothing, nothing, false, alg, String[alg.petsc_options; extra_options],
-        false,
+        false, nothing,
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -8167,22 +8168,38 @@ function _initial_failure!(integ::PETScIntegrator)
     return nothing
 end
 
+# Whether a callback without its own `initializealg` is followed by a `CheckInit`.
+function _solve_checks(integ::PETScIntegrator)
+    h = integ.h
+    h.checks === nothing && (
+        h.checks = _resolve_init(_initializealg(integ), integ.prob.f) isa SciMLBase.CheckInit
+    )
+    return h.checks
+end
+
 # The algebraic rows of the residual a `CheckInit` after a callback reads on a mass matrix,
-# or nothing where no such check follows.
+# or nothing where no such check follows or they are not finite.
 function _check_residual(integ::PETScIntegrator, init)
     h = integ.h
     ctx = h.ctx
     !ctx.dae && ctx.M !== nothing || return nothing
-    _resolve_init(something(init, _initializealg(integ)), integ.prob.f) isa
-        SciMLBase.CheckInit || return nothing
+    checks = init === nothing ? _solve_checks(integ) :
+        _resolve_init(init, integ.prob.f) isa SciMLBase.CheckInit
+    checks || return nothing
     u = integ.u isa Array ? vec(integ.u) : Vector(integ.u)
     r = similar(u)
     mass = _mass_of(integ.prob)
     eqs = mass === nothing || mass == LinearAlgebra.I ? falses(length(u)) : _zero_rows(mass)
     _anywhere(ctx.comm, any(eqs)) || return nothing
-    _checked_everywhere(() -> h.f_init(r, u, integ.p, integ.t), ctx.comm)
-    r[.!eqs] .= 0
-    return r
+    # An `f` that throws here leaves the callback to run and the check to follow it.
+    finite = try
+        h.f_init(r, u, integ.p, integ.t)
+        r[.!eqs] .= 0
+        all(isfinite, r)
+    catch
+        false
+    end
+    return _everywhere(ctx.comm, finite) ? r : nothing
 end
 
 # The state and the residual a callback finds, which a `CheckInit` after it compares against.
@@ -8198,10 +8215,11 @@ function _reinitialize!(integ::PETScIntegrator, init, before, slope = integ.h.ct
     # PETSc keeps a DAEProblem's derivative to itself, so a state left alone passes the check.
     ctx.dae && init isa SciMLBase.CheckInit && _everywhere(ctx.comm, integ.u == before) &&
         return nothing
-    # PETSc's interpolant can miss a mass matrix's algebraic equations by more than abstol, so
-    # a callback that changes neither the state nor their residual passes the check.
+    # The state PETSc gives at an event or a step end can miss a mass matrix's algebraic
+    # equations by more than abstol, so a callback that changes neither the state nor their
+    # residual passes the check.
     before isa Tuple && _everywhere(ctx.comm, integ.u == before[1]) &&
-        _everywhere(ctx.comm, isequal(_check_residual(integ, init), before[2])) &&
+        _everywhere(ctx.comm, _check_residual(integ, init) == before[2]) &&
         return nothing
     _initialize_state!(integ, init, slope) || _initial_failure!(integ)
     return nothing
@@ -8729,7 +8747,6 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
     h = integ.h
     cbs = (integ.callbacks..., integ.continuous...)
     before = copy(integ.u)
-    found = h.ctx.dae || isempty(cbs) ? before : _found(integ, nothing)
     modified = false
     _checked_everywhere(h.ctx.comm) do
         for cb in cbs
@@ -8739,7 +8756,7 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
         end
     end
     integ.derivative_discontinuity = false
-    _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, found)
+    _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, before)
     integ.finished && return nothing
     initialize_save && integ.opts.save_discretes && _discretes(integ.sol) !== nothing &&
         SciMLBase.save_discretes_if_enabled!(integ, integ.opts.callback; skip_duplicates = true)
