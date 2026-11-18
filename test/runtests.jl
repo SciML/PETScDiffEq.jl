@@ -3588,6 +3588,23 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                     loose...,
                 )
                 @test sol.retcode == SciMLBase.ReturnCode.Success
+                kick = SciMLBase.ODEProblem(
+                    SciMLBase.ODEFunction(
+                        (du, u, p, t) -> (
+                            du[1] = -u[1] + sin(t); du[2] = u[2] - u[1]^2; du[3] = -u[3]
+                        );
+                        mass_matrix = Diagonal([1.0, 0.0, 1.0]),
+                    ), [1.0, 1.0, 1.0], (0.0, 3.0),
+                )
+                sol = SciMLBase.solve(
+                    kick, alg; callback = crossing(integ -> (integ.u[3] = 1.0; nothing)),
+                    loose...,
+                )
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test_throws SciMLBase.CheckInitFailureError SciMLBase.solve(
+                    kick, alg; callback = crossing(integ -> (integ.u[1] += 0.1; nothing)),
+                    loose...,
+                )
             end
             sol = SciMLBase.solve(
                 square(p -> p[1], [1.0]), PETScDiffEq.TSRosW(); abstol = 1.0e-8, reltol = 1.0e-3,
@@ -3602,10 +3619,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             half = (u, t, integ) -> t - 0.5
             beuler = PETScDiffEq.TSImplicit("beuler")
-            @test_throws SciMLBase.CheckInitFailureError SciMLBase.solve(
-                at_half(() -> NaN), beuler; dt = 1.0, adaptive = false,
-                callback = SciMLBase.ContinuousCallback(half, integ -> nothing),
-            )
+            for bad in (NaN, Inf)
+                @test_throws SciMLBase.CheckInitFailureError SciMLBase.solve(
+                    at_half(() -> bad), beuler; dt = 1.0, adaptive = false,
+                    callback = SciMLBase.ContinuousCallback(half, integ -> nothing),
+                )
+            end
             sol = SciMLBase.solve(
                 at_half(() -> error("f fails at the event")), beuler; dt = 1.0, adaptive = false,
                 callback = SciMLBase.ContinuousCallback(half, SciMLBase.terminate!),
