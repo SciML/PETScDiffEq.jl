@@ -6005,6 +6005,32 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test diagonly[2, 2] == 6.0
         end
 
+        @testset "copying the prototype's pattern or part of it" begin
+            proto = sparse(Tridiagonal(ones(5), ones(6), ones(5)))
+            J = PETScDiffEq._structure(Float64, proto)
+            same = copy(proto)
+            same.nzval .= 1:nnz(same)
+            same.nzval[2] = 0.0
+            PETScDiffEq._copy_jac!(J, same)
+            @test J.nzval == same.nzval
+            @test J.rowval == proto.rowval
+
+            narrow = sparse([1, 3, 2, 5, 6], [1, 2, 3, 6, 6], [2.0, 0.0, 3.0, 4.0, 5.0], 6, 6)
+            PETScDiffEq._copy_jac!(J, narrow)
+            @test J == narrow
+            @test nnz(J) == nnz(proto)
+            PETScDiffEq._copy_jac!(J, Matrix(narrow))
+            @test J == narrow
+
+            @test_throws ArgumentError PETScDiffEq._copy_jac!(J, sparse([1], [6], [0.0], 6, 6))
+            @test_throws ArgumentError PETScDiffEq._copy_jac!(
+                J, sparse([1, 4, 2], [1, 1, 2], [1.0, 1.0, 1.0], 6, 6),
+            )
+            wide = Matrix(narrow)
+            wide[6, 1] = 1.0
+            @test_throws ArgumentError PETScDiffEq._copy_jac!(J, wide)
+        end
+
         @testset "split, callbacks and the integrator" begin
             split = SciMLBase.SplitODEProblem(
                 (u, p, t) -> [-1000 * (u[1] - cos(t))], (u, p, t) -> [-sin(t)],

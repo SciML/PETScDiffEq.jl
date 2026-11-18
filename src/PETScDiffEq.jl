@@ -4091,19 +4091,40 @@ function _setstored!(J::SparseMatrixCSC, i, j, v)
     return nothing
 end
 
+# Rows ascend within a column, so `k` walks column j once; the search handles any other order.
+function _setstored!(J::SparseMatrixCSC, k, i, j, v)
+    stop = J.colptr[j + 1]
+    while k < stop && J.rowval[k] < i
+        k += 1
+    end
+    k < stop && J.rowval[k] == i ? (J.nzval[k] = v) : _setstored!(J, i, j, v)
+    return k
+end
+
 function _copy_jac!(J::SparseMatrixCSC, A::SparseMatrixCSC)
+    n = SparseArrays.nnz(A)
+    if J.colptr == A.colptr && view(J.rowval, 1:n) == view(A.rowval, 1:n)
+        copyto!(J.nzval, 1, A.nzval, 1, n)
+        return nothing
+    end
     fill!(J.nzval, 0.0)
     rows, vals = rowvals(A), nonzeros(A)
-    @inbounds for j in axes(A, 2), k in nzrange(A, j)
-        _setstored!(J, rows[k], j, vals[k])
+    @inbounds for j in axes(A, 2)
+        p = J.colptr[j]
+        for k in nzrange(A, j)
+            p = _setstored!(J, p, rows[k], j, vals[k])
+        end
     end
     return nothing
 end
 
 function _copy_jac!(J::SparseMatrixCSC, A::AbstractMatrix)
     fill!(J.nzval, 0.0)
-    @inbounds for j in axes(A, 2), i in axes(A, 1)
-        iszero(A[i, j]) || _setstored!(J, i, j, A[i, j])
+    @inbounds for j in axes(A, 2)
+        p = J.colptr[j]
+        for i in axes(A, 1)
+            iszero(A[i, j]) || (p = _setstored!(J, p, i, j, A[i, j]))
+        end
     end
     return nothing
 end
