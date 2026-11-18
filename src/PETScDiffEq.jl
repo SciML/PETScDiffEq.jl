@@ -2369,6 +2369,8 @@ _unsupported_deriv(deriv) = ArgumentError(
 const PETSC_ERR_SUP = 56
 const PETSC_ERR_MAT_LU_ZRPVT = 71
 const PETSC_ERR_FP = 72
+const PETSC_ERR_USER = 83
+const PETSC_ERR_MISSING_FACTOR = 92
 const CALLBACK_THREW = 1
 
 # Dense LU raises on a zero pivot whatever -ts_error_if_step_fails says.
@@ -7289,6 +7291,128 @@ end
 
 _viewers_off(pl) = LibPETSc.PetscOptionsGetCreateViewerOff(pl) != LibPETSc.PETSC_FALSE
 
+function _object_type(pl, obj)
+    name = Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscObjectGetType), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}), obj, name,
+        ),
+    )
+    return name[] == C_NULL ? "" : unsafe_string(name[])
+end
+
+# Whether PETSc's `solver`, or any when it is `nothing`, supports an `mtype` matrix, and
+# whether it makes this factorization of one.
+function _factors(pl, solver, mtype, ftype)
+    supports, create = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :MatSolverTypeGet), _Err,
+            (
+                Cstring, Cstring, LibPETSc.MatFactorType, Ptr{LibPETSc.PetscBool},
+                Ptr{LibPETSc.PetscBool}, Ptr{Ptr{Cvoid}},
+            ),
+            something(solver, Cstring(C_NULL)), mtype, ftype, C_NULL, supports, create,
+        ),
+    )
+    return supports[] == LibPETSc.PETSC_TRUE, create[] != C_NULL
+end
+
+const _FACTOR_PCS = Dict(
+    "lu" => LibPETSc.MAT_FACTOR_LU, "cholesky" => LibPETSc.MAT_FACTOR_CHOLESKY,
+    "ilu" => LibPETSc.MAT_FACTOR_ILU, "icc" => LibPETSc.MAT_FACTOR_ICC,
+)
+
+# The type of the KSP's own preconditioner, of the matrix it is given, and the solver it
+# factors with, if it names one.
+function _top_pc(pl, ts)
+    ksp, pc = Ref{LibPETSc.CKSP}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    set, P, name = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :SNESGetKSP), _Err, (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}),
+            _snes(pl, ts.ptr), ksp,
+        ),
+    )
+    _check_code(
+        ccall(_symbol(pl, :KSPGetPC), _Err, (LibPETSc.CKSP, Ptr{Ptr{Cvoid}}), ksp[], pc),
+    )
+    # PCGetOperators would create a matrix that is not set.
+    _check_code(
+        ccall(
+            _symbol(pl, :PCGetOperatorsSet), _Err,
+            (Ptr{Cvoid}, Ptr{LibPETSc.PetscBool}, Ptr{LibPETSc.PetscBool}), pc[], C_NULL, set,
+        ),
+    )
+    set[] == LibPETSc.PETSC_TRUE || return "", "", nothing
+    _check_code(
+        ccall(
+            _symbol(pl, :PCGetOperators), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}),
+            pc[], C_NULL, P,
+        ),
+    )
+    pc_type = _object_type(pl, pc[])
+    haskey(_FACTOR_PCS, pc_type) && _check_code(
+        ccall(
+            _symbol(pl, :PCFactorGetMatSolverType), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}),
+            pc[], name,
+        ),
+    )
+    return pc_type, _object_type(pl, P[]), name[] == C_NULL ? nothing : unsafe_string(name[])
+end
+
+# PETSc takes a solver that cannot handle the Jacobian's matrix type and fails in the first
+# linear solve with a bare code. Its message for the first error says when that was the cause.
+function _refuse_matrix_type(e, h)
+    e isa LibPETSc.PetscError || return nothing
+    pl, text, why = h.petsclib, Ref{Ptr{Cchar}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscErrorMessage), _Err, (_Err, Ptr{Ptr{Cchar}}, Ptr{Ptr{Cchar}}),
+            e.code, text, why,
+        ),
+    )
+    why = why[] == C_NULL ? "" : rstrip(unsafe_string(why[]), '.')
+    named = match(
+        r"^MatSolverType (\S+) does not support (?:factorization type (\S+) for )?matrix type (\S+)$",
+        why,
+    )
+    unnamed = match(
+        r"^Could not locate a solver type for factorization type (\S+) and matrix type (\S+)$",
+        why,
+    )
+    graph = match(r"^No method creategraph for Mat of type (\S+)$", why)
+    if e.code == PETSC_ERR_MISSING_FACTOR && named !== nothing
+        solver, ftype, mtype, gamg = String(named[1]), named[2], named[3], false
+    elseif e.code == PETSC_ERR_MISSING_FACTOR && unnamed !== nothing
+        solver, ftype, mtype, gamg = nothing, unnamed[1], unnamed[2], false
+    elseif e.code == PETSC_ERR_SUP && graph !== nothing
+        solver, ftype, mtype, gamg = nothing, nothing, graph[1], true
+    elseif e.code == PETSC_ERR_USER && why == "Require AIJ matrix"
+        solver, ftype, mtype, gamg = nothing, nothing, nothing, true
+    else
+        return nothing
+    end
+    pc_type, jtype, pc_solver = _top_pc(pl, h.ts)
+    # The message is about the Jacobian only when the KSP's own preconditioner failed on it.
+    own = something(mtype, jtype) == jtype && (
+        gamg ? pc_type == "gamg" :
+            haskey(_FACTOR_PCS, pc_type) && solver == pc_solver &&
+            something(ftype, uppercase(pc_type)) == uppercase(pc_type)
+    )
+    own || throw(ArgumentError("PETSc's linear solver cannot take a matrix it was given: $why"))
+    # GAMG builds its graph from an AIJ matrix only.
+    aij = gamg || last(_factors(pl, solver, "seqaij", _FACTOR_PCS[pc_type]))
+    hint = jtype == "seqdense" && aij ?
+        "; with a sparse `jac_prototype` that matrix is `seqaij`, which this solver supports" : ""
+    throw(
+        ArgumentError(
+            "PETSc's linear solver cannot take the `$jtype` matrix that holds this solve's " *
+                "Jacobian: $why$hint",
+        ),
+    )
+end
+
 # Under a distributed comm the error is returned, to raise once the ranks agree on who threw.
 function _run!(f::F, h::TSHandles) where {F}
     ctx = h.ctx
@@ -7297,7 +7421,8 @@ function _run!(f::F, h::TSHandles) where {F}
             _quiet_errors(() -> _with_options(f, h), h)
         catch e
             if ctx.comm === nothing
-                ctx.err === nothing && !_failed_step(e, h) && rethrow()
+                ctx.err === nothing && !_failed_step(e, h) &&
+                    (_refuse_matrix_type(e, h); rethrow())
             elseif !_failed_step(e, h)
                 return e
             end

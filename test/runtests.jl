@@ -10357,6 +10357,67 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "a solver the dense Jacobian cannot take is named with its matrix type" begin
+            n = 8
+            A = spdiagm(-1 => ones(n - 1), 0 => fill(-2.0, n), 1 => ones(n - 1))
+            lin!(du, u, p, t) = mul!(du, A, u)
+            dense = SciMLBase.ODEProblem(lin!, ones(n), (0.0, 1.0))
+            sparse = SciMLBase.ODEProblem(
+                SciMLBase.ODEFunction(lin!; jac_prototype = A), ones(n), (0.0, 1.0),
+            )
+            umfpack = ["-pc_type", "lu", "-pc_factor_mat_solver_type", "umfpack"]
+            cases = [
+                (["-pc_type", "gamg"], "No method creategraph"),
+                (["-pc_type", "gamg", "-pc_gamg_type", "classical"], "Require AIJ matrix"),
+                (["-pc_type", "icc"], "Could not locate a solver type for factorization type ICC"),
+            ]
+            # Not every PETSc build has SuiteSparse, and one without it fails on `seqaij` too.
+            on_sparse = try
+                SciMLBase.solve(sparse, PETScDiffEq.TSImplicit("bdf", umfpack)).retcode
+            catch
+                nothing
+            end
+            on_sparse == SciMLBase.ReturnCode.Success &&
+                push!(cases, (umfpack, "MatSolverType umfpack does not support matrix type"))
+            for (opts, message) in cases
+                for ad in (PETScDiffEq.AutoForwardDiff(), PETScDiffEq.AutoFiniteDiff())
+                    alg = PETScDiffEq.TSImplicit("bdf", opts; autodiff = ad)
+                    @test SciMLBase.solve(sparse, alg).retcode == SciMLBase.ReturnCode.Success
+                    @test_throws [message, "`seqdense`", "sparse `jac_prototype`"] SciMLBase.solve(
+                        dense, alg,
+                    )
+                end
+                integ = SciMLBase.init(dense, PETScDiffEq.TSImplicit("bdf", opts))
+                @test_throws ArgumentError SciMLBase.step!(integ)
+            end
+            # GMRES has no natural norm, which PETSc finds before it sets up GAMG.
+            natural = ["-pc_type", "gamg", "-ksp_type", "gmres", "-ksp_norm_type", "natural"]
+            err = try
+                SciMLBase.solve(dense, PETScDiffEq.TSImplicit("bdf", natural))
+            catch e
+                e
+            end
+            @test err isa PETScDiffEq.LibPETSc.PetscError && err.code == 56
+            # UMFPACK makes no ILU of `seqaij` either, and ASM's dense blocks are not the Jacobian.
+            ilu = ["-pc_type", "ilu", "-pc_factor_mat_solver_type", "umfpack"]
+            asm = [
+                "-pc_type", "asm", "-pc_asm_overlap", "0", "-pc_asm_sub_mat_type", "seqdense",
+                "-sub_pc_type", "lu", "-sub_pc_factor_mat_solver_type", "umfpack",
+            ]
+            for (prob, opts, own) in ((dense, ilu, true), (sparse, asm, false))
+                on_sparse == SciMLBase.ReturnCode.Success || break
+                err = try
+                    SciMLBase.solve(prob, PETScDiffEq.TSImplicit("bdf", opts))
+                catch e
+                    e
+                end
+                text = err isa ArgumentError ? err.msg : ""
+                @test occursin("MatSolverType umfpack does not support matrix type seqdense", text)
+                @test occursin("this solve's Jacobian", text) == own
+                @test !occursin("jac_prototype", text)
+            end
+        end
+
         @testset "an option PETSc reads inside the solve is in force there" begin
             n = 8
             A = spdiagm(-1 => ones(n - 1), 0 => fill(-2.0, n), 1 => ones(n - 1))
