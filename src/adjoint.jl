@@ -883,8 +883,10 @@ _option_key(opt) = (
 _option_name(opt) = lowercase(_option_key(opt))
 # `lowercase(key) == name`, without building the lowercase key.
 _names_option(opt, name) = startswith(opt, "-") && (
-    key = _option_key(opt);
-    length(key) == length(name) && all(((a, b),) -> lowercase(a) == b, zip(key, name))
+    !isvalid(opt) ? _option_name(opt) == name : (
+            key = _option_key(opt);
+            length(key) == length(name) && all(((a, b),) -> lowercase(a) == b, zip(key, name))
+        )
 )
 
 _unset(v) = _no_callback(v) || ((v isa Tuple || v isa AbstractArray) && isempty(v))
