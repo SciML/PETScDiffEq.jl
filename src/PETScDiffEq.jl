@@ -6778,7 +6778,6 @@ function _setup_problem(
             elseif _uses_ifunction(alg)
                 _difference_jacobian!(petsclib, ts, nothing, ctxptr)
             end
-            LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
             dt_given && _hand_step!(h, dt, dtmin, force_dtmin)
             LibPETSc.TSSetMaxTime(petsclib, ts, _max_time(tf))
@@ -6853,6 +6852,8 @@ function _setup_problem(
                 try
                     # Monitors and viewers are made here, so they follow the solve's own options.
                     _with_options(() -> LibPETSc.TSSetFromOptions(petsclib, ts), h)
+                    # Set after the options, as -ts_monitor_cancel removes every monitor set before.
+                    LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
                 catch e
                     e isa LibPETSc.PetscError || rethrow()
                     throw(
@@ -6865,6 +6866,7 @@ function _setup_problem(
                 end
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
+                LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             end
             # The integrator resets PETSc's step limit from maxiters before each step.
             limit = LibPETSc.TSGetMaxSteps(petsclib, ts)
