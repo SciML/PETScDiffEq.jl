@@ -2155,6 +2155,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test all(<=(tf), seen)
             end
         end
+        @testset "a lag of -2 forms its matrix again for the new state" begin
+            lv = SciMLBase.ODEProblem(lotka_volterra!, [1.0, 1.0], (0.0, 1.0), [1.5, 1.0, 3.0, 1.0])
+            for lag in ("-snes_lag_jacobian=-2", "-snes_lag_preconditioner=-2")
+                alg = PETScDiffEq.TSImplicit("beuler", ["-snes_type", "ksponly", lag])
+                integ = SciMLBase.init(lv, alg; dt = 0.01, adaptive = false)
+                SciMLBase.solve!(integ)
+                SciMLBase.reinit!(integ, [2.0, 0.5])
+                fresh = SciMLBase.solve(
+                    SciMLBase.remake(lv; u0 = [2.0, 0.5]), alg; dt = 0.01, adaptive = false,
+                )
+                @test SciMLBase.solve!(integ).u == fresh.u
+            end
+        end
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"))
             fresh = SciMLBase.solve(prob, alg; dt = 0.1)
@@ -4174,6 +4187,16 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.EnsembleProblem(mass; prob_func = scale!, safetycopy = false),
             PETScDiffEq.TSRosW(), 4, refs,
         ) == 2
+        for options in (
+                ["-snes_type", "ksponly", "-snes_lag_jacobian=-2"],
+                ["-snes_type", "ksponly", "-snes_lag_preconditioner=-2"],
+                ["-snes_lag_jacobian=3", "-snes_lag_jacobian_persists"],
+            )
+            @test check(
+                SciMLBase.EnsembleProblem(lv; prob_func = vary),
+                PETScDiffEq.TSImplicit("beuler", options), 3; dt = 0.01, adaptive = false,
+            ) == 0
+        end
 
         # Problem keywords set through remake, a split problem's per-solve cache and
         # setup warnings do not stop reuse, and each solve still warns.

@@ -6232,6 +6232,9 @@ const _NO_REUSE_OPTIONS = (
     "ts_init_time", "ts_max_time", "ts_max_snes_failures", "ts_max_reject",
     "ts_max_step_rejections", "ts_monitor", "ts_trajectory", "ts_save_trajectory",
     "ts_view", "ts_adjoint",
+    # A lag of -2 becomes -1 once the SNES builds its matrix, and a persisting lag counts on.
+    "snes_lag_jacobian", "snes_lag_jacobian_persists", "snes_lag_preconditioner",
+    "snes_lag_preconditioner_persists",
 )
 
 # The first step `_setup` gives a solve that names no `dt`; `h.ctx.f!` may be reversed.
