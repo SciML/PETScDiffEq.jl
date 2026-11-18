@@ -4803,6 +4803,27 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws "no derivative to build a Hermite" integ(integ.t + integ.dt / 2)
             SciMLBase.terminate!(integ)
         end
+
+        @testset "a step proposed below the spacing at t is raised to it, as OrdinaryDiffEq does" begin
+            sink = SciMLBase.ODEProblem(
+                (du, u, p, t) -> (du .= -100 .* sqrt.(abs.(u))), [1.0], (0.0, 1.0),
+            )
+            sol = SciMLBase.solve(
+                sink, PETScDiffEq.TSRK("5dp"); callback = DiffEqCallbacks.PositiveDomain(),
+            )
+            @test sol.retcode == SciMLBase.ReturnCode.Success
+            @test sol.t[end] == 1.0
+            for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSRosW()),
+                    dt in (0.0, 1.0e-300), dtmin in (0.0, 1.0e-6)
+                integ = SciMLBase.init(prob, alg; dtmin)
+                SciMLBase.step!(integ)
+                SciMLBase.step!(integ)
+                SciMLBase.set_proposed_dt!(integ, dt)
+                @test SciMLBase.solve!(integ).retcode == (
+                    dtmin == 0 ? SciMLBase.ReturnCode.Success : SciMLBase.ReturnCode.DtLessThanMin
+                )
+            end
+        end
     end
 
     # Parameters `[d, e, k]`: `d` is timeseries partition 1 and `e` is partition 2.
