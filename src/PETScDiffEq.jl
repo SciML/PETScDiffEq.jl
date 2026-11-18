@@ -9575,10 +9575,12 @@ _bad_hmax(h, stops = ()) = Sys.ARCH === :i686 || _off_max_time(h.t0, h.tf) ||
 
 _off_max_time(t0, tmax) = !iszero(tmax) && abs(tmax - t0) > 8 * abs(tmax)
 
-# TSSolve refuses PETSc's evaluation times under any mode but MATCHSTEP.
-_evaluates(h) = any(
-    o -> _names_option(o, "ts_time_span") || _names_option(o, "ts_eval_times"), h.user_options,
-)
+# TSSolve refuses PETSc's evaluation times under any mode but MATCHSTEP; -ts_eval_times
+# arrived in 3.23.
+_evaluates(h) = any(h.user_options) do o
+    _names_option(o, "ts_time_span") ||
+        _petsc_version(h.petsclib) >= v"3.23" && _names_option(o, "ts_eval_times")
+end
 
 # The span is set before the options, so an option can move either end of it.
 function _refuse_span_options(pl, ts, t0, tmax)

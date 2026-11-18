@@ -10435,16 +10435,23 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 )
                 @test du0[1] ≈ exp(-11) rtol = 1.0e-4
             end
+            still!(du, u, p, t) = (du .= 0; nothing)
+            still = SciMLBase.ODEProblem(still!, [1.0], (-100.0, 0.01))
+            long = (dt = 100.01, adaptive = false)
+            span = PETScDiffEq.TSRK("5dp", ["-ts_time_span=-100,0.01"])
+            stepped = SciMLBase.solve!(SciMLBase.init(still, span; long...))
+            @test stepped.t[end] == 0.01
             # PETSc 3.22 refuses MATCHSTEP's landing a step this long a few ulps off tf.
             if new_names
-                still!(du, u, p, t) = (du .= 0; nothing)
-                still = SciMLBase.ODEProblem(still!, [1.0], (-100.0, 0.01))
-                one_step = SciMLBase.solve(
-                    still, PETScDiffEq.TSRK("5dp", ["-ts_time_span=-100,0.01"]); dt = 100.01,
-                    adaptive = false,
-                )
+                one_step = SciMLBase.solve(still, span; long...)
                 @test one_step.t[end] == 0.01
                 @test one_step.u[end] == [1.0]
+            else
+                # 3.22 has no -ts_eval_times, so the solve keeps its own landing.
+                eval_times = PETScDiffEq.TSRK("5dp", ["-ts_eval_times=-100,0.01"])
+                never_read = (:warn, r"^PETSc never read -ts_eval_times")
+                unread = @test_logs never_read SciMLBase.solve(still, eval_times; long...)
+                @test unread.t[end] == 0.01
             end
         end
 
