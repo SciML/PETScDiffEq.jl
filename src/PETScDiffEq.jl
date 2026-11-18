@@ -531,7 +531,8 @@ smaller one damps the highest frequencies more.
 Adapts on PETSc's error estimate for the method, which PETSc leaves off unless asked, so
 `reltol` and `abstol` apply. PETSc weighs the velocity and the position with one tolerance
 per component of the position, so a vector tolerance on the state `[v; u]` takes the smaller
-of each velocity and position pair. `adaptive = false` steps at the `dt` you give. PETSc
+of each velocity and position pair. `adaptive = false` steps at the `dt` you give, unless
+`petsc_options` pick an adaptive `-ts_adapt_type`, which wins. PETSc
 forms the velocity and the acceleration from the step's change in position, so an adaptive
 solve ends with `Unstable` when a component's change falls below the position's floating
 point spacing while the velocity it would carry exceeds the tolerance. A tight tolerance
@@ -6780,7 +6781,6 @@ function _setup_problem(
             elseif _uses_ifunction(alg)
                 _difference_jacobian!(petsclib, ts, nothing, ctxptr)
             end
-            LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
             dt_given && _hand_step!(h, dt, dtmin, force_dtmin)
             LibPETSc.TSSetMaxTime(petsclib, ts, _max_time(tf))
@@ -6855,6 +6855,8 @@ function _setup_problem(
                 try
                     # Monitors and viewers are made here, so they follow the solve's own options.
                     _with_options(() -> LibPETSc.TSSetFromOptions(petsclib, ts), h)
+                    # Set after the options, as -ts_monitor_cancel removes every monitor set before.
+                    LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
                 catch e
                     e isa LibPETSc.PetscError || rethrow()
                     throw(
@@ -6867,6 +6869,7 @@ function _setup_problem(
                 end
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
+                LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             end
             # The integrator resets PETSc's step limit from maxiters before each step.
             limit = LibPETSc.TSGetMaxSteps(petsclib, ts)
@@ -6978,10 +6981,14 @@ function _setup_problem(
                 _set_ksp_type!(petsclib, ts, "gmres")
             end
             adapts = _adapts(running)
+            # glle reports `none` but steps with its own controller unless an option sets
+            # `-ts_adapt_type`, of which it takes only `none`.
+            adapting = !fixed || running == "glle" &&
+                !any(o -> _names_option(o, "ts_adapt_type"), effective_options)
             dt_option = any(effective_options) do o
                 _names_petsc_option(petsclib, o, "ts_dt")
             end
-            if !dt_given && !dt_option && !(adaptive && adapts === true)
+            if !dt_given && !dt_option && !((adaptive || adapting) && adapts === true)
                 throw(
                     ArgumentError(
                         "PETScDiffEq needs `dt` unless the solve adapts on an error estimate " *
@@ -7007,9 +7014,9 @@ function _setup_problem(
                 )
                 @warn setup_warnings[end]
             end
-            ctx.dtmin = _floor(R, dtmin, force_dtmin, adaptive && adapts !== false)
+            ctx.dtmin = _floor(R, dtmin, force_dtmin, adapting && adapts !== false)
             ctx.retry_fp = !fixed && (comm === nothing || !_uses_ifunction(alg)) &&
-                adaptive && adapts !== false
+                adapts !== false
             if ctx.dtmin > 0 || ctx.unstable !== nothing || comm !== nothing
                 _set_post_step!(petsclib, ts, ctx)
             end
@@ -8096,10 +8103,10 @@ function _set_proposed_dt_unlocked(integ::PETScIntegrator, dt)
     end
     integ.finished && return nothing
     h, opts = integ.h, integ.opts
-    _hand_step!(
-        h, _smallest(h.ctx.comm, abs(oftype(integ.t, dt))), getfield(opts, :dtmin),
-        getfield(opts, :force_dtmin),
-    )
+    dt = _smallest(h.ctx.comm, abs(oftype(integ.t, dt)))
+    # OrdinaryDiffEq raises an adaptive step to the spacing at t, and the adaptor grows it back.
+    h.fixed || (dt = max(dt, eps(integ.t)))
+    _hand_step!(h, dt, getfield(opts, :dtmin), getfield(opts, :force_dtmin))
     _cap_step!(h.petsclib, h.ts, h.fixed)
     return nothing
 end
@@ -8118,7 +8125,7 @@ function _make_opts(
     ) where {R}
     ctx = h.ctx
     return PETScIntegratorOpts(
-        h, get(kwargs, :adaptive, true) === true,
+        h, !h.fixed,
         _own_tol(h.abstol), _own_tol(h.reltol),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
@@ -8751,6 +8758,9 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
         end
     end
     best === nothing && return false
+    if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
+        dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
+    end
     saved = _save_step!(integ, best, false; slack = zero(best))
     slope = ctx.fend
     _rollback!(integ, best, dt, true)
@@ -8775,10 +8785,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     modified && _reinitialize!(integ, best_cb.initializealg, before, slope)
     integ.finished && return true
     integ.derivative_discontinuity = false
-    if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
-        dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
-    end
-    _rollback!(integ, integ.t, dt, false)
+    _rollback!(integ, integ.t, _proposed_dt_unlocked(integ), false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
     if best_cb.save_positions[2]
         _save_here!(integ)
@@ -9270,8 +9277,14 @@ function _reinit_unlocked(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
         p = integ.p,
     )
-    written = filter(!in((:abstol, :reltol)), getfield(integ.opts, :written))
-    kept = NamedTuple{Tuple(written)}(map(k -> getfield(integ.opts, k), Tuple(written)))
+    written = getfield(integ.opts, :written)
+    # No setter sees a tolerance vector written in place, so compare it with the one set up.
+    moved = filter(
+        k -> _anywhere(old.ctx.comm, getfield(integ.opts, k) != getfield(old, k)),
+        [:abstol, :reltol],
+    )
+    carried = Tuple(union(written, moved))
+    kept = NamedTuple{carried}(map(k -> getfield(integ.opts, k), carried))
     setup_kwargs = merge(integ.kwargs, kept)
     # As in OrdinaryDiffEq, a fixed step made live keeps the step it has.
     get(setup_kwargs, :adaptive, true) === false && get(setup_kwargs, :dt, nothing) === nothing &&
@@ -9288,7 +9301,7 @@ function _reinit_unlocked(
     end
     stops = vcat(tstops, d_discontinuities)
     before = erase_sol && saveat === nothing && reinit_dae && old.fresh !== nothing &&
-        !old.destroyed && isempty(getfield(integ.opts, :written)) ? _ts_state(old) : nothing
+        !old.destroyed && isempty(carried) ? _ts_state(old) : nothing
     reused = before !== nothing && _reuse!(old, prob, stops)
     h = reused ? old : _setup(
             prob, integ.alg; tstops = stops, setup_kwargs..., direction = integ.tdir,
@@ -9348,7 +9361,7 @@ function _reinit_unlocked(
         h, setup_kwargs; tstops = integ.tstops, d_discontinuities = d_discontinuities,
         callback = getfield(integ.opts, :callback),
     )
-    append!(getfield(integ.opts, :written), written)
+    append!(getfield(integ.opts, :written), carried)
     integ.finished = false
     integ.iter = 0
     dt === nothing || _use_dt!(integ, dt, reset_dt === true)
