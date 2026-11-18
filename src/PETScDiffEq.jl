@@ -6778,7 +6778,6 @@ function _setup_problem(
             elseif _uses_ifunction(alg)
                 _difference_jacobian!(petsclib, ts, nothing, ctxptr)
             end
-            LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             LibPETSc.TSSetTime(petsclib, ts, t0)
             dt_given && _hand_step!(h, dt, dtmin, force_dtmin)
             LibPETSc.TSSetMaxTime(petsclib, ts, _max_time(tf))
@@ -6853,6 +6852,8 @@ function _setup_problem(
                 try
                     # Monitors and viewers are made here, so they follow the solve's own options.
                     _with_options(() -> LibPETSc.TSSetFromOptions(petsclib, ts), h)
+                    # Set after the options, as -ts_monitor_cancel removes every monitor set before.
+                    LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
                 catch e
                     e isa LibPETSc.PetscError || rethrow()
                     throw(
@@ -6865,6 +6866,7 @@ function _setup_problem(
                 end
             else
                 LibPETSc.TSSetFromOptions(petsclib, ts)
+                LibPETSc.TSMonitorSet(petsclib, ts, ptrs.monitor, ctxptr)
             end
             # The integrator resets PETSc's step limit from maxiters before each step.
             limit = LibPETSc.TSGetMaxSteps(petsclib, ts)
@@ -7975,10 +7977,10 @@ function _set_proposed_dt_unlocked(integ::PETScIntegrator, dt)
     end
     integ.finished && return nothing
     h, opts = integ.h, integ.opts
-    _hand_step!(
-        h, _smallest(h.ctx.comm, abs(oftype(integ.t, dt))), getfield(opts, :dtmin),
-        getfield(opts, :force_dtmin),
-    )
+    dt = _smallest(h.ctx.comm, abs(oftype(integ.t, dt)))
+    # OrdinaryDiffEq raises an adaptive step to the spacing at t, and the adaptor grows it back.
+    h.fixed || (dt = max(dt, eps(integ.t)))
+    _hand_step!(h, dt, getfield(opts, :dtmin), getfield(opts, :force_dtmin))
     _cap_step!(h.petsclib, h.ts, h.fixed)
     return nothing
 end
@@ -9149,8 +9151,14 @@ function _reinit_unlocked(
         integ.prob; u0 = _retype(integ.prob.u0, u0), tspan = _retype(integ.prob.tspan, (t0, tf)),
         p = integ.p,
     )
-    written = filter(!in((:abstol, :reltol)), getfield(integ.opts, :written))
-    kept = NamedTuple{Tuple(written)}(map(k -> getfield(integ.opts, k), Tuple(written)))
+    written = getfield(integ.opts, :written)
+    # No setter sees a tolerance vector written in place, so compare it with the one set up.
+    moved = filter(
+        k -> _anywhere(old.ctx.comm, getfield(integ.opts, k) != getfield(old, k)),
+        [:abstol, :reltol],
+    )
+    carried = Tuple(union(written, moved))
+    kept = NamedTuple{carried}(map(k -> getfield(integ.opts, k), carried))
     setup_kwargs = merge(integ.kwargs, kept)
     # As in OrdinaryDiffEq, a fixed step made live keeps the step it has.
     get(setup_kwargs, :adaptive, true) === false && get(setup_kwargs, :dt, nothing) === nothing &&
@@ -9167,7 +9175,7 @@ function _reinit_unlocked(
     end
     stops = vcat(tstops, d_discontinuities)
     before = erase_sol && saveat === nothing && reinit_dae && old.fresh !== nothing &&
-        !old.destroyed && isempty(getfield(integ.opts, :written)) ? _ts_state(old) : nothing
+        !old.destroyed && isempty(carried) ? _ts_state(old) : nothing
     reused = before !== nothing && _reuse!(old, prob, stops)
     h = reused ? old : _setup(
             prob, integ.alg; tstops = stops, setup_kwargs..., direction = integ.tdir,
@@ -9227,7 +9235,7 @@ function _reinit_unlocked(
         h, setup_kwargs; tstops = integ.tstops, d_discontinuities = d_discontinuities,
         callback = getfield(integ.opts, :callback),
     )
-    append!(getfield(integ.opts, :written), written)
+    append!(getfield(integ.opts, :written), carried)
     integ.finished = false
     integ.iter = 0
     dt === nothing || _use_dt!(integ, dt, reset_dt === true)
