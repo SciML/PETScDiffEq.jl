@@ -6239,6 +6239,9 @@ const _NO_REUSE_OPTIONS = (
     "ts_time_span", "ts_eval_times",
 )
 
+# A prefixed name, as -npc_snes_lag_jacobian, keeps the same state in an inner solver.
+_stops_reuse(o) = startswith(o, "-") && any(k -> endswith(_option_name(o), k), _NO_REUSE_OPTIONS)
+
 # The first step `_setup` gives a solve that names no `dt`; `h.ctx.f!` may be reversed.
 function _first_dt(
         h, is_dae, has_mass, dtmin, abstol, reltol, dtmax, user_f1, user_f2, running,
@@ -7083,7 +7086,7 @@ function _setup_problem(
             end
             _cap_step!(petsclib, ts, fixed)
             if comm === nothing && dm === nothing && tf != -1 && _reusable(running, is_split) &&
-                    !any(o -> any(k -> _names_option(o, k), _NO_REUSE_OPTIONS), effective_options)
+                    !any(_stops_reuse, effective_options)
                 h.again = (;
                     alg, initializealg, dt = dt_given ? dt : nothing, dtmin, dtmax, force_dtmin,
                     save_args, dt_args, estimates, est_calls, step_limit, hook = Ref{Any}(nothing),

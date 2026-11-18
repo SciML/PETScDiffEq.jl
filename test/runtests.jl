@@ -4197,6 +4197,21 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 PETScDiffEq.TSImplicit("beuler", options), 3; dt = 0.01, adaptive = false,
             ) == 0
         end
+        npc = [
+            "-snes_type", "nrichardson", "-snes_npc_side", "left", "-snes_linesearch_type", "basic",
+            "-snes_max_it", "4", "-npc_snes_type", "ksponly", "-npc_ksp_type", "preonly",
+            "-npc_pc_type", "lu", "-npc_snes_lag_jacobian=-2",
+        ]
+        rate!(du, u, p, t) = (du .= -p .* u; nothing)
+        rate_jac!(J, u, p, t) = (J[1, 1] = -p; nothing)
+        rate = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(rate!; jac = rate_jac!), [1.0], (0.0, 0.1), 1.0,
+        )
+        stiffen(pr, c) = SciMLBase.remake(pr; p = 100.0^(c.sim_id - 1))
+        @test check(
+            SciMLBase.EnsembleProblem(rate; prob_func = stiffen),
+            PETScDiffEq.TSImplicit("beuler", npc), 2; dt = 0.1, adaptive = false,
+        ) == 0
         for options in (["-ts_time_span", "0,1,2"], ["-ts_eval_times", "0,1,2"])
             @test check(SciMLBase.EnsembleProblem(lv), PETScDiffEq.TSRK("5dp", options), 3) == 0
         end
