@@ -6029,6 +6029,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             wide = Matrix(narrow)
             wide[6, 1] = 1.0
             @test_throws ArgumentError PETScDiffEq._copy_jac!(J, wide)
+
+            PETScDiffEq._copy_jac!(J, same)
+            PETScDiffEq._copy_jac!(J, J)
+            @test J.nzval == same.nzval
+            PETScDiffEq._copy_jac!(J, Symmetric(J))
+            @test J == Symmetric(same)
+            lower = sparse([1, 2, 2], [1, 1, 2], [1.0, 2.0, 3.0], 2, 2)
+            PETScDiffEq._copy_jac!(lower, SparseMatrixCSC(2, 2, [1, 3, 4], [2, 1, 2], lower.nzval))
+            @test lower.nzval == [2.0, 1.0, 3.0]
+
+            repeated = SparseMatrixCSC(2, 2, [1, 3, 3], [1, 1], [2.0, 3.0])
+            Jr = SparseMatrixCSC(2, 2, [1, 3, 3], [1, 1], zeros(2))
+            PETScDiffEq._copy_jac!(Jr, repeated)
+            @test Jr.nzval == [3.0, 0.0]
+            PETScDiffEq._copy_jac!(repeated, repeated)
+            @test repeated.nzval == [3.0, 0.0]
         end
 
         @testset "split, callbacks and the integrator" begin
