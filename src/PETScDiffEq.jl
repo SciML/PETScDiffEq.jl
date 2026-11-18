@@ -1975,7 +1975,7 @@ _copied(S, x, idxs::Vector{Int}) = Vector{S}(view(vec(x), idxs))
 
 _kept(ctx::TSContext{R, S, A}, x) where {R, S, A} = A <: Number ? only(x) :
     A <: Vector ? x :
-    A <: Array ? reshape(x, ctx.shape) : copyto!(similar(ctx.wrapped_u, eltype(A)), x)
+    A <: Array ? reshape(x, ctx.shape) : _partition(ctx.wrapped_u, x, eltype(A))
 
 function _record_end!(ctx, t, x)
     du = _record!(ctx, t, x, ctx.fend)
@@ -2088,7 +2088,7 @@ function _post_step_collective!(ctx, ts_ptr)
                 )
                 flat = ctx.flat_vec === nothing ? PETScCompat.VecPtr(pl, x[]) : ctx.flat_vec
                 u = _read_state!(ctx.u, ctx, flat)
-                ctx.wrapped_u === nothing || (u = copyto!(ctx.wrapped_u, u))
+                ctx.wrapped_u === nothing || (u = _load!(ctx.wrapped_u, u))
                 if ctx.unstable !== nothing
                     unstable = _asked(ctx) do
                         ctx.unstable(ctx.tdir * hnext, u, ctx.p, _user_t(ctx.tdir, s))
@@ -3767,25 +3767,31 @@ _shaped(f, ::Nothing) = f
 _shaped(::Nothing, ::Dims) = nothing
 _shaped(::Nothing, ::AbstractArray) = nothing
 _shaped(f, shape::Dims) = (du, u, p, t) -> f(reshape(du, shape), reshape(u, shape), p, t)
-_shaped(f, like::AbstractArray) = Wrapped(f, similar(like), similar(like))
+_shaped(f, like::AbstractArray) = Wrapped(f, _buffer(like), similar(like))
 _shaped_jac(j, ::Nothing) = j
 _shaped_jac(j, shape::Dims) = (J, u, p, t) -> j(J, reshape(u, shape), p, t)
 function _shaped_jac(j, like::AbstractArray)
-    u = similar(like)
-    return (J, x, p, t) -> j(J, copyto!(u, x), p, t)
+    u = _buffer(like)
+    return (J, x, p, t) -> j(J, _load!(u, x), p, t)
 end
 
 # A state of another array type is copied into arrays like `u0`; dual numbers get their own.
-struct Wrapped{F, U}
+# An immutable `u0`, an SVector, has no buffer to fill: the StaticArrays extension rebuilds it.
+_buffer(like) = similar(like)
+_load!(buf, x) = copyto!(buf, x)
+_input(buf, x, same) = copyto!(same ? buf : similar(buf, eltype(x)), x)
+_state_type(like, U) = typeof(similar(like, U))
+
+struct Wrapped{F, U, D}
     f::F
     u::U
-    du::U
+    du::D
 end
 
 function (w::Wrapped)(dx, x, p, t)
-    u, du = eltype(x) === eltype(w.u) && eltype(dx) === eltype(w.du) ? (w.u, w.du) :
-        (similar(w.u, eltype(x)), similar(w.du, eltype(dx)))
-    w.f(du, copyto!(u, x), p, t)
+    same = eltype(x) === eltype(w.u) && eltype(dx) === eltype(w.du)
+    du = same ? w.du : similar(w.du, eltype(dx))
+    w.f(du, _input(w.u, x, same), p, t)
     copyto!(dx, du)
     return nothing
 end
@@ -3799,7 +3805,7 @@ function _wraps(prob, alg)
     return !flat && !(similar(prob.u0) isa Array)
 end
 
-_as_u0(ctx, u) = ctx.wrapped_u !== nothing ? copyto!(ctx.wrapped_u, u) :
+_as_u0(ctx, u) = ctx.wrapped_u !== nothing ? _load!(ctx.wrapped_u, u) :
     ctx.shape === nothing ? u : reshape(u, ctx.shape)
 
 # A reshaped state, or a wrapped one such as a ComponentArray, is never `==` a flat vector.
@@ -4060,7 +4066,7 @@ function _kick_time(d::Partitioned, sub_ts, pl, t)
     return t0 + (t - t0) * oftype(t, d.kicks[i])
 end
 
-_partition(template, x) = copyto!(similar(template, eltype(x)), x)
+_partition(template, x, T = eltype(x)) = copyto!(similar(template, T), x)
 
 function _partitioned_jac(jac, template, iip)
     iip && return (J, x, p, t) -> jac(J, _partition(template, x), p, t)
@@ -6615,7 +6621,7 @@ function _setup_problem(
         _plain_mdot(() -> LibPETSc.DMCreateGlobalVector(petsclib, clone), petsclib)
     # A single index saves numbers, as OrdinaryDiffEq does.
     A = kept !== nothing ? (_listed(save_idxs) || length(kept) > 1 ? Vector{U} : U) :
-        like === nothing ? Array{U, ndims(prob.u0)} : typeof(similar(like, U))
+        like === nothing ? Array{U, ndims(prob.u0)} : _state_type(like, U)
     # f scatters through the caller's DM, so the handle holds a reference to it.
     dms = clone === nothing ? Ptr{Cvoid}[] : [clone.ptr, _referenced(petsclib, dm.ptr)]
     # Inferring these from abstract arguments leaves edges Julia re-verifies on every load.
@@ -7860,7 +7866,10 @@ double precision, while the solution it saves stays in single. For a `DynamicalO
 `SecondOrderODEProblem` the state is an `ArrayPartition` of the velocity and the position, as
 in OrdinaryDiffEq. An array-shaped `u0` gives `u`, `uprev` and every state read from the
 integrator as an `Array` of its size, and a `u0` of another array type, such as a
-`ComponentArray`, gives them as `similar(u0)` makes them.
+`ComponentArray`, gives them as `similar(u0)` makes them. A static `u0`, such as an `SVector`, reaches `f`, `jac`
+and the saved states `sol.u` in its own type, so an `f` written for it runs as it does under
+OrdinaryDiffEq; this needs StaticArrays to be loaded. The integrator's own `u` and `uprev` stay
+the mutable `similar(u0)`, since it updates them in place.
 
 `iter` counts every step attempted, accepted, rejected or failed, as `maxiters` does, and
 `stats` is the running `sol.stats`. `opts`
@@ -8086,8 +8095,9 @@ end
 _at_step_end(integ::PETScIntegrator) = integ.h.ctx.fend !== nothing &&
     integ.tdir * integ.t == integ.h.ctx.end_s && _same_entries(integ.u, integ.h.ctx.end_u)
 
-_integ_state(ctx, x, f = copy) =
-    ctx.wrapped_u === nothing ? _as_u0(ctx, f(x)) : _partition(ctx.wrapped_u, x)
+# The integrator updates its states in place, so they stay mutable even for a static `u0`.
+_integ_state(ctx, x, f = copy) = ctx.wrapped_u === nothing ? _as_u0(ctx, f(x)) :
+    copyto!(similar(ctx.wrapped_u, eltype(x)), x)
 
 SciMLBase.get_du(integ::PETScIntegrator) = _checked_du(integ)
 function SciMLBase.get_du!(out, integ::PETScIntegrator)
@@ -9256,7 +9266,7 @@ function _reinit_unlocked(
 end
 
 _retype(old, new) = !(eltype(old) <: Union{AbstractFloat, Complex}) ? new :
-    new isa AbstractArray ? copyto!(similar(new, eltype(old)), new) : eltype(old).(new)
+    new isa AbstractArray ? _partition(new, new, eltype(old)) : eltype(old).(new)
 
 # `f` keeps seeing the problem's shape and array type, so another is read in linear order.
 function _in_shape(old, new)

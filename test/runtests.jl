@@ -9,6 +9,7 @@ using DiffEqCallbacks: PresetTimeCallback
 using MPI
 using OrdinaryDiffEqTsit5: Tsit5
 using RecipesBase: RecipesBase
+using StaticArrays: SVector, SMatrix
 using Test
 
 RecipesBase.is_key_supported(::Symbol) = true
@@ -126,6 +127,28 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             orders = [log2(errs[i] / errs[i + 1]) for i in 1:(length(errs) - 1)]
             @test all(o -> isapprox(o, expected_order; atol = 0.15), orders)
         end
+    end
+
+    @testset "A static u0 keeps its type for f, sol.u and reinit!" begin
+        rot_typed(u::SVector{2, Float64}, p, t) = SVector(-u[2], u[1])
+        prob = SciMLBase.ODEProblem(rot_typed, SVector(1.0, 0.0), (0.0, 1.0))
+        sol = SciMLBase.solve(prob, PETScDiffEq.TSRK())
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        @test all(u -> u isa SVector{2, Float64}, sol.u)
+        @test sol.u[end] ≈ SVector(cos(1.0), sin(1.0)) atol = 1.0e-4
+        integ = SciMLBase.init(prob, PETScDiffEq.TSRK())
+        SciMLBase.step!(integ)
+        @test integ.t > 0
+        SciMLBase.reinit!(integ, SVector(0.0, 1.0))
+        @test integ.prob.u0 isa SVector{2, Float64}
+        SciMLBase.solve!(integ)
+        @test integ.sol.retcode == SciMLBase.ReturnCode.Success
+        rotm(u::SMatrix{2, 2, Float64, 4}, p, t) = -u
+        solm = SciMLBase.solve(
+            SciMLBase.ODEProblem(rotm, SMatrix{2, 2}(1.0, 0.0, 0.0, 1.0), (0.0, 1.0)),
+            PETScDiffEq.TSRK(),
+        )
+        @test solm.u[end] isa SMatrix{2, 2, Float64, 4}
     end
 
     @testset "TSRosW convergence order" begin

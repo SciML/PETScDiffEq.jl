@@ -80,7 +80,8 @@ an array of `u0`'s size or a vector of its length. `set_u!` and `reinit!` also t
 of another shape or array type with as many entries and read it in linear order. An array
 type other than `Array` comes back as `similar(u0)` makes it: a `ComponentArray` or another
 wrapper of a vector reaches all of these, `f`'s `du` included, as a copy in its own type,
-and a `Transpose` matrix as a `Matrix`. The solve is the one of the same problem written on
+and a `Transpose` matrix as a `Matrix`. A static `u0` such as an `SVector`, with StaticArrays
+loaded, reaches `f` and `sol.u` as itself, with `du` its mutable `similar`. The solve is the one of the same problem written on
 `vec(u0)`, step for step. This covers an `ODEProblem` and a `SplitODEProblem` on
 `MPI.COMM_SELF`; [Limitations](@ref) lists what still needs `vec(u0)`.
 
