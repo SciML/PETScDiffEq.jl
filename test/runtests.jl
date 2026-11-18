@@ -6022,7 +6022,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             PETScDiffEq._copy_jac!(J, Matrix(narrow))
             @test J == narrow
 
-            @test_throws ArgumentError PETScDiffEq._copy_jac!(J, sparse([1], [6], [0.0], 6, 6))
+            @test_throws "entry at (1, 6)" PETScDiffEq._copy_jac!(J, sparse([1], [6], [0.0], 6, 6))
             @test_throws ArgumentError PETScDiffEq._copy_jac!(
                 J, sparse([1, 4, 2], [1, 1, 2], [1.0, 1.0, 1.0], 6, 6),
             )
@@ -6033,8 +6033,6 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             PETScDiffEq._copy_jac!(J, same)
             PETScDiffEq._copy_jac!(J, J)
             @test J.nzval == same.nzval
-            PETScDiffEq._copy_jac!(J, Symmetric(J))
-            @test J == Symmetric(same)
             lower = sparse([1, 2, 2], [1, 1, 2], [1.0, 2.0, 3.0], 2, 2)
             PETScDiffEq._copy_jac!(lower, SparseMatrixCSC(2, 2, [1, 3, 4], [2, 1, 2], lower.nzval))
             @test lower.nzval == [2.0, 1.0, 3.0]

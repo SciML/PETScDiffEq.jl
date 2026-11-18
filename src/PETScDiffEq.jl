@@ -4129,12 +4129,14 @@ function _copy_jac!(J::SparseMatrixCSC, A::SparseMatrixCSC)
 end
 
 function _copy_jac!(J::SparseMatrixCSC, A::AbstractMatrix)
-    Base.mightalias(J, A) && (A = copy(A))
     fill!(J.nzval, 0.0)
     @inbounds for j in axes(A, 2)
         p = J.colptr[j]
         for i in axes(A, 1)
-            iszero(A[i, j]) || (p = _setstored!(J, p, i, j, A[i, j]))
+            a = A[i, j]
+            if !iszero(a)
+                p = _setstored!(J, p, i, j, a)
+            end
         end
     end
     return nothing
