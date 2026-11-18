@@ -10581,6 +10581,14 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test rosw(knoll).u == rosw([knoll; "-ksp_type"; "gmres"]).u
             nonzero = ["-ksp_initial_guess_nonzero", "true"]
             @test rosw(nonzero).u == rosw([nonzero; "-ksp_type"; "gmres"]).u
+            fischer = ["-ksp_guess_type", "fischer"]
+            @test rosw(fischer).u == rosw([fischer; "-ksp_type"; "gmres"]).u
+            viewed = SciMLBase.init(
+                prob, PETScDiffEq.TSImplicit("beuler", ["-ksp_view", "ascii:$(tempname())"]);
+                dt = 0.01, adaptive = false,
+            )
+            @test viewed.h.lu !== nothing
+            @test SciMLBase.solve!(viewed).retcode == SciMLBase.ReturnCode.Success
             for type in ("beuler", "bdf")
                 solve_with(o) = SciMLBase.solve(
                     prob, PETScDiffEq.TSImplicit(type, o); dt = 0.01, adaptive = false,
