@@ -10166,9 +10166,12 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             # GMRES has no natural norm, which PETSc finds before it sets up GAMG.
             natural = ["-pc_type", "gamg", "-ksp_type", "gmres", "-ksp_norm_type", "natural"]
-            @test_throws PETScDiffEq.LibPETSc.PetscError(56) SciMLBase.solve(
-                dense, PETScDiffEq.TSImplicit("bdf", natural),
-            )
+            err = try
+                SciMLBase.solve(dense, PETScDiffEq.TSImplicit("bdf", natural))
+            catch e
+                e
+            end
+            @test err isa PETScDiffEq.LibPETSc.PetscError && err.code == 56
             # UMFPACK makes no ILU of `seqaij` either, and ASM's dense blocks are not the Jacobian.
             ilu = ["-pc_type", "ilu", "-pc_factor_mat_solver_type", "umfpack"]
             asm = [
