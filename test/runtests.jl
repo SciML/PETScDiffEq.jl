@@ -10413,6 +10413,41 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "PETSc's evaluation times on a span that ends near 0" begin
+            near_zero = SciMLBase.ODEProblem(decay!, [1.0], (-10.0, 1.0))
+            new_names = PETScDiffEq._petsc_version(PETScDiffEq._petsclib(Float64)) >= v"3.25"
+            spans = [["-ts_time_span=-10,0,1"]]
+            new_names && push!(spans, ["-ts_eval_times=-10,0,1"])
+            tight = (abstol = 1.0e-10, reltol = 1.0e-10)
+            for o in spans, kw in ((dt = 0.1, adaptive = false), tight)
+                alg = PETScDiffEq.TSRK("5dp", o)
+                for sol in (
+                        SciMLBase.solve(near_zero, alg; kw...),
+                        SciMLBase.solve!(SciMLBase.init(near_zero, alg; kw...)),
+                        SciMLBase.solve(near_zero, alg; tstops = [0.5], kw...),
+                    )
+                    @test sol.t[end] == 1.0
+                    @test sol.u[end][1] ≈ exp(-11) rtol = 1.0e-4
+                end
+                du0, _ = PETScDiffEq._discrete_adjoint(
+                    near_zero, alg, PETScAdjoint(); t = [1.0],
+                    dgdu_discrete = (out, u, p, t, i) -> (out .= 1; nothing), kw...,
+                )
+                @test du0[1] ≈ exp(-11) rtol = 1.0e-4
+            end
+            # PETSc 3.22 refuses MATCHSTEP's landing a step this long a few ulps off tf.
+            if new_names
+                still!(du, u, p, t) = (du .= 0; nothing)
+                still = SciMLBase.ODEProblem(still!, [1.0], (-100.0, 0.01))
+                one_step = SciMLBase.solve(
+                    still, PETScDiffEq.TSRK("5dp", ["-ts_time_span=-100,0.01"]); dt = 100.01,
+                    adaptive = false,
+                )
+                @test one_step.t[end] == 0.01
+                @test one_step.u[end] == [1.0]
+            end
+        end
+
         @testset "a cancelled monitor still yields the final state" begin
             sol = SciMLBase.solve(
                 prob, PETScDiffEq.TSRK("5dp", ["-ts_monitor_cancel"]); dt = 0.1,
