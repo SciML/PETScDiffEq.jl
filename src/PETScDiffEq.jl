@@ -6235,6 +6235,8 @@ const _NO_REUSE_OPTIONS = (
     # A lag of -2 becomes -1 once the SNES builds its matrix, and a persisting lag counts on.
     "snes_lag_jacobian", "snes_lag_jacobian_persists", "snes_lag_preconditioner",
     "snes_lag_preconditioner_persists",
+    # Only TSSetEvaluationTimes resets the count of solutions TSSolve has stored.
+    "ts_time_span", "ts_eval_times",
 )
 
 # The first step `_setup` gives a solve that names no `dt`; `h.ctx.f!` may be reversed.

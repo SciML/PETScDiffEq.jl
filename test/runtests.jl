@@ -4197,6 +4197,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 PETScDiffEq.TSImplicit("beuler", options), 3; dt = 0.01, adaptive = false,
             ) == 0
         end
+        for options in (["-ts_time_span", "0,1,2"], ["-ts_eval_times", "0,1,2"])
+            @test check(SciMLBase.EnsembleProblem(lv), PETScDiffEq.TSRK("5dp", options), 3) == 0
+        end
 
         # Problem keywords set through remake, a split problem's per-solve cache and
         # setup warnings do not stop reuse, and each solve still warns.
