@@ -903,6 +903,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     tend::R
     attempt_margin::Int
     trial::Int
+    adapts::Union{Nothing, Bool}
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -6646,7 +6647,7 @@ function _setup_problem(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
-        nothing, mass_slope, tf, -1, -1,
+        nothing, mass_slope, tf, -1, -1, _adapts(_warn_name(alg)),
     )::TSContext
     h = Base.inferencebarrier(TSHandles)(
         ctx, petsclib, LibPETSc.TS(petsclib), uvec, nothing, nothing, ad_calls, nothing,
@@ -7050,6 +7051,7 @@ function _setup_problem(
                 ctx.hermite = !has_mass && !is_dae
                 ctx.interpolates = nothing
                 ctx.alg_name = running
+                ctx.adapts = _adapts(running)
             end
             tableau = _tableau_name(petsclib, ts, running)
             if _implicit_first_stage(tableau)
@@ -8151,7 +8153,7 @@ function _make_opts(
 end
 
 SciMLBase.isadaptive(integ::PETScIntegrator) =
-    getfield(integ.opts, :adaptive) && _adapts(integ.h.ctx.alg_name) !== false
+    getfield(integ.opts, :adaptive) && integ.h.ctx.adapts !== false
 
 function (integ::PETScIntegrator)(t, ::Type{deriv} = Val{0}; idxs = nothing) where {deriv}
     t isa Number || return [integ(ti, deriv; idxs) for ti in t]
