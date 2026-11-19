@@ -3786,6 +3786,7 @@ _load!(buf, x) = copyto!(buf, x)
 _input(buf, x, same) = copyto!(same ? buf : similar(buf, eltype(x)), x)
 _state_type(like, U) = typeof(similar(like, U))
 _static(x) = false
+_user_state(like, u) = u
 
 struct Wrapped{F, U, D}
     f::F
@@ -8037,7 +8038,7 @@ double precision, while the solution it saves stays in single. For a `DynamicalO
 `SecondOrderODEProblem` the state is an `ArrayPartition` of the velocity and the position, as
 in OrdinaryDiffEq. An array-shaped `u0` gives `u`, `uprev` and every state read from the
 integrator as an `Array` of its size, and a `u0` of another array type, such as a
-`ComponentArray`, gives them as `similar(u0)` makes them. For an out-of-place problem with a static `u0` (an `SVector` or `SMatrix`) and StaticArrays loaded, `f`, `jac` and the saved states `sol.u` get the state in that type, in PETSc's working precision. The integrator's own `u` and `uprev` stay the mutable `similar(u0)`, since it updates them in place.
+`ComponentArray`, gives them as `similar(u0)` makes them. For an For an out-of-place problem with a static `u0` (an `SVector` or `SMatrix`) and StaticArrays loaded, `f`, `jac`, `unstable_check`, `isoutofdomain` and the saved states `sol.u` get the state in that type. `f` and `jac` get it in PETSc's working precision; `sol.u` keeps the element type of `u0`. The integrator's own `u` and `uprev` stay the mutable `similar(u0)`, since it updates them in place.
 
 `iter` counts every step attempted, accepted, rejected or failed, as `maxiters` does, and
 `stats` is the running `sol.stats`. `opts`
@@ -9858,7 +9859,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     integ.dt = integ.t - integ.tprev
     _with_u(u -> _read_state!(integ.u, ctx, u), h)
     if ctx.domain !== nothing && SciMLBase.isadaptive(integ) &&
-            _predicate(() -> ctx.domain(integ.u, ctx.p, integ.t), ctx)
+            _predicate(() -> ctx.domain(_user_state(ctx.wrapped_u, integ.u), ctx.p, integ.t), ctx)
         return _reject_step!(integ, before, prev, abs(integ.t - integ.tprev))
     end
     _end_step_here!(integ)
@@ -9881,7 +9882,11 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
         if ctx.dtmin > 0 && hnext < ctx.dtmin && integ.tdir * integ.t + hnext < limit - tol
             ctx.dt_too_small = true
         elseif ctx.unstable !== nothing &&
-                _predicate(() -> ctx.unstable(integ.tdir * hnext, integ.u, ctx.p, integ.t), ctx)
+                _predicate(
+                () -> ctx.unstable(
+                    integ.tdir * hnext, _user_state(ctx.wrapped_u, integ.u), ctx.p, integ.t,
+                ), ctx,
+            )
             ctx.unstable_hit = true
         end
     end

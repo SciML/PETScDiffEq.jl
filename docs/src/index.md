@@ -81,7 +81,7 @@ an array of `u0`'s size or a vector of its length. `set_u!` and `reinit!` also t
 of another shape or array type with as many entries and read it in linear order. An array
 type other than `Array` comes back as `similar(u0)` makes it: a `ComponentArray` or another
 wrapper of a vector reaches all of these, `f`'s `du` included, as a copy in its own type,
-and a `Transpose` matrix as a `Matrix`. For an out-of-place problem whose `u0` is an `SVector` or `SMatrix`, with StaticArrays loaded, `f`, `jac` and `sol.u` receive the state as that type, in PETSc's working precision. An `f` that was written for the mutable `similar(u0)` must now accept the static type. The integrator's own `u` and `uprev` stay the mutable `similar(u0)`.
+and a `Transpose` matrix as a `Matrix`. For an out-of-place problem whose `u0` is an `SVector` or `SMatrix`, with StaticArrays loaded, `f`, `jac`, `unstable_check`, `isoutofdomain` and `sol.u` receive the state as that type. `f` and `jac` get it in PETSc's working precision, while `sol.u` keeps the element type of `u0`. An `f` that was written for the mutable `similar(u0)` must now accept the static type. The integrator's own `u` and `uprev` stay the mutable `similar(u0)`.
 The solve is the one of the same problem written on
 `vec(u0)`, step for step. This covers an `ODEProblem` and a `SplitODEProblem` on
 `MPI.COMM_SELF`; [Limitations](@ref) lists what still needs `vec(u0)`.

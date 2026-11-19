@@ -171,6 +171,20 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test solm.retcode == SciMLBase.ReturnCode.Success
         @test solm.u[end] isa SMatrix{2, 2, Float64, 4}
         @test solm.u[end] ≈ exp(-1.0) * M0 atol = 1.0e-2
+        # unstable_check and isoutofdomain see the static type, with and without tstops
+        seen = DataType[]
+        probu = SciMLBase.ODEProblem(rot_typed, SVector(1.0, 0.0), (0.0, 1.0))
+        chk(dt, u, p, t) = (push!(seen, typeof(u)); false)
+        dom(u, p, t) = (push!(seen, typeof(u)); false)
+        for kw in ((;), (; tstops = [0.5]))
+            empty!(seen)
+            sold = SciMLBase.solve(
+                probu, PETScDiffEq.TSRK(); unstable_check = chk, isoutofdomain = dom, kw...
+            )
+            @test sold.retcode == SciMLBase.ReturnCode.Success
+            @test !isempty(seen)
+            @test all(==(SVector{2, Float64}), seen)
+        end
     end
 
     @testset "TSRosW convergence order" begin
