@@ -531,7 +531,8 @@ smaller one damps the highest frequencies more.
 Adapts on PETSc's error estimate for the method, which PETSc leaves off unless asked, so
 `reltol` and `abstol` apply. PETSc weighs the velocity and the position with one tolerance
 per component of the position, so a vector tolerance on the state `[v; u]` takes the smaller
-of each velocity and position pair. `adaptive = false` steps at the `dt` you give. PETSc
+of each velocity and position pair. `adaptive = false` steps at the `dt` you give, unless
+`petsc_options` pick an adaptive `-ts_adapt_type`, which wins. PETSc
 forms the velocity and the acceleration from the step's change in position, so an adaptive
 solve ends with `Unstable` when a component's change falls below the position's floating
 point spacing while the velocity it would carry exceeds the tolerance. A tight tolerance
@@ -2368,6 +2369,8 @@ _unsupported_deriv(deriv) = ArgumentError(
 const PETSC_ERR_SUP = 56
 const PETSC_ERR_MAT_LU_ZRPVT = 71
 const PETSC_ERR_FP = 72
+const PETSC_ERR_USER = 83
+const PETSC_ERR_MISSING_FACTOR = 92
 const CALLBACK_THREW = 1
 
 # Dense LU raises on a zero pivot whatever -ts_error_if_step_fails says.
@@ -5403,6 +5406,8 @@ mutable struct TSHandles{CTX, L, R, S}
     alg::Any
     user_options::Vector{String}
     switched::Bool
+    checks::Union{Nothing, Bool}
+    rows::Union{Nothing, BitVector}
 end
 
 # Finalizers run after atexit hooks, when freeing aborts, so exit frees live handles.
@@ -6657,7 +6662,7 @@ function _setup_problem(
         Any[], Union{Nothing, Vector{S}}[nothing, nothing], false, nothing, dms,
         !initialized, f_init, jac_init, something(abstol, 1.0e-6), something(reltol, 1.0e-3),
         nothing, nothing, nothing, false, alg, String[alg.petsc_options; extra_options],
-        false,
+        false, nothing, nothing,
     )::TSHandles
     if comm !== nothing && MPI.Comm_size(comm) > 1
         PARALLEL_HANDLES[h] = nothing
@@ -6985,10 +6990,14 @@ function _setup_problem(
                 _set_ksp_type!(petsclib, ts, "gmres")
             end
             adapts = _adapts(running)
+            # glle reports `none` but steps with its own controller unless an option sets
+            # `-ts_adapt_type`, of which it takes only `none`.
+            adapting = !fixed || running == "glle" &&
+                !any(o -> _names_option(o, "ts_adapt_type"), effective_options)
             dt_option = any(effective_options) do o
                 _names_petsc_option(petsclib, o, "ts_dt")
             end
-            if !dt_given && !dt_option && !(adaptive && adapts === true)
+            if !dt_given && !dt_option && !((adaptive || adapting) && adapts === true)
                 throw(
                     ArgumentError(
                         "PETScDiffEq needs `dt` unless the solve adapts on an error estimate " *
@@ -7014,13 +7023,9 @@ function _setup_problem(
                 )
                 @warn setup_warnings[end]
             end
-            # glle steps with its own controller under PETSc's `none`.
-            ctx.dtmin = _floor(
-                R, dtmin, force_dtmin,
-                adaptive && adapts !== false && (!fixed || running == "glle"),
-            )
+            ctx.dtmin = _floor(R, dtmin, force_dtmin, adapting && adapts !== false)
             ctx.retry_fp = !fixed && (comm === nothing || !_uses_ifunction(alg)) &&
-                adaptive && adapts !== false
+                adapts !== false
             if ctx.dtmin > 0 || ctx.unstable !== nothing || comm !== nothing
                 _set_post_step!(petsclib, ts, ctx)
             end
@@ -7295,6 +7300,128 @@ end
 
 _viewers_off(pl) = LibPETSc.PetscOptionsGetCreateViewerOff(pl) != LibPETSc.PETSC_FALSE
 
+function _object_type(pl, obj)
+    name = Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscObjectGetType), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}), obj, name,
+        ),
+    )
+    return name[] == C_NULL ? "" : unsafe_string(name[])
+end
+
+# Whether PETSc's `solver`, or any when it is `nothing`, supports an `mtype` matrix, and
+# whether it makes this factorization of one.
+function _factors(pl, solver, mtype, ftype)
+    supports, create = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :MatSolverTypeGet), _Err,
+            (
+                Cstring, Cstring, LibPETSc.MatFactorType, Ptr{LibPETSc.PetscBool},
+                Ptr{LibPETSc.PetscBool}, Ptr{Ptr{Cvoid}},
+            ),
+            something(solver, Cstring(C_NULL)), mtype, ftype, C_NULL, supports, create,
+        ),
+    )
+    return supports[] == LibPETSc.PETSC_TRUE, create[] != C_NULL
+end
+
+const _FACTOR_PCS = Dict(
+    "lu" => LibPETSc.MAT_FACTOR_LU, "cholesky" => LibPETSc.MAT_FACTOR_CHOLESKY,
+    "ilu" => LibPETSc.MAT_FACTOR_ILU, "icc" => LibPETSc.MAT_FACTOR_ICC,
+)
+
+# The type of the KSP's own preconditioner, of the matrix it is given, and the solver it
+# factors with, if it names one.
+function _top_pc(pl, ts)
+    ksp, pc = Ref{LibPETSc.CKSP}(C_NULL), Ref{Ptr{Cvoid}}(C_NULL)
+    set, P, name = Ref(LibPETSc.PETSC_FALSE), Ref{Ptr{Cvoid}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :SNESGetKSP), _Err, (LibPETSc.CSNES, Ptr{LibPETSc.CKSP}),
+            _snes(pl, ts.ptr), ksp,
+        ),
+    )
+    _check_code(
+        ccall(_symbol(pl, :KSPGetPC), _Err, (LibPETSc.CKSP, Ptr{Ptr{Cvoid}}), ksp[], pc),
+    )
+    # PCGetOperators would create a matrix that is not set.
+    _check_code(
+        ccall(
+            _symbol(pl, :PCGetOperatorsSet), _Err,
+            (Ptr{Cvoid}, Ptr{LibPETSc.PetscBool}, Ptr{LibPETSc.PetscBool}), pc[], C_NULL, set,
+        ),
+    )
+    set[] == LibPETSc.PETSC_TRUE || return "", "", nothing
+    _check_code(
+        ccall(
+            _symbol(pl, :PCGetOperators), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}),
+            pc[], C_NULL, P,
+        ),
+    )
+    pc_type = _object_type(pl, pc[])
+    haskey(_FACTOR_PCS, pc_type) && _check_code(
+        ccall(
+            _symbol(pl, :PCFactorGetMatSolverType), _Err, (Ptr{Cvoid}, Ptr{Ptr{Cchar}}),
+            pc[], name,
+        ),
+    )
+    return pc_type, _object_type(pl, P[]), name[] == C_NULL ? nothing : unsafe_string(name[])
+end
+
+# PETSc takes a solver that cannot handle the Jacobian's matrix type and fails in the first
+# linear solve with a bare code. Its message for the first error says when that was the cause.
+function _refuse_matrix_type(e, h)
+    e isa LibPETSc.PetscError || return nothing
+    pl, text, why = h.petsclib, Ref{Ptr{Cchar}}(C_NULL), Ref{Ptr{Cchar}}(C_NULL)
+    _check_code(
+        ccall(
+            _symbol(pl, :PetscErrorMessage), _Err, (_Err, Ptr{Ptr{Cchar}}, Ptr{Ptr{Cchar}}),
+            e.code, text, why,
+        ),
+    )
+    why = why[] == C_NULL ? "" : rstrip(unsafe_string(why[]), '.')
+    named = match(
+        r"^MatSolverType (\S+) does not support (?:factorization type (\S+) for )?matrix type (\S+)$",
+        why,
+    )
+    unnamed = match(
+        r"^Could not locate a solver type for factorization type (\S+) and matrix type (\S+)$",
+        why,
+    )
+    graph = match(r"^No method creategraph for Mat of type (\S+)$", why)
+    if e.code == PETSC_ERR_MISSING_FACTOR && named !== nothing
+        solver, ftype, mtype, gamg = String(named[1]), named[2], named[3], false
+    elseif e.code == PETSC_ERR_MISSING_FACTOR && unnamed !== nothing
+        solver, ftype, mtype, gamg = nothing, unnamed[1], unnamed[2], false
+    elseif e.code == PETSC_ERR_SUP && graph !== nothing
+        solver, ftype, mtype, gamg = nothing, nothing, graph[1], true
+    elseif e.code == PETSC_ERR_USER && why == "Require AIJ matrix"
+        solver, ftype, mtype, gamg = nothing, nothing, nothing, true
+    else
+        return nothing
+    end
+    pc_type, jtype, pc_solver = _top_pc(pl, h.ts)
+    # The message is about the Jacobian only when the KSP's own preconditioner failed on it.
+    own = something(mtype, jtype) == jtype && (
+        gamg ? pc_type == "gamg" :
+            haskey(_FACTOR_PCS, pc_type) && solver == pc_solver &&
+            something(ftype, uppercase(pc_type)) == uppercase(pc_type)
+    )
+    own || throw(ArgumentError("PETSc's linear solver cannot take a matrix it was given: $why"))
+    # GAMG builds its graph from an AIJ matrix only.
+    aij = gamg || last(_factors(pl, solver, "seqaij", _FACTOR_PCS[pc_type]))
+    hint = jtype == "seqdense" && aij ?
+        "; with a sparse `jac_prototype` that matrix is `seqaij`, which this solver supports" : ""
+    throw(
+        ArgumentError(
+            "PETSc's linear solver cannot take the `$jtype` matrix that holds this solve's " *
+                "Jacobian: $why$hint",
+        ),
+    )
+end
+
 # Under a distributed comm the error is returned, to raise once the ranks agree on who threw.
 function _run!(f::F, h::TSHandles) where {F}
     ctx = h.ctx
@@ -7303,7 +7430,8 @@ function _run!(f::F, h::TSHandles) where {F}
             _quiet_errors(() -> _with_options(f, h), h)
         catch e
             if ctx.comm === nothing
-                ctx.err === nothing && !_failed_step(e, h) && rethrow()
+                ctx.err === nothing && !_failed_step(e, h) &&
+                    (_refuse_matrix_type(e, h); rethrow())
             elseif !_failed_step(e, h)
                 return e
             end
@@ -7857,7 +7985,10 @@ The integrator `SciMLBase.init` returns for a PETSc TS algorithm. Step it with
 restart it with `reinit!`. Between steps `u`, `uprev`, `t`, `tprev` and `dt`
 are readable, `integ(t)`, `integ(t, Val{1})`, `integ(t; idxs)` and `integ(out, t)` give the
 state or its slope inside the step just taken, and `add_tstop!` schedules a time to land on
-exactly. Assigning `u` or `t` takes effect at the next step, as `set_u!` and `set_t!` do.
+exactly. `integ.ps[sym]` gets and sets parameters by symbol, and a write is a
+`derivative_discontinuity!(integ, true)`, so the next step restarts the method and
+initializes a DAE again. Assigning `u` or `t` takes effect at the next step, as `set_u!` and
+`set_t!` do.
 
 These are in the types PETSc steps in. The clock, and so `t`, `dt` and the saved times, is
 `Float32` for a `Float32` or `ComplexF32` state with a `Float32` span and `Float64`
@@ -7948,6 +8079,10 @@ end
 SciMLBase.derivative_discontinuity!(integ::PETScIntegrator, bool::Bool) =
     _locked(() -> _discontinuity_unlocked(integ, bool))
 
+# SciMLBase before 3.51 leaves a `ps` write undeclared.
+SII.finalize_parameters_hook!(integ::PETScIntegrator, _) =
+    SciMLBase.derivative_discontinuity!(integ, true)
+
 function _set_p_unlocked(integ::PETScIntegrator, v)
     setfield!(integ, :p, convert(fieldtype(typeof(integ), :p), v))
     h = integ.h
@@ -7966,9 +8101,10 @@ function Base.setproperty!(integ::PETScIntegrator, name::Symbol, v)
 end
 
 Base.getproperty(integ::PETScIntegrator, name::Symbol) =
-    name === :stats ? getfield(integ, :sol).stats : getfield(integ, name)
+    name === :stats ? getfield(integ, :sol).stats :
+    invoke(getproperty, Tuple{SciMLBase.DEIntegrator, Symbol}, integ, name)
 Base.propertynames(integ::PETScIntegrator, private::Bool = false) =
-    (fieldnames(typeof(integ))..., :stats)
+    (fieldnames(typeof(integ))..., :stats, :ps)
 SciMLBase.has_stats(::PETScIntegrator) = true
 
 SciMLBase.get_dt(integ::PETScIntegrator) = integ.dt
@@ -8006,7 +8142,7 @@ function _make_opts(
     ) where {R}
     ctx = h.ctx
     return PETScIntegratorOpts(
-        h, get(kwargs, :adaptive, true) === true && !h.fixed,
+        h, !h.fixed,
         _own_tol(h.abstol), _own_tol(h.reltol),
         R(something(get(kwargs, :dtmin, nothing), 0.0)),
         R(something(get(kwargs, :dtmax, nothing), Inf)),
@@ -8181,6 +8317,51 @@ function _initial_failure!(integ::PETScIntegrator)
     return nothing
 end
 
+# Whether a callback without its own `initializealg` is followed by a `CheckInit`.
+function _solve_checks(integ::PETScIntegrator)
+    h = integ.h
+    h.checks === nothing && (
+        h.checks = _resolve_init(_initializealg(integ), integ.prob.f) isa SciMLBase.CheckInit
+    )
+    return h.checks
+end
+
+# The zero rows of the mass matrix, which does not change during a solve.
+function _algebraic_rows(integ::PETScIntegrator)
+    h = integ.h
+    if h.rows === nothing
+        mass = _mass_of(integ.prob)
+        plain = mass === nothing || mass == LinearAlgebra.I
+        h.rows = plain ? falses(length(integ.u)) : BitVector(_zero_rows(mass))
+    end
+    return h.rows
+end
+
+# The algebraic rows of the residual a `CheckInit` after a callback reads on a mass matrix,
+# or nothing where no such check follows or they are not finite.
+function _check_residual(integ::PETScIntegrator, init)
+    h = integ.h
+    ctx = h.ctx
+    !ctx.dae && ctx.M !== nothing || return nothing
+    checks = init === nothing ? _solve_checks(integ) :
+        _resolve_init(init, integ.prob.f) isa SciMLBase.CheckInit
+    checks || return nothing
+    eqs = _algebraic_rows(integ)
+    _anywhere(ctx.comm, any(eqs)) || return nothing
+    u = integ.u isa Array ? vec(integ.u) : Vector(integ.u)
+    r = similar(u)
+    # An `f` that throws here leaves the callback to run and the check to follow it.
+    finite = try
+        h.f_init(r, u, integ.p, integ.t)
+        r .= ifelse.(eqs, r, zero(eltype(r)))
+        all(isfinite, r)
+    catch e
+        e isa InterruptException && rethrow()
+        false
+    end
+    return _everywhere(ctx.comm, finite) ? r : nothing
+end
+
 function _reinitialize!(integ::PETScIntegrator, init, before, slope = integ.h.ctx.fend)
     ctx = integ.h.ctx
     ctx.dae || ctx.M !== nothing || return nothing
@@ -8188,6 +8369,10 @@ function _reinitialize!(integ::PETScIntegrator, init, before, slope = integ.h.ct
     # PETSc keeps a DAEProblem's derivative to itself, so a state left alone passes the check.
     ctx.dae && init isa SciMLBase.CheckInit && _everywhere(ctx.comm, integ.u == before) &&
         return nothing
+    # The state PETSc gives at an event or a step end can miss a mass matrix's algebraic
+    # equations by more than abstol, so a callback that leaves their residual alone passes.
+    !ctx.dae && before !== nothing &&
+        _everywhere(ctx.comm, _check_residual(integ, init) == before) && return nothing
     _initialize_state!(integ, init, slope) || _initial_failure!(integ)
     return nothing
 end
@@ -8640,6 +8825,9 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
         end
     end
     best === nothing && return false
+    if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
+        dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
+    end
     saved = _save_step!(integ, best, false; slack = zero(best))
     slope = ctx.fend
     _rollback!(integ, best, dt, true)
@@ -8650,7 +8838,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     pre = ctx.save_everystep && !saved && !best_cb.save_positions[1] ? copy(integ.u) : nothing
     integ.derivative_discontinuity = true
     _pin_step!(integ)
-    before = ctx.dae ? copy(integ.u) : nothing
+    before = ctx.dae ? copy(integ.u) : _check_residual(integ, best_cb.initializealg)
     stop = let cb = best_cb, crossing = best_crossing
         _affect!(integ) do
             _checked_everywhere(() -> _fire!(integ, cb, crossing), ctx.comm)
@@ -8664,10 +8852,7 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     modified && _reinitialize!(integ, best_cb.initializealg, before, slope)
     integ.finished && return true
     integ.derivative_discontinuity = false
-    if SciMLBase.isadaptive(integ) && best_cb.dtrelax != 1
-        dt = integ.tdir * max(nextfloat(abs(integ.opts.dtmin)), abs(dt) * best_cb.dtrelax)
-    end
-    _rollback!(integ, integ.t, dt, false)
+    _rollback!(integ, integ.t, _proposed_dt_unlocked(integ), false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
     if best_cb.save_positions[2]
         _save_here!(integ)
@@ -8687,7 +8872,7 @@ function _apply_callbacks!(integ::PETScIntegrator, saved::Bool)
         saved = false
         integ.derivative_discontinuity = true
         _pin_step!(integ)
-        before = ctx.dae ? copy(integ.u) : nothing
+        before = ctx.dae ? copy(integ.u) : _check_residual(integ, cb.initializealg)
         stop = _affect!(() -> _checked_everywhere(() -> cb.affect!(integ), ctx.comm), integ)
         integ.finished && return nothing
         stop === nothing || (_stop!(integ, cb, stop, nothing); return nothing)
@@ -8723,7 +8908,8 @@ function _initialize_callbacks!(integ::PETScIntegrator, initialize_save::Bool)
         end
     end
     integ.derivative_discontinuity = false
-    _anywhere(h.ctx.comm, modified) && _reinitialize!(integ, nothing, before)
+    _anywhere(h.ctx.comm, modified) &&
+        _reinitialize!(integ, nothing, h.ctx.dae ? before : nothing)
     integ.finished && return nothing
     initialize_save && integ.opts.save_discretes && _discretes(integ.sol) !== nothing &&
         SciMLBase.save_discretes_if_enabled!(integ, integ.opts.callback; skip_duplicates = true)
@@ -8899,8 +9085,8 @@ end
 
 function _take_discontinuity!(integ::PETScIntegrator)
     h = integ.h
-    # `set_u!` leaves `end_u` behind, so only a state nothing touched passes as consistent.
-    _reinitialize!(integ, nothing, copy(h.ctx.end_u))
+    # `set_u!` leaves `end_u` behind, so only a DAE state nothing touched passes as consistent.
+    _reinitialize!(integ, nothing, h.ctx.dae ? copy(h.ctx.end_u) : nothing)
     integ.derivative_discontinuity = false
     integ.finished && return nothing
     _write_state!(h, integ.u)
