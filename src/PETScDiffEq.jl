@@ -6816,7 +6816,7 @@ function _setup_problem(
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
                 !_names_linear_solver(user_options)
             small_lu = _small_lu(h, alg, comm, clone, uses_sparse_jac, dm_jac, n) &&
-                !_names_linear_solver(user_options) &&
+                !_tunes_linear_solver(user_options) &&
                 !any(o -> startswith(lowercase(o), "-pc_"), user_options)
             dense_lu && !small_lu &&
                 append!(effective_options, ["-ksp_type", "preonly", "-pc_type", "lu"])
