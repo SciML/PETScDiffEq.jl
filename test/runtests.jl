@@ -2155,6 +2155,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test all(<=(tf), seen)
             end
         end
+        @testset "a lag of -2 forms its matrix again for the new state" begin
+            lv = SciMLBase.ODEProblem(lotka_volterra!, [1.0, 1.0], (0.0, 1.0), [1.5, 1.0, 3.0, 1.0])
+            for lag in ("-snes_lag_jacobian=-2", "-snes_lag_preconditioner=-2")
+                alg = PETScDiffEq.TSImplicit("beuler", ["-snes_type", "ksponly", lag])
+                integ = SciMLBase.init(lv, alg; dt = 0.01, adaptive = false)
+                SciMLBase.solve!(integ)
+                SciMLBase.reinit!(integ, [2.0, 0.5])
+                fresh = SciMLBase.solve(
+                    SciMLBase.remake(lv; u0 = [2.0, 0.5]), alg; dt = 0.01, adaptive = false,
+                )
+                @test SciMLBase.solve!(integ).u == fresh.u
+            end
+        end
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"))
             fresh = SciMLBase.solve(prob, alg; dt = 0.1)
@@ -4174,6 +4187,38 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.EnsembleProblem(mass; prob_func = scale!, safetycopy = false),
             PETScDiffEq.TSRosW(), 4, refs,
         ) == 2
+        for options in (
+                ["-snes_type", "ksponly", "-snes_lag_jacobian=-2"],
+                ["-snes_type", "ksponly", "-snes_lag_preconditioner=-2"],
+            )
+            @test check(
+                SciMLBase.EnsembleProblem(lv; prob_func = vary),
+                PETScDiffEq.TSImplicit("beuler", options), 3; dt = 0.01, adaptive = false,
+            ) == 0
+        end
+        # An adaptive BDF solve sets its own lag, which this makes persist.
+        @test check(
+            SciMLBase.EnsembleProblem(lv; prob_func = vary),
+            PETScDiffEq.TSImplicit("bdf", ["-snes_lag_jacobian_persists"]), 3,
+        ) == 0
+        npc = [
+            "-snes_type", "nrichardson", "-snes_npc_side", "left", "-snes_linesearch_type", "basic",
+            "-snes_max_it", "4", "-npc_snes_type", "ksponly", "-npc_ksp_type", "preonly",
+            "-npc_pc_type", "lu", "-npc_snes_lag_jacobian=-2",
+        ]
+        rate!(du, u, p, t) = (du .= -p .* u; nothing)
+        rate_jac!(J, u, p, t) = (J[1, 1] = -p; nothing)
+        rate = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(rate!; jac = rate_jac!), [1.0], (0.0, 0.1), 1.0,
+        )
+        stiffen(pr, c) = SciMLBase.remake(pr; p = 100.0^(c.sim_id - 1))
+        @test check(
+            SciMLBase.EnsembleProblem(rate; prob_func = stiffen),
+            PETScDiffEq.TSImplicit("beuler", npc), 2; dt = 0.1, adaptive = false,
+        ) == 0
+        for options in (["-ts_time_span", "0,1,2"], ["-ts_eval_times", "0,1,2"])
+            @test check(SciMLBase.EnsembleProblem(lv), PETScDiffEq.TSRK("5dp", options), 3) == 0
+        end
 
         # Problem keywords set through remake, a split problem's per-solve cache and
         # setup warnings do not stop reuse, and each solve still warns.
@@ -10453,6 +10498,48 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "PETSc's evaluation times on a span that ends near 0" begin
+            near_zero = SciMLBase.ODEProblem(decay!, [1.0], (-10.0, 1.0))
+            new_names = PETScDiffEq._petsc_version(PETScDiffEq._petsclib(Float64)) >= v"3.25"
+            spans = [["-ts_time_span=-10,0,1"]]
+            new_names && push!(spans, ["-ts_eval_times=-10,0,1"])
+            tight = (abstol = 1.0e-10, reltol = 1.0e-10)
+            for o in spans, kw in ((dt = 0.1, adaptive = false), tight)
+                alg = PETScDiffEq.TSRK("5dp", o)
+                for sol in (
+                        SciMLBase.solve(near_zero, alg; kw...),
+                        SciMLBase.solve!(SciMLBase.init(near_zero, alg; kw...)),
+                        SciMLBase.solve(near_zero, alg; tstops = [0.5], kw...),
+                    )
+                    @test sol.t[end] == 1.0
+                    @test sol.u[end][1] ≈ exp(-11) rtol = 1.0e-4
+                end
+                du0, _ = PETScDiffEq._discrete_adjoint(
+                    near_zero, alg, PETScAdjoint(); t = [1.0],
+                    dgdu_discrete = (out, u, p, t, i) -> (out .= 1; nothing), kw...,
+                )
+                @test du0[1] ≈ exp(-11) rtol = 1.0e-4
+            end
+            still!(du, u, p, t) = (du .= 0; nothing)
+            still = SciMLBase.ODEProblem(still!, [1.0], (-100.0, 0.01))
+            long = (dt = 100.01, adaptive = false)
+            span = PETScDiffEq.TSRK("5dp", ["-ts_time_span=-100,0.01"])
+            stepped = SciMLBase.solve!(SciMLBase.init(still, span; long...))
+            @test stepped.t[end] == 0.01
+            # PETSc 3.22 refuses MATCHSTEP's landing a step this long a few ulps off tf.
+            if new_names
+                one_step = SciMLBase.solve(still, span; long...)
+                @test one_step.t[end] == 0.01
+                @test one_step.u[end] == [1.0]
+            else
+                # 3.22 has no -ts_eval_times, so the solve keeps its own landing.
+                eval_times = PETScDiffEq.TSRK("5dp", ["-ts_eval_times=-100,0.01"])
+                never_read = (:warn, r"^PETSc never read -ts_eval_times")
+                unread = @test_logs never_read SciMLBase.solve(still, eval_times; long...)
+                @test unread.t[end] == 0.01
+            end
+        end
+
         @testset "a cancelled monitor still yields the final state" begin
             sol = SciMLBase.solve(
                 prob, PETScDiffEq.TSRK("5dp", ["-ts_monitor_cancel"]); dt = 0.1,
@@ -10612,6 +10699,30 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             for kind in ("basic", "dsp")
                 sol = SciMLBase.solve(prob, PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", kind]))
                 @test sol.retcode == SciMLBase.ReturnCode.Success
+            end
+        end
+
+        @testset "a KSP option keeps PETSc's own solver for a small dense Jacobian" begin
+            knoll = ["-ksp_knoll", "true"]
+            rosw(o) = SciMLBase.solve(prob, PETScDiffEq.TSRosW("ra34pw2", o))
+            @test rosw(knoll).u == rosw([knoll; "-ksp_type"; "gmres"]).u
+            nonzero = ["-ksp_initial_guess_nonzero", "true"]
+            @test rosw(nonzero).u == rosw([nonzero; "-ksp_type"; "gmres"]).u
+            fischer = ["-ksp_guess_type", "fischer"]
+            @test rosw(fischer).u == rosw([fischer; "-ksp_type"; "gmres"]).u
+            viewed = SciMLBase.init(
+                prob, PETScDiffEq.TSImplicit("beuler", ["-ksp_view", "ascii:$(tempname())"]);
+                dt = 0.01, adaptive = false,
+            )
+            @test viewed.h.lu !== nothing
+            @test SciMLBase.solve!(viewed).retcode == SciMLBase.ReturnCode.Success
+            for type in ("beuler", "bdf")
+                solve_with(o) = SciMLBase.solve(
+                    prob, PETScDiffEq.TSImplicit(type, o); dt = 0.01, adaptive = false,
+                )
+                # A preonly KSP reads no Knoll guess.
+                sol = @test_logs (:warn, r"^PETSc never read -ksp_knoll") solve_with(knoll)
+                @test sol.u == solve_with(["-ksp_type", "preonly", "-pc_type", "lu"]).u
             end
         end
 
