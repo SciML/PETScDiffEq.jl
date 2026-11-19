@@ -4091,11 +4091,39 @@ function _setstored!(J::SparseMatrixCSC, i, j, v)
     return nothing
 end
 
+# Rows ascend within a column, so `k` walks column j once; the search handles any other order.
+function _setstored!(J::SparseMatrixCSC, k, i, j, v)
+    stop = J.colptr[j + 1]
+    while k < stop && J.rowval[k] < i
+        k += 1
+    end
+    k < stop && J.rowval[k] == i ? (J.nzval[k] = v) : _setstored!(J, i, j, v)
+    return k
+end
+
+# A hand-built CSC may repeat a row in a column; the walk writes its last value to the first slot.
+function _ascending_rows(A::SparseMatrixCSC)
+    rows = rowvals(A)
+    @inbounds for j in axes(A, 2), k in (A.colptr[j] + 1):(A.colptr[j + 1] - 1)
+        rows[k - 1] < rows[k] || return false
+    end
+    return true
+end
+
 function _copy_jac!(J::SparseMatrixCSC, A::SparseMatrixCSC)
+    n = SparseArrays.nnz(A)
+    if J.colptr == A.colptr && view(J.rowval, 1:n) == view(A.rowval, 1:n) &&
+            _ascending_rows(A)
+        copyto!(J.nzval, 1, A.nzval, 1, n)
+        return nothing
+    end
+    rows, vals = rowvals(A), A.nzval === J.nzval ? copy(A.nzval) : nonzeros(A)
     fill!(J.nzval, 0.0)
-    rows, vals = rowvals(A), nonzeros(A)
-    @inbounds for j in axes(A, 2), k in nzrange(A, j)
-        _setstored!(J, rows[k], j, vals[k])
+    @inbounds for j in axes(A, 2)
+        p = J.colptr[j]
+        for k in nzrange(A, j)
+            p = _setstored!(J, p, rows[k], j, vals[k])
+        end
     end
     return nothing
 end
