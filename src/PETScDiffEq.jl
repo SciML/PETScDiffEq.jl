@@ -4092,11 +4092,39 @@ function _setstored!(J::SparseMatrixCSC, i, j, v)
     return nothing
 end
 
+# Rows ascend within a column, so `k` walks column j once; the search handles any other order.
+function _setstored!(J::SparseMatrixCSC, k, i, j, v)
+    stop = J.colptr[j + 1]
+    while k < stop && J.rowval[k] < i
+        k += 1
+    end
+    k < stop && J.rowval[k] == i ? (J.nzval[k] = v) : _setstored!(J, i, j, v)
+    return k
+end
+
+# A hand-built CSC may repeat a row in a column; the walk writes its last value to the first slot.
+function _ascending_rows(A::SparseMatrixCSC)
+    rows = rowvals(A)
+    @inbounds for j in axes(A, 2), k in (A.colptr[j] + 1):(A.colptr[j + 1] - 1)
+        rows[k - 1] < rows[k] || return false
+    end
+    return true
+end
+
 function _copy_jac!(J::SparseMatrixCSC, A::SparseMatrixCSC)
+    n = SparseArrays.nnz(A)
+    if J.colptr == A.colptr && view(J.rowval, 1:n) == view(A.rowval, 1:n) &&
+            _ascending_rows(A)
+        copyto!(J.nzval, 1, A.nzval, 1, n)
+        return nothing
+    end
+    rows, vals = rowvals(A), A.nzval === J.nzval ? copy(A.nzval) : nonzeros(A)
     fill!(J.nzval, 0.0)
-    rows, vals = rowvals(A), nonzeros(A)
-    @inbounds for j in axes(A, 2), k in nzrange(A, j)
-        _setstored!(J, rows[k], j, vals[k])
+    @inbounds for j in axes(A, 2)
+        p = J.colptr[j]
+        for k in nzrange(A, j)
+            p = _setstored!(J, p, rows[k], j, vals[k])
+        end
     end
     return nothing
 end
@@ -6233,7 +6261,14 @@ const _NO_REUSE_OPTIONS = (
     "ts_init_time", "ts_max_time", "ts_max_snes_failures", "ts_max_reject",
     "ts_max_step_rejections", "ts_monitor", "ts_trajectory", "ts_save_trajectory",
     "ts_view", "ts_adjoint",
+    # A lag of -2 becomes -1 once the SNES builds its matrix, and a persisting lag counts on.
+    "snes_lag_jacobian", "snes_lag_jacobian_persists", "snes_lag_preconditioner",
+    # Only TSSetEvaluationTimes resets the count of solutions TSSolve has stored.
+    "ts_time_span", "ts_eval_times",
 )
+
+# A prefixed name, as -npc_snes_lag_jacobian, keeps the same state in an inner solver.
+_stops_reuse(o) = startswith(o, "-") && any(k -> endswith(_option_name(o), k), _NO_REUSE_OPTIONS)
 
 # The first step `_setup` gives a solve that names no `dt`; `h.ctx.f!` may be reversed.
 function _first_dt(
@@ -6810,7 +6845,7 @@ function _setup_problem(
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
                 !_names_linear_solver(user_options)
             small_lu = _small_lu(h, alg, comm, clone, uses_sparse_jac, dm_jac, n) &&
-                !_names_linear_solver(user_options) &&
+                !_tunes_linear_solver(user_options) &&
                 !any(o -> startswith(lowercase(o), "-pc_"), user_options)
             dense_lu && !small_lu &&
                 append!(effective_options, ["-ksp_type", "preonly", "-pc_type", "lu"])
@@ -7080,7 +7115,7 @@ function _setup_problem(
             end
             _cap_step!(petsclib, ts, fixed)
             if comm === nothing && dm === nothing && tf != -1 && _reusable(running, is_split) &&
-                    !any(o -> any(k -> _names_option(o, k), _NO_REUSE_OPTIONS), effective_options)
+                    !any(_stops_reuse, effective_options)
                 h.again = (;
                     alg, initializealg, dt = dt_given ? dt : nothing, dtmin, dtmax, force_dtmin,
                     save_args, dt_args, estimates, est_calls, step_limit, hook = Ref{Any}(nothing),
@@ -7454,8 +7489,10 @@ end
 The objects are freed when the outermost `reusing` returns. Solves made by other tasks
 while `f` runs may reuse them too. A solve is made as before when it has a callback,
 `tstops`, `isoutofdomain` or a Float32 clock, runs over a communicator or a DM, has a state
-that is not a real `Array`, or uses a method `reinit!` cannot reuse; one whose `f`, mass
-matrix, Jacobian sparsity, algorithm or keywords differ from every kept solve's starts anew.
+that is not a real `Array`, uses a method `reinit!` cannot reuse, or passes an option whose
+PETSc state outlives a solve, as `-snes_lag_jacobian`, `-ts_time_span` and `-ts_monitor` do;
+one whose `f`, mass matrix, Jacobian sparsity, algorithm or keywords differ from every kept
+solve's starts anew.
 """
 function reusing(f)
     _locked(() -> (REUSERS[] += 1))
@@ -7642,7 +7679,7 @@ function _solve_unlocked(
         forced = get(kwargs, :force_dtmin, false) === true
         verbose = get(kwargs, :verbose, true)
         fixed = LibPETSc.TSAdaptGetType(pl, LibPETSc.TSGetAdapt(pl, h.ts)) == "none"
-        _match_steps_here!(h)
+        _match_steps_here!(h; tssolve = true)
         if new_kept
             _with_options(() -> LibPETSc.TSSetUp(pl, h.ts), h)
             _mark_fresh!(h)
@@ -9577,6 +9614,13 @@ _bad_hmax(h, stops = ()) = Sys.ARCH === :i686 || _off_max_time(h.t0, h.tf) ||
 
 _off_max_time(t0, tmax) = !iszero(tmax) && abs(tmax - t0) > 8 * abs(tmax)
 
+# TSSolve refuses PETSc's evaluation times under any mode but MATCHSTEP; -ts_eval_times
+# arrived in 3.23.
+_evaluates(h) = any(h.user_options) do o
+    _names_option(o, "ts_time_span") ||
+        _petsc_version(h.petsclib) >= v"3.23" && _names_option(o, "ts_eval_times")
+end
+
 # The span is set before the options, so an option can move either end of it.
 function _refuse_span_options(pl, ts, t0, tmax)
     LibPETSc.TSGetTime(pl, ts) == t0 && LibPETSc.TSGetMaxTime(pl, ts) == tmax || throw(
@@ -9629,14 +9673,16 @@ function _cut_first_step!(pl, ts)
 end
 
 # MATCHSTEP refuses a step leaving under 10 eps (1.2e-6 in Float32) before a stop.
-function _match_steps_here!(h::TSHandles{<:Any, <:Any, R}, stops = ()) where {R}
+function _match_steps_here!(
+        h::TSHandles{<:Any, <:Any, R}, stops = (); tssolve = false,
+    ) where {R}
     pl, ts = h.petsclib, h.ts
     mode = _exact_final_time(pl, ts)
     if R !== Float32
         # A kept TS takes the mode its new span needs, whichever an earlier span left. A
         # user's stepover is refused, so a stepover here is this package's.
         mode == LibPETSc.TS_EXACTFINALTIME_INTERPOLATE && return nothing
-        if _bad_hmax(h, stops)
+        if _bad_hmax(h, stops) && !(tssolve && _evaluates(h))
             mode == LibPETSc.TS_EXACTFINALTIME_STEPOVER ? (h.ctx.own_matchstep = true) :
                 _take_matchstep!(h)
         else
