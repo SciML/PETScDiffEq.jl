@@ -11,5 +11,6 @@ PETScDiffEq._buffer(like::SArray) = like
 PETScDiffEq._load!(buf::SArray, x) = PETScDiffEq._partition(buf, x)
 PETScDiffEq._input(buf::SArray, x, same) = PETScDiffEq._partition(buf, x)
 PETScDiffEq._state_type(like::SArray, U) = similar_type(typeof(like), U)
+PETScDiffEq._static(::SArray) = true
 
 end

@@ -3781,6 +3781,7 @@ _buffer(like) = similar(like)
 _load!(buf, x) = copyto!(buf, x)
 _input(buf, x, same) = copyto!(same ? buf : similar(buf, eltype(x)), x)
 _state_type(like, U) = typeof(similar(like, U))
+_static(x) = false
 
 struct Wrapped{F, U, D}
     f::F
@@ -7866,10 +7867,7 @@ double precision, while the solution it saves stays in single. For a `DynamicalO
 `SecondOrderODEProblem` the state is an `ArrayPartition` of the velocity and the position, as
 in OrdinaryDiffEq. An array-shaped `u0` gives `u`, `uprev` and every state read from the
 integrator as an `Array` of its size, and a `u0` of another array type, such as a
-`ComponentArray`, gives them as `similar(u0)` makes them. A static `u0`, such as an `SVector`, reaches `f`, `jac`
-and the saved states `sol.u` in its own type, so an `f` written for it runs as it does under
-OrdinaryDiffEq; this needs StaticArrays to be loaded. The integrator's own `u` and `uprev` stay
-the mutable `similar(u0)`, since it updates them in place.
+`ComponentArray`, gives them as `similar(u0)` makes them. For an out-of-place problem with a static `u0` (an `SVector` or `SMatrix`) and StaticArrays loaded, `f`, `jac` and the saved states `sol.u` get the state in that type, in PETSc's working precision. The integrator's own `u` and `uprev` stay the mutable `similar(u0)`, since it updates them in place.
 
 `iter` counts every step attempted, accepted, rejected or failed, as `maxiters` does, and
 `stats` is the running `sol.stats`. `opts`
@@ -9222,8 +9220,13 @@ function _reinit_unlocked(
         reused ? _restore_ts_state!(h, before) : _destroy!(h)
         rethrow()
     end
+    try
+        integ.h = h
+    catch
+        reused || _destroy!(h)
+        rethrow()
+    end
     reused || _destroy!(old)
-    integ.h = h
     if _overrides(get(setup_kwargs, :initializealg, DiffEqBase.DefaultInit()), prob.f)
         setfield!(integ, :p, convert(fieldtype(typeof(integ), :p), h.ctx.p))
         integ.prob = _with_p(integ.prob, integ.p)
@@ -9271,7 +9274,7 @@ _retype(old, new) = !(eltype(old) <: Union{AbstractFloat, Complex}) ? new :
 # `f` keeps seeing the problem's shape and array type, so another is read in linear order.
 function _in_shape(old, new)
     new isa AbstractArray || return new
-    retype = typeof(similar(new, eltype(old))) != typeof(similar(old))
+    retype = typeof(similar(new, eltype(old))) != typeof(similar(old)) || _static(new) != _static(old)
     retype || size(new) != size(old) || return new
     retype || !(old isa AbstractVector && new isa AbstractVector) || return new
     length(new) == length(old) || throw(

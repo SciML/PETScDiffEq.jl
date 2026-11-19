@@ -9,7 +9,7 @@ using DiffEqCallbacks: PresetTimeCallback
 using MPI
 using OrdinaryDiffEqTsit5: Tsit5
 using RecipesBase: RecipesBase
-using StaticArrays: SVector, SMatrix
+using StaticArrays: SVector, MVector, SMatrix
 using Test
 
 RecipesBase.is_key_supported(::Symbol) = true
@@ -136,19 +136,41 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @test sol.retcode == SciMLBase.ReturnCode.Success
         @test all(u -> u isa SVector{2, Float64}, sol.u)
         @test sol.u[end] ≈ SVector(cos(1.0), sin(1.0)) atol = 1.0e-4
+
         integ = SciMLBase.init(prob, PETScDiffEq.TSRK())
         SciMLBase.step!(integ)
         @test integ.t > 0
         SciMLBase.reinit!(integ, SVector(0.0, 1.0))
-        @test integ.prob.u0 isa SVector{2, Float64}
         SciMLBase.solve!(integ)
         @test integ.sol.retcode == SciMLBase.ReturnCode.Success
-        rotm(u::SMatrix{2, 2, Float64, 4}, p, t) = -u
-        solm = SciMLBase.solve(
-            SciMLBase.ODEProblem(rotm, SMatrix{2, 2}(1.0, 0.0, 0.0, 1.0), (0.0, 1.0)),
-            PETScDiffEq.TSRK(),
-        )
+        @test all(u -> u isa SVector{2, Float64}, integ.sol.u)
+        @test integ.sol.u[end] ≈ SVector(-sin(1.0), cos(1.0)) atol = 1.0e-4
+
+        # restart across static and mutable states, with a rebuild forced by saveat
+        rot_any(u, p, t) = SVector(-u[2], u[1])
+        probm = SciMLBase.ODEProblem(rot_any, MVector(1.0, 0.0), (0.0, 1.0))
+        integm = SciMLBase.init(probm, PETScDiffEq.TSRK("4"); dt = 0.01, adaptive = false)
+        SciMLBase.step!(integm)
+        SciMLBase.reinit!(integm, SVector(0.0, 2.0); saveat = [0.5, 1.0])
+        SciMLBase.solve!(integm)
+        @test integm.sol.retcode == SciMLBase.ReturnCode.Success
+        @test integm.sol.u[end] ≈ [-2sin(1.0), 2cos(1.0)] atol = 1.0e-6
+
+        probs = SciMLBase.ODEProblem(rot_any, SVector(1.0, 0.0), (0.0, 1.0))
+        integs = SciMLBase.init(probs, PETScDiffEq.TSRK("4"); dt = 0.01, adaptive = false)
+        SciMLBase.step!(integs)
+        SciMLBase.reinit!(integs, MVector(0.0, 2.0); saveat = [0.5, 1.0])
+        SciMLBase.solve!(integs)
+        @test integs.sol.retcode == SciMLBase.ReturnCode.Success
+        @test integs.sol.u[end] ≈ [-2sin(1.0), 2cos(1.0)] atol = 1.0e-6
+
+        # a nonsymmetric matrix catches an entry-order error
+        decay(u::SMatrix{2, 2, Float64, 4}, p, t) = -u
+        M0 = SMatrix{2, 2}(1.0, 2.0, 3.0, 4.0)
+        solm = SciMLBase.solve(SciMLBase.ODEProblem(decay, M0, (0.0, 1.0)), PETScDiffEq.TSRK())
+        @test solm.retcode == SciMLBase.ReturnCode.Success
         @test solm.u[end] isa SMatrix{2, 2, Float64, 4}
+        @test solm.u[end] ≈ exp(-1.0) * M0 atol = 1.0e-2
     end
 
     @testset "TSRosW convergence order" begin
