@@ -6232,7 +6232,14 @@ const _NO_REUSE_OPTIONS = (
     "ts_init_time", "ts_max_time", "ts_max_snes_failures", "ts_max_reject",
     "ts_max_step_rejections", "ts_monitor", "ts_trajectory", "ts_save_trajectory",
     "ts_view", "ts_adjoint",
+    # A lag of -2 becomes -1 once the SNES builds its matrix, and a persisting lag counts on.
+    "snes_lag_jacobian", "snes_lag_jacobian_persists", "snes_lag_preconditioner",
+    # Only TSSetEvaluationTimes resets the count of solutions TSSolve has stored.
+    "ts_time_span", "ts_eval_times",
 )
+
+# A prefixed name, as -npc_snes_lag_jacobian, keeps the same state in an inner solver.
+_stops_reuse(o) = startswith(o, "-") && any(k -> endswith(_option_name(o), k), _NO_REUSE_OPTIONS)
 
 # The first step `_setup` gives a solve that names no `dt`; `h.ctx.f!` may be reversed.
 function _first_dt(
@@ -7078,7 +7085,7 @@ function _setup_problem(
             end
             _cap_step!(petsclib, ts, fixed)
             if comm === nothing && dm === nothing && tf != -1 && _reusable(running, is_split) &&
-                    !any(o -> any(k -> _names_option(o, k), _NO_REUSE_OPTIONS), effective_options)
+                    !any(_stops_reuse, effective_options)
                 h.again = (;
                     alg, initializealg, dt = dt_given ? dt : nothing, dtmin, dtmax, force_dtmin,
                     save_args, dt_args, estimates, est_calls, step_limit, hook = Ref{Any}(nothing),
@@ -7452,8 +7459,10 @@ end
 The objects are freed when the outermost `reusing` returns. Solves made by other tasks
 while `f` runs may reuse them too. A solve is made as before when it has a callback,
 `tstops`, `isoutofdomain` or a Float32 clock, runs over a communicator or a DM, has a state
-that is not a real `Array`, or uses a method `reinit!` cannot reuse; one whose `f`, mass
-matrix, Jacobian sparsity, algorithm or keywords differ from every kept solve's starts anew.
+that is not a real `Array`, uses a method `reinit!` cannot reuse, or passes an option whose
+PETSc state outlives a solve, as `-snes_lag_jacobian`, `-ts_time_span` and `-ts_monitor` do;
+one whose `f`, mass matrix, Jacobian sparsity, algorithm or keywords differ from every kept
+solve's starts anew.
 """
 function reusing(f)
     _locked(() -> (REUSERS[] += 1))

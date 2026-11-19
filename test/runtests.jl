@@ -2155,6 +2155,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test all(<=(tf), seen)
             end
         end
+        @testset "a lag of -2 forms its matrix again for the new state" begin
+            lv = SciMLBase.ODEProblem(lotka_volterra!, [1.0, 1.0], (0.0, 1.0), [1.5, 1.0, 3.0, 1.0])
+            for lag in ("-snes_lag_jacobian=-2", "-snes_lag_preconditioner=-2")
+                alg = PETScDiffEq.TSImplicit("beuler", ["-snes_type", "ksponly", lag])
+                integ = SciMLBase.init(lv, alg; dt = 0.01, adaptive = false)
+                SciMLBase.solve!(integ)
+                SciMLBase.reinit!(integ, [2.0, 0.5])
+                fresh = SciMLBase.solve(
+                    SciMLBase.remake(lv; u0 = [2.0, 0.5]), alg; dt = 0.01, adaptive = false,
+                )
+                @test SciMLBase.solve!(integ).u == fresh.u
+            end
+        end
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
         for alg in (PETScDiffEq.TSRK("5dp"), PETScDiffEq.TSImplicit("bdf"))
             fresh = SciMLBase.solve(prob, alg; dt = 0.1)
@@ -4174,6 +4187,38 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             SciMLBase.EnsembleProblem(mass; prob_func = scale!, safetycopy = false),
             PETScDiffEq.TSRosW(), 4, refs,
         ) == 2
+        for options in (
+                ["-snes_type", "ksponly", "-snes_lag_jacobian=-2"],
+                ["-snes_type", "ksponly", "-snes_lag_preconditioner=-2"],
+            )
+            @test check(
+                SciMLBase.EnsembleProblem(lv; prob_func = vary),
+                PETScDiffEq.TSImplicit("beuler", options), 3; dt = 0.01, adaptive = false,
+            ) == 0
+        end
+        # An adaptive BDF solve sets its own lag, which this makes persist.
+        @test check(
+            SciMLBase.EnsembleProblem(lv; prob_func = vary),
+            PETScDiffEq.TSImplicit("bdf", ["-snes_lag_jacobian_persists"]), 3,
+        ) == 0
+        npc = [
+            "-snes_type", "nrichardson", "-snes_npc_side", "left", "-snes_linesearch_type", "basic",
+            "-snes_max_it", "4", "-npc_snes_type", "ksponly", "-npc_ksp_type", "preonly",
+            "-npc_pc_type", "lu", "-npc_snes_lag_jacobian=-2",
+        ]
+        rate!(du, u, p, t) = (du .= -p .* u; nothing)
+        rate_jac!(J, u, p, t) = (J[1, 1] = -p; nothing)
+        rate = SciMLBase.ODEProblem(
+            SciMLBase.ODEFunction(rate!; jac = rate_jac!), [1.0], (0.0, 0.1), 1.0,
+        )
+        stiffen(pr, c) = SciMLBase.remake(pr; p = 100.0^(c.sim_id - 1))
+        @test check(
+            SciMLBase.EnsembleProblem(rate; prob_func = stiffen),
+            PETScDiffEq.TSImplicit("beuler", npc), 2; dt = 0.1, adaptive = false,
+        ) == 0
+        for options in (["-ts_time_span", "0,1,2"], ["-ts_eval_times", "0,1,2"])
+            @test check(SciMLBase.EnsembleProblem(lv), PETScDiffEq.TSRK("5dp", options), 3) == 0
+        end
 
         # Problem keywords set through remake, a split problem's per-solve cache and
         # setup warnings do not stop reuse, and each solve still warns.
