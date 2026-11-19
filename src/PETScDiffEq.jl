@@ -903,6 +903,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     tend::R
     attempt_margin::Int
     trial::Int
+    adapts::Union{Nothing, Bool}
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -6681,7 +6682,7 @@ function _setup_problem(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
-        nothing, mass_slope, tf, -1, -1,
+        nothing, mass_slope, tf, -1, -1, _adapts(_warn_name(alg)),
     )::TSContext
     h = Base.inferencebarrier(TSHandles)(
         ctx, petsclib, LibPETSc.TS(petsclib), uvec, nothing, nothing, ad_calls, nothing,
@@ -7085,6 +7086,7 @@ function _setup_problem(
                 ctx.hermite = !has_mass && !is_dae
                 ctx.interpolates = nothing
                 ctx.alg_name = running
+                ctx.adapts = _adapts(running)
             end
             tableau = _tableau_name(petsclib, ts, running)
             if _implicit_first_stage(tableau)
@@ -7930,7 +7932,7 @@ function _setopt_unlocked(o::PETScIntegratorOpts{H, R}, name::Symbol, v) where {
         changed && _set_adaptive!(h, getfield(o, :adaptive))
         h.ctx.dtmin = _floor(
             R, getfield(o, :dtmin), getfield(o, :force_dtmin),
-            getfield(o, :adaptive) && _adapts(h.ctx.alg_name) !== false,
+            getfield(o, :adaptive) && h.ctx.adapts !== false,
         )
     elseif name === :dtmax
         adapt = LibPETSc.TSGetAdapt(pl, h.ts)
@@ -7946,7 +7948,7 @@ Base.setproperty!(o::PETScIntegratorOpts, name::Symbol, v) =
 
 function _check_live_adaptive(h::TSHandles)
     pl, ctx = h.petsclib, h.ctx
-    adapts = _adapts(ctx.alg_name)
+    adapts = ctx.adapts
     adapts === false && return nothing
     why = adapts === nothing ? "PETScDiffEq does not know whether `$(ctx.alg_name)` has an " *
         "error estimate" :
@@ -7966,7 +7968,7 @@ end
 # Puts in or takes out what `_setup` installs for an adaptive step.
 function _set_adaptive!(h::TSHandles, adaptive::Bool)
     pl, ts, ctx = h.petsclib, h.ts, h.ctx
-    _adapts(ctx.alg_name) === true || return nothing
+    ctx.adapts === true || return nothing
     _check_code(
         ccall(
             _symbol(pl, :TSAdaptSetType), LibPETSc.PetscErrorCode, (Ptr{Cvoid}, Cstring),
@@ -8188,7 +8190,7 @@ function _make_opts(
 end
 
 SciMLBase.isadaptive(integ::PETScIntegrator) =
-    getfield(integ.opts, :adaptive) && _adapts(integ.h.ctx.alg_name) !== false
+    getfield(integ.opts, :adaptive) && integ.h.ctx.adapts !== false
 
 function (integ::PETScIntegrator)(t, ::Type{deriv} = Val{0}; idxs = nothing) where {deriv}
     t isa Number || return [integ(ti, deriv; idxs) for ti in t]
@@ -9732,11 +9734,12 @@ end
 _fixed_step(h::TSHandles) =
     LibPETSc.TSAdaptGetType(h.petsclib, LibPETSc.TSGetAdapt(h.petsclib, h.ts)) == "none"
 
-_retcode(integ::PETScIntegrator) =
-    getfield(getfield(integ, :sol), :retcode)::SciMLBase.ReturnCode.T
+# `sol` is untyped and a ReturnCode crossing it is boxed: compare past it, with `code` constant.
+@inline _retcode_is(integ::PETScIntegrator, code) = _retcode_is(getfield(integ, :sol), code)
+_retcode_is(sol, code) = sol.retcode == code
 
 function _step_unlocked(integ::PETScIntegrator, outer = nothing)
-    integ.finished && _retcode(integ) == SciMLBase.ReturnCode.InitialFailure &&
+    integ.finished && _retcode_is(integ, SciMLBase.ReturnCode.InitialFailure) &&
         return nothing
     integ.finished && throw(
         ArgumentError(
@@ -9876,7 +9879,7 @@ function _step_unlocked(integ::PETScIntegrator, outer = nothing)
     else
         _past_discontinuity!(integ)
         _live_stats!(integ)
-        _retcode(integ) == SciMLBase.ReturnCode.Default && (
+        _retcode_is(integ, SciMLBase.ReturnCode.Default) && (
             integ.sol =
                 SciMLBase.solution_new_retcode(integ.sol, SciMLBase.ReturnCode.Success)
         )

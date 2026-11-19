@@ -876,11 +876,18 @@ const _ADJOINT_REFUSED_KWARGS = (
 const _ADJOINT_OWNED_KWARGS =
     (:saveat, :save_everystep, :save_start, :save_end, :dense, :extra_options, :sensealg)
 
-_option_name(opt) = (
+_option_key(opt) = (
     i = findfirst('=', opt);
-    lowercase(SubString(opt, 2, i === nothing ? lastindex(opt) : prevind(opt, i)))
+    SubString(opt, 2, i === nothing ? lastindex(opt) : prevind(opt, i))
 )
-_names_option(opt, name) = startswith(opt, "-") && _option_name(opt) == name
+_option_name(opt) = lowercase(_option_key(opt))
+# `lowercase(key) == name`, without building the lowercase key.
+_names_option(opt, name) = startswith(opt, "-") && (
+    !isvalid(opt) ? _option_name(opt) == name : (
+            key = _option_key(opt);
+            length(key) == length(name) && all(((a, b),) -> lowercase(a) == b, zip(key, name))
+        )
+)
 
 _unset(v) = _no_callback(v) || ((v isa Tuple || v isa AbstractArray) && isempty(v))
 

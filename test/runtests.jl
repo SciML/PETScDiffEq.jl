@@ -11209,6 +11209,29 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "an explicit step! and isadaptive allocate nothing" begin
+            lv = SciMLBase.ODEProblem(
+                lotka_volterra!, [1.0, 1.0], (0.0, 1.0e6), [1.5, 1.0, 3.0, 1.0],
+            )
+            function steps(integ, n)
+                for _ in 1:n
+                    SciMLBase.step!(integ)
+                end
+                return nothing
+            end
+            for kw in ((; dt = 1.0e-3, adaptive = false), (;))
+                integ = SciMLBase.init(
+                    lv, PETScDiffEq.TSRK("5dp"); save_everystep = false, kw...,
+                )
+                steps(integ, 2)
+                @test (@allocated steps(integ, 100)) == 0
+                SciMLBase.isadaptive(integ)
+                @test (@allocated SciMLBase.isadaptive(integ)) == 0
+                @test !SciMLBase.done(integ)
+                SciMLBase.terminate!(integ)
+            end
+        end
+
         @testset "step!(integ, dt) advances through the generic loop" begin
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
             SciMLBase.step!(integ, 0.3)
