@@ -876,11 +876,18 @@ const _ADJOINT_REFUSED_KWARGS = (
 const _ADJOINT_OWNED_KWARGS =
     (:saveat, :save_everystep, :save_start, :save_end, :dense, :extra_options, :sensealg)
 
-_option_name(opt) = (
+_option_key(opt) = (
     i = findfirst('=', opt);
-    lowercase(SubString(opt, 2, i === nothing ? lastindex(opt) : prevind(opt, i)))
+    SubString(opt, 2, i === nothing ? lastindex(opt) : prevind(opt, i))
 )
-_names_option(opt, name) = startswith(opt, "-") && _option_name(opt) == name
+_option_name(opt) = lowercase(_option_key(opt))
+# `lowercase(key) == name`, without building the lowercase key.
+_names_option(opt, name) = startswith(opt, "-") && (
+    !isvalid(opt) ? _option_name(opt) == name : (
+            key = _option_key(opt);
+            length(key) == length(name) && all(((a, b),) -> lowercase(a) == b, zip(key, name))
+        )
+)
 
 _unset(v) = _no_callback(v) || ((v isa Tuple || v isa AbstractArray) && isempty(v))
 
@@ -1449,7 +1456,8 @@ function _discrete_adjoint_unlocked(
         # PETSc 3.22 allocates the span's states in TSSetUp, which the solve below is first to call.
         spanned = adaptive && !stopping && _set_time_span!(h, cost_s)
         # The rules `_match_steps_here!` gives `solve` in place of PETSc's MATCHSTEP.
-        matches, own = R === Float32, R !== Float32 && _bad_hmax(h, vcat(tstops, jumps, cost_t))
+        matches = R === Float32
+        own = !matches && _bad_hmax(h, vcat(tstops, jumps, cost_t)) && !_evaluates(h)
         # A fixed-step Float32 `solve` keeps that rule without stops too.
         queued = stopping || matches && !adaptive
         queue = queued ? StopQueue{R}(
