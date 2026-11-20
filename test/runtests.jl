@@ -10556,6 +10556,19 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
     @testset "PETSc options that alter stepping" begin
         prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
 
+        @testset "a nonzero initial guess with a dense Jacobian" begin
+            nonzero = ["-ksp_initial_guess_nonzero", "true"]
+            for alg in (
+                    PETScDiffEq.TSImplicit("beuler", nonzero),
+                    PETScDiffEq.TSImplicit("bdf", nonzero),
+                    PETScDiffEq.TSARKIMEX("1bee", nonzero),
+                )
+                sol = SciMLBase.solve(prob, alg; dt = 0.01, adaptive = false)
+                @test SciMLBase.successful_retcode(sol)
+                @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-2
+            end
+        end
+
         @testset "interpolated final time keeps sol.t sorted and inside tspan" begin
             for dt in (0.3, 0.7)
                 sol = SciMLBase.solve(

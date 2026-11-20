@@ -6850,8 +6850,10 @@ function _setup_problem(
             end
             # ILU(0) of a dense matrix is already its full LU, which GMRES then wraps in a
             # Krylov iteration it does not need.
+            # Preonly rejects a nonzero initial guess.
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
-                !_names_linear_solver(user_options)
+                !_names_linear_solver(user_options) &&
+                !_option_flag(user_options, "ksp_initial_guess_nonzero")
             small_lu = _small_lu(h, alg, comm, clone, uses_sparse_jac, dm_jac, n) &&
                 !_tunes_linear_solver(user_options) &&
                 !any(o -> startswith(lowercase(o), "-pc_"), user_options)

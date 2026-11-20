@@ -154,7 +154,8 @@ A dense Jacobian, which a serial solve without a sparse `jac_prototype` or a `dm
 factored directly. Up to 64 states the package factors it itself, with partial pivoting as
 LAPACK does, behind a shell preconditioner and `-ksp_type preonly`, since at these sizes
 PETSc's LU spends longer in its own calls than in the factorization. Larger ones use
-`-ksp_type preonly -pc_type lu`. PETSc's own default, GMRES with ILU(0), does the same
+`-ksp_type preonly -pc_type lu`, unless `-ksp_initial_guess_nonzero` is set, which preonly
+rejects. PETSc's own default, GMRES with ILU(0), does the same
 factorization, since ILU(0) of a dense matrix is its full LU, and runs a Krylov iteration on
 top. Above 64 states `TSRosW`, and any solve whose SNES is `ksponly`, keeps GMRES, whose
 residual norm is what notices a NaN right-hand side so that a smaller step is tried; below,
