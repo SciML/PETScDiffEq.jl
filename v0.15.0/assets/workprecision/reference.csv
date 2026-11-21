@@ -1,0 +1,5 @@
+problem,reference_gap
+lotka_volterra,4.841e-14
+hires,5.867e-12
+robertson_dae,2.923e-12
+brusselator,4.285e-10
