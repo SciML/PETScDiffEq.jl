@@ -8885,9 +8885,12 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     integ.derivative_discontinuity = false
     _rollback!(integ, integ.t, _proposed_dt_unlocked(integ), false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
-    if best_cb.save_positions[2]
+    if best_cb.save_positions[2] && modified
         _save_here!(integ)
-        modified && _save_discretes!(integ, best_cb, best_crossing)
+        _save_discretes!(integ, best_cb, best_crossing)
+    elseif !modified && pre !== nothing
+        # Nothing was saved in the callback, so the step point is saved as OrdinaryDiffEq does.
+        _record!(ctx, integ.tdir * integ.t, pre)
     end
     return true
 end
@@ -9569,9 +9572,9 @@ end
 
 function _stop!(integ::PETScIntegrator, cb, retcode, pre, crossing = nothing, modified = true)
     pre === nothing || _record!(integ.h.ctx, integ.tdir * integ.t, pre)
-    if cb.save_positions[2]
+    if cb.save_positions[2] && modified
         _save_here!(integ)
-        modified && _save_discretes!(integ, cb, crossing)
+        _save_discretes!(integ, cb, crossing)
     end
     _finish!(integ, retcode)
     return nothing
