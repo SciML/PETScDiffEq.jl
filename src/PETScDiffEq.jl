@@ -8038,7 +8038,7 @@ double precision, while the solution it saves stays in single. For a `DynamicalO
 `SecondOrderODEProblem` the state is an `ArrayPartition` of the velocity and the position, as
 in OrdinaryDiffEq. An array-shaped `u0` gives `u`, `uprev` and every state read from the
 integrator as an `Array` of its size, and a `u0` of another array type, such as a
-`ComponentArray`, gives them as `similar(u0)` makes them. For an For an out-of-place problem with a static `u0` (an `SVector` or `SMatrix`) and StaticArrays loaded, `f`, `jac`, `unstable_check`, `isoutofdomain` and the saved states `sol.u` get the state in that type. `f` and `jac` get it in PETSc's working precision; `sol.u` keeps the element type of `u0`. The integrator's own `u` and `uprev` stay the mutable `similar(u0)`, since it updates them in place.
+`ComponentArray`, gives them as `similar(u0)` makes them. For an out-of-place problem with a static `u0` (an `SVector` or `SMatrix`) and StaticArrays loaded, `f`, `jac`, `unstable_check`, `isoutofdomain` and the saved states `sol.u` get the state in that type. `f` and `jac` get it in PETSc's working precision; `sol.u` keeps the element type of `u0`. The integrator's own `u` and `uprev` stay the mutable `similar(u0)`, since it updates them in place.
 
 `iter` counts every step attempted, accepted, rejected or failed, as `maxiters` does, and
 `stats` is the running `sol.stats`. `opts`
@@ -9509,7 +9509,8 @@ function _in_shape(old, new)
                 "size $(size(old)); give one with its $(length(old)) entries",
         ),
     )
-    return retype ? _partition(old, new) : reshape(new, size(old))
+    T = eltype(old) <: Union{AbstractFloat, Complex} ? eltype(old) : eltype(new)
+    return retype ? _partition(old, new, T) : reshape(new, size(old))
 end
 
 SciMLBase.reinit!(integ::PETScIntegrator, u0 = integ.prob.u0; kwargs...) =
