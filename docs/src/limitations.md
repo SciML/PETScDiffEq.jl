@@ -9,7 +9,7 @@ An array-shaped `u0` is taken for an `ODEProblem` and a `SplitODEProblem` on
 `MPI.COMM_SELF`. A `DAEProblem`, a solve on another `comm` or with a `dm`, and `PETScAdjoint`
 need the state as a vector and raise an `ArgumentError` that says so: pass `vec(u0)` and
 reshape it inside the problem's functions. A `u0` of another vector type, such as a
-`ComponentArray`, keeps its type wherever an array-shaped one is taken, `PETScAdjoint`
+`ComponentArray` or, with StaticArrays loaded, an `SVector`, keeps its type wherever an array-shaped one is taken, `PETScAdjoint`
 included, and is stepped and given back as a `Vector` in a `DAEProblem` or a solve on
 another `comm` or with a `dm`. A `DynamicalODEProblem` or `SecondOrderODEProblem` takes
 vectors for its velocity and position.

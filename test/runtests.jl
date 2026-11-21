@@ -9,6 +9,7 @@ using DiffEqCallbacks: PresetTimeCallback
 using MPI
 using OrdinaryDiffEqTsit5: Tsit5
 using RecipesBase: RecipesBase
+using StaticArrays: SVector, MVector, SMatrix
 using Test
 
 RecipesBase.is_key_supported(::Symbol) = true
@@ -125,6 +126,76 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
             orders = [log2(errs[i] / errs[i + 1]) for i in 1:(length(errs) - 1)]
             @test all(o -> isapprox(o, expected_order; atol = 0.15), orders)
+        end
+    end
+
+    @testset "A static u0 keeps its type for f, sol.u and reinit!" begin
+        rot_typed(u::SVector{2, Float64}, p, t) = SVector(-u[2], u[1])
+        prob = SciMLBase.ODEProblem(rot_typed, SVector(1.0, 0.0), (0.0, 1.0))
+        sol = SciMLBase.solve(prob, PETScDiffEq.TSRK())
+        @test sol.retcode == SciMLBase.ReturnCode.Success
+        @test all(u -> u isa SVector{2, Float64}, sol.u)
+        @test sol.u[end] ≈ SVector(cos(1.0), sin(1.0)) atol = 1.0e-4
+
+        integ = SciMLBase.init(prob, PETScDiffEq.TSRK())
+        SciMLBase.step!(integ)
+        @test integ.t > 0
+        SciMLBase.reinit!(integ, SVector(0.0, 1.0))
+        SciMLBase.solve!(integ)
+        @test integ.sol.retcode == SciMLBase.ReturnCode.Success
+        @test all(u -> u isa SVector{2, Float64}, integ.sol.u)
+        @test integ.sol.u[end] ≈ SVector(-sin(1.0), cos(1.0)) atol = 1.0e-4
+
+        # restart across static and mutable states, with a rebuild forced by saveat
+        rot_any(u, p, t) = SVector(-u[2], u[1])
+        probm = SciMLBase.ODEProblem(rot_any, MVector(1.0, 0.0), (0.0, 1.0))
+        integm = SciMLBase.init(probm, PETScDiffEq.TSRK("4"); dt = 0.01, adaptive = false)
+        SciMLBase.step!(integm)
+        SciMLBase.reinit!(integm, SVector(0.0, 2.0); saveat = [0.5, 1.0])
+        SciMLBase.solve!(integm)
+        @test integm.sol.retcode == SciMLBase.ReturnCode.Success
+        @test integm.sol.u[end] ≈ [-2sin(1.0), 2cos(1.0)] atol = 1.0e-6
+
+        probs = SciMLBase.ODEProblem(rot_any, SVector(1.0, 0.0), (0.0, 1.0))
+        integs = SciMLBase.init(probs, PETScDiffEq.TSRK("4"); dt = 0.01, adaptive = false)
+        SciMLBase.step!(integs)
+        SciMLBase.reinit!(integs, MVector(0.0, 2.0); saveat = [0.5, 1.0])
+        SciMLBase.solve!(integs)
+        @test integs.sol.retcode == SciMLBase.ReturnCode.Success
+        @test integs.sol.u[end] ≈ [-2sin(1.0), 2cos(1.0)] atol = 1.0e-6
+
+        # a mixed-precision restart keeps the problem's own state type and element type
+        integb = SciMLBase.init(probm, PETScDiffEq.TSRK("4"); dt = 0.01, adaptive = false)
+        SciMLBase.step!(integb)
+        SciMLBase.reinit!(integb, SVector(big"0.0", big"2.0"); saveat = [0.5, 1.0])
+        SciMLBase.solve!(integb)
+        @test integb.sol.retcode == SciMLBase.ReturnCode.Success
+        @test all(u -> u isa MVector{2, Float64}, integb.sol.u)
+        @test integb.sol.u[end] ≈ [-2sin(1.0), 2cos(1.0)] atol = 1.0e-6
+        # a nonsymmetric matrix catches an entry-order error
+        decay(u::SMatrix{2, 2, Float64, 4}, p, t) = -u
+        M0 = SMatrix{2, 2}(1.0, 2.0, 3.0, 4.0)
+        solm = SciMLBase.solve(SciMLBase.ODEProblem(decay, M0, (0.0, 1.0)), PETScDiffEq.TSRK())
+        @test solm.retcode == SciMLBase.ReturnCode.Success
+        @test solm.u[end] isa SMatrix{2, 2, Float64, 4}
+        @test solm.u[end] ≈ exp(-1.0) * M0 atol = 1.0e-2
+        # unstable_check and isoutofdomain see the static type, with and without tstops
+        probu = SciMLBase.ODEProblem(rot_typed, SVector(1.0, 0.0), (0.0, 1.0))
+        seen_chk = DataType[]
+        seen_dom = DataType[]
+        chk(dt, u, p, t) = (push!(seen_chk, typeof(u)); false)
+        dom(u, p, t) = (push!(seen_dom, typeof(u)); false)
+        for kw in ((;), (; tstops = [0.5]))
+            empty!(seen_chk)
+            empty!(seen_dom)
+            sold = SciMLBase.solve(
+                probu, PETScDiffEq.TSRK(); unstable_check = chk, isoutofdomain = dom, kw...
+            )
+            @test sold.retcode == SciMLBase.ReturnCode.Success
+            @test !isempty(seen_chk)
+            @test !isempty(seen_dom)
+            @test all(==(SVector{2, Float64}), seen_chk)
+            @test all(==(SVector{2, Float64}), seen_dom)
         end
     end
 
