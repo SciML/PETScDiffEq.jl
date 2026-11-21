@@ -9005,8 +9005,13 @@ function _init_unlocked(
         end
         stops_given = vcat(tstops, d_discontinuities)
     end
-    _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
-    _match_steps_here!(h, stops_given)
+    try
+        _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
+        _match_steps_here!(h, stops_given)
+    catch
+        _destroy!(h)
+        rethrow()
+    end
     _mark_fresh!(h)
     _initial_save!(h)
     stops = _tstops(stops_given, h)
@@ -9691,6 +9696,14 @@ end
 function _match_steps_here!(
         h::TSHandles{<:Any, <:Any, R}, stops = (); tssolve = false,
     ) where {R}
+    # TSStep never stores the solutions these options exist for.
+    !tssolve && _evaluates(h) && throw(
+        ArgumentError(
+            "`-ts_time_span` and `-ts_eval_times` need PETSc's TSSolve, which this solve " *
+                "does not use (it steps with TSStep, for example because of callbacks or " *
+                "tstops); use `saveat` and `tstops` instead",
+        ),
+    )
     pl, ts = h.petsclib, h.ts
     mode = _exact_final_time(pl, ts)
     if R !== Float32

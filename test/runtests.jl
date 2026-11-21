@@ -10577,14 +10577,11 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             tight = (abstol = 1.0e-10, reltol = 1.0e-10)
             for o in spans, kw in ((dt = 0.1, adaptive = false), tight)
                 alg = PETScDiffEq.TSRK("5dp", o)
-                for sol in (
-                        SciMLBase.solve(near_zero, alg; kw...),
-                        SciMLBase.solve!(SciMLBase.init(near_zero, alg; kw...)),
-                        SciMLBase.solve(near_zero, alg; tstops = [0.5], kw...),
-                    )
-                    @test sol.t[end] == 1.0
-                    @test sol.u[end][1] ≈ exp(-11) rtol = 1.0e-4
-                end
+                sol = SciMLBase.solve(near_zero, alg; kw...)
+                @test sol.t[end] == 1.0
+                @test sol.u[end][1] ≈ exp(-11) rtol = 1.0e-4
+                @test_throws ArgumentError SciMLBase.init(near_zero, alg; kw...)
+                @test_throws ArgumentError SciMLBase.solve(near_zero, alg; tstops = [0.5], kw...)
                 du0, _ = PETScDiffEq._discrete_adjoint(
                     near_zero, alg, PETScAdjoint(); t = [1.0],
                     dgdu_discrete = (out, u, p, t, i) -> (out .= 1; nothing), kw...,
@@ -10595,8 +10592,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             still = SciMLBase.ODEProblem(still!, [1.0], (-100.0, 0.01))
             long = (dt = 100.01, adaptive = false)
             span = PETScDiffEq.TSRK("5dp", ["-ts_time_span=-100,0.01"])
-            stepped = SciMLBase.solve!(SciMLBase.init(still, span; long...))
-            @test stepped.t[end] == 0.01
+            @test_throws ArgumentError SciMLBase.init(still, span; long...)
             # PETSc 3.22 refuses MATCHSTEP's landing a step this long a few ulps off tf.
             if new_names
                 one_step = SciMLBase.solve(still, span; long...)
@@ -10827,6 +10823,23 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_logs unread("-ts_adapt_dtmax") SciMLBase.solve(
                 ensemble, rk(typo), SciMLBase.EnsembleSerial(); trajectories = 3,
             )
+        end
+
+        @testset "PETSc's evaluation times need TSSolve" begin
+            prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
+            new_names = PETScDiffEq._petsc_version(PETScDiffEq._petsclib(Float64)) >= v"3.25"
+            spans = [["-ts_time_span=0,0.5,1"]]
+            new_names && push!(spans, ["-ts_eval_times=0,0.5,1"])
+            nothing_cb = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
+            for o in spans
+                alg = PETScDiffEq.TSRK("5dp", o)
+                sol = SciMLBase.solve(prob, alg; dt = 0.1)
+                @test sol.retcode == SciMLBase.ReturnCode.Success
+                @test sol.u[end][1] ≈ exp(-1) rtol = 1.0e-4
+                @test_throws ArgumentError SciMLBase.init(prob, alg; dt = 0.1, adaptive = false)
+                @test_throws ArgumentError SciMLBase.solve(prob, alg; tstops = [0.3])
+                @test_throws ArgumentError SciMLBase.solve(prob, alg; callback = nothing_cb)
+            end
         end
     end
 
