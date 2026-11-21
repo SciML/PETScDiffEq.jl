@@ -6645,6 +6645,40 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test n[] <= 30
         end
 
+        @testset "a cleared discontinuity skips the save after the event" begin
+            ramp = SciMLBase.ODEProblem(ramp!, [0.0], (0.0, 1.0))
+            clear! = integ -> SciMLBase.derivative_discontinuity!(integ, false)
+            for cb in (
+                    SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.5, clear!),
+                    SciMLBase.VectorContinuousCallback(
+                        (out, u, t, integ) -> (out[1] = u[1] - 0.5; nothing),
+                        (integ, mask) -> clear!(integ), 1,
+                    ),
+                )
+                sol = SciMLBase.solve(
+                    ramp, PETScDiffEq.TSRK("5dp"); callback = cb, save_everystep = false,
+                )
+                @test length(sol.t) == 3 && abs(sol.t[2] - 0.5) < 1.0e-12
+            end
+            alg = PETScDiffEq.TSRK("5dp")
+            # The step point at the event keeps the state from before the affect!.
+            shift = SciMLBase.ODEProblem((du, u, p, t) -> (du .= (1.0, 0.0); nothing), [0.0, 0.0], (0.0, 1.0))
+            for save_positions in ((false, false), (false, true))
+                post = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> u[1] - 0.5, integ -> (integ.u[2] += 1.0; clear!(integ));
+                    save_positions,
+                )
+                sol = SciMLBase.solve(shift, alg; callback = post)
+                at = findall(t -> abs(t - 0.5) < 1.0e-12, sol.t)
+                @test length(at) == 1 && sol.u[only(at)][2] == 0.0 && sol.u[end][2] == 1.0
+            end
+            stop = SciMLBase.ContinuousCallback(
+                (u, t, integ) -> u[1] - 0.5, integ -> (clear!(integ); SciMLBase.terminate!(integ)),
+            )
+            sol = SciMLBase.solve(ramp, alg; callback = stop)
+            @test count(t -> abs(t - 0.5) < 1.0e-12, sol.t) == 1
+        end
+
         @testset "dtrelax scales the step after an event" begin
             proposed = map((1, 0.01)) do dtrelax
                 cb = SciMLBase.ContinuousCallback(
