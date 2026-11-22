@@ -131,7 +131,8 @@ TSRosW(
     TSImplicit(subtype, theta; ...)
     TSImplicit(subtype, [theta,] petsc_options; ...)
 
-Fully implicit methods from PETSc: `"beuler"`, `"cn"`, `"theta"` and `"bdf"`.
+Fully implicit methods from PETSc: `"beuler"`, `"cn"`, `"theta"` and `"bdf"`. The types
+[`TSGeneric`](@ref) refuses, such as `"alpha2"` or `"discgrad"`, are refused here too.
 `theta` sets the parameter of the theta method, where `0.5` is Crank-Nicolson
 and `1.0` is backward Euler.
 
@@ -189,7 +190,7 @@ TSImplicit(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
-    String(subtype), nothing, _bdf_order(subtype, order), String[], _check_autodiff(autodiff),
+    _drivable(subtype), nothing, _bdf_order(subtype, order), String[], _check_autodiff(autodiff),
     _alg_comm(comm, dm), dm,
 )
 TSImplicit(
@@ -197,7 +198,7 @@ TSImplicit(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
-    String(subtype), _theta(subtype, theta), _bdf_order(subtype, order), String[],
+    _drivable(subtype), _theta(subtype, theta), _bdf_order(subtype, order), String[],
     _check_autodiff(autodiff), _alg_comm(comm, dm), dm,
 )
 TSImplicit(
@@ -205,7 +206,7 @@ TSImplicit(
     order = nothing, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
-    String(subtype), nothing, _bdf_order(subtype, order),
+    _drivable(subtype), nothing, _bdf_order(subtype, order),
     String[String(o) for o in petsc_options], _check_autodiff(autodiff),
     _alg_comm(comm, dm), dm,
 )
@@ -215,7 +216,7 @@ TSImplicit(
     comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSImplicit(
-    String(subtype), _theta(subtype, theta), _bdf_order(subtype, order),
+    _drivable(subtype), _theta(subtype, theta), _bdf_order(subtype, order),
     String[String(o) for o in petsc_options], _check_autodiff(autodiff),
     _alg_comm(comm, dm), dm,
 )
@@ -280,7 +281,7 @@ TSIRK(
 
 Fully implicit methods applied to a `DAEProblem`, whose residual `G(t, u, u') = 0`
 is exactly the form PETSc's `IFunction` takes. `subtype` is `"beuler"`, `"cn"`,
-`"theta"` or `"bdf"`. There is no `theta` argument as [`TSImplicit`](@ref) has: `"theta"`
+`"theta"` or `"bdf"`, and the types [`TSGeneric`](@ref) refuses are refused here too. There is no `theta` argument as [`TSImplicit`](@ref) has: `"theta"`
 runs PETSc's default of 0.5, and `petsc_options` such as `["-ts_theta_theta", "1.0"]` set
 another.
 
@@ -320,7 +321,7 @@ TSDAE(
     order = nothing, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
     autodiff = _default_autodiff(comm, dm),
 ) = TSDAE(
-    String(subtype), _bdf_order(subtype, order), String[String(o) for o in petsc_options],
+    _drivable(subtype), _bdf_order(subtype, order), String[String(o) for o in petsc_options],
     _check_autodiff(autodiff), _alg_comm(comm, dm), dm,
 )
 
@@ -639,6 +640,14 @@ const _NEEDS_OTHER_SETUP = Dict(
     "pseudo" => "is pseudo-transient continuation toward a steady state and runs past the final time",
 )
 
+function _drivable(ts_type)
+    t = String(ts_type)
+    haskey(_NEEDS_OTHER_SETUP, t) && throw(
+        ArgumentError("PETScDiffEq cannot drive `$t`, which $(_NEEDS_OTHER_SETUP[t])"),
+    )
+    return t
+end
+
 const _ADAPT_NEEDS_SETUP = Dict(
     "cfl" => "needs TSSetCFLTimeLocal",
     "history" => "needs TSAdaptHistorySetHistory",
@@ -654,10 +663,7 @@ function TSGeneric(
         explicit::Bool = false, comm::Union{Nothing, MPI.Comm} = nothing, dm = nothing,
         autodiff = _default_autodiff(comm, dm),
     )
-    t = String(ts_type)
-    haskey(_NEEDS_OTHER_SETUP, t) && throw(
-        ArgumentError("PETScDiffEq cannot drive `$t`, which $(_NEEDS_OTHER_SETUP[t])"),
-    )
+    t = _drivable(ts_type)
     !explicit && t in _EXPLICIT_ONLY && throw(
         ArgumentError("`$t` is an explicit PETSc type, so it needs `explicit = true`"),
     )
