@@ -6748,6 +6748,50 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             )
             sol = SciMLBase.solve(ramp, alg; callback = stop)
             @test count(t -> abs(t - 0.5) < 1.0e-12, sol.t) == 1
+            @test sol.retcode == SciMLBase.ReturnCode.Terminated && abs(sol.t[end] - 0.5) < 1.0e-12
+            # The dense output before the event uses the parameters from before it.
+            for save_positions in ((false, false), (false, true))
+                drift = SciMLBase.ODEProblem(
+                    (du, u, p, t) -> (du[1] = u[2] - p[1]; du[2] = 0.0; nothing), [0.0, 0.0],
+                    (0.0, 1.0), [0.0],
+                )
+                bump = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> t - 0.375,
+                    integ -> (integ.u[2] += 1.0; integ.p[1] += 1.0; clear!(integ));
+                    save_positions,
+                )
+                fixed = PETScDiffEq.TSRK("5dp", ["-ts_adapt_type", "none"])
+                sol = SciMLBase.solve(drift, fixed; dt = 0.25, callback = bump)
+                @test sol(0.3125)[1] == 0.0 && sol(0.4375)[1] == 0.0
+            end
+            # A save the callback asks for at the final time stays without save_end.
+            still = SciMLBase.ODEProblem((du, u, p, t) -> (du .= 0.0; nothing), [0.0], (0.0, 1.0))
+            for term in (false, true)
+                final = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> t - 1.0,
+                    integ -> (clear!(integ); term && SciMLBase.terminate!(integ)),
+                )
+                sol = SciMLBase.solve(
+                    still, alg; callback = final, save_end = false, save_everystep = false,
+                )
+                @test sol.t == [0.0, 1.0]
+            end
+            # The step point comes before the affect!'s own saves.
+            for (save_positions, term) in (((false, false), false), ((false, true), true))
+                inside = SciMLBase.ContinuousCallback(
+                    (u, t, integ) -> t - 0.5,
+                    integ -> begin
+                        integ.u[1] += 1.0
+                        SciMLBase.savevalues!(integ, true)
+                        clear!(integ)
+                        term && SciMLBase.terminate!(integ)
+                    end;
+                    save_positions,
+                )
+                sol = SciMLBase.solve(still, alg; callback = inside)
+                at = findall(t -> abs(t - 0.5) < 1.0e-12, sol.t)
+                @test [sol.u[k][1] for k in at] == [0.0, 1.0] && sol.u[end][1] == 1.0
+            end
         end
 
         @testset "dtrelax scales the step after an event" begin
