@@ -9635,10 +9635,24 @@ _bad_hmax(h, stops = ()) = Sys.ARCH === :i686 || _off_max_time(h.t0, h.tf) ||
 _off_max_time(t0, tmax) = !iszero(tmax) && abs(tmax - t0) > 8 * abs(tmax)
 
 # TSSolve refuses PETSc's evaluation times under any mode but MATCHSTEP; -ts_eval_times
-# arrived in 3.23.
-_evaluates(h) = any(h.user_options) do o
-    _names_option(o, "ts_time_span") ||
-        _petsc_version(h.petsclib) >= v"3.23" && _names_option(o, "ts_eval_times")
+# arrived in 3.23 as a separate key. Asked of the options PETSc holds, so its own last-wins
+# and case rules apply; both are names PETSc reads anyway, so asking leaves no warning out.
+function _evaluates(h)
+    h.opts === nothing && return false
+    pl = h.petsclib
+    function set(name)
+        found, buf = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE), zeros(UInt8, 256)
+        _check_code(
+            ccall(
+                _symbol(pl, :PetscOptionsGetString), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{Cchar}, Ptr{Cchar}, Ptr{UInt8}, Csize_t, Ptr{LibPETSc.PetscBool}),
+                h.opts.ptr, C_NULL, name, buf, sizeof(buf), found,
+            ),
+        )
+        n = something(findfirst(iszero, buf), length(buf) + 1) - 1
+        return found[] == LibPETSc.PETSC_TRUE && !isempty(strip(String(buf[1:n])))
+    end
+    return set("-ts_time_span") || _petsc_version(pl) >= v"3.23" && set("-ts_eval_times")
 end
 
 # The span is set before the options, so an option can move either end of it.

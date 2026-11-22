@@ -189,7 +189,8 @@ as a whole solve, so `init` refuses it and so does a solve with a callback or `t
 [`TSGeneric`](@ref). `-ts_time_span` and `-ts_eval_times` need a plain `solve`, as PETSc
 stores their solutions only there: `init` refuses them, and so does a solve that steps through
 it, as one with a callback, `tstops`, `d_discontinuities`, `isoutofdomain`, a Float32 clock,
-`TSMPRK` or `TSBasicSymplectic` does; `saveat` and `tstops` take their place. After a step the running solution's retcode is `Success`, as
+`TSMPRK` or `TSBasicSymplectic` does; `saveat` and `tstops` take their place. PETSc 3.22
+does not read `-ts_eval_times`, so there only `-ts_time_span` applies. After a step the running solution's retcode is `Success`, as
 OrdinaryDiffEq's is. `check_error` gives `Success` while the integrator can go on and the
 retcode it stopped with after that. In a callback's `finalize` it gives the retcode passed to
 `terminate!`, and `Success` for a solve that ended any other way, where OrdinaryDiffEq's

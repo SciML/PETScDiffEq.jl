@@ -10828,17 +10828,43 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         @testset "PETSc's evaluation times need TSSolve" begin
             prob = SciMLBase.ODEProblem(decay!, [1.0], (0.0, 1.0))
             new_names = PETScDiffEq._petsc_version(PETScDiffEq._petsclib(Float64)) >= v"3.25"
-            spans = [["-ts_time_span=0,0.5,1"]]
-            new_names && push!(spans, ["-ts_eval_times=0,0.5,1"])
+            spans = [["-ts_time_span=0,0.37,0.71,1"]]
+            new_names && push!(spans, ["-ts_eval_times=0,0.37,0.71,1"])
             nothing_cb = SciMLBase.DiscreteCallback((u, t, integ) -> false, integ -> nothing)
             for o in spans
                 alg = PETScDiffEq.TSRK("5dp", o)
-                sol = SciMLBase.solve(prob, alg; dt = 0.1)
+                sol = SciMLBase.solve(prob, alg; dt = 0.17, adaptive = false)
                 @test sol.retcode == SciMLBase.ReturnCode.Success
-                @test sol.u[end][1] ≈ exp(-1) rtol = 1.0e-4
+                for t in (0.37, 0.71)
+                    i = findfirst(==(t), sol.t)
+                    @test i !== nothing
+                    i === nothing || @test sol.u[i][1] ≈ exp(-t) rtol = 1.0e-4
+                end
                 @test_throws ArgumentError SciMLBase.init(prob, alg; dt = 0.1, adaptive = false)
                 @test_throws ArgumentError SciMLBase.solve(prob, alg; tstops = [0.3])
                 @test_throws ArgumentError SciMLBase.solve(prob, alg; callback = nothing_cb)
+            end
+            # An empty value clears the list; PETSc 3.22 keeps an earlier list despite it.
+            cleared = [["-ts_time_span="]]
+            new_names && push!(
+                cleared, ["-ts_eval_times=0,0.37,1", "-ts_eval_times="],
+            )
+            # PETSc reads a value starting with '-' as a new option, so stores no span.
+            push!(cleared, ["-ts_time_span", "-1,0.37,1"])
+            for o in cleared
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp", o); dt = 0.17, adaptive = false)
+                @test SciMLBase.solve!(integ).retcode == SciMLBase.ReturnCode.Success
+            end
+            # From 3.23 the names are separate keys, so either list alone evaluates.
+            if new_names
+                for o in (
+                        ["-ts_time_span=0,0.37,1", "-ts_eval_times="],
+                        ["-ts_eval_times=0,0.37,1", "-ts_time_span="],
+                    )
+                    alg = PETScDiffEq.TSRK("5dp", o)
+                    @test 0.37 in SciMLBase.solve(prob, alg; dt = 0.17, adaptive = false).t
+                    @test_throws ArgumentError SciMLBase.init(prob, alg; dt = 0.17, adaptive = false)
+                end
             end
         end
     end
