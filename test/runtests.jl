@@ -10567,6 +10567,32 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test SciMLBase.successful_retcode(sol)
                 @test abs(sol.u[end][1] - exp(-1.0)) < 1.0e-2
             end
+            function guess(opts)
+                integ = SciMLBase.init(
+                    prob, PETScDiffEq.TSImplicit("beuler", opts); dt = 0.01, adaptive = false
+                )
+                SciMLBase.solve!(integ)
+                @test SciMLBase.successful_retcode(integ.sol)
+                pl = integ.h.petsclib
+                snes, ksp = Ref{PETScDiffEq.LibPETSc.CSNES}(C_NULL), Ref{PETScDiffEq.LibPETSc.CKSP}(C_NULL)
+                flag = Ref{PETScDiffEq.LibPETSc.PetscBool}(PETScDiffEq.LibPETSc.PETSC_FALSE)
+                @test ccall(
+                    PETScDiffEq._symbol(pl, :TSGetSNES), PETScDiffEq.LibPETSc.PetscErrorCode,
+                    (PETScDiffEq.LibPETSc.CTS, Ptr{PETScDiffEq.LibPETSc.CSNES}), integ.h.ts, snes,
+                ) == 0
+                @test ccall(
+                    PETScDiffEq._symbol(pl, :SNESGetKSP), PETScDiffEq.LibPETSc.PetscErrorCode,
+                    (PETScDiffEq.LibPETSc.CSNES, Ptr{PETScDiffEq.LibPETSc.CKSP}), snes[], ksp,
+                ) == 0
+                @test ccall(
+                    PETScDiffEq._symbol(pl, :KSPGetInitialGuessNonzero), PETScDiffEq.LibPETSc.PetscErrorCode,
+                    (PETScDiffEq.LibPETSc.CKSP, Ptr{PETScDiffEq.LibPETSc.PetscBool}), ksp[], flag,
+                ) == 0
+                return flag[] == PETScDiffEq.LibPETSc.PETSC_TRUE
+            end
+            @test guess(["-ksp_initial_guess_nonzero="])
+            @test guess(["-ksp_initial_guess_nonzero", "false", "-KSP_INITIAL_GUESS_NONZERO", "true"])
+            @test !guess(["-ksp_initial_guess_nonzero", "true", "-KSP_INITIAL_GUESS_NONZERO", "false"])
         end
 
         @testset "interpolated final time keeps sol.t sorted and inside tspan" begin
