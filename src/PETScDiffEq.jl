@@ -174,7 +174,8 @@ function _bdf_order(subtype, order)
     order === nothing && return nothing
     subtype == "bdf" ||
         throw(ArgumentError("`order` applies to TSImplicit(\"bdf\"), not \"$subtype\""))
-    1 <= order <= 6 || throw(ArgumentError("PETSc supports BDF orders 1 through 6"))
+    order isa Real && isinteger(order) && 1 <= order <= 6 ||
+        throw(ArgumentError("PETSc supports BDF orders 1 through 6, got $order"))
     return Int(order)
 end
 

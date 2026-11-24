@@ -2904,6 +2904,9 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test_throws ArgumentError PETScDiffEq.TSImplicit("theta"; order = 3)
             @test_throws ArgumentError PETScDiffEq.TSImplicit("bdf"; order = 0)
             @test_throws ArgumentError PETScDiffEq.TSImplicit("bdf"; order = 7)
+            @test_throws ArgumentError PETScDiffEq.TSImplicit("bdf"; order = 2.5)
+            @test_throws ArgumentError PETScDiffEq.TSDAE("bdf"; order = 2.5)
+            @test PETScDiffEq.TSImplicit("bdf"; order = 3.0).order === 3
         end
 
         @testset "the positional constructors are unchanged" begin
