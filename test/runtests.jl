@@ -2675,6 +2675,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         for t in ("alpha2", "basicsymplectic", "discgrad", "eimex", "mimex", "mprk", "pseudo")
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t)
             @test_throws ArgumentError PETScDiffEq.TSGeneric(t; explicit = true)
+            why = "PETScDiffEq cannot drive `$t`"
+            @test_throws why PETScDiffEq.TSImplicit(t)
+            @test_throws why PETScDiffEq.TSImplicit(t, ["-snes_rtol", "1e-8"])
+            @test_throws why PETScDiffEq.TSDAE(t)
         end
 
         for t in ("euler", "glee", "rk", "ssp")
