@@ -3409,9 +3409,21 @@ function _option_flag(opts, name)
         _names_option(opt, name) || continue
         setting = occursin("=", opt) ? last(split(opt, "="; limit = 2)) :
             i < length(opts) && !startswith(opts[i + 1], "-") ? opts[i + 1] : "true"
-        value = lowercase(setting) in ("1", "true", "yes", "on")
+        value = lowercase(setting) in ("", "1", "true", "yes", "on")
     end
     return value
+end
+
+# PETSc names are case-insensitive and the last setting wins; parse_options keys by spelling.
+function _last_spellings(opts)
+    startswith(first(opts), "-") || return opts
+    starts = findall(o -> startswith(o, "-"), opts)
+    ends = [starts[2:end] .- 1; lastindex(opts)]
+    keep = [
+        all(j -> _option_name(opts[j]) != _option_name(opts[s]), starts[(k + 1):end])
+            for (k, s) in enumerate(starts)
+    ]
+    return reduce(vcat, [opts[starts[k]:ends[k]] for k in eachindex(starts) if keep[k]])
 end
 
 # PETSc 3.22 reorders for a nonzero diagonal even when the factorization orders itself, as
@@ -6851,8 +6863,10 @@ function _setup_problem(
             end
             # ILU(0) of a dense matrix is already its full LU, which GMRES then wraps in a
             # Krylov iteration it does not need.
+            # Preonly rejects a nonzero initial guess.
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
-                !_names_linear_solver(user_options)
+                !_names_linear_solver(user_options) &&
+                !_option_flag(user_options, "ksp_initial_guess_nonzero")
             small_lu = _small_lu(h, alg, comm, clone, uses_sparse_jac, dm_jac, n) &&
                 !_tunes_linear_solver(user_options) &&
                 !any(o -> startswith(lowercase(o), "-pc_"), user_options)
@@ -6897,7 +6911,7 @@ function _setup_problem(
             append!(effective_options, extra_options)
             h.quiet = !any(_viewer_option, effective_options)
             if !isempty(effective_options)
-                parsed = PETSc.parse_options(effective_options)
+                parsed = PETSc.parse_options(_last_spellings(effective_options))
                 h.opts = PETScCompat.PetscOptions(petsclib; parsed...)
                 try
                     # Monitors and viewers are made here, so they follow the solve's own options.
@@ -9026,8 +9040,13 @@ function _init_unlocked(
         end
         stops_given = vcat(tstops, d_discontinuities)
     end
-    _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
-    _match_steps_here!(h, stops_given)
+    try
+        _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
+        _match_steps_here!(h, stops_given)
+    catch
+        _destroy!(h)
+        rethrow()
+    end
     _mark_fresh!(h)
     _initial_save!(h)
     stops = _tstops(stops_given, h)
@@ -9652,10 +9671,24 @@ _bad_hmax(h, stops = ()) = Sys.ARCH === :i686 || _off_max_time(h.t0, h.tf) ||
 _off_max_time(t0, tmax) = !iszero(tmax) && abs(tmax - t0) > 8 * abs(tmax)
 
 # TSSolve refuses PETSc's evaluation times under any mode but MATCHSTEP; -ts_eval_times
-# arrived in 3.23.
-_evaluates(h) = any(h.user_options) do o
-    _names_option(o, "ts_time_span") ||
-        _petsc_version(h.petsclib) >= v"3.23" && _names_option(o, "ts_eval_times")
+# arrived in 3.23 as a separate key. Asked of the options PETSc holds, so its own last-wins
+# and case rules apply; both are names PETSc reads anyway, so asking leaves no warning out.
+function _evaluates(h)
+    h.opts === nothing && return false
+    pl = h.petsclib
+    function set(name)
+        found, buf = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE), zeros(UInt8, 256)
+        _check_code(
+            ccall(
+                _symbol(pl, :PetscOptionsGetString), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{Cchar}, Ptr{Cchar}, Ptr{UInt8}, Csize_t, Ptr{LibPETSc.PetscBool}),
+                h.opts.ptr, C_NULL, name, buf, sizeof(buf), found,
+            ),
+        )
+        n = something(findfirst(iszero, buf), length(buf) + 1) - 1
+        return found[] == LibPETSc.PETSC_TRUE && !isempty(strip(String(buf[1:n])))
+    end
+    return set("-ts_time_span") || _petsc_version(pl) >= v"3.23" && set("-ts_eval_times")
 end
 
 # The span is set before the options, so an option can move either end of it.
@@ -9713,6 +9746,14 @@ end
 function _match_steps_here!(
         h::TSHandles{<:Any, <:Any, R}, stops = (); tssolve = false,
     ) where {R}
+    # TSStep never stores the solutions these options exist for.
+    !tssolve && _evaluates(h) && throw(
+        ArgumentError(
+            "`-ts_time_span` and `-ts_eval_times` need PETSc's TSSolve, which this solve " *
+                "does not use (it steps with TSStep, for example because of callbacks or " *
+                "tstops); use `saveat` and `tstops` instead",
+        ),
+    )
     pl, ts = h.petsclib, h.ts
     mode = _exact_final_time(pl, ts)
     if R !== Float32
