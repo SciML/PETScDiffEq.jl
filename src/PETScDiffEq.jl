@@ -10034,9 +10034,28 @@ SciMLBase.solve!(integ::PETScIntegrator) = _locked(() -> _solve_integrator_unloc
 
 SciMLBase.done(integ::PETScIntegrator) = integ.finished
 
-SciMLBase.check_error(integ::PETScIntegrator) =
-    integ.sol.retcode == SciMLBase.ReturnCode.Default ? SciMLBase.ReturnCode.Success :
-    integ.sol.retcode
+# SciMLBase's generic checks with step!'s rules; step! already warns, so this does not.
+# Collective on a distributed integrator, as step! is.
+function SciMLBase.check_error(integ::PETScIntegrator)
+    RC = SciMLBase.ReturnCode
+    code = integ.sol.retcode::RC.T
+    code == RC.Success || code == RC.Default || return code
+    h = integ.h
+    ctx, pl = h.ctx, h.petsclib
+    isnan(integ.dt) && return RC.DtNaN
+    _attempts(ctx, pl, h.ts) > ctx.maxiters && return RC.MaxIters
+    hnext = LibPETSc.TSGetTimeStep(pl, h.ts)
+    tol = _near(h.tf, ctx.tbound)
+    limit = isempty(integ.tstops) ? h.tf : min(integ.tstops[1], h.tf)
+    ctx.dtmin > 0 && hnext < ctx.dtmin && integ.tdir * integ.t + hnext < limit - tol &&
+        return RC.DtLessThanMin
+    ctx.unstable !== nothing && _predicate(
+        () -> ctx.unstable(
+            integ.tdir * hnext, _user_state(ctx.wrapped_u, integ.u), ctx.p, integ.t,
+        ), ctx,
+    ) && return RC.Unstable
+    return RC.Success
+end
 
 function _postamble_unlocked(integ::PETScIntegrator)
     integ.finished || _finish!(integ, integ.sol.retcode)

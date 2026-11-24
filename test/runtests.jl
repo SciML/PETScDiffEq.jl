@@ -11810,6 +11810,40 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 SciMLBase.step!(integ)
                 SciMLBase.terminate!(integ, RC.Failure)
                 @test seen == [RC.Terminated, RC.Failure]
+
+                integ = SciMLBase.init(
+                    prob, PETScDiffEq.TSRK("5dp"); unstable_check = (dt, u, p, t) -> u[1] < 0,
+                )
+                SciMLBase.step!(integ)
+                SciMLBase.set_u!(integ, -integ.u)
+                @test integ.sol.retcode == RC.Success
+                @test SciMLBase.check_error(integ) == RC.Unstable
+                integ = SciMLBase.init(lv, PETScDiffEq.TSRK("5dp"); maxiters = 10)
+                foreach(_ -> SciMLBase.step!(integ), 1:3)
+                integ.opts.maxiters = 3
+                @test SciMLBase.check_error(integ) == RC.Success
+                integ.opts.maxiters = 2
+                @test SciMLBase.check_error(integ) == RC.MaxIters
+                integ.opts.unstable_check = (dt, u, p, t) -> true
+                integ.sol = SciMLBase.solution_new_retcode(integ.sol, RC.Failure)
+                @test SciMLBase.check_error(integ) == RC.Failure
+
+                integ = SciMLBase.init(
+                    prob, PETScDiffEq.TSRK("5dp"); dtmin = 1.0e-3, tstops = [0.1, 0.1 + 1.0e-5],
+                )
+                codes = RC.T[]
+                while !integ.finished
+                    SciMLBase.step!(integ)
+                    push!(codes, SciMLBase.check_error(integ))
+                end
+                @test all(==(RC.Success), codes)
+                long = SciMLBase.remake(prob; tspan = (0.0, 10.0))
+                integ = SciMLBase.init(long, PETScDiffEq.TSRK("5dp"))
+                SciMLBase.step!(integ)
+                integ.opts.dtmin = 2.0
+                @test SciMLBase.check_error(integ) == RC.DtLessThanMin
+                SciMLBase.step!(integ)
+                @test integ.sol.retcode == RC.DtLessThanMin
             end
 
             @testset "last_step_failed is a fixed step whose Newton solve failed" begin
