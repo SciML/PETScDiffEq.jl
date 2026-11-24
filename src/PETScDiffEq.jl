@@ -910,6 +910,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     attempt_margin::Int
     trial::Int
     adapts::Union{Nothing, Bool}
+    kept::Int
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -3414,9 +3415,21 @@ function _option_flag(opts, name)
         _names_option(opt, name) || continue
         setting = occursin("=", opt) ? last(split(opt, "="; limit = 2)) :
             i < length(opts) && !startswith(opts[i + 1], "-") ? opts[i + 1] : "true"
-        value = lowercase(setting) in ("1", "true", "yes", "on")
+        value = lowercase(setting) in ("", "1", "true", "yes", "on")
     end
     return value
+end
+
+# PETSc names are case-insensitive and the last setting wins; parse_options keys by spelling.
+function _last_spellings(opts)
+    startswith(first(opts), "-") || return opts
+    starts = findall(o -> startswith(o, "-"), opts)
+    ends = [starts[2:end] .- 1; lastindex(opts)]
+    keep = [
+        all(j -> _option_name(opts[j]) != _option_name(opts[s]), starts[(k + 1):end])
+            for (k, s) in enumerate(starts)
+    ]
+    return reduce(vcat, [opts[starts[k]:ends[k]] for k in eachindex(starts) if keep[k]])
 end
 
 # PETSc 3.22 reorders for a nonzero diagonal even when the factorization orders itself, as
@@ -6696,7 +6709,7 @@ function _setup_problem(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
-        nothing, mass_slope, tf, -1, -1, _adapts(_warn_name(alg)),
+        nothing, mass_slope, tf, -1, -1, _adapts(_warn_name(alg)), 0,
     )::TSContext
     h = Base.inferencebarrier(TSHandles)(
         ctx, petsclib, LibPETSc.TS(petsclib), uvec, nothing, nothing, ad_calls, nothing,
@@ -6856,8 +6869,10 @@ function _setup_problem(
             end
             # ILU(0) of a dense matrix is already its full LU, which GMRES then wraps in a
             # Krylov iteration it does not need.
+            # Preonly rejects a nonzero initial guess.
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
-                !_names_linear_solver(user_options)
+                !_names_linear_solver(user_options) &&
+                !_option_flag(user_options, "ksp_initial_guess_nonzero")
             small_lu = _small_lu(h, alg, comm, clone, uses_sparse_jac, dm_jac, n) &&
                 !_tunes_linear_solver(user_options) &&
                 !any(o -> startswith(lowercase(o), "-pc_"), user_options)
@@ -6902,7 +6917,7 @@ function _setup_problem(
             append!(effective_options, extra_options)
             h.quiet = !any(_viewer_option, effective_options)
             if !isempty(effective_options)
-                parsed = PETSc.parse_options(effective_options)
+                parsed = PETSc.parse_options(_last_spellings(effective_options))
                 h.opts = PETScCompat.PetscOptions(petsclib; parsed...)
                 try
                     # Monitors and viewers are made here, so they follow the solve's own options.
@@ -7208,7 +7223,9 @@ function _assemble(
         _record!(ctx, tend, uend)
     end
     # A zero span's point at tf is its start, which save_start keeps.
-    if !h.save_end && t0 != tf && !isempty(ctx.ts) && abs(ctx.ts[end] - tf) <= tol
+    # A callback's own saves at tf stay, as only the step's end point is dropped.
+    if !h.save_end && t0 != tf && !isempty(ctx.ts) && abs(ctx.ts[end] - tf) <= tol &&
+            length(ctx.ts) != ctx.kept
         pop!(ctx.ts)
         pop!(ctx.us)
         ctx.dense && pop!(ctx.dus)
@@ -8439,7 +8456,10 @@ function _set_t_unlocked(integ::PETScIntegrator, t)
     isnan(t) && throw(ArgumentError("`set_t!` was given a NaN time"))
     integ.t = oftype(integ.t, t)
     _end_step_here!(integ)
-    integ.finished || LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * integ.t)
+    integ.finished && return nothing
+    # History taken at the old times no longer lines up with the new clock.
+    LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * integ.t)
+    LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
     return nothing
 end
 
@@ -8461,8 +8481,8 @@ end
 function _change_t_unlocked(
         integ::PETScIntegrator, t, modify_save_endpoint::Type{Val{T}} = Val{false},
     ) where {T}
-    integ.finished && return nothing
     t = oftype(integ.t, t)
+    integ.finished && return _change_t_finished!(integ, t, T)
     copyto!(integ.u, _state_at(integ, t))
     integ.t = t
     integ.dt = integ.t - integ.tprev
@@ -8472,6 +8492,42 @@ function _change_t_unlocked(
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
     T && _rewind_saves!(integ)
     _raise_threw!(integ)
+    return nothing
+end
+
+# After the solve the integrator stays finished; only its state and the saved end point move.
+function _change_t_finished!(integ::PETScIntegrator, t, modify_save_endpoint::Bool)
+    t == integ.t && return nothing
+    copyto!(integ.u, _state_at(integ, t))
+    integ.t = t
+    integ.dt = integ.t - integ.tprev
+    _end_step_here!(integ)
+    modify_save_endpoint && _replace_saved_end!(integ)
+    return nothing
+end
+
+# OrdinaryDiffEq's endpoint rule on the assembled solution, dropping points at or past `t`.
+function _replace_saved_end!(integ::PETScIntegrator)
+    h, sol, t = integ.h, integ.sol, integ.t
+    ctx, s = h.ctx, integ.tdir * integ.t
+    h.save_end || return nothing
+    if !isempty(sol.t)
+        sol.t[end] == t && return nothing
+        tol = _near(h.tf, ctx.tbound)
+        h.end_saveat === nothing || any(x -> abs(x - s) <= tol, h.end_saveat) ||
+            return nothing
+    end
+    while !isempty(sol.t) && integ.tdir * sol.t[end] >= s
+        pop!(sol.t)
+        pop!(sol.u)
+        ctx.dense && pop!(sol.interp.du)
+    end
+    push!(sol.t, t)
+    push!(sol.u, _saved(ctx, integ.u))
+    if ctx.dense
+        du = integ.tdir .* _select(_derivative(ctx, s, integ.u), ctx.save_idxs)
+        push!(sol.interp.du, _kept(ctx, du))
+    end
     return nothing
 end
 
@@ -8857,6 +8913,19 @@ function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
     return nothing
 end
 
+# The step point from before an affect! goes ahead of the affect!'s own saves, as in
+# OrdinaryDiffEq, and with them it stays past a dropped end point unless the state changed.
+function _record_pre!(ctx, t, n, pre, du, modified)
+    if pre !== nothing
+        _record!(ctx, t, pre, du)
+        for v in (ctx.ts, ctx.us, ctx.user_ts, ctx.dense ? ctx.dus : nothing, ctx.user_dus)
+            v === nothing || v === ctx.user_dus && !ctx.dense || insert!(v, n + 1, pop!(v))
+        end
+    end
+    modified || (ctx.kept = length(ctx.ts))
+    return nothing
+end
+
 function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     isempty(integ.continuous) && return false
     ctx = integ.h.ctx
@@ -8882,6 +8951,9 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
         _fill_conditions!(residual, integ, best_cb, integ.t)
     best_cb.save_positions[1] && !saved && _save_here!(integ)
     pre = ctx.save_everystep && !saved && !best_cb.save_positions[1] ? copy(integ.u) : nothing
+    # The slope before the affect!, which may change p, keeps the dense output on the step.
+    pre_du = pre !== nothing && ctx.dense ? _derivative(ctx, integ.tdir * integ.t, pre) : nothing
+    nsaved = length(ctx.ts)
     integ.derivative_discontinuity = true
     _pin_step!(integ)
     before = ctx.dae ? copy(integ.u) : _check_residual(integ, best_cb.initializealg)
@@ -8894,15 +8966,17 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     # OrdinaryDiffEq saves no discretes after an affect! that clears the discontinuity.
     modified = _anywhere(ctx.comm, integ.derivative_discontinuity)
     stop === nothing ||
-        (_stop!(integ, best_cb, stop, pre, best_crossing, modified); return true)
+        (_stop!(integ, best_cb, stop, (nsaved, pre, pre_du), best_crossing, modified); return true)
     modified && _reinitialize!(integ, best_cb.initializealg, before, slope)
     integ.finished && return true
     integ.derivative_discontinuity = false
     _rollback!(integ, integ.t, _proposed_dt_unlocked(integ), false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
-    if best_cb.save_positions[2]
+    if best_cb.save_positions[2] && modified
         _save_here!(integ)
-        modified && _save_discretes!(integ, best_cb, best_crossing)
+        _save_discretes!(integ, best_cb, best_crossing)
+    elseif !modified
+        _record_pre!(ctx, integ.tdir * integ.t, nsaved, pre, pre_du, false)
     end
     return true
 end
@@ -9011,8 +9085,13 @@ function _init_unlocked(
         end
         stops_given = vcat(tstops, d_discontinuities)
     end
-    _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
-    _match_steps_here!(h, stops_given)
+    try
+        _with_options(() -> LibPETSc.TSSetUp(h.petsclib, h.ts), h)
+        _match_steps_here!(h, stops_given)
+    catch
+        _destroy!(h)
+        rethrow()
+    end
     _mark_fresh!(h)
     _initial_save!(h)
     stops = _tstops(stops_given, h)
@@ -9459,6 +9538,7 @@ function _reinit_unlocked(
         rethrow()
     end
     reused || _destroy!(old)
+    h.ctx.kept = 0
     if _overrides(get(setup_kwargs, :initializealg, DiffEqBase.DefaultInit()), prob.f)
         setfield!(integ, :p, convert(fieldtype(typeof(integ), :p), h.ctx.p))
         integ.prob = _with_p(integ.prob, integ.p)
@@ -9589,10 +9669,10 @@ function _affect!(f, integ::PETScIntegrator)
 end
 
 function _stop!(integ::PETScIntegrator, cb, retcode, pre, crossing = nothing, modified = true)
-    pre === nothing || _record!(integ.h.ctx, integ.tdir * integ.t, pre)
-    if cb.save_positions[2]
+    pre === nothing || _record_pre!(integ.h.ctx, integ.tdir * integ.t, pre..., modified)
+    if cb.save_positions[2] && modified
         _save_here!(integ)
-        modified && _save_discretes!(integ, cb, crossing)
+        _save_discretes!(integ, cb, crossing)
     end
     _finish!(integ, retcode)
     return nothing
@@ -9636,10 +9716,24 @@ _bad_hmax(h, stops = ()) = Sys.ARCH === :i686 || _off_max_time(h.t0, h.tf) ||
 _off_max_time(t0, tmax) = !iszero(tmax) && abs(tmax - t0) > 8 * abs(tmax)
 
 # TSSolve refuses PETSc's evaluation times under any mode but MATCHSTEP; -ts_eval_times
-# arrived in 3.23.
-_evaluates(h) = any(h.user_options) do o
-    _names_option(o, "ts_time_span") ||
-        _petsc_version(h.petsclib) >= v"3.23" && _names_option(o, "ts_eval_times")
+# arrived in 3.23 as a separate key. Asked of the options PETSc holds, so its own last-wins
+# and case rules apply; both are names PETSc reads anyway, so asking leaves no warning out.
+function _evaluates(h)
+    h.opts === nothing && return false
+    pl = h.petsclib
+    function set(name)
+        found, buf = Ref{LibPETSc.PetscBool}(LibPETSc.PETSC_FALSE), zeros(UInt8, 256)
+        _check_code(
+            ccall(
+                _symbol(pl, :PetscOptionsGetString), LibPETSc.PetscErrorCode,
+                (Ptr{Cvoid}, Ptr{Cchar}, Ptr{Cchar}, Ptr{UInt8}, Csize_t, Ptr{LibPETSc.PetscBool}),
+                h.opts.ptr, C_NULL, name, buf, sizeof(buf), found,
+            ),
+        )
+        n = something(findfirst(iszero, buf), length(buf) + 1) - 1
+        return found[] == LibPETSc.PETSC_TRUE && !isempty(strip(String(buf[1:n])))
+    end
+    return set("-ts_time_span") || _petsc_version(pl) >= v"3.23" && set("-ts_eval_times")
 end
 
 # The span is set before the options, so an option can move either end of it.
@@ -9697,6 +9791,14 @@ end
 function _match_steps_here!(
         h::TSHandles{<:Any, <:Any, R}, stops = (); tssolve = false,
     ) where {R}
+    # TSStep never stores the solutions these options exist for.
+    !tssolve && _evaluates(h) && throw(
+        ArgumentError(
+            "`-ts_time_span` and `-ts_eval_times` need PETSc's TSSolve, which this solve " *
+                "does not use (it steps with TSStep, for example because of callbacks or " *
+                "tstops); use `saveat` and `tstops` instead",
+        ),
+    )
     pl, ts = h.petsclib, h.ts
     mode = _exact_final_time(pl, ts)
     if R !== Float32
