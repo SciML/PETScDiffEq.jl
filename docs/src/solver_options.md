@@ -213,7 +213,10 @@ new start is not saved again, as in OrdinaryDiffEq, and a solution saved under `
 without dense output stays without it when the new `saveat` would otherwise turn it on, since
 a partial state gives no derivative to interpolate with.
 `change_t_via_interpolation!` with `Val{true}` drops what was saved past the new time, and
-saves the new end when `save_everystep` asks for every step. `resize!`, `deleteat!` and
+saves the new end when `save_everystep` asks for every step. On an integrator that has finished,
+it moves `t` and `u` back inside the last step, drops what was saved at or past the new
+time, and saves the new end when OrdinaryDiffEq's end-point rule would; the integrator stays
+finished and `step!` still refuses. `resize!`, `deleteat!` and
 `addat!` raise an `ArgumentError`, since PETSc sizes its vectors and solvers when the
 integrator is made. So does a `reinit!` whose `t0` and `tf` run the other way in time from
 the span the integrator was made for; make a new integrator for that direction.

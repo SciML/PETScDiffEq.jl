@@ -8475,8 +8475,8 @@ end
 function _change_t_unlocked(
         integ::PETScIntegrator, t, modify_save_endpoint::Type{Val{T}} = Val{false},
     ) where {T}
-    integ.finished && return nothing
     t = oftype(integ.t, t)
+    integ.finished && return _change_t_finished!(integ, t, T)
     copyto!(integ.u, _state_at(integ, t))
     integ.t = t
     integ.dt = integ.t - integ.tprev
@@ -8486,6 +8486,42 @@ function _change_t_unlocked(
     LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
     T && _rewind_saves!(integ)
     _raise_threw!(integ)
+    return nothing
+end
+
+# After the solve the integrator stays finished; only its state and the saved end point move.
+function _change_t_finished!(integ::PETScIntegrator, t, modify_save_endpoint::Bool)
+    t == integ.t && return nothing
+    copyto!(integ.u, _state_at(integ, t))
+    integ.t = t
+    integ.dt = integ.t - integ.tprev
+    _end_step_here!(integ)
+    modify_save_endpoint && _replace_saved_end!(integ)
+    return nothing
+end
+
+# OrdinaryDiffEq's endpoint rule on the assembled solution, dropping points at or past `t`.
+function _replace_saved_end!(integ::PETScIntegrator)
+    h, sol, t = integ.h, integ.sol, integ.t
+    ctx, s = h.ctx, integ.tdir * integ.t
+    h.save_end || return nothing
+    if !isempty(sol.t)
+        sol.t[end] == t && return nothing
+        tol = _near(h.tf, ctx.tbound)
+        h.end_saveat === nothing || any(x -> abs(x - s) <= tol, h.end_saveat) ||
+            return nothing
+    end
+    while !isempty(sol.t) && integ.tdir * sol.t[end] >= s
+        pop!(sol.t)
+        pop!(sol.u)
+        ctx.dense && pop!(sol.interp.du)
+    end
+    push!(sol.t, t)
+    push!(sol.u, _saved(ctx, integ.u))
+    if ctx.dense
+        du = integ.tdir .* _select(_derivative(ctx, s, integ.u), ctx.save_idxs)
+        push!(sol.interp.du, _kept(ctx, du))
+    end
     return nothing
 end
 

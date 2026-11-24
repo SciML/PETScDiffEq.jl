@@ -12006,6 +12006,44 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
                 @test sol.t == [0.15, 0.5]
                 @test abs(sol.u[1][1] - 2exp(-0.15)) < 1.0e-7
             end
+
+            @testset "change_t_via_interpolation! after solve! moves the finished integrator" begin
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("4"); dt = 0.25)
+                SciMLBase.solve!(integ)
+                SciMLBase.change_t_via_interpolation!(integ, 0.875, Val{false})
+                @test integ.t == 0.875
+                @test abs(integ.u[1] - exp(-0.875)) < 1.0e-4
+                @test integ.sol.t[end] == 1.0
+
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("4"); dt = 0.25)
+                SciMLBase.solve!(integ)
+                SciMLBase.change_t_via_interpolation!(integ, 0.875, Val{true})
+                @test integ.t == 0.875
+                @test abs(integ.u[1] - exp(-0.875)) < 1.0e-4
+                @test integ.sol.t == [0.0, 0.25, 0.5, 0.75, 0.875]
+                @test integ.sol.u[end] == integ.u
+                @test integ.sol(0.875) ≈ integ.u
+                @test_throws "has finished" SciMLBase.step!(integ)
+
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("4"); dt = 0.25, saveat = [0.5])
+                SciMLBase.solve!(integ)
+                SciMLBase.change_t_via_interpolation!(integ, 0.875, Val{true})
+                @test integ.t == 0.875
+                @test integ.sol.t == [0.5]
+
+                integ = SciMLBase.init(
+                    prob, PETScDiffEq.TSRK("4"); dt = 0.25, saveat = [0.9], save_end = true,
+                )
+                SciMLBase.solve!(integ)
+                SciMLBase.change_t_via_interpolation!(integ, 0.875, Val{true})
+                @test integ.sol.t == [0.875]
+                @test integ.sol.u[end] == integ.u
+
+                integ = SciMLBase.init(prob, PETScDiffEq.TSRK("4"); dt = 0.25, saveat = 0.125)
+                SciMLBase.solve!(integ)
+                SciMLBase.change_t_via_interpolation!(integ, 0.875, Val{true})
+                @test integ.sol.t == 0.0:0.125:1.0
+            end
         end
 
         @testset "assigning integ.t moves the clock as set_t! does" begin
