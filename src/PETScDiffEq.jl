@@ -904,6 +904,7 @@ mutable struct TSContext{R, S, A, F, F2, JAC, JBUF, P, L, V}
     attempt_margin::Int
     trial::Int
     adapts::Union{Nothing, Bool}
+    kept::Int
 end
 
 _distributed(alg::AnyPETScTS) = alg.comm != MPI.COMM_SELF
@@ -6702,7 +6703,7 @@ function _setup_problem(
         force_dtmin && dtmin !== nothing && dtmin != 0,
         nothing, 0, 0, bound,
         false, false, step_limit, false, nothing, nothing, 0, 0, false, shape, nothing,
-        nothing, mass_slope, tf, -1, -1, _adapts(_warn_name(alg)),
+        nothing, mass_slope, tf, -1, -1, _adapts(_warn_name(alg)), 0,
     )::TSContext
     h = Base.inferencebarrier(TSHandles)(
         ctx, petsclib, LibPETSc.TS(petsclib), uvec, nothing, nothing, ad_calls, nothing,
@@ -7216,7 +7217,9 @@ function _assemble(
         _record!(ctx, tend, uend)
     end
     # A zero span's point at tf is its start, which save_start keeps.
-    if !h.save_end && t0 != tf && !isempty(ctx.ts) && abs(ctx.ts[end] - tf) <= tol
+    # A callback's own saves at tf stay, as only the step's end point is dropped.
+    if !h.save_end && t0 != tf && !isempty(ctx.ts) && abs(ctx.ts[end] - tf) <= tol &&
+            length(ctx.ts) != ctx.kept
         pop!(ctx.ts)
         pop!(ctx.us)
         ctx.dense && pop!(ctx.dus)
@@ -8865,6 +8868,19 @@ function _rollback!(integ::PETScIntegrator, t, dt, interpolate::Bool)
     return nothing
 end
 
+# The step point from before an affect! goes ahead of the affect!'s own saves, as in
+# OrdinaryDiffEq, and with them it stays past a dropped end point unless the state changed.
+function _record_pre!(ctx, t, n, pre, du, modified)
+    if pre !== nothing
+        _record!(ctx, t, pre, du)
+        for v in (ctx.ts, ctx.us, ctx.user_ts, ctx.dense ? ctx.dus : nothing, ctx.user_dus)
+            v === nothing || v === ctx.user_dus && !ctx.dense || insert!(v, n + 1, pop!(v))
+        end
+    end
+    modified || (ctx.kept = length(ctx.ts))
+    return nothing
+end
+
 function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     isempty(integ.continuous) && return false
     ctx = integ.h.ctx
@@ -8890,6 +8906,9 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
         _fill_conditions!(residual, integ, best_cb, integ.t)
     best_cb.save_positions[1] && !saved && _save_here!(integ)
     pre = ctx.save_everystep && !saved && !best_cb.save_positions[1] ? copy(integ.u) : nothing
+    # The slope before the affect!, which may change p, keeps the dense output on the step.
+    pre_du = pre !== nothing && ctx.dense ? _derivative(ctx, integ.tdir * integ.t, pre) : nothing
+    nsaved = length(ctx.ts)
     integ.derivative_discontinuity = true
     _pin_step!(integ)
     before = ctx.dae ? copy(integ.u) : _check_residual(integ, best_cb.initializealg)
@@ -8902,15 +8921,17 @@ function _apply_continuous_callbacks!(integ::PETScIntegrator, dt)
     # OrdinaryDiffEq saves no discretes after an affect! that clears the discontinuity.
     modified = _anywhere(ctx.comm, integ.derivative_discontinuity)
     stop === nothing ||
-        (_stop!(integ, best_cb, stop, pre, best_crossing, modified); return true)
+        (_stop!(integ, best_cb, stop, (nsaved, pre, pre_du), best_crossing, modified); return true)
     modified && _reinitialize!(integ, best_cb.initializealg, before, slope)
     integ.finished && return true
     integ.derivative_discontinuity = false
     _rollback!(integ, integ.t, _proposed_dt_unlocked(integ), false)
     _mark_fired!(integ.event_t[best_k], best_cb, best_crossing, integ.t)
-    if best_cb.save_positions[2]
+    if best_cb.save_positions[2] && modified
         _save_here!(integ)
-        modified && _save_discretes!(integ, best_cb, best_crossing)
+        _save_discretes!(integ, best_cb, best_crossing)
+    elseif !modified
+        _record_pre!(ctx, integ.tdir * integ.t, nsaved, pre, pre_du, false)
     end
     return true
 end
@@ -9472,6 +9493,7 @@ function _reinit_unlocked(
         rethrow()
     end
     reused || _destroy!(old)
+    h.ctx.kept = 0
     if _overrides(get(setup_kwargs, :initializealg, DiffEqBase.DefaultInit()), prob.f)
         setfield!(integ, :p, convert(fieldtype(typeof(integ), :p), h.ctx.p))
         integ.prob = _with_p(integ.prob, integ.p)
@@ -9602,10 +9624,10 @@ function _affect!(f, integ::PETScIntegrator)
 end
 
 function _stop!(integ::PETScIntegrator, cb, retcode, pre, crossing = nothing, modified = true)
-    pre === nothing || _record!(integ.h.ctx, integ.tdir * integ.t, pre)
-    if cb.save_positions[2]
+    pre === nothing || _record_pre!(integ.h.ctx, integ.tdir * integ.t, pre..., modified)
+    if cb.save_positions[2] && modified
         _save_here!(integ)
-        modified && _save_discretes!(integ, cb, crossing)
+        _save_discretes!(integ, cb, crossing)
     end
     _finish!(integ, retcode)
     return nothing
