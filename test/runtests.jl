@@ -6017,6 +6017,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             sol = SciMLBase.solve(grid, alg; dt = 0.1, saveat = 0.5, save_idxs = [1 2; 3 4], tols...)
             @test sol.u == [vec(u)[[1, 3, 2, 4]] for u in full.u]
         end
+
+        @testset "a Colon saves every component flat, as in OrdinaryDiffEq" begin
+            grid = SciMLBase.ODEProblem(decay!, [1.0 2.0; 3.0 4.0], (0.0, 1.0))
+            for kw in ((dt = 0.1, tols...), (dt = 0.1, saveat = 0.5, tols...))
+                full = SciMLBase.solve(grid, alg; kw...)
+                sol = SciMLBase.solve(grid, alg; kw..., save_idxs = :)
+                @test sol.t == full.t
+                @test sol.u == [vec(u) for u in full.u]
+                @test sol(0.55) ≈ vec(full(0.55))
+            end
+            integ = SciMLBase.init(grid, alg; dt = 0.1, save_idxs = :, tols...)
+            SciMLBase.step!(integ)
+            SciMLBase.reinit!(integ)
+            sol = SciMLBase.solve!(integ)
+            @test sol.u == [vec(u) for u in SciMLBase.solve(grid, alg; dt = 0.1, tols...).u]
+        end
     end
 
     @testset "out-of-place problems" begin

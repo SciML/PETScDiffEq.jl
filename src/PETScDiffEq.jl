@@ -3876,9 +3876,12 @@ function _save_index(u0, I::CartesianIndex)
     return LinearIndices(u0)[I]
 end
 
-_listed(idxs) = idxs isa AbstractArray && SII.symbolic_type(idxs) == SII.NotSymbolic()
+_listed(idxs) =
+    idxs isa Colon || idxs isa AbstractArray && SII.symbolic_type(idxs) == SII.NotSymbolic()
 
 function _save_idxs(prob, idxs)
+    # A Colon saves every component as a flat vector, as `u[:]` does in OrdinaryDiffEq.
+    idxs isa Colon && return collect(1:length(prob.u0))
     _listed(idxs) || return _state_indices!(Int[], prob, idxs)
     v = Int[]
     for i in idxs
