@@ -169,9 +169,10 @@ grid fills in: on a 2-D Brusselator with 2048 states PETSc's LU took 5 to 9 time
 DM and distributed Jacobians keep GMRES with ILU(0), block Jacobi in parallel. A `-ksp_type`,
 `-pc_type`, `-snes_mf` or `-snes_mf_operator`, or any other `-ksp_` or `-pc_` option but a
 viewer, monitor or converged reason, in `petsc_options` replaces this choice; for a dense
-Jacobian only the first four do, and any other `-pc_` option, or `-ksp_` option whose name
-has no `view`, `monitor` or `converged_reason` in it, keeps PETSc's own factorization for a
-small one.
+Jacobian only the first four do, and enabling `-ksp_initial_guess_nonzero`, which preonly
+rejects, keeps GMRES with ILU(0) at any size. Any other `-pc_` option, or `-ksp_` option
+whose name has no `view`, `monitor` or `converged_reason` in it, including that flag set to
+false, keeps PETSc's own factorization for a small one.
 
 PETSc's Newton solver forms a new Jacobian at every iteration. An adaptive BDF solve, through
 `TSImplicit("bdf")` or `TSDAE`, sets `-snes_lag_jacobian 5`: one Jacobian per nonlinear
@@ -186,7 +187,11 @@ fixed-step backward Euler solve fail. A `-snes_lag_jacobian` in `petsc_options` 
 all work, as does the integrator interface through `init`, `step!`, `solve!`, `reinit!`,
 `terminate!` and `initialize_dae!`. The exception is PETSc's `"glle"`, which PETSc runs only
 as a whole solve, so `init` refuses it and so does a solve with a callback or `tstops`; see
-[`TSGeneric`](@ref). After a step the running solution's retcode is `Success`, as
+[`TSGeneric`](@ref). `-ts_time_span` and `-ts_eval_times` need a plain `solve`, as PETSc
+stores their solutions only there: `init` refuses them, and so does a solve that steps through
+it, as one with a callback, `tstops`, `d_discontinuities`, `isoutofdomain`, a Float32 clock,
+`TSMPRK` or `TSBasicSymplectic` does; `saveat` and `tstops` take their place. PETSc 3.22
+does not read `-ts_eval_times`, so there only `-ts_time_span` applies. After a step the running solution's retcode is `Success`, as
 OrdinaryDiffEq's is. `check_error` gives `Success` while the integrator can go on and the
 retcode it stopped with after that. In a callback's `finalize` it gives the retcode passed to
 `terminate!`, and `Success` for a solve that ended any other way, where OrdinaryDiffEq's
@@ -208,7 +213,10 @@ new start is not saved again, as in OrdinaryDiffEq, and a solution saved under `
 without dense output stays without it when the new `saveat` would otherwise turn it on, since
 a partial state gives no derivative to interpolate with.
 `change_t_via_interpolation!` with `Val{true}` drops what was saved past the new time, and
-saves the new end when `save_everystep` asks for every step. `resize!`, `deleteat!` and
+saves the new end when `save_everystep` asks for every step. On an integrator that has finished,
+it moves `t` and `u` back inside the last step, drops what was saved at or past the new
+time, and saves the new end when OrdinaryDiffEq's end-point rule would; the integrator stays
+finished and `step!` still refuses. `resize!`, `deleteat!` and
 `addat!` raise an `ArgumentError`, since PETSc sizes its vectors and solvers when the
 integrator is made. So does a `reinit!` whose `t0` and `tf` run the other way in time from
 the span the integrator was made for; make a new integrator for that direction.
