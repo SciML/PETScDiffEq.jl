@@ -3408,9 +3408,21 @@ function _option_flag(opts, name)
         _names_option(opt, name) || continue
         setting = occursin("=", opt) ? last(split(opt, "="; limit = 2)) :
             i < length(opts) && !startswith(opts[i + 1], "-") ? opts[i + 1] : "true"
-        value = lowercase(setting) in ("1", "true", "yes", "on")
+        value = lowercase(setting) in ("", "1", "true", "yes", "on")
     end
     return value
+end
+
+# PETSc names are case-insensitive and the last setting wins; parse_options keys by spelling.
+function _last_spellings(opts)
+    startswith(first(opts), "-") || return opts
+    starts = findall(o -> startswith(o, "-"), opts)
+    ends = [starts[2:end] .- 1; lastindex(opts)]
+    keep = [
+        all(j -> _option_name(opts[j]) != _option_name(opts[s]), starts[(k + 1):end])
+            for (k, s) in enumerate(starts)
+    ]
+    return reduce(vcat, [opts[starts[k]:ends[k]] for k in eachindex(starts) if keep[k]])
 end
 
 # PETSc 3.22 reorders for a nonzero diagonal even when the factorization orders itself, as
@@ -6850,8 +6862,10 @@ function _setup_problem(
             end
             # ILU(0) of a dense matrix is already its full LU, which GMRES then wraps in a
             # Krylov iteration it does not need.
+            # Preonly rejects a nonzero initial guess.
             dense_lu = _dense_jacobian(h, alg, comm, clone, uses_sparse_jac, dm_jac) &&
-                !_names_linear_solver(user_options)
+                !_names_linear_solver(user_options) &&
+                !_option_flag(user_options, "ksp_initial_guess_nonzero")
             small_lu = _small_lu(h, alg, comm, clone, uses_sparse_jac, dm_jac, n) &&
                 !_tunes_linear_solver(user_options) &&
                 !any(o -> startswith(lowercase(o), "-pc_"), user_options)
@@ -6896,7 +6910,7 @@ function _setup_problem(
             append!(effective_options, extra_options)
             h.quiet = !any(_viewer_option, effective_options)
             if !isempty(effective_options)
-                parsed = PETSc.parse_options(effective_options)
+                parsed = PETSc.parse_options(_last_spellings(effective_options))
                 h.opts = PETScCompat.PetscOptions(petsclib; parsed...)
                 try
                     # Monitors and viewers are made here, so they follow the solve's own options.

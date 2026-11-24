@@ -169,9 +169,10 @@ grid fills in: on a 2-D Brusselator with 2048 states PETSc's LU took 5 to 9 time
 DM and distributed Jacobians keep GMRES with ILU(0), block Jacobi in parallel. A `-ksp_type`,
 `-pc_type`, `-snes_mf` or `-snes_mf_operator`, or any other `-ksp_` or `-pc_` option but a
 viewer, monitor or converged reason, in `petsc_options` replaces this choice; for a dense
-Jacobian only the first four do, and any other `-pc_` option, or `-ksp_` option whose name
-has no `view`, `monitor` or `converged_reason` in it, keeps PETSc's own factorization for a
-small one.
+Jacobian only the first four do, and enabling `-ksp_initial_guess_nonzero`, which preonly
+rejects, keeps GMRES with ILU(0) at any size. Any other `-pc_` option, or `-ksp_` option
+whose name has no `view`, `monitor` or `converged_reason` in it, including that flag set to
+false, keeps PETSc's own factorization for a small one.
 
 PETSc's Newton solver forms a new Jacobian at every iteration. An adaptive BDF solve, through
 `TSImplicit("bdf")` or `TSDAE`, sets `-snes_lag_jacobian 5`: one Jacobian per nonlinear
