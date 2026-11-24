@@ -12023,6 +12023,22 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             @test sol.u[end][1] ≈ 1.1
         end
 
+        @testset "set_t! restarts BDF, as OrdinaryDiffEq resets ABDF2" begin
+            ramp!(du, u, p, t) = (du[1] = 1.0; nothing)
+            ramp = SciMLBase.ODEProblem(ramp!, [0.0], (0.0, 2.0))
+            integ = SciMLBase.init(
+                ramp, PETScDiffEq.TSImplicit("bdf"); dt = 0.125, adaptive = false,
+                save_everystep = false,
+            )
+            SciMLBase.step!(integ)
+            SciMLBase.step!(integ)
+            SciMLBase.set_t!(integ, 1.0)
+            SciMLBase.step!(integ)
+            @test integ.t == 1.125
+            @test integ.u[1] ≈ 0.375
+            SciMLBase.terminate!(integ)
+        end
+
         @testset "iter and opts read as OrdinaryDiffEq's do" begin
             integ = SciMLBase.init(prob, PETScDiffEq.TSRK("5dp"); dt = 0.1, adaptive = false)
             @test integ.iter == 0

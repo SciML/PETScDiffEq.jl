@@ -8450,7 +8450,10 @@ function _set_t_unlocked(integ::PETScIntegrator, t)
     isnan(t) && throw(ArgumentError("`set_t!` was given a NaN time"))
     integ.t = oftype(integ.t, t)
     _end_step_here!(integ)
-    integ.finished || LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * integ.t)
+    integ.finished && return nothing
+    # History taken at the old times no longer lines up with the new clock.
+    LibPETSc.TSSetTime(integ.h.petsclib, integ.h.ts, integ.tdir * integ.t)
+    LibPETSc.TSRestartStep(integ.h.petsclib, integ.h.ts)
     return nothing
 end
 
