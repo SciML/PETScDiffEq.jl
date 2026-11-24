@@ -6355,6 +6355,9 @@ function _save_plan(R, t0, tf, tdir, saveat, save_everystep, save_start, save_en
     )
     save_on || empty!(saveat_times)
     save_start || filter!(!at_start, saveat_times)
+    # OrdinaryDiffEq saves t0 once however often saveat lists it.
+    nstart = count(at_start, saveat_times)
+    nstart > 1 && deleteat!(saveat_times, 1:(nstart - 1))
     save_end || filter!(!at_end, saveat_times)
     return saveat_times, save_everystep, save_start, save_end, end_saveat, bound
 end

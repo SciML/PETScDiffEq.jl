@@ -9402,6 +9402,32 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             end
         end
 
+        @testset "a repeated t0 in saveat is saved once, as in OrdinaryDiffEq" begin
+            ramp!(du, u, p, t) = (du[1] = 1.0; nothing)
+            for (tspan, saveat, kw, want) in (
+                    ((0.0, 1.0), [0.0, 0.0, 1.0], (;), [0.0, 1.0]),
+                    ((0.0, 1.0), [0.0, 0.0, 0.5], (; save_end = false), [0.0, 0.5]),
+                    ((0.0, 1.0), [0.0, 0.0, 0.5], (; save_start = false), [0.5]),
+                    ((0.0, 1.0), [0.0, 0.5, 0.5, 1.0, 1.0], (;), [0.0, 0.5, 0.5, 1.0, 1.0]),
+                    ((1.0, 0.0), [1.0, 1.0, 0.0], (;), [1.0, 0.0]),
+                )
+                ramp = SciMLBase.ODEProblem(ramp!, [0.0], tspan)
+                dt = 0.25 * sign(tspan[2] - tspan[1])
+                @test SciMLBase.solve(ramp, alg; dt, saveat, kw...).t == want
+                integ = SciMLBase.init(ramp, alg; dt, saveat, kw...)
+                @test SciMLBase.solve!(integ).t == want
+            end
+            ramp = SciMLBase.ODEProblem(ramp!, [0.0], (0.0, 1.0))
+            kw = (; dt = 0.25, dense = true, save_everystep = true, saveat = [0.0, 0.0, 1.0])
+            for sol in (
+                    SciMLBase.solve(ramp, alg; kw...),
+                    SciMLBase.solve!(SciMLBase.init(ramp, alg; kw...)),
+                )
+                @test sol.t == 0.0:0.25:1.0
+                @test sol(0.0, Val{1}; idxs = 1) ≈ 1.0
+            end
+        end
+
         @testset "the saving flags combine as in OrdinaryDiffEq" begin
             both = SciMLBase.solve(
                 prob, alg; dt = 0.25, saveat = [0.3], save_everystep = true, tstops = [0.5],
