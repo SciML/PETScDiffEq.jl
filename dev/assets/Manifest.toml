@@ -2,7 +2,7 @@
 
 julia_version = "1.13.4"
 manifest_format = "2.1"
-project_hash = "bee5e3a359ada12c152c9a5ee7441a0beaf4c603"
+project_hash = "bbc629a72ee954a57b83002d07ae84390f4fd99d"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -141,11 +141,11 @@ version = "1.12.8"
     ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 
 [[deps.Bzip2_jll]]
-deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "1b96ea4a01afe0ea4090c5c8039690672dd13f2e"
+deps = ["Artifacts", "LazyJLLWrappers", "Libdl"]
+git-tree-sha1 = "4d0b66ab0ba8ed6fccfd82631775b22fc1f6823a"
 registries = "General"
 uuid = "6e34b625-4abd-537c-b88f-471c36dfa7a0"
-version = "1.0.9+0"
+version = "1.0.10"
 
 [[deps.CodecZlib]]
 deps = ["TranscodingStreams", "Zlib_jll"]
@@ -397,10 +397,10 @@ version = "0.8.28"
 
 [[deps.Expat_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "f2659a735f9360fedfa29925812380f322679e93"
+git-tree-sha1 = "30fbbf8fb9d4e5d3264b4eb10c04f8a9ebaf9381"
 registries = "General"
 uuid = "2e619515-83b5-522b-bb60-26c02a35a201"
-version = "2.10.0+0"
+version = "2.11.0+0"
 
 [[deps.ExprTools]]
 git-tree-sha1 = "d2e49e7efd29719d6f28b891b0e0e159daa9d2b4"
@@ -545,10 +545,10 @@ version = "2.56.0+0"
 
 [[deps.HDF5_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LibCURL_jll", "Libdl", "MPIABI_jll", "MPICH_jll", "MPIPreferences", "MPItrampoline_jll", "MicrosoftMPI_jll", "OpenMPI_jll", "OpenSSL_jll", "TOML", "Zlib_jll", "aws_c_s3_jll", "dlfcn_win32_jll", "libaec_jll", "mpif_jll"]
-git-tree-sha1 = "d791a1c4c3c8f383b248a799be31105d00310204"
+git-tree-sha1 = "50d3523c90f2392334956375d2129a84e3df328b"
 registries = "General"
 uuid = "0234f1f7-429e-5d53-9886-15a909be8d59"
-version = "2.2.4+0"
+version = "2.3.0+0"
 
 [[deps.HYPRE64_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LLVMOpenMP_jll", "Libdl", "MPIABI_jll", "MPICH_jll", "MPIPreferences", "MPItrampoline_jll", "MicrosoftMPI_jll", "OpenMPI_jll", "TOML", "libblastrampoline_jll"]
@@ -985,9 +985,9 @@ version = "0.5.6"
 
 [[deps.PETScDiffEq]]
 deps = ["ADTypes", "ConstructionBase", "DiffEqBase", "DifferentiationInterface", "ForwardDiff", "Libdl", "LinearAlgebra", "MPI", "PETSc", "PETSc_jll", "PrecompileTools", "SciMLBase", "SciMLLogging", "SciMLOperators", "SparseArrays", "SparseMatrixColorings", "SymbolicIndexingInterface"]
-path = "/home/runner/_work/PETScDiffEq.jl/PETScDiffEq.jl"
+path = "/home/runner/work/PETScDiffEq.jl/PETScDiffEq.jl"
 uuid = "0a65194f-a16f-47d0-900e-080c22068669"
-version = "0.15.8"
+version = "0.15.11"
 
     [deps.PETScDiffEq.extensions]
     PETScDiffEqSciMLSensitivityExt = ["SciMLSensitivity", "ChainRulesCore"]
@@ -1316,10 +1316,10 @@ version = "1.13.0"
 
 [[deps.SparseMatrixColorings]]
 deps = ["ADTypes", "DocStringExtensions", "LinearAlgebra", "PrecompileTools", "Random", "SparseArrays"]
-git-tree-sha1 = "0730f14b07c68fd3b3a6fae89a829a5124a7ae7e"
+git-tree-sha1 = "7143e58a1ce776485bc0e2c1df746b098f0b9381"
 registries = "General"
 uuid = "0a514795-09f3-496d-8182-132a7b665d35"
-version = "0.4.29"
+version = "0.4.30"
 
     [deps.SparseMatrixColorings.extensions]
     SparseMatrixColoringsAMDGPUExt = "AMDGPU"
@@ -1599,11 +1599,11 @@ uuid = "b2a88e68-78e7-5e94-8c20-c02986ec140e"
 version = "1.0.1+1"
 
 [[deps.dlfcn_win32_jll]]
-deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "e141d67ffe550eadfb5af1bdbdaf138031e4805f"
+deps = ["Artifacts", "LazyJLLWrappers", "Libdl"]
+git-tree-sha1 = "0893150d2766f258f4e3fc2d4a4aa7097414cceb"
 registries = "General"
 uuid = "c4b69c83-5512-53e3-94e6-de98773c479f"
-version = "1.4.2+0"
+version = "1.4.3"
 
 [[deps.libaec_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
