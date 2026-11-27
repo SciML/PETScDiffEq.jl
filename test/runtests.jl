@@ -638,7 +638,10 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
             !any(P.PETScCompat.isinitialized, P.PETSc.petsclibs) && !P.MPI.Initialized() ||
             exit(2)
         f!(du, u, p, t) = (du[1] = -u[1]; nothing)
-        SciMLBase.solve(SciMLBase.ODEProblem(f!, [1.0], (0.0, 1.0)), PETScDiffEq.TSRK())
+        prob = SciMLBase.ODEProblem(f!, [1.0], (0.0, 1.0))
+        SciMLBase.solve(prob, PETScDiffEq.TSRK())
+        cb = SciMLBase.ContinuousCallback((u, t, integ) -> u[1] - 0.5, integ -> nothing)
+        SciMLBase.solve(prob, PETScDiffEq.TSRK(); callback = cb)
         """
         trace = tempname()
         # Coverage turns off the native code in package images.
@@ -646,7 +649,7 @@ const ALL_TESTS = Test.DefaultTestSet("PETScDiffEq.jl")
         cmd = `$(Base.julia_cmd()) $flags --project=$(Base.active_project())
             --trace-compile=$trace -e $script`
         @test success(pipeline(cmd; stdout = devnull, stderr = devnull))
-        @test count(l -> occursin("PETScDiffEq.", l), readlines(trace)) < 10
+        @test count(l -> occursin("PETScDiffEq.", l), readlines(trace)) < 15
     end
 
     @testset "precompile workload" begin

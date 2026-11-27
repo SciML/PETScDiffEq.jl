@@ -14,6 +14,10 @@ function _wl_stiff!(du, u, p, t)
 end
 
 _wl_cost!(out, u, p, t, i) = (out .= u; nothing)
+_wl_residual!(r, du, u, p, t) = (r .= du .+ u; nothing)
+_wl_cond(u, t, integ) = u[1] - 0.75
+_wl_affect!(integ) = (integ.u[1] = 1.0; nothing)
+_wl_when(u, t, integ) = t > 0.5
 
 # Under mpiexec or srun, MPI_Init in the precompiling process aborts it.
 _under_mpi_launcher() = any(
@@ -49,6 +53,18 @@ function _run_workload()
         SciMLBase.solve(pprob, TSRK())
         SciMLBase.solve(pprob, TSRosW())
         SciMLBase.solve(pprob, TSImplicit("bdf"))
+        # Most problems carry no parameters, which specializes differently from pprob.
+        SciMLBase.solve(prob, TSRosW())
+        SciMLBase.solve(prob, TSImplicit("bdf"))
+        SciMLBase.solve(prob, TSRK(); saveat = 0.1)
+        SciMLBase.solve(prob, TSRK(); callback = SciMLBase.ContinuousCallback(_wl_cond, _wl_affect!))
+        SciMLBase.solve(prob, TSRK(); callback = SciMLBase.DiscreteCallback(_wl_when, _wl_affect!))
+        mm_f = SciMLBase.ODEFunction(_wl_decay!; mass_matrix = [1.0 0.0; 0.0 1.0])
+        SciMLBase.solve(SciMLBase.ODEProblem(mm_f, u0, tspan), TSImplicit("bdf"))
+        SciMLBase.solve(
+            SciMLBase.DAEProblem(_wl_residual!, -u0, u0, tspan; differential_vars = [true, true]),
+            TSDAE(),
+        )
         sparse_f = SciMLBase.ODEFunction(
             _wl_decay!; jac_prototype = SparseArrays.sparse([1, 2, 2], [1, 1, 2], ones(3)),
         )
